@@ -1,119 +1,3 @@
-Okay so I'm doing vmware scripting
-
-I've already got asking the user for credentials to get a SDDC API token and also the credentials which get stored into a variable, this variable has the hostname, and passowrd for the root account. It willl connect to all the VCs and enable the SSH of all ESXI host.. That's sorted
-
-I'm having issues and want to get the code for
-Getting the fingerprint for first time SSH and say yes to that fingerprint. It will generate a public and private key of itself and upload the key to ssh auhtorised keys to allow it to run esxcli commands. 
-This bit always having troubles as it always hangs as its interactive and asking for password credentaisl
-Edit
-
-I can help you with the SSH key generation and fingerprint acceptance part of your VMware scripting. The hanging issue you're experiencing is common when dealing with interactive SSH prompts.
-
-Here are a few approaches to handle this programmatically:
-
-The script above provides several methods to handle the SSH key setup without hanging on interactive prompts:
-Key Features:
-
-    Automatic Fingerprint Handling: Uses ssh-keyscan to pre-populate known_hosts, avoiding the "yes/no" fingerprint prompt
-    Multiple Authentication Methods:
-        sshpass (most reliable if available)
-        expect scripts (for Linux/WSL environments)
-        Posh-SSH PowerShell module
-    Key Generation: Automatically generates SSH key pairs if they don't exist
-    Non-interactive: All methods bypass interactive prompts
-
-Installation Requirements:
-
-For the most reliable method, install sshpass:
-
-Windows (using Chocolatey):
-powershell
-
-choco install sshpass
-
-Or for Posh-SSH module:
-powershell
-
-Install-Module -Name Posh-SSH -Force
-
-Usage Example:
-powershell
-
-# Your existing credential variables
-$esxiHosts = @("esxi1.domain.com", "esxi2.domain.com")
-$rootPassword = $credentials.Password  # From your existing credential variable
-
-# Setup SSH keys
-Set-ESXiSSHKeys -ESXiHosts $esxiHosts -Username "root" -Password $rootPassword
-
-# Now you can run commands without passwords
-Invoke-ESXiCommand -ESXiHost "esxi1.domain.com" -Command "esxcli system version get"
-
-The script handles the common issues that cause hanging:
-
-    Pre-accepts host fingerprints
-    Uses non-interactive SSH options (-o StrictHostKeyChecking=no)
-    Provides multiple fallback methods
-    Includes proper error handling
-
-Would you like me to modify any part of this approach or help integrate it with your existing VMware scripting framework?
-
-Don't use posh-ssh. Is there a ssh.exe on windows or plink
-Edit
-
-Yes, absolutely! Modern Windows 10/11 comes with OpenSSH client (ssh.exe) built-in, and you can also use plink.exe from PuTTY. Let me update the script to focus on these native options:
-
-Perfect! Here's what I've updated to focus on native Windows tools:
-Available SSH Tools on Windows:
-
-    Windows 10/11 Built-in SSH (ssh.exe):
-        Available by default on Windows 10 (1809+) and Windows 11
-        If not available, install with: Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0
-    PuTTY plink.exe:
-        Download from https://www.putty.org/
-        More reliable for automation as it handles passwords better
-        Use -batch flag to avoid interactive prompts
-
-Key Improvements:
-
-For plink.exe (Recommended for automation):
-powershell
-
-# Auto-accepts host keys and uses password authentication
-plink -ssh -batch -auto_store_key_in_cache -pw $Password $Username@$ESXiHost "command"
-
-For native ssh.exe:
-powershell
-
-# Uses options to bypass interactive prompts
-ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=nul -o PreferredAuthentications=password $Username@$ESXiHost
-
-Quick Setup Check:
-
-The script includes a Test-SSHTools function that checks what's available:
-powershell
-
-Test-SSHTools  # Shows available SSH tools
-
-Usage:
-powershell
-
-# Your existing variables
-$esxiHosts = @("esxi1.domain.com", "esxi2.domain.com") 
-$rootPassword = $credentials.Password
-
-# Use the native Windows version
-Set-ESXiSSHKeys-Native -ESXiHosts $esxiHosts -Username "root" -Password $rootPassword
-
-plink.exe is generally more reliable for automation because:
-
-    Better handles password input without hanging
-    -batch mode prevents interactive prompts
-    -auto_store_key_in_cache handles host key acceptance automatically
-
-Would you like me to create a version that focuses specifically on plink.exe, or do you need help integrating this with your existing VMware script structure?
-
-
 # VMware ESXi SSH Key Setup Script
 # Handles fingerprint acceptance and key generation/upload
 
@@ -314,7 +198,243 @@ echo $Password
         }
     }
     
-# Alternative function using pure Windows ssh.exe with expect-like behavior
+# Function using plink without batch mode for initial connection
+function Install-SSHKeyToESXi-PlinkInteractive {
+    param(
+        [string]$ESXiHost,
+        [string]$Username = "root",
+        [string]$Password,
+        [string]$PublicKeyPath = "$env:USERPROFILE\.ssh\id_rsa.pub"
+    )
+    
+    if (-not (Test-Path $PublicKeyPath)) {
+        throw "Public key not found at $PublicKeyPath"
+    }
+    
+    $publicKeyContent = Get-Content $PublicKeyPath -Raw
+    $publicKeyContent = $publicKeyContent.Trim()
+    
+    Write-Host "Installing SSH key to $ESXiHost using plink..." -ForegroundColor Green
+    
+    # Method 1: Use plink without -batch for password auth, then switch to batch for commands
+    try {
+        Write-Host "Establishing initial connection..." -ForegroundColor Yellow
+        
+        # First establish connection and accept host key (interactive)
+        $plinkArgs = @(
+            "-ssh",
+            "-pw", $Password,
+            "$Username@$ESXiHost",
+            "echo 'Initial connection successful'"
+        )
+        
+        Write-Host "Running: plink -ssh -pw [PASSWORD] $Username@$ESXiHost" -ForegroundColor Gray
+        $result = & plink @plinkArgs 2>&1
+        
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "Initial connection established, installing SSH key..." -ForegroundColor Green
+            
+            # Now use batch mode for commands since host key is cached
+            $commands = @(
+                "mkdir -p /etc/ssh/keys-root",
+                "echo '$publicKeyContent' >> /etc/ssh/keys-root/authorized_keys",
+                "chmod 600 /etc/ssh/keys-root/authorized_keys",
+                "chmod 700 /etc/ssh/keys-root"
+            )
+            
+            foreach ($cmd in $commands) {
+                $batchArgs = @(
+                    "-ssh",
+                    "-batch",
+                    "-pw", $Password,
+                    "$Username@$ESXiHost",
+                    $cmd
+                )
+                
+                Write-Host "Executing: $cmd" -ForegroundColor Gray
+                $cmdResult = & plink @batchArgs 2>&1
+                
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Warning "Command may have failed: $cmd"
+                    Write-Warning "Output: $cmdResult"
+                } else {
+                    Write-Host "Success: $cmd" -ForegroundColor Green
+                }
+            }
+            
+            return $true
+        } else {
+            Write-Warning "Initial connection failed: $result"
+        }
+    }
+    catch {
+        Write-Warning "Plink method failed: $($_.Exception.Message)"
+    }
+    
+    return $false
+}
+
+# Alternative method using Windows ssh.exe with echo for password
+function Install-SSHKeyToESXi-SSHEcho {
+    param(
+        [string]$ESXiHost,
+        [string]$Username = "root",
+        [string]$Password,
+        [string]$PublicKeyPath = "$env:USERPROFILE\.ssh\id_rsa.pub"
+    )
+    
+    if (-not (Test-Path $PublicKeyPath)) {
+        throw "Public key not found at $PublicKeyPath"
+    }
+    
+    $publicKeyContent = Get-Content $PublicKeyPath -Raw
+    $publicKeyContent = $publicKeyContent.Trim()
+    
+    Write-Host "Installing SSH key to $ESXiHost using ssh.exe..." -ForegroundColor Green
+    
+    try {
+        # Create a PowerShell script that handles the SSH interaction
+        $scriptContent = @"
+`$password = '$Password'
+`$commands = @(
+    'mkdir -p /etc/ssh/keys-root',
+    'echo ''$publicKeyContent'' >> /etc/ssh/keys-root/authorized_keys',
+    'chmod 600 /etc/ssh/keys-root/authorized_keys',
+    'chmod 700 /etc/ssh/keys-root',
+    'exit'
+)
+
+# Use Process.Start to control stdin
+`$psi = New-Object System.Diagnostics.ProcessStartInfo
+`$psi.FileName = 'ssh'
+`$psi.Arguments = '-o StrictHostKeyChecking=no -o UserKnownHostsFile=nul -o PreferredAuthentications=password -o PubkeyAuthentication=no $Username@$ESXiHost'
+`$psi.UseShellExecute = `$false
+`$psi.RedirectStandardInput = `$true
+`$psi.RedirectStandardOutput = `$true
+`$psi.RedirectStandardError = `$true
+
+`$process = [System.Diagnostics.Process]::Start(`$psi)
+
+# Send password
+`$process.StandardInput.WriteLine(`$password)
+
+# Send commands
+foreach (`$cmd in `$commands) {
+    `$process.StandardInput.WriteLine(`$cmd)
+    Start-Sleep -Milliseconds 100
+}
+
+`$process.StandardInput.Close()
+`$process.WaitForExit(30000)  # 30 second timeout
+
+`$output = `$process.StandardOutput.ReadToEnd()
+`$error = `$process.StandardError.ReadToEnd()
+
+Write-Host "Output: `$output"
+if (`$error) { Write-Warning "Error: `$error" }
+
+`$process.Close()
+"@
+        
+        $tempScript = [System.IO.Path]::GetTempFileName() + ".ps1"
+        $scriptContent | Out-File -FilePath $tempScript -Encoding UTF8
+        
+        # Execute the script
+        $result = & powershell.exe -ExecutionPolicy Bypass -File $tempScript
+        
+        # Clean up
+        Remove-Item $tempScript -Force
+        
+        Write-Host "SSH key installation attempted using ssh.exe" -ForegroundColor Green
+        return $true
+    }
+    catch {
+        Write-Warning "SSH method failed: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+# Function using pscp to copy a script file and execute it
+function Install-SSHKeyToESXi-ScriptUpload {
+    param(
+        [string]$ESXiHost,
+        [string]$Username = "root",
+        [string]$Password,
+        [string]$PublicKeyPath = "$env:USERPROFILE\.ssh\id_rsa.pub"
+    )
+    
+    if (-not (Get-Command pscp -ErrorAction SilentlyContinue)) {
+        Write-Warning "pscp not found. This method requires PuTTY's pscp.exe"
+        return $false
+    }
+    
+    if (-not (Test-Path $PublicKeyPath)) {
+        throw "Public key not found at $PublicKeyPath"
+    }
+    
+    $publicKeyContent = Get-Content $PublicKeyPath -Raw
+    $publicKeyContent = $publicKeyContent.Trim()
+    
+    Write-Host "Installing SSH key using pscp and script upload..." -ForegroundColor Green
+    
+    try {
+        # Create a script to run on ESXi
+        $scriptContent = @"
+#!/bin/sh
+mkdir -p /etc/ssh/keys-root
+echo '$publicKeyContent' >> /etc/ssh/keys-root/authorized_keys
+chmod 600 /etc/ssh/keys-root/authorized_keys
+chmod 700 /etc/ssh/keys-root
+echo "SSH key installation completed"
+"@
+        
+        $tempScript = [System.IO.Path]::GetTempFileName() + ".sh"
+        $scriptContent | Out-File -FilePath $tempScript -Encoding UTF8
+        
+        # Upload script to ESXi
+        Write-Host "Uploading script to ESXi..." -ForegroundColor Yellow
+        $pscpArgs = @(
+            "-pw", $Password,
+            "-batch",
+            $tempScript,
+            "$Username@${ESXiHost}:/tmp/install_key.sh"
+        )
+        
+        $uploadResult = & pscp @pscpArgs 2>&1
+        
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "Script uploaded, executing..." -ForegroundColor Green
+            
+            # Execute the script
+            $plinkArgs = @(
+                "-ssh",
+                "-batch",
+                "-pw", $Password,
+                "$Username@$ESXiHost",
+                "chmod +x /tmp/install_key.sh && /tmp/install_key.sh && rm /tmp/install_key.sh"
+            )
+            
+            $execResult = & plink @plinkArgs 2>&1
+            
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "SSH key installed successfully via script upload" -ForegroundColor Green
+                Remove-Item $tempScript -Force
+                return $true
+            } else {
+                Write-Warning "Script execution failed: $execResult"
+            }
+        } else {
+            Write-Warning "Script upload failed: $uploadResult"
+        }
+        
+        # Clean up
+        Remove-Item $tempScript -Force
+    }
+    catch {
+        Write-Warning "Script upload method failed: $($_.Exception.Message)"
+    }
+    
+# Enhanced version with multiple fallback methods for Windows
 function Install-SSHKeyToESXi-WindowsNative {
     param(
         [string]$ESXiHost,
@@ -327,107 +447,35 @@ function Install-SSHKeyToESXi-WindowsNative {
         throw "Public key not found at $PublicKeyPath"
     }
     
-    $publicKeyContent = Get-Content $PublicKeyPath -Raw
-    $publicKeyContent = $publicKeyContent.Trim()
+    Write-Host "Trying multiple methods to install SSH key on $ESXiHost..." -ForegroundColor Green
     
-    Write-Host "Installing SSH key to $ESXiHost using Windows SSH..." -ForegroundColor Green
-    
-    # Method 1: Using Windows ssh.exe with pipeline input
-    try {
-        # Create commands as a single string to execute
-        $commandString = @"
-mkdir -p /etc/ssh/keys-root
-echo '$publicKeyContent' >> /etc/ssh/keys-root/authorized_keys
-chmod 600 /etc/ssh/keys-root/authorized_keys
-chmod 700 /etc/ssh/keys-root
-exit
-"@
-        
-        # Write commands to temp file
-        $tempFile = [System.IO.Path]::GetTempFileName()
-        $commandString | Out-File -FilePath $tempFile -Encoding UTF8
-        
-        # Use ssh with input redirection
-        $sshArgs = @(
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "UserKnownHostsFile=nul", 
-            "-o", "PreferredAuthentications=password",
-            "-o", "PubkeyAuthentication=no",
-            "-o", "BatchMode=no",
-            "$Username@$ESXiHost"
-        )
-        
-        # Execute SSH with password (you'll need to handle this interactively or use expect)
-        Write-Host "Note: You may need to enter the password interactively" -ForegroundColor Yellow
-        $result = Get-Content $tempFile | ssh @sshArgs
-        
-        # Clean up
-        Remove-Item $tempFile -Force
-        
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host "SSH key installed successfully" -ForegroundColor Green
+    # Method 1: Script upload (most reliable)
+    if (Get-Command pscp -ErrorAction SilentlyContinue) {
+        Write-Host "Attempting method 1: Script upload with pscp" -ForegroundColor Yellow
+        if (Install-SSHKeyToESXi-ScriptUpload -ESXiHost $ESXiHost -Username $Username -Password $Password -PublicKeyPath $PublicKeyPath) {
             return $true
         }
     }
-    catch {
-        Write-Warning "Method 1 failed: $($_.Exception.Message)"
-    }
     
-    # Method 2: Using plink if available (more reliable for automation)
+    # Method 2: Interactive plink
     if (Get-Command plink -ErrorAction SilentlyContinue) {
-        try {
-            Write-Host "Using plink for automated installation..." -ForegroundColor Yellow
-            
-            # First, store the host key (equivalent to accepting fingerprint)
-            $plinkArgs = @(
-                "-ssh",
-                "-batch", 
-                "-auto_store_key_in_cache",
-                "-pw", $Password,
-                "$Username@$ESXiHost",
-                "echo 'Connection test'"
-            )
-            
-            $null = & plink @plinkArgs 2>&1
-            
-            # Now execute the key installation commands
-            $commands = @(
-                "mkdir -p /etc/ssh/keys-root",
-                "echo '$publicKeyContent' >> /etc/ssh/keys-root/authorized_keys",
-                "chmod 600 /etc/ssh/keys-root/authorized_keys",
-                "chmod 700 /etc/ssh/keys-root"
-            )
-            
-            foreach ($cmd in $commands) {
-                $plinkArgs = @(
-                    "-ssh",
-                    "-batch",
-                    "-pw", $Password,
-                    "$Username@$ESXiHost", 
-                    $cmd
-                )
-                
-                $result = & plink @plinkArgs 2>&1
-                Write-Host "Executed: $cmd" -ForegroundColor Gray
-                
-                if ($LASTEXITCODE -ne 0) {
-                    Write-Warning "Command failed: $cmd"
-                    Write-Warning "Output: $result"
-                }
-            }
-            
-            Write-Host "SSH key installation completed with plink" -ForegroundColor Green
+        Write-Host "Attempting method 2: Interactive plink" -ForegroundColor Yellow
+        if (Install-SSHKeyToESXi-PlinkInteractive -ESXiHost $ESXiHost -Username $Username -Password $Password -PublicKeyPath $PublicKeyPath) {
             return $true
-        }
-        catch {
-            Write-Warning "Plink method failed: $($_.Exception.Message)"
         }
     }
     
+    # Method 3: SSH with process control
+    if (Get-Command ssh -ErrorAction SilentlyContinue) {
+        Write-Host "Attempting method 3: SSH with process control" -ForegroundColor Yellow
+        if (Install-SSHKeyToESXi-SSHEcho -ESXiHost $ESXiHost -Username $Username -Password $Password -PublicKeyPath $PublicKeyPath) {
+            return $true
+        }
+    }
+    
+    Write-Error "All methods failed for $ESXiHost"
     return $false
 }
-
-# Function to check if SSH tools are available
 function Test-SSHTools {
     $tools = @()
     
