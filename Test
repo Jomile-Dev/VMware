@@ -1,0 +1,250 @@
+# VMware ESXi SSH Key Setup Script
+# Handles fingerprint acceptance and key generation/upload
+
+# Function to generate SSH key pair if it doesn't exist
+function New-SSHKeyPair {
+    param(
+        [string]$KeyPath = "$env:USERPROFILE\.ssh\id_rsa"
+    )
+    
+    if (-not (Test-Path $KeyPath)) {
+        Write-Host "Generating SSH key pair..." -ForegroundColor Green
+        ssh-keygen -t rsa -b 4096 -f $KeyPath -N '""' -q
+        Write-Host "SSH key pair generated at $KeyPath" -ForegroundColor Green
+    } else {
+        Write-Host "SSH key pair already exists at $KeyPath" -ForegroundColor Yellow
+    }
+}
+
+# Function to add host to known_hosts (bypasses fingerprint prompt)
+function Add-HostToKnownHosts {
+    param(
+        [string]$HostName,
+        [string]$KnownHostsPath = "$env:USERPROFILE\.ssh\known_hosts"
+    )
+    
+    # Create .ssh directory if it doesn't exist
+    $sshDir = Split-Path $KnownHostsPath -Parent
+    if (-not (Test-Path $sshDir)) {
+        New-Item -ItemType Directory -Path $sshDir -Force | Out-Null
+    }
+    
+    # Get host key and add to known_hosts
+    try {
+        Write-Host "Adding $HostName to known_hosts..." -ForegroundColor Green
+        $hostKey = ssh-keyscan -H $HostName 2>$null
+        if ($hostKey) {
+            Add-Content -Path $KnownHostsPath -Value $hostKey
+            Write-Host "Host key added successfully" -ForegroundColor Green
+        }
+    }
+    catch {
+        Write-Warning "Failed to get host key for $HostName : $($_.Exception.Message)"
+    }
+}
+
+# Function to upload public key to ESXi host
+function Install-SSHKeyToESXi {
+    param(
+        [string]$ESXiHost,
+        [string]$Username = "root",
+        [string]$Password,
+        [string]$PublicKeyPath = "$env:USERPROFILE\.ssh\id_rsa.pub"
+    )
+    
+    if (-not (Test-Path $PublicKeyPath)) {
+        throw "Public key not found at $PublicKeyPath"
+    }
+    
+    $publicKeyContent = Get-Content $PublicKeyPath -Raw
+    $publicKeyContent = $publicKeyContent.Trim()
+    
+    Write-Host "Installing SSH key to $ESXiHost..." -ForegroundColor Green
+    
+    # Method 1: Using sshpass (if available) - most reliable
+    if (Get-Command sshpass -ErrorAction SilentlyContinue) {
+        try {
+            # Create authorized_keys directory and file
+            $commands = @(
+                "mkdir -p /etc/ssh/keys-root",
+                "echo '$publicKeyContent' >> /etc/ssh/keys-root/authorized_keys",
+                "chmod 600 /etc/ssh/keys-root/authorized_keys",
+                "chmod 700 /etc/ssh/keys-root"
+            )
+            
+            foreach ($cmd in $commands) {
+                sshpass -p $Password ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $Username@$ESXiHost $cmd
+            }
+            Write-Host "SSH key installed successfully on $ESXiHost" -ForegroundColor Green
+            return $true
+        }
+        catch {
+            Write-Warning "Failed to install SSH key using sshpass: $($_.Exception.Message)"
+        }
+    }
+    
+    # Method 2: Using Expect script (if on Linux/WSL)
+    if ($IsLinux -or $env:WSL_DISTRO_NAME) {
+        try {
+            $expectScript = @"
+#!/usr/bin/expect -f
+set timeout 30
+spawn ssh -o StrictHostKeyChecking=no $Username@$ESXiHost
+expect "password:"
+send "$Password\r"
+expect "~]# "
+send "mkdir -p /etc/ssh/keys-root\r"
+expect "~]# "
+send "echo '$publicKeyContent' >> /etc/ssh/keys-root/authorized_keys\r"
+expect "~]# "
+send "chmod 600 /etc/ssh/keys-root/authorized_keys\r"
+expect "~]# "
+send "chmod 700 /etc/ssh/keys-root\r"
+expect "~]# "
+send "exit\r"
+expect eof
+"@
+            $expectScript | Out-File -FilePath "/tmp/ssh_key_install.exp" -Encoding UTF8
+            chmod +x /tmp/ssh_key_install.exp
+            expect /tmp/ssh_key_install.exp
+            Remove-Item "/tmp/ssh_key_install.exp" -Force
+            Write-Host "SSH key installed successfully on $ESXiHost" -ForegroundColor Green
+            return $true
+        }
+        catch {
+            Write-Warning "Failed to install SSH key using expect: $($_.Exception.Message)"
+        }
+    }
+    
+    # Method 3: Using PowerShell with Posh-SSH module
+    if (Get-Module -ListAvailable -Name Posh-SSH) {
+        try {
+            Import-Module Posh-SSH -Force
+            
+            # Create secure string for password
+            $securePassword = ConvertTo-SecureString $Password -AsPlainText -Force
+            $credential = New-Object System.Management.Automation.PSCredential($Username, $securePassword)
+            
+            # Create SSH session
+            $session = New-SSHSession -ComputerName $ESXiHost -Credential $credential -AcceptKey
+            
+            if ($session) {
+                # Execute commands to setup SSH key
+                $commands = @(
+                    "mkdir -p /etc/ssh/keys-root",
+                    "echo '$publicKeyContent' >> /etc/ssh/keys-root/authorized_keys",
+                    "chmod 600 /etc/ssh/keys-root/authorized_keys",
+                    "chmod 700 /etc/ssh/keys-root"
+                )
+                
+                foreach ($cmd in $commands) {
+                    $result = Invoke-SSHCommand -SSHSession $session -Command $cmd
+                    if ($result.ExitStatus -ne 0) {
+                        throw "Command failed: $cmd - $($result.Error)"
+                    }
+                }
+                
+                Remove-SSHSession -SSHSession $session
+                Write-Host "SSH key installed successfully on $ESXiHost using Posh-SSH" -ForegroundColor Green
+                return $true
+            }
+        }
+        catch {
+            Write-Warning "Failed to install SSH key using Posh-SSH: $($_.Exception.Message)"
+        }
+    }
+    
+    return $false
+}
+
+# Function to test SSH key authentication
+function Test-SSHKeyAuth {
+    param(
+        [string]$ESXiHost,
+        [string]$Username = "root",
+        [string]$PrivateKeyPath = "$env:USERPROFILE\.ssh\id_rsa"
+    )
+    
+    try {
+        Write-Host "Testing SSH key authentication to $ESXiHost..." -ForegroundColor Green
+        $result = ssh -i $PrivateKeyPath -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $Username@$ESXiHost "echo 'SSH key authentication successful'"
+        
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "SSH key authentication successful for $ESXiHost" -ForegroundColor Green
+            return $true
+        } else {
+            Write-Warning "SSH key authentication failed for $ESXiHost"
+            return $false
+        }
+    }
+    catch {
+        Write-Warning "SSH key authentication test failed: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+# Main function to setup SSH keys for all ESXi hosts
+function Set-ESXiSSHKeys {
+    param(
+        [array]$ESXiHosts,
+        [string]$Username = "root",
+        [string]$Password
+    )
+    
+    # Generate SSH key pair
+    New-SSHKeyPair
+    
+    $publicKeyPath = "$env:USERPROFILE\.ssh\id_rsa.pub"
+    $privateKeyPath = "$env:USERPROFILE\.ssh\id_rsa"
+    
+    foreach ($esxiHost in $ESXiHosts) {
+        Write-Host "`nProcessing ESXi host: $esxiHost" -ForegroundColor Cyan
+        
+        try {
+            # Add host to known_hosts to avoid fingerprint prompt
+            Add-HostToKnownHosts -HostName $esxiHost
+            
+            # Install SSH key
+            $success = Install-SSHKeyToESXi -ESXiHost $esxiHost -Username $Username -Password $Password -PublicKeyPath $publicKeyPath
+            
+            if ($success) {
+                # Test the key authentication
+                Start-Sleep -Seconds 2
+                Test-SSHKeyAuth -ESXiHost $esxiHost -Username $Username -PrivateKeyPath $privateKeyPath
+            } else {
+                Write-Error "Failed to install SSH key on $esxiHost"
+            }
+        }
+        catch {
+            Write-Error "Error processing $esxiHost : $($_.Exception.Message)"
+        }
+    }
+}
+
+# Example usage:
+# Assuming you have your ESXi hosts and credentials
+<#
+$esxiHosts = @("esxi1.domain.com", "esxi2.domain.com", "esxi3.domain.com")
+$rootPassword = "YourRootPassword"
+
+Set-ESXiSSHKeys -ESXiHosts $esxiHosts -Username "root" -Password $rootPassword
+#>
+
+# Function to run esxcli commands using SSH key
+function Invoke-ESXiCommand {
+    param(
+        [string]$ESXiHost,
+        [string]$Command,
+        [string]$Username = "root",
+        [string]$PrivateKeyPath = "$env:USERPROFILE\.ssh\id_rsa"
+    )
+    
+    try {
+        $result = ssh -i $PrivateKeyPath -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $Username@$ESXiHost $Command
+        return $result
+    }
+    catch {
+        Write-Error "Failed to execute command on $ESXiHost : $($_.Exception.Message)"
+        return $null
+    }
+}
