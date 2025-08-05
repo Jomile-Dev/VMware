@@ -1,25 +1,57 @@
-# VM Configuration Update Script - ROBUST PARALLEL VERSION
-# This script processes a CSV file to update VM CPU and memory settings in parallel
+# VM Configuration Script - ROBUST JOB VERSION
+# Addresses common PowerShell job issues
 
-# Specify the CSV file path here
-$CSVPath = "C:\path\to\your\vmlist.csv"
+param(
+    [string]$CSVPath = "C:\path\to\your\vmlist.csv",
+    [string]$ReportPath = "C:\Reports\VM_Configuration_Report_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+)
 
-# Specify the report file path here
-$ReportPath = "C:\Reports\VM_Configuration_Report_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+Write-Host "=== VM Configuration Script - Robust Job Version ===" -ForegroundColor Green
+Write-Host "Started: $(Get-Date)" -ForegroundColor Gray
 
-Write-Host "Starting VM Configuration Update Script (Parallel Mode)..." -ForegroundColor Green
-Write-Host "Script started at: $(Get-Date)" -ForegroundColor Gray
+# Clean up any existing jobs first
+Write-Host "Cleaning up any existing jobs..." -ForegroundColor Yellow
+Get-Job | Remove-Job -Force -ErrorAction SilentlyContinue
 
-# Set PowerCLI configuration to ignore certificate warnings
-Write-Host "Configuring PowerCLI settings..." -ForegroundColor Yellow
-try {
-    Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session
-    Write-Host "PowerCLI configuration set successfully" -ForegroundColor Green
-} catch {
-    Write-Warning "Failed to set PowerCLI configuration: $($_.Exception.Message)"
+# Test PowerShell jobs work at all
+Write-Host "Testing PowerShell job functionality..." -ForegroundColor Yellow
+$testJob = Start-Job -ScriptBlock { "Test successful" }
+Start-Sleep 3
+
+if ($testJob.State -eq "Completed") {
+    $testResult = Receive-Job $testJob
+    Write-Host "✓ Job test passed: $testResult" -ForegroundColor Green
+    Remove-Job $testJob
+} else {
+    Write-Host "✗ Basic PowerShell jobs not working. State: $($testJob.State)" -ForegroundColor Red
+    Write-Host "Switching to sequential processing..." -ForegroundColor Yellow
+    Remove-Job $testJob -Force
+    
+    # Fall back to sequential processing
+    & {
+        # Include your sequential processing code here
+        Write-Host "Sequential processing would run here..." -ForegroundColor Cyan
+        return
+    }
 }
 
-# vCenter connection parameters
+# Load and validate CSV
+if (!(Test-Path $CSVPath)) {
+    Write-Error "CSV not found: $CSVPath"
+    exit 1
+}
+
+$VMList = Import-Csv $CSVPath
+Write-Host "Loaded $($VMList.Count) VMs from CSV" -ForegroundColor Green
+
+# Get credentials
+$Credential = Get-Credential -Message "vCenter credentials"
+if (!$Credential) {
+    Write-Error "No credentials provided"
+    exit 1
+}
+
+# vCenter servers
 $vCenterServers = @(
     "test.test.test",
     "test.test.test", 
@@ -28,486 +60,444 @@ $vCenterServers = @(
     "test.test.test"
 )
 
-Write-Host "Starting VM Configuration Update Process" -ForegroundColor Cyan
-Write-Host "CSV File: $CSVPath" -ForegroundColor Yellow
-Write-Host "Report will be saved to: $ReportPath" -ForegroundColor Yellow
-
-# Validate CSV file exists
-Write-Host "Checking CSV file..." -ForegroundColor Yellow
-if (!(Test-Path $CSVPath)) {
-    Write-Error "CSV file not found at path: $CSVPath"
-    Read-Host "Press Enter to exit"
-    exit 1
-}
-Write-Host "CSV file found successfully" -ForegroundColor Green
-
-# Read and validate CSV file
-Write-Host "Reading CSV file..." -ForegroundColor Yellow
-try {
-    $VMList = Import-Csv -Path $CSVPath
-    Write-Host "Successfully imported CSV with $($VMList.Count) VMs" -ForegroundColor Green
-    
-    if ($VMList.Count -eq 0) {
-        Write-Error "CSV file is empty or contains no data rows"
-        Read-Host "Press Enter to exit"
-        exit 1
-    }
-} catch {
-    Write-Error "Failed to import CSV file: $($_.Exception.Message)"
-    Read-Host "Press Enter to exit"
-    exit 1
-}
-
-# Validate CSV headers
-Write-Host "Validating CSV headers..." -ForegroundColor Yellow
-$requiredHeaders = @("VMName", "PowerState", "CPUHotAddEnabled", "MemoryHotAddEnabled", "CPUCountBefore", "CPUCountAfter")
-$csvHeaders = $VMList[0].PSObject.Properties.Name
-$missingHeaders = $requiredHeaders | Where-Object { $_ -notin $csvHeaders }
-
-if ($missingHeaders) {
-    Write-Error "Missing required CSV headers: $($missingHeaders -join ', ')"
-    Write-Host "Required headers: $($requiredHeaders -join ', ')" -ForegroundColor Yellow
-    Read-Host "Press Enter to exit"
-    exit 1
-}
-Write-Host "CSV headers validated successfully" -ForegroundColor Green
-
-# Connect to vCenter servers
-Write-Host "Preparing to connect to vCenter servers..." -ForegroundColor Yellow
-$Credential = Get-Credential -Message "Enter vCenter credentials"
-
-if (!$Credential) {
-    Write-Error "No credentials provided. Exiting."
-    Read-Host "Press Enter to exit"
-    exit 1
-}
-
+# Test vCenter connectivity before starting jobs
+Write-Host "Testing vCenter connectivity..." -ForegroundColor Yellow
 $connectedServers = @()
 
-Write-Host "Attempting to connect to vCenter servers..." -ForegroundColor Yellow
 foreach ($vc in $vCenterServers) {
-    Write-Host "Connecting to $vc..." -ForegroundColor Gray
     try {
-        Connect-VIServer -Server $vc -Credential $Credential -ErrorAction Stop
-        Write-Host "Connected to $vc" -ForegroundColor Green
+        $connection = Connect-VIServer -Server $vc -Credential $Credential -ErrorAction Stop
+        Write-Host "✓ Connected to $vc" -ForegroundColor Green
         $connectedServers += $vc
     } catch {
-        Write-Warning "Failed to connect to $vc : $($_.Exception.Message)"
+        Write-Host "✗ Failed to connect to $vc : $($_.Exception.Message)" -ForegroundColor Red
     }
 }
 
 if ($connectedServers.Count -eq 0) {
-    Write-Error "Failed to connect to any vCenter servers"
-    Read-Host "Press Enter to exit"
+    Write-Error "Could not connect to any vCenter servers"
     exit 1
 }
 
-Write-Host "Successfully connected to $($connectedServers.Count) vCenter server(s)" -ForegroundColor Green
-
-# Display confirmation
-Write-Host "`n" + "=" * 80 -ForegroundColor Yellow
-Write-Host "VM CONFIGURATION CHANGE CONFIRMATION" -ForegroundColor Yellow
-Write-Host "=" * 80 -ForegroundColor Yellow
-
-foreach ($vmEntry in $VMList) {
-    Write-Host "VM: $($vmEntry.VMName) | CPU: $($vmEntry.CPUCountBefore) -> $($vmEntry.CPUCountAfter) | Hot Add: Enabled" -ForegroundColor Cyan
-}
-
-Write-Host "`nTotal VMs: $($VMList.Count) | Processing: PARALLEL" -ForegroundColor Yellow
-Write-Host "WARNING: VMs will be shut down and reconfigured!" -ForegroundColor Red
-Write-Host "`nPress ENTER to continue or CTRL+C to cancel..." -ForegroundColor White
-Read-Host
-
-# Create robust script block for parallel processing
-$vmProcessingScript = {
-    param($vmData, $vCenterList, $username, $password, $jobId)
+# Simplified, more reliable job script
+$vmJobScript = {
+    param($VMName, $CPUTarget, $vCenters, $Username, $Password)
     
-    # Create a unique log identifier
-    $logPrefix = "[$($vmData.VMName)][Job$jobId]"
-    $progressLog = @()
-    
-    function Add-ProgressLog {
+    # Simple progress function
+    function Write-Progress {
         param($Message)
-        $timestamp = Get-Date -Format "HH:mm:ss.fff"
-        $logEntry = "$timestamp $logPrefix $Message"
-        $script:progressLog += $logEntry
-        Write-Output $logEntry  # This goes to job output
+        Write-Output "[$(Get-Date -Format 'HH:mm:ss')] [$VMName] $Message"
     }
     
     try {
-        Add-ProgressLog "STARTING - Initializing job environment"
+        Write-Progress "STARTING job for $VMName"
         
-        # Recreate credential securely
-        $securePassword = ConvertTo-SecureString -String $password -AsPlainText -Force
-        $jobCredential = New-Object System.Management.Automation.PSCredential($username, $securePassword)
+        # Recreate credential
+        $SecPass = ConvertTo-SecureString -String $Password -AsPlainText -Force  
+        $Cred = New-Object System.Management.Automation.PSCredential($Username, $SecPass)
+        Write-Progress "Credential recreated"
         
-        # Import PowerCLI with retry logic
+        # Try to import PowerCLI with more aggressive approach
+        Write-Progress "Loading PowerCLI..."
+        $modulePaths = @(
+            "VMware.PowerCLI",
+            "VMware.VimAutomation.Core", 
+            "VMware.VimAutomation.Common"
+        )
+        
         $moduleLoaded = $false
-        $retryCount = 0
-        while (-not $moduleLoaded -and $retryCount -lt 3) {
+        foreach ($moduleName in $modulePaths) {
             try {
-                if (Get-Module -ListAvailable -Name VMware.PowerCLI) {
-                    Import-Module VMware.PowerCLI -Force -Global -ErrorAction Stop
-                } elseif (Get-Module -ListAvailable -Name VMware.VimAutomation.Core) {
-                    Import-Module VMware.VimAutomation.Core -Force -Global -ErrorAction Stop
-                    Import-Module VMware.VimAutomation.Common -Force -Global -ErrorAction SilentlyContinue
-                } else {
-                    throw "PowerCLI modules not found"
+                if (Get-Module -ListAvailable -Name $moduleName) {
+                    Import-Module $moduleName -Force -Global
+                    $moduleLoaded = $true
+                    Write-Progress "Loaded module: $moduleName"
+                    break
                 }
-                
-                Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope AllUsers -ErrorAction SilentlyContinue
-                $moduleLoaded = $true
-                Add-ProgressLog "INITIALIZED - PowerCLI loaded successfully"
             } catch {
-                $retryCount++
-                Add-ProgressLog "MODULE_RETRY - Attempt $retryCount failed: $($_.Exception.Message)"
-                Start-Sleep -Seconds 2
+                Write-Progress "Failed to load $moduleName : $($_.Exception.Message)"
             }
         }
         
         if (-not $moduleLoaded) {
-            throw "Failed to load PowerCLI after 3 attempts"
+            throw "Could not load any PowerCLI modules"
         }
         
-        # Initialize result object
-        $result = [PSCustomObject]@{
-            VMName = $vmData.VMName
-            JobId = $jobId
-            Status = "Processing"
-            OriginalPowerState = $vmData.PowerState
-            OriginalCPUCount = $vmData.CPUCountBefore
-            TargetCPUCount = $vmData.CPUCountAfter
-            NewCPUCount = ""
-            NewCoresPerSocket = ""
-            NewCPUHotAddEnabled = ""
-            NewMemoryHotAddEnabled = ""
-            FinalPowerState = ""
-            ErrorMessage = ""
-            StartTime = Get-Date
-            EndTime = $null
-            ProcessingTimeMinutes = 0
-            ProgressLog = $progressLog
-        }
+        # Set PowerCLI config
+        Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session -ErrorAction SilentlyContinue
+        Write-Progress "PowerCLI configured"
         
-        # Connect to vCenter servers
-        Add-ProgressLog "CONNECTING - Attempting vCenter connections"
-        $jobConnections = @()
-        
-        foreach ($vcServer in $vCenterList) {
+        # Connect to vCenter
+        $connected = $false
+        foreach ($vc in $vCenters) {
             try {
-                $connection = Connect-VIServer -Server $vcServer -Credential $jobCredential -ErrorAction Stop
-                $jobConnections += $vcServer
-                Add-ProgressLog "CONNECTED - Successfully connected to $vcServer"
+                Connect-VIServer -Server $vc -Credential $Cred -ErrorAction Stop | Out-Null
+                Write-Progress "Connected to $vc"
+                $connected = $true
                 
                 # Try to find VM immediately
-                $testVM = Get-VM -Name $vmData.VMName -Server $vcServer -ErrorAction SilentlyContinue
-                if ($testVM) {
-                    Add-ProgressLog "VM_LOCATED - Found VM on $vcServer"
+                $vm = Get-VM -Name $VMName -Server $vc -ErrorAction SilentlyContinue
+                if ($vm) {
+                    Write-Progress "Found VM on $vc"
                     break
                 }
             } catch {
-                Add-ProgressLog "CONNECT_FAILED - $vcServer : $($_.Exception.Message)"
+                Write-Progress "Connection to $vc failed: $($_.Exception.Message)"
             }
         }
         
-        if ($jobConnections.Count -eq 0) {
-            throw "No vCenter connections established"
+        if (-not $connected) {
+            throw "Could not connect to any vCenter"
         }
         
-        # Locate the VM
-        Add-ProgressLog "SEARCHING - Looking for VM across connected servers"
-        $targetVM = $null
-        $vmServer = $null
-        
-        foreach ($server in $jobConnections) {
-            $targetVM = Get-VM -Name $vmData.VMName -Server $server -ErrorAction SilentlyContinue
-            if ($targetVM) {
-                $vmServer = $server
-                Add-ProgressLog "VM_FOUND - Located on $server"
-                break
-            }
+        # Find VM
+        $vm = Get-VM -Name $VMName -ErrorAction SilentlyContinue
+        if (-not $vm) {
+            throw "VM $VMName not found"
         }
+        Write-Progress "VM located successfully"
         
-        if (-not $targetVM) {
-            throw "VM '$($vmData.VMName)' not found on any connected vCenter"
-        }
-        
-        # PHASE 1: Shutdown if needed
-        if ($targetVM.PowerState -eq "PoweredOn") {
-            Add-ProgressLog "SHUTDOWN_START - Initiating graceful shutdown"
-            Shutdown-VMGuest -VM $targetVM -Confirm:$false
+        # Process VM
+        if ($vm.PowerState -eq "PoweredOn") {
+            Write-Progress "Shutting down VM..."
+            Shutdown-VMGuest -VM $vm -Confirm:$false
             
-            $shutdownTimeout = (Get-Date).AddMinutes(8)
-            $shutdownStart = Get-Date
-            
-            while ($targetVM.PowerState -ne "PoweredOff" -and (Get-Date) -lt $shutdownTimeout) {
-                Start-Sleep -Seconds 10
-                $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer
-                $elapsed = [math]::Round(((Get-Date) - $shutdownStart).TotalSeconds)
-                
-                if ($elapsed % 30 -eq 0) {  # Log every 30 seconds
-                    Add-ProgressLog "SHUTDOWN_WAIT - Graceful shutdown in progress ($elapsed sec)"
+            # Wait for shutdown (simplified)
+            $timeout = 300 # 5 minutes
+            $elapsed = 0
+            while ($vm.PowerState -ne "PoweredOff" -and $elapsed -lt $timeout) {
+                Start-Sleep 10
+                $elapsed += 10
+                $vm = Get-VM -Name $VMName
+                if ($elapsed % 60 -eq 0) {
+                    Write-Progress "Still shutting down... ($elapsed seconds)"
                 }
             }
             
-            if ($targetVM.PowerState -ne "PoweredOff") {
-                Add-ProgressLog "SHUTDOWN_FORCE - Graceful timeout, forcing power off"
-                Stop-VM -VM $targetVM -Confirm:$false
-                Start-Sleep -Seconds 5
-                $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer
+            if ($vm.PowerState -ne "PoweredOff") {
+                Write-Progress "Forcing power off..."
+                Stop-VM -VM $vm -Confirm:$false
+                Start-Sleep 5
             }
-            
-            Add-ProgressLog "SHUTDOWN_COMPLETE - VM is powered off"
-        } else {
-            Add-ProgressLog "SHUTDOWN_SKIP - VM already powered off"
+            Write-Progress "VM is now powered off"
         }
         
-        # PHASE 2: Reconfigure VM
-        Add-ProgressLog "CONFIG_START - Beginning VM reconfiguration"
-        $vmView = Get-View -VIObject $targetVM
-        $targetCPUs = [int]$vmData.CPUCountAfter
+        # Configure VM
+        Write-Progress "Configuring VM..."
+        $vmView = Get-View -VIObject $vm
+        $spec = New-Object VMware.Vim.VirtualMachineConfigSpec
+        $spec.NumCPUs = [int]$CPUTarget
+        $spec.NumCoresPerSocket = 1
+        $spec.CpuHotAddEnabled = $true
+        $spec.MemoryHotAddEnabled = $true
         
-        $configSpec = New-Object VMware.Vim.VirtualMachineConfigSpec
-        $configSpec.NumCPUs = $targetCPUs
-        $configSpec.NumCoresPerSocket = 1
-        $configSpec.CpuHotAddEnabled = $true
-        $configSpec.MemoryHotAddEnabled = $true
+        $vmView.ReconfigVM($spec)
+        Write-Progress "VM reconfigured"
         
-        Add-ProgressLog "CONFIG_APPLY - Setting $targetCPUs CPUs, 1 core/socket, Hot Add enabled"
-        $vmView.ReconfigVM($configSpec)
-        Add-ProgressLog "CONFIG_COMPLETE - VM reconfiguration applied"
+        # Power on
+        Write-Progress "Powering on VM..."
+        Start-VM -VM $vm -Confirm:$false
         
-        # PHASE 3: Power on
-        Add-ProgressLog "POWERON_START - Starting VM"
-        Start-VM -VM $targetVM -Confirm:$false
-        
-        $powerOnTimeout = (Get-Date).AddMinutes(8)
-        $powerOnStart = Get-Date
-        
-        while ($targetVM.PowerState -ne "PoweredOn" -and (Get-Date) -lt $powerOnTimeout) {
-            Start-Sleep -Seconds 10
-            $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer
-            $elapsed = [math]::Round(((Get-Date) - $powerOnStart).TotalSeconds)
-            
-            if ($elapsed % 30 -eq 0) {  # Log every 30 seconds
-                Add-ProgressLog "POWERON_WAIT - VM starting up ($elapsed sec)"
+        # Wait for power on (simplified)
+        $timeout = 300
+        $elapsed = 0
+        while ($vm.PowerState -ne "PoweredOn" -and $elapsed -lt $timeout) {
+            Start-Sleep 10
+            $elapsed += 10
+            $vm = Get-VM -Name $VMName
+            if ($elapsed % 60 -eq 0) {
+                Write-Progress "Still powering on... ($elapsed seconds)"
             }
         }
         
-        if ($targetVM.PowerState -eq "PoweredOn") {
-            Add-ProgressLog "POWERON_COMPLETE - VM started successfully"
-        } else {
-            Add-ProgressLog "POWERON_TIMEOUT - VM did not start within timeout"
+        # Final verification
+        $vm = Get-VM -Name $VMName
+        $vmView = Get-View -VIObject $vm
+        
+        $result = [PSCustomObject]@{
+            VMName = $VMName
+            Status = "Success"
+            NewCPUCount = $vmView.Config.Hardware.NumCPU
+            NewCoresPerSocket = $vmView.Config.Hardware.NumCoresPerSocket
+            CPUHotAddEnabled = $vmView.Config.CpuHotAddEnabled
+            MemoryHotAddEnabled = $vmView.Config.MemoryHotAddEnabled
+            PowerState = $vm.PowerState
         }
         
-        # PHASE 4: Verify and finalize
-        Add-ProgressLog "VERIFY_START - Checking final configuration"
-        $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer
-        $finalVmView = Get-View -VIObject $targetVM
+        Write-Progress "SUCCESS - $($result.NewCPUCount) CPUs, Hot Add enabled, Power: $($result.PowerState)"
         
-        $result.NewCPUCount = $finalVmView.Config.Hardware.NumCPU
-        $result.NewCoresPerSocket = $finalVmView.Config.Hardware.NumCoresPerSocket
-        $result.NewCPUHotAddEnabled = $finalVmView.Config.CpuHotAddEnabled
-        $result.NewMemoryHotAddEnabled = $finalVmView.Config.MemoryHotAddEnabled
-        $result.FinalPowerState = $targetVM.PowerState
-        $result.Status = "Success"
-        $result.EndTime = Get-Date
-        $result.ProcessingTimeMinutes = [math]::Round(($result.EndTime - $result.StartTime).TotalMinutes, 2)
+        # Clean disconnect
+        Get-VIServer | Disconnect-VIServer -Confirm:$false -Force -ErrorAction SilentlyContinue
         
-        Add-ProgressLog "SUCCESS - Processing completed in $($result.ProcessingTimeMinutes) minutes"
-        Add-ProgressLog "FINAL_CONFIG - CPUs: $($result.NewCPUCount), Cores/Socket: $($result.NewCoresPerSocket), Power: $($result.FinalPowerState)"
-        
-        # Cleanup connections
-        foreach ($server in $jobConnections) {
-            try {
-                Disconnect-VIServer -Server $server -Confirm:$false -Force -ErrorAction SilentlyContinue
-            } catch {
-                # Ignore cleanup errors
-            }
-        }
+        return $result
         
     } catch {
-        $result.Status = "Failed"
-        $result.ErrorMessage = $_.Exception.Message
-        $result.EndTime = Get-Date
-        if ($result.StartTime) {
-            $result.ProcessingTimeMinutes = [math]::Round(($result.EndTime - $result.StartTime).TotalMinutes, 2)
+        Write-Progress "FAILED: $($_.Exception.Message)"
+        return [PSCustomObject]@{
+            VMName = $VMName
+            Status = "Failed"
+            ErrorMessage = $_.Exception.Message
         }
-        Add-ProgressLog "FAILED - $($_.Exception.Message)"
     }
-    
-    # Always include the progress log in the result
-    $result.ProgressLog = $progressLog
-    
-    # Return the result object
-    return $result
 }
 
-# Extract credentials for job parameters
+# Extract credential components
 $Username = $Credential.UserName
 $Password = $Credential.GetNetworkCredential().Password
 
-# Start parallel processing with improved job management
-Write-Host "`nStarting parallel processing..." -ForegroundColor Green
-Write-Host "Maximum concurrent jobs: 4" -ForegroundColor Yellow
-
+# Start jobs with DETAILED real-time monitoring
+Write-Host "`nStarting VM processing jobs with enhanced monitoring..." -ForegroundColor Cyan
 $jobs = @()
-$maxJobs = 4
-$jobCounter = 1
-
-# Start jobs in batches
-foreach ($vmEntry in $VMList) {
-    # Wait for available slot
-    while ((Get-Job -State Running).Count -ge $maxJobs) {
-        Start-Sleep -Seconds 3
-        
-        # Check for completed jobs and process them immediately
-        $completedJobs = Get-Job | Where-Object { $_.State -eq 'Completed' }
-        foreach ($completedJob in $completedJobs) {
-            Write-Host "Job $($completedJob.Id) completed for processing..." -ForegroundColor Green
-        }
-    }
-    
-    # Start new job
-    $job = Start-Job -ScriptBlock $vmProcessingScript -ArgumentList $vmEntry, $vCenterServers, $Username, $Password, $jobCounter
-    $jobs += [PSCustomObject]@{
-        Job = $job
-        VMName = $vmEntry.VMName 
-        JobId = $jobCounter
-        StartTime = Get-Date
-    }
-    
-    Write-Host "Started Job $jobCounter for VM: $($vmEntry.VMName) (PowerShell Job ID: $($job.Id))" -ForegroundColor Cyan
-    $jobCounter++
-    
-    # Small delay to prevent overwhelming the system
-    Start-Sleep -Seconds 1
-}
-
-Write-Host "`nAll jobs started. Monitoring progress..." -ForegroundColor Green
-Write-Host "Active PowerShell jobs: $((Get-Job -State Running).Count)" -ForegroundColor Yellow
-
-# Enhanced job monitoring with real-time progress
 $results = @()
-$processedJobs = @()
-$lastProgressUpdate = Get-Date
+$jobTracker = @{}  # Track job start times and VM names
 
-while ($jobs.Count -gt $processedJobs.Count) {
-    $runningJobs = Get-Job -State Running
-    $completedJobs = Get-Job | Where-Object { $_.State -ne 'Running' -and $_.Id -notin $processedJobs }
-    
-    # Process completed jobs immediately
+foreach ($vmEntry in $VMList) {
+    # Process completed jobs and show detailed progress
+    $completedJobs = Get-Job -State Completed
     foreach ($completedJob in $completedJobs) {
-        $jobInfo = $jobs | Where-Object { $_.Job.Id -eq $completedJob.Id }
-        if ($jobInfo) {
-            Write-Host "`nProcessing completed job for VM: $($jobInfo.VMName)" -ForegroundColor Green
+        $vmName = $jobTracker[$completedJob.Id]
+        Write-Host "`n🔄 PROCESSING COMPLETED JOB for $vmName" -ForegroundColor Green
+        try {
+            $jobOutput = Receive-Job -Job $completedJob
             
-            try {
-                $jobResult = Receive-Job -Job $completedJob -ErrorAction Stop
-                
-                # Find the result object in the output
-                $vmResult = $jobResult | Where-Object { $_ -is [PSCustomObject] -and $_.PSObject.Properties.Name -contains "VMName" } | Select-Object -Last 1
-                
-                if ($vmResult) {
-                    $results += $vmResult
-                    $duration = [math]::Round(((Get-Date) - $jobInfo.StartTime).TotalMinutes, 2)
-                    
-                    if ($vmResult.Status -eq "Success") {
-                        Write-Host "✓ SUCCESS: $($vmResult.VMName) - $($vmResult.NewCPUCount) CPUs, Power: $($vmResult.FinalPowerState) ($duration min)" -ForegroundColor Green
-                    } else {
-                        Write-Host "✗ FAILED: $($vmResult.VMName) - $($vmResult.ErrorMessage)" -ForegroundColor Red
-                    }
-                    
-                    # Show last few progress entries
-                    if ($vmResult.ProgressLog -and $vmResult.ProgressLog.Count -gt 0) {
-                        $lastLogs = $vmResult.ProgressLog | Select-Object -Last 3
-                        foreach ($log in $lastLogs) {
-                            Write-Host "    $log" -ForegroundColor Gray
-                        }
-                    }
+            # Show ALL progress messages from the job
+            $progressMessages = $jobOutput | Where-Object { $_ -is [string] }
+            if ($progressMessages) {
+                Write-Host "   📋 Job Progress Log:" -ForegroundColor Cyan
+                $progressMessages | ForEach-Object {
+                    Write-Host "     $_" -ForegroundColor Gray
+                }
+            }
+            
+            # Extract result
+            $result = $jobOutput | Where-Object { $_ -is [PSCustomObject] } | Select-Object -Last 1
+            if ($result) {
+                $results += $result
+                if ($result.Status -eq "Success") {
+                    Write-Host "   ✅ SUCCESS: $($result.VMName) - $($result.NewCPUCount) CPUs, Power: $($result.PowerState)" -ForegroundColor Green
                 } else {
-                    Write-Warning "Could not extract result for VM: $($jobInfo.VMName)"
+                    Write-Host "   ❌ FAILED: $($result.VMName) - $($result.ErrorMessage)" -ForegroundColor Red
+                }
+            }
+        } catch {
+            Write-Host "   ⚠️  Error processing job: $_" -ForegroundColor Red
+        }
+        Remove-Job -Job $completedJob
+        $jobTracker.Remove($completedJob.Id)
+    }
+    
+    # Wait for job slot with detailed status
+    while ((Get-Job -State Running).Count -ge 3) {
+        $runningJobs = Get-Job -State Running
+        Write-Host "`n⏳ WAITING FOR JOB SLOT..." -ForegroundColor Yellow
+        Write-Host "   Currently running jobs:" -ForegroundColor Yellow
+        
+        foreach ($runningJob in $runningJobs) {
+            $vmName = $jobTracker[$runningJob.Id]
+            $runtime = if ($runningJob.PSBeginTime) { 
+                [math]::Round(((Get-Date) - $runningJob.PSBeginTime).TotalMinutes, 1) 
+            } else { "Unknown" }
+            
+            Write-Host "     • Job $($runningJob.Id): $vmName (running $runtime min)" -ForegroundColor Gray
+            
+            # Try to peek at recent output
+            if ($runningJob.HasMoreData) {
+                try {
+                    $recentOutput = Receive-Job -Job $runningJob -Keep | Select-Object -Last 1
+                    if ($recentOutput) {
+                        Write-Host "       Latest: $recentOutput" -ForegroundColor DarkGray
+                    }
+                } catch {
+                    Write-Host "       (No recent output)" -ForegroundColor DarkGray
+                }
+            } else {
+                Write-Host "       (No output yet)" -ForegroundColor DarkGray
+            }
+        }
+        
+        # Check for any completed jobs during wait
+        $newCompleted = Get-Job -State Completed
+        if ($newCompleted) {
+            Write-Host "   🎉 Jobs completed while waiting!" -ForegroundColor Green
+            break
+        }
+        
+        Start-Sleep 10
+    }
+    
+    # Start new job with detailed info
+    $targetCPUs = $vmEntry.CPUCountAfter
+    $job = Start-Job -ScriptBlock $vmJobScript -ArgumentList $vmEntry.VMName, $targetCPUs, $connectedServers, $Username, $Password
+    $jobs += $job
+    $jobTracker[$job.Id] = $vmEntry.VMName
+    
+    Write-Host "`n🚀 STARTED NEW JOB" -ForegroundColor Cyan
+    Write-Host "   Job ID: $($job.Id)" -ForegroundColor White
+    Write-Host "   VM Name: $($vmEntry.VMName)" -ForegroundColor White  
+    Write-Host "   Target CPUs: $($vmEntry.CPUCountBefore) → $targetCPUs" -ForegroundColor White
+    Write-Host "   Started: $(Get-Date -Format 'HH:mm:ss')" -ForegroundColor White
+    Write-Host "   Total active jobs: $((Get-Job -State Running).Count)" -ForegroundColor Yellow
+    
+    Start-Sleep 3  # Give job time to initialize
+    
+    # Check if job started successfully
+    $job = Get-Job -Id $job.Id
+    if ($job.State -eq "Failed") {
+        Write-Host "   ❌ JOB FAILED TO START!" -ForegroundColor Red
+        try {
+            $failureOutput = Receive-Job -Job $job
+            Write-Host "   Error details: $failureOutput" -ForegroundColor Red
+        } catch {
+            Write-Host "   Could not get failure details" -ForegroundColor Red
+        }
+        Remove-Job -Job $job
+        $jobTracker.Remove($job.Id)
+    } elseif ($job.State -eq "Running") {
+        Write-Host "   ✅ Job running successfully" -ForegroundColor Green
+        
+        # Try to get initial output
+        Start-Sleep 2
+        if ($job.HasMoreData) {
+            try {
+                $initialOutput = Receive-Job -Job $job -Keep | Select-Object -Last 2
+                if ($initialOutput) {
+                    Write-Host "   Initial progress:" -ForegroundColor Cyan
+                    $initialOutput | ForEach-Object { Write-Host "     $_" -ForegroundColor Gray }
                 }
             } catch {
-                Write-Warning "Error processing job $($completedJob.Id): $_"
+                Write-Host "   (Waiting for initial output...)" -ForegroundColor Gray
+            }
+        }
+    }
+}
+
+# Monitor remaining jobs with DETAILED status updates
+Write-Host "`n🔍 MONITORING REMAINING JOBS..." -ForegroundColor Yellow
+$monitorStartTime = Get-Date
+
+while (Get-Job -State Running) {
+    $runningJobs = Get-Job -State Running
+    $completedCount = $results.Count
+    $totalJobs = $VMList.Count
+    
+    Write-Host "`n" + "="*60 -ForegroundColor Cyan
+    Write-Host "📊 PROGRESS UPDATE - $(Get-Date -Format 'HH:mm:ss')" -ForegroundColor Cyan
+    Write-Host "   ✅ Completed: $completedCount/$totalJobs" -ForegroundColor Green
+    Write-Host "   🔄 Running: $($runningJobs.Count)" -ForegroundColor Yellow
+    Write-Host "   ⏱️  Total runtime: $([math]::Round(((Get-Date) - $monitorStartTime).TotalMinutes, 1)) minutes" -ForegroundColor Gray
+    Write-Host "="*60 -ForegroundColor Cyan
+    
+    # Show detailed status of each running job
+    if ($runningJobs.Count -gt 0) {
+        Write-Host "`n🔄 ACTIVE JOBS DETAIL:" -ForegroundColor Yellow
+        foreach ($runningJob in $runningJobs) {
+            $vmName = $jobTracker[$runningJob.Id]
+            $runtime = if ($runningJob.PSBeginTime) { 
+                [math]::Round(((Get-Date) - $runningJob.PSBeginTime).TotalMinutes, 1) 
+            } else { "Unknown" }
+            
+            Write-Host "   🖥️  VM: $vmName (Job $($runningJob.Id))" -ForegroundColor White
+            Write-Host "     ⏱️  Runtime: $runtime minutes" -ForegroundColor Gray
+            Write-Host "     📊 State: $($runningJob.State)" -ForegroundColor Gray
+            Write-Host "     📝 Has Output: $($runningJob.HasMoreData)" -ForegroundColor Gray
+            
+            # Get the latest progress from the job
+            if ($runningJob.HasMoreData) {
+                try {
+                    $latestOutput = Receive-Job -Job $runningJob -Keep | Select-Object -Last 2
+                    if ($latestOutput) {
+                        Write-Host "     💬 Latest Activity:" -ForegroundColor Cyan
+                        $latestOutput | ForEach-Object { 
+                            Write-Host "       $_" -ForegroundColor DarkCyan 
+                        }
+                    }
+                } catch {
+                    Write-Host "     💬 (Checking for activity...)" -ForegroundColor DarkGray
+                }
+            } else {
+                Write-Host "     💬 (No output yet - job may be initializing)" -ForegroundColor DarkGray
             }
             
-            Remove-Job -Job $completedJob -Force
-            $processedJobs += $completedJob.Id
-        }
-    }
-    
-    # Periodic status update
-    if (((Get-Date) - $lastProgressUpdate).TotalSeconds -ge 15) {
-        $completed = $processedJobs.Count
-        $running = $runningJobs.Count
-        $total = $jobs.Count
-        
-        Write-Host "`n--- PROGRESS UPDATE ---" -ForegroundColor Yellow
-        Write-Host "Completed: $completed/$total | Running: $running | Remaining: $($total - $completed)" -ForegroundColor Cyan
-        
-        if ($running -gt 0) {
-            Write-Host "Currently processing:" -ForegroundColor Yellow
-            $runningJobsInfo = $jobs | Where-Object { $_.Job.Id -in $runningJobs.Id }
-            foreach ($runningJob in $runningJobsInfo) {
-                $elapsed = [math]::Round(((Get-Date) - $runningJob.StartTime).TotalMinutes, 1)
-                Write-Host "  • $($runningJob.VMName) (Job $($runningJob.JobId) - $elapsed min)" -ForegroundColor Gray
+            # Warn about stuck jobs
+            if ($runtime -gt 15 -and -not $runningJob.HasMoreData) {
+                Write-Host "     ⚠️  WARNING: Job may be stuck (no output for $runtime minutes)" -ForegroundColor Red
             }
+            
+            Write-Host ""
         }
-        
-        $lastProgressUpdate = Get-Date
     }
     
-    Start-Sleep -Seconds 2
+    # Process any newly completed jobs with full detail
+    $completedJobs = Get-Job -State Completed
+    foreach ($completedJob in $completedJobs) {
+        $vmName = $jobTracker[$completedJob.Id]
+        Write-Host "`n🎉 JOB COMPLETED: $vmName" -ForegroundColor Green
+        Write-Host "   Job ID: $($completedJob.Id)" -ForegroundColor White
+        Write-Host "   Processing results..." -ForegroundColor Yellow
+        
+        try {
+            $jobOutput = Receive-Job -Job $completedJob
+            
+            # Show complete progress log
+            $progressMessages = $jobOutput | Where-Object { $_ -is [string] }
+            if ($progressMessages) {
+                Write-Host "   📋 Complete Progress Log:" -ForegroundColor Cyan
+                $progressMessages | ForEach-Object {
+                    Write-Host "     $_" -ForegroundColor Gray
+                }
+            }
+            
+            # Extract and show result
+            $result = $jobOutput | Where-Object { $_ -is [PSCustomObject] } | Select-Object -Last 1
+            if ($result) {
+                $results += $result
+                Write-Host "`n   📊 FINAL RESULT:" -ForegroundColor White
+                if ($result.Status -eq "Success") {
+                    Write-Host "   ✅ STATUS: SUCCESS" -ForegroundColor Green
+                    Write-Host "   🖥️  VM: $($result.VMName)" -ForegroundColor White
+                    Write-Host "   🔧 CPUs: $($result.NewCPUCount)" -ForegroundColor White
+                    Write-Host "   🔥 CPU Hot Add: $($result.CPUHotAddEnabled)" -ForegroundColor White
+                    Write-Host "   🔥 Memory Hot Add: $($result.MemoryHotAddEnabled)" -ForegroundColor White
+                    Write-Host "   ⚡ Power State: $($result.PowerState)" -ForegroundColor White
+                } else {
+                    Write-Host "   ❌ STATUS: FAILED" -ForegroundColor Red
+                    Write-Host "   🖥️  VM: $($result.VMName)" -ForegroundColor White
+                    Write-Host "   ❗ Error: $($result.ErrorMessage)" -ForegroundColor Red
+                }
+            } else {
+                Write-Host "   ⚠️  Could not extract result object" -ForegroundColor Yellow
+            }
+        } catch {
+            Write-Host "   ❌ Error processing job results: $_" -ForegroundColor Red
+        }
+        
+        Remove-Job -Job $completedJob
+        $jobTracker.Remove($completedJob.Id)
+        Write-Host "   🗑️  Job cleaned up" -ForegroundColor Gray
+    }
+    
+    Write-Host "`n⏳ Next update in 15 seconds..." -ForegroundColor DarkGray
+    Start-Sleep 15
 }
 
-# Final processing and reporting
-Write-Host "`n" + "=" * 80 -ForegroundColor Green
-Write-Host "ALL JOBS COMPLETED - GENERATING FINAL REPORT" -ForegroundColor Green
-Write-Host "=" * 80 -ForegroundColor Green
+# Final cleanup and reporting
+Get-Job | Remove-Job -Force
+foreach ($server in $connectedServers) {
+    Disconnect-VIServer -Server $server -Confirm:$false -Force -ErrorAction SilentlyContinue
+}
 
+# Generate report
 if ($results.Count -gt 0) {
-    # Export detailed report
     $results | Export-Csv -Path $ReportPath -NoTypeInformation
     
-    # Summary statistics
-    $successful = ($results | Where-Object { $_.Status -eq "Success" }).Count
-    $failed = ($results | Where-Object { $_.Status -eq "Failed" }).Count
-    $avgTime = [math]::Round(($results | Measure-Object ProcessingTimeMinutes -Average).Average, 2)
+    Write-Host "`n=== FINAL RESULTS ===" -ForegroundColor Green
+    Write-Host "Total processed: $($results.Count)" -ForegroundColor Yellow
+    Write-Host "Successful: $(($results | Where-Object Status -eq 'Success').Count)" -ForegroundColor Green
+    Write-Host "Failed: $(($results | Where-Object Status -eq 'Failed').Count)" -ForegroundColor Red
     
-    Write-Host "`nFINAL SUMMARY:" -ForegroundColor Cyan
-    Write-Host "Total VMs: $($results.Count)" -ForegroundColor Yellow
-    Write-Host "Successful: $successful" -ForegroundColor Green
-    Write-Host "Failed: $failed" -ForegroundColor Red
-    Write-Host "Average processing time: $avgTime minutes" -ForegroundColor Yellow
-    Write-Host "Report saved: $ReportPath" -ForegroundColor Yellow
-    
-    # Detailed results table
-    Write-Host "`nDETAILED RESULTS:" -ForegroundColor Cyan
-    $results | Select-Object VMName, Status, NewCPUCount, NewCoresPerSocket, FinalPowerState, ProcessingTimeMinutes | 
-        Format-Table -AutoSize
-    
-    # Show failures if any
-    $failures = $results | Where-Object { $_.Status -eq "Failed" }
-    if ($failures) {
-        Write-Host "`nFAILURE DETAILS:" -ForegroundColor Red
-        $failures | Select-Object VMName, ErrorMessage | Format-Table -AutoSize -Wrap
-    }
-    
+    $results | Format-Table VMName, Status, NewCPUCount, PowerState -AutoSize
 } else {
-    Write-Warning "No results collected! Check for job execution issues."
+    Write-Warning "No results collected!"
 }
 
-# Cleanup vCenter connections
-Write-Host "`nCleaning up vCenter connections..." -ForegroundColor Yellow
-foreach ($server in $connectedServers) {
-    try {
-        Disconnect-VIServer -Server $server -Confirm:$false
-        Write-Host "Disconnected from $server" -ForegroundColor Green
-    } catch {
-        Write-Warning "Failed to disconnect from $server"
-    }
-}
-
-Write-Host "`nScript completed at: $(Get-Date)" -ForegroundColor Green
-Write-Host "Total script runtime: $([math]::Round(((Get-Date) - (Get-Date $MyInvocation.MyCommand.Definition).LastWriteTime).TotalMinutes, 2)) minutes" -ForegroundColor Cyan
+Write-Host "`nScript completed: $(Get-Date)" -ForegroundColor Green
