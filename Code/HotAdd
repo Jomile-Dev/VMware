@@ -5,7 +5,12 @@
 Import-Module VMware.VimAutomation.Core -ErrorAction SilentlyContinue
 
 # vCenter connection parameters
-$vCenterServer = Read-Host "Enter vCenter Server FQDN or IP"
+$vCenterServer = @("test.test.test",
+                   "test.test.test"",
+                   "test.test.test"",
+                   "test.test.test"",
+                   "test.test.test"")
+
 $Credential = Get-Credential -Message "Enter vCenter credentials"
 
 # Output file path
@@ -14,7 +19,14 @@ $OutputPath = "C:\Temp\VM_HotAdd_Status.csv"
 try {
     # Connect to vCenter
     Write-Host "Connecting to vCenter Server: $vCenterServer" -ForegroundColor Yellow
-    Connect-VIServer -Server $vCenterServer -Credential $Credential -ErrorAction Stop
+    foreach ($vc in vCenterServer) {
+        try {
+            Connect-VIServer -Server $vCenterServer -Credential $Credential -ErrorAction Stop
+            Write-Host "Connected to $vc" - ForegroundColor Green
+        } catch {
+            Write-Warning "Failed to connect to $vc $_"
+        }
+    }
     Write-Host "Successfully connected to vCenter" -ForegroundColor Green
     
     # Get all VMs
@@ -47,9 +59,6 @@ try {
                 GuestOS = $VM.GuestId
                 VMHost = $VM.VMHost.Name
                 Cluster = if ($VM.VMHost.Parent.GetType().Name -eq "ClusterImpl") { $VM.VMHost.Parent.Name } else { "N/A" }
-                Datacenter = $VM.VMHost.Parent.Parent.Name
-                VMwareTools = $VM.ExtensionData.Guest.ToolsStatus
-                HardwareVersion = $VM.HardwareVersion
             }
             
             $Results += $VMInfo
@@ -68,9 +77,6 @@ try {
                 GuestOS = $VM.GuestId
                 VMHost = $VM.VMHost.Name
                 Cluster = if ($VM.VMHost.Parent.GetType().Name -eq "ClusterImpl") { $VM.VMHost.Parent.Name } else { "N/A" }
-                Datacenter = $VM.VMHost.Parent.Parent.Name
-                VMwareTools = $VM.ExtensionData.Guest.ToolsStatus
-                HardwareVersion = $VM.HardwareVersion
             }
             
             $Results += $VMInfo
