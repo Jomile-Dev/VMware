@@ -6,10 +6,10 @@ Import-Module VMware.VimAutomation.Core -ErrorAction SilentlyContinue
 
 # vCenter connection parameters
 $vCenterServer = @("test.test.test",
-                   "test.test.test"",
-                   "test.test.test"",
-                   "test.test.test"",
-                   "test.test.test"")
+                   "test.test.test",
+                   "test.test.test",
+                   "test.test.test",
+                   "test.test.test")
 
 $Credential = Get-Credential -Message "Enter vCenter credentials"
 
@@ -19,10 +19,10 @@ $OutputPath = "C:\Temp\VM_HotAdd_Status.csv"
 try {
     # Connect to vCenter
     Write-Host "Connecting to vCenter Server: $vCenterServer" -ForegroundColor Yellow
-    foreach ($vc in vCenterServer) {
+    foreach ($vc in $vCenterServer) {
         try {
-            Connect-VIServer -Server $vCenterServer -Credential $Credential -ErrorAction Stop
-            Write-Host "Connected to $vc" - ForegroundColor Green
+            Connect-VIServer -Server $vc -Credential $Credential -ErrorAction Stop
+            Write-Host "Connected to $vc" -ForegroundColor Green
         } catch {
             Write-Warning "Failed to connect to $vc $_"
         }
@@ -48,6 +48,19 @@ try {
             # Get VM configuration
             $VMConfig = $VM.ExtensionData.Config
             
+            # Calculate cores per socket (CPUs / Sockets)
+            $CoresPerSocket = if ($VMConfig.Hardware.NumCoresPerSocket -gt 0) { 
+                $VMConfig.Hardware.NumCoresPerSocket 
+            } else { 
+                1 
+            }
+            
+            $NumSockets = if ($VM.NumCpu -gt 0 -and $CoresPerSocket -gt 0) {
+                [math]::Ceiling($VM.NumCpu / $CoresPerSocket)
+            } else {
+                "N/A"
+            }
+            
             # Create custom object with VM details
             $VMInfo = [PSCustomObject]@{
                 VMName = $VM.Name
@@ -55,6 +68,8 @@ try {
                 CPUHotAddEnabled = $VMConfig.CpuHotAddEnabled
                 MemoryHotAddEnabled = $VMConfig.MemoryHotAddEnabled
                 CPUCount = $VM.NumCpu
+                NumSockets = $NumSockets
+                CoresPerSocket = $CoresPerSocket
                 MemoryGB = [math]::Round($VM.MemoryGB, 2)
                 GuestOS = $VM.GuestId
                 VMHost = $VM.VMHost.Name
@@ -73,6 +88,8 @@ try {
                 CPUHotAddEnabled = "Error retrieving data"
                 MemoryHotAddEnabled = "Error retrieving data"
                 CPUCount = $VM.NumCpu
+                NumSockets = "Error"
+                CoresPerSocket = "Error"
                 MemoryGB = [math]::Round($VM.MemoryGB, 2)
                 GuestOS = $VM.GuestId
                 VMHost = $VM.VMHost.Name
@@ -121,6 +138,17 @@ try {
     Write-Host "VMs with CPU Hot Add enabled: $CPUHotAddEnabled" -ForegroundColor White
     Write-Host "VMs with Memory Hot Add enabled: $MemoryHotAddEnabled" -ForegroundColor White
     Write-Host "VMs with both CPU and Memory Hot Add enabled: $BothHotAddEnabled" -ForegroundColor White
+    
+    # Socket Statistics
+    $SocketStats = $UniqueResults | Where-Object { $_.NumSockets -ne "Error" -and $_.NumSockets -ne "N/A" } | 
+                   Group-Object NumSockets | Sort-Object Name
+    
+    if ($SocketStats.Count -gt 0) {
+        Write-Host "`n=== SOCKET STATISTICS ===" -ForegroundColor Cyan
+        foreach ($Stat in $SocketStats) {
+            Write-Host "VMs with $($Stat.Name) socket(s): $($Stat.Count)" -ForegroundColor White
+        }
+    }
     
     Write-Host "`nReport saved to: $OutputPath" -ForegroundColor Green
     
