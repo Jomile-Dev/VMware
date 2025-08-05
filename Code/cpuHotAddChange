@@ -7,17 +7,29 @@ $CSVPath = "C:\path\to\your\vmlist.csv"
 # Specify the report file path here
 $ReportPath = "C:\Reports\VM_Configuration_Report_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
 
+Write-Host "Starting VM Configuration Update Script..." -ForegroundColor Green
+Write-Host "Script started at: $(Get-Date)" -ForegroundColor Gray
+
 # Import required PowerCLI modules
+Write-Host "Importing PowerCLI modules..." -ForegroundColor Yellow
 try {
     Import-Module VMware.PowerCLI -ErrorAction Stop
     Write-Host "PowerCLI module imported successfully" -ForegroundColor Green
 } catch {
     Write-Error "Failed to import PowerCLI module. Please ensure VMware PowerCLI is installed."
+    Write-Host "Error details: $($_.Exception.Message)" -ForegroundColor Red
+    Read-Host "Press Enter to exit"
     exit 1
 }
 
 # Set PowerCLI configuration to ignore certificate warnings
-Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session
+Write-Host "Configuring PowerCLI settings..." -ForegroundColor Yellow
+try {
+    Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session
+    Write-Host "PowerCLI configuration set successfully" -ForegroundColor Green
+} catch {
+    Write-Warning "Failed to set PowerCLI configuration: $($_.Exception.Message)"
+}
 
 # vCenter connection parameters
 $vCenterServers = @(
@@ -33,48 +45,82 @@ Write-Host "CSV File: $CSVPath" -ForegroundColor Yellow
 Write-Host "Report will be saved to: $ReportPath" -ForegroundColor Yellow
 
 # Validate CSV file exists
+Write-Host "Checking CSV file..." -ForegroundColor Yellow
+Write-Host "Looking for CSV at: $CSVPath" -ForegroundColor Gray
+
 if (!(Test-Path $CSVPath)) {
     Write-Error "CSV file not found at path: $CSVPath"
+    Write-Host "Please check the file path and ensure the file exists." -ForegroundColor Red
+    Read-Host "Press Enter to exit"
     exit 1
 }
+Write-Host "CSV file found successfully" -ForegroundColor Green
 
 # Read and validate CSV file
+Write-Host "Reading CSV file..." -ForegroundColor Yellow
 try {
     $VMList = Import-Csv -Path $CSVPath
     Write-Host "Successfully imported CSV with $($VMList.Count) VMs" -ForegroundColor Green
+    
+    if ($VMList.Count -eq 0) {
+        Write-Error "CSV file is empty or contains no data rows"
+        Read-Host "Press Enter to exit"
+        exit 1
+    }
 } catch {
-    Write-Error "Failed to import CSV file: $_"
+    Write-Error "Failed to import CSV file: $($_.Exception.Message)"
+    Read-Host "Press Enter to exit"
     exit 1
 }
 
 # Validate CSV headers
+Write-Host "Validating CSV headers..." -ForegroundColor Yellow
 $requiredHeaders = @("VMName", "PowerState", "CPUHotAddEnabled", "MemoryHotAddEnabled", "CPUCountBefore", "CPUCountAfter")
 $csvHeaders = $VMList[0].PSObject.Properties.Name
+Write-Host "Found headers: $($csvHeaders -join ', ')" -ForegroundColor Gray
+
 $missingHeaders = $requiredHeaders | Where-Object { $_ -notin $csvHeaders }
 
 if ($missingHeaders) {
     Write-Error "Missing required CSV headers: $($missingHeaders -join ', ')"
+    Write-Host "Required headers: $($requiredHeaders -join ', ')" -ForegroundColor Yellow
+    Read-Host "Press Enter to exit"
+    exit 1
+}
+Write-Host "CSV headers validated successfully" -ForegroundColor Green
+
+# Connect to vCenter servers
+Write-Host "Preparing to connect to vCenter servers..." -ForegroundColor Yellow
+$Credential = Get-Credential -Message "Enter vCenter credentials"
+
+if (!$Credential) {
+    Write-Error "No credentials provided. Exiting."
+    Read-Host "Press Enter to exit"
     exit 1
 }
 
-# Connect to vCenter servers
-$Credential = Get-Credential -Message "Enter vCenter credentials"
 $connectedServers = @()
 
+Write-Host "Attempting to connect to vCenter servers..." -ForegroundColor Yellow
 foreach ($vc in $vCenterServers) {
+    Write-Host "Connecting to $vc..." -ForegroundColor Gray
     try {
         Connect-VIServer -Server $vc -Credential $Credential -ErrorAction Stop
         Write-Host "Connected to $vc" -ForegroundColor Green
         $connectedServers += $vc
     } catch {
-        Write-Warning "Failed to connect to $vc : $_"
+        Write-Warning "Failed to connect to $vc : $($_.Exception.Message)"
     }
 }
 
 if ($connectedServers.Count -eq 0) {
     Write-Error "Failed to connect to any vCenter servers"
+    Write-Host "Please check your credentials and server connectivity." -ForegroundColor Red
+    Read-Host "Press Enter to exit"
     exit 1
 }
+
+Write-Host "Successfully connected to $($connectedServers.Count) vCenter server(s)" -ForegroundColor Green
 
 # Initialize report array
 $report = @()
