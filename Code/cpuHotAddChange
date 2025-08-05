@@ -465,7 +465,7 @@ foreach ($vmEntry in $VMList) {
         StartTime = Get-Date
     }
     
-    Write-Host "`n🚀 LAUNCHED JOB $jobCounter FOR VM: $($vmEntry.VMName)" -ForegroundColor Cyan -BackgroundColor DarkBlue
+    Write-Host "`nLAUNCHED JOB $jobCounter FOR VM: $($vmEntry.VMName)" -ForegroundColor Cyan -BackgroundColor DarkBlue
     Write-Host "   PowerShell Job ID: $($job.Id) | Target CPUs: $($vmEntry.CPUCountBefore) → $($vmEntry.CPUCountAfter)" -ForegroundColor White
     $jobCounter++
     
@@ -546,16 +546,16 @@ while ($jobs.Count -gt $processedJobs.Count) {
                         Write-Host "    Processing Time: $duration minutes" -ForegroundColor Red
                     }
                 } else {
-                    Write-Warning "⚠️  Could not extract result for VM: $($jobInfo.VMName)"
+                    Write-Warning "Could not extract result for VM: $($jobInfo.VMName)"
                 }
             } catch {
-                Write-Warning "⚠️  Error processing job $($completedJob.Id): $_"
+                Write-Warning "Error processing job $($completedJob.Id): $_"
             }
             
             Remove-Job -Job $completedJob -Force
             $processedJobs += $completedJob.Id
             
-            Write-Host "🏁" * 50 -ForegroundColor Magenta
+            Write-Host "=" * 50 -ForegroundColor Magenta
             Write-Host ""
         }
     }
@@ -567,24 +567,24 @@ while ($jobs.Count -gt $processedJobs.Count) {
         $total = $jobs.Count
         $elapsedTotal = [math]::Round(((Get-Date) - $scriptStartTime).TotalMinutes, 1)
         
-        Write-Host "`n" + "📊" * 30 -ForegroundColor Yellow
+        Write-Host "`n" + "=" * 30 -ForegroundColor Yellow
         Write-Host "COMPREHENSIVE STATUS UPDATE - $elapsedTotal minutes elapsed" -ForegroundColor Yellow -BackgroundColor DarkYellow
-        Write-Host "📊" * 30 -ForegroundColor Yellow
-        Write-Host "✅ Completed: $completed/$total" -ForegroundColor Green
-        Write-Host "🏃 Running: $running" -ForegroundColor Cyan
-        Write-Host "⏳ Remaining: $($total - $completed)" -ForegroundColor Yellow
-        Write-Host "📈 Success Rate: $([math]::Round(($results | Where-Object {$_.Status -eq 'Success'}).Count / [math]::Max($completed, 1) * 100, 1))%" -ForegroundColor Green
+        Write-Host "=" * 30 -ForegroundColor Yellow
+        Write-Host "Completed: $completed/$total" -ForegroundColor Green
+        Write-Host "Running: $running" -ForegroundColor Cyan
+        Write-Host "Remaining: $($total - $completed)" -ForegroundColor Yellow
+        Write-Host "Success Rate: $([math]::Round(($results | Where-Object {$_.Status -eq 'Success'}).Count / [math]::Max($completed, 1) * 100, 1))%" -ForegroundColor Green
         
         if ($running -gt 0) {
-            Write-Host "`n🏃 CURRENTLY PROCESSING:" -ForegroundColor Cyan
+            Write-Host "`nCURRENTLY PROCESSING:" -ForegroundColor Cyan
             $runningJobsInfo = $jobs | Where-Object { $_.Job.Id -in $runningJobs.Id }
             foreach ($runningJob in $runningJobsInfo) {
                 $elapsed = [math]::Round(((Get-Date) - $runningJob.StartTime).TotalMinutes, 1)
-                Write-Host "   🔄 $($runningJob.VMName) (Job $($runningJob.JobId) - ${elapsed}m)" -ForegroundColor White
+                Write-Host "   • $($runningJob.VMName) (Job $($runningJob.JobId) - ${elapsed}m)" -ForegroundColor White
             }
         }
         
-        Write-Host "📊" * 30 -ForegroundColor Yellow
+        Write-Host "=" * 30 -ForegroundColor Yellow
         Write-Host ""
         
         $lastSummaryUpdate = Get-Date
@@ -596,9 +596,9 @@ while ($jobs.Count -gt $processedJobs.Count) {
 # Final processing and comprehensive reporting
 $totalScriptTime = [math]::Round(((Get-Date) - $scriptStartTime).TotalMinutes, 2)
 
-Write-Host "`n" + "🎉" * 80 -ForegroundColor Green
-Write-Host "🎉🎉🎉 ALL JOBS COMPLETED - GENERATING COMPREHENSIVE FINAL REPORT 🎉🎉🎉" -ForegroundColor Green -BackgroundColor DarkGreen
-Write-Host "🎉" * 80 -ForegroundColor Green
+Write-Host "`n" + "=" * 80 -ForegroundColor Green
+Write-Host "*** ALL JOBS COMPLETED - GENERATING COMPREHENSIVE FINAL REPORT ***" -ForegroundColor Green -BackgroundColor DarkGreen
+Write-Host "=" * 80 -ForegroundColor Green
 
 if ($results.Count -gt 0) {
     # Export detailed report
@@ -608,4 +608,18 @@ if ($results.Count -gt 0) {
     $successful = ($results | Where-Object { $_.Status -eq "Success" }).Count
     $failed = ($results | Where-Object { $_.Status -eq "Failed" }).Count
     $avgTime = if ($results.Count -gt 0) { [math]::Round(($results | Measure-Object ProcessingTimeMinutes -Average).Average, 2) } else { 0 }
-    $maxTime = if ($results.Count -gt 0) { [math]::Round(($
+    $maxTime = if ($results.Count -gt 0) { [math]::Round(($results | Measure-Object ProcessingTimeMinutes -Maximum).Maximum, 2) } else { 0 }
+    $minTime = if ($results.Count -gt 0) { [math]::Round(($results | Measure-Object ProcessingTimeMinutes -Minimum).Minimum, 2) } else { 0 }
+    
+    Write-Host "`nCOMPREHENSIVE FINAL SUMMARY:" -ForegroundColor Cyan -BackgroundColor DarkCyan
+    Write-Host "=" * 50 -ForegroundColor Cyan
+    Write-Host "Total VMs Processed: $($results.Count)" -ForegroundColor Yellow
+    Write-Host "Successful Operations: $successful" -ForegroundColor Green
+    Write-Host "Failed Operations: $failed" -ForegroundColor Red
+    Write-Host "Success Rate: $([math]::Round($successful / [math]::Max($results.Count, 1) * 100, 1))%" -ForegroundColor $(if ($successful -eq $results.Count) { "Green" } else { "Yellow" })
+    Write-Host "Total Script Runtime: $totalScriptTime minutes" -ForegroundColor Yellow
+    Write-Host "Average Processing Time per VM: $avgTime minutes" -ForegroundColor Yellow
+    Write-Host "Fastest VM Processing: $minTime minutes" -ForegroundColor Green
+    Write-Host "Slowest VM Processing: $maxTime minutes" -ForegroundColor Yellow
+    Write-Host "Report File: $ReportPath" -ForegroundColor Cyan
+    Write-Host "=" * 50 -ForegroundColor Cyan$
