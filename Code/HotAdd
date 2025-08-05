@@ -1,250 +1,171 @@
-# VM Configuration Update Script
-# This script processes a CSV file to update VM CPU and memory settings
+# VM Hot Add Status Check Script
+# This script connects to vCenter and checks CPU/Memory hot add status for all VMs
 
-param(
-    [Parameter(Mandatory=$true)]
-    [string]$CSVPath
-)
-
-# Specify the report file path here
-$ReportPath = "C:\Reports\VM_Configuration_Report_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
-
-# Import required PowerCLI modules
-try {
-    Import-Module VMware.PowerCLI -ErrorAction Stop
-    Write-Host "PowerCLI module imported successfully" -ForegroundColor Green
-} catch {
-    Write-Error "Failed to import PowerCLI module. Please ensure VMware PowerCLI is installed."
-    exit 1
-}
-
-# Set PowerCLI configuration to ignore certificate warnings
-Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session
+# Import required module
+Import-Module VMware.VimAutomation.Core -ErrorAction SilentlyContinue
 
 # vCenter connection parameters
-$vCenterServers = @(
-    "test.test.test",
-    "test.test.test", 
-    "test.test.test",
-    "test.test.test",
-    "test.test.test"
-)
+$vCenterServer = @("test.test.test",
+                   "test.test.test",
+                   "test.test.test",
+                   "test.test.test",
+                   "test.test.test")
 
-Write-Host "Starting VM Configuration Update Process" -ForegroundColor Cyan
-Write-Host "CSV File: $CSVPath" -ForegroundColor Yellow
-Write-Host "Report will be saved to: $ReportPath" -ForegroundColor Yellow
-
-# Validate CSV file exists
-if (!(Test-Path $CSVPath)) {
-    Write-Error "CSV file not found at path: $CSVPath"
-    exit 1
-}
-
-# Read and validate CSV file
-try {
-    $VMList = Import-Csv -Path $CSVPath
-    Write-Host "Successfully imported CSV with $($VMList.Count) VMs" -ForegroundColor Green
-} catch {
-    Write-Error "Failed to import CSV file: $_"
-    exit 1
-}
-
-# Validate CSV headers
-$requiredHeaders = @("VMName", "PowerState", "CPUHotAddEnabled", "MemoryHotAddEnabled", "CPUCountBefore", "CPUCountAfter")
-$csvHeaders = $VMList[0].PSObject.Properties.Name
-$missingHeaders = $requiredHeaders | Where-Object { $_ -notin $csvHeaders }
-
-if ($missingHeaders) {
-    Write-Error "Missing required CSV headers: $($missingHeaders -join ', ')"
-    exit 1
-}
-
-# Connect to vCenter servers
 $Credential = Get-Credential -Message "Enter vCenter credentials"
-$connectedServers = @()
 
-foreach ($vc in $vCenterServers) {
-    try {
-        Connect-VIServer -Server $vc -Credential $Credential -ErrorAction Stop
-        Write-Host "Connected to $vc" -ForegroundColor Green
-        $connectedServers += $vc
-    } catch {
-        Write-Warning "Failed to connect to $vc : $_"
+# Output file path
+$OutputPath = "C:\Temp\VM_HotAdd_Status.csv"
+
+try {
+    # Connect to vCenter
+    Write-Host "Connecting to vCenter Server: $vCenterServer" -ForegroundColor Yellow
+    foreach ($vc in $vCenterServer) {
+        try {
+            Connect-VIServer -Server $vc -Credential $Credential -ErrorAction Stop
+            Write-Host "Connected to $vc" -ForegroundColor Green
+        } catch {
+            Write-Warning "Failed to connect to $vc $_"
+        }
     }
-}
-
-if ($connectedServers.Count -eq 0) {
-    Write-Error "Failed to connect to any vCenter servers"
-    exit 1
-}
-
-# Initialize report array
-$report = @()
-
-# Function to wait for VM to be fully powered off
-function Wait-VMPowerOff {
-    param([string]$VMName, [int]$TimeoutMinutes = 10)
+    Write-Host "Successfully connected to vCenter" -ForegroundColor Green
     
-    $timeout = (Get-Date).AddMinutes($TimeoutMinutes)
-    do {
-        Start-Sleep -Seconds 10
-        $vm = Get-VM -Name $VMName -ErrorAction SilentlyContinue
-        if ($vm.PowerState -eq "PoweredOff") {
-            return $true
-        }
-        Write-Host "Waiting for $VMName to power off..." -ForegroundColor Yellow
-    } while ((Get-Date) -lt $timeout)
+    # Get all VMs
+    Write-Host "Retrieving all VMs from vCenter..." -ForegroundColor Yellow
+    $AllVMs = Get-VM | Sort-Object Name
+    Write-Host "Found $($AllVMs.Count) VMs" -ForegroundColor Green
     
-    return $false
-}
-
-# Function to wait for VM to be fully powered on
-function Wait-VMPowerOn {
-    param([string]$VMName, [int]$TimeoutMinutes = 10)
+    # Initialize array to store results
+    $Results = @()
     
-    $timeout = (Get-Date).AddMinutes($TimeoutMinutes)
-    do {
-        Start-Sleep -Seconds 10
-        $vm = Get-VM -Name $VMName -ErrorAction SilentlyContinue
-        if ($vm.PowerState -eq "PoweredOn") {
-            return $true
-        }
-        Write-Host "Waiting for $VMName to power on..." -ForegroundColor Yellow
-    } while ((Get-Date) -lt $timeout)
+    # Progress counter
+    $Counter = 1
     
-    return $false
-}
-
-# Process each VM
-foreach ($vmEntry in $VMList) {
-    Write-Host "`nProcessing VM: $($vmEntry.VMName)" -ForegroundColor Cyan
-    
-    $vmReport = [PSCustomObject]@{
-        VMName = $vmEntry.VMName
-        OriginalPowerState = $vmEntry.PowerState
-        OriginalCPUHotAddEnabled = $vmEntry.CPUHotAddEnabled
-        OriginalMemoryHotAddEnabled = $vmEntry.MemoryHotAddEnabled
-        OriginalCPUCount = $vmEntry.CPUCountBefore
-        TargetCPUCount = $vmEntry.CPUCountAfter
-        NewCPUCount = ""
-        NewCoresPerSocket = ""
-        NewCPUHotAddEnabled = ""
-        NewMemoryHotAddEnabled = ""
-        FinalPowerState = ""
-        Status = ""
-        ErrorMessage = ""
-    }
-    
-    try {
-        # Find the VM across all connected vCenters
-        $vm = $null
-        foreach ($server in $connectedServers) {
-            $vm = Get-VM -Name $vmEntry.VMName -Server $server -ErrorAction SilentlyContinue
-            if ($vm) {
-                Write-Host "Found VM $($vmEntry.VMName) on server $server" -ForegroundColor Green
-                break
-            }
-        }
+    # Check each VM for hot add settings
+    foreach ($VM in $AllVMs) {
+        Write-Progress -Activity "Checking VM Hot Add Settings" -Status "Processing: $($VM.Name)" -PercentComplete (($Counter / $AllVMs.Count) * 100)
         
-        if (!$vm) {
-            throw "VM '$($vmEntry.VMName)' not found on any connected vCenter server"
-        }
-        
-        # Step 1: Shutdown VM if it's powered on
-        if ($vm.PowerState -eq "PoweredOn") {
-            Write-Host "Shutting down VM: $($vmEntry.VMName)" -ForegroundColor Yellow
-            Shutdown-VMGuest -VM $vm -Confirm:$false
+        try {
+            # Get VM configuration
+            $VMConfig = $VM.ExtensionData.Config
             
-            # Wait for VM to be fully powered off
-            $shutdownSuccess = Wait-VMPowerOff -VMName $vmEntry.VMName -TimeoutMinutes 10
-            if (!$shutdownSuccess) {
-                Write-Warning "VM did not shutdown gracefully, forcing power off"
-                Stop-VM -VM $vm -Confirm:$false
-                Start-Sleep -Seconds 30
+            # Calculate cores per socket (CPUs / Sockets)
+            $CoresPerSocket = if ($VMConfig.Hardware.NumCoresPerSocket -gt 0) { 
+                $VMConfig.Hardware.NumCoresPerSocket 
+            } else { 
+                1 
             }
+            
+            $NumSockets = if ($VM.NumCpu -gt 0 -and $CoresPerSocket -gt 0) {
+                [math]::Ceiling($VM.NumCpu / $CoresPerSocket)
+            } else {
+                "N/A"
+            }
+            
+            # Create custom object with VM details
+            $VMInfo = [PSCustomObject]@{
+                VMName = $VM.Name
+                PowerState = $VM.PowerState
+                CPUHotAddEnabled = $VMConfig.CpuHotAddEnabled
+                MemoryHotAddEnabled = $VMConfig.MemoryHotAddEnabled
+                CPUCount = $VM.NumCpu
+                NumSockets = $NumSockets
+                CoresPerSocket = $CoresPerSocket
+                MemoryGB = [math]::Round($VM.MemoryGB, 2)
+                GuestOS = $VM.GuestId
+                VMHost = $VM.VMHost.Name
+                Cluster = if ($VM.VMHost.Parent.GetType().Name -eq "ClusterImpl") { $VM.VMHost.Parent.Name } else { "N/A" }
+            }
+            
+            $Results += $VMInfo
+        }
+        catch {
+            Write-Warning "Failed to process VM: $($VM.Name) - Error: $($_.Exception.Message)"
+            
+            # Add VM with error status
+            $VMInfo = [PSCustomObject]@{
+                VMName = $VM.Name
+                PowerState = $VM.PowerState
+                CPUHotAddEnabled = "Error retrieving data"
+                MemoryHotAddEnabled = "Error retrieving data"
+                CPUCount = $VM.NumCpu
+                NumSockets = "Error"
+                CoresPerSocket = "Error"
+                MemoryGB = [math]::Round($VM.MemoryGB, 2)
+                GuestOS = $VM.GuestId
+                VMHost = $VM.VMHost.Name
+                Cluster = if ($VM.VMHost.Parent.GetType().Name -eq "ClusterImpl") { $VM.VMHost.Parent.Name } else { "N/A" }
+            }
+            
+            $Results += $VMInfo
         }
         
-        # Refresh VM object
-        $vm = Get-VM -Name $vmEntry.VMName
-        
-        # Step 2: Get current CPU configuration
-        $vmView = Get-View -VIObject $vm
-        $currentCoresPerSocket = $vmView.Config.Hardware.NumCoresPerSocket
-        $currentCPUCount = $vmView.Config.Hardware.NumCPU
-        
-        Write-Host "Current CPU Config - Count: $currentCPUCount, Cores per Socket: $currentCoresPerSocket" -ForegroundColor Yellow
-        
-        # Step 3: Configure CPU settings (1 core per socket, update CPU count)
-        $targetCPUCount = [int]$vmEntry.CPUCountAfter
-        Write-Host "Configuring CPU: Count=$targetCPUCount, Cores per Socket=1" -ForegroundColor Yellow
-        
-        $vmConfigSpec = New-Object VMware.Vim.VirtualMachineConfigSpec
-        $vmConfigSpec.NumCPUs = $targetCPUCount
-        $vmConfigSpec.NumCoresPerSocket = 1
-        
-        # Step 4: Enable CPU and Memory Hot Add
-        $vmConfigSpec.CpuHotAddEnabled = $true
-        $vmConfigSpec.MemoryHotAddEnabled = $true
-        
-        # Apply configuration changes
-        $vmView.ReconfigVM($vmConfigSpec)
-        Write-Host "Applied CPU and Hot Add configuration" -ForegroundColor Green
-        
-        # Step 5: Power on the VM
-        Write-Host "Starting VM: $($vmEntry.VMName)" -ForegroundColor Yellow
-        Start-VM -VM $vm -Confirm:$false
-        
-        # Wait for VM to be fully powered on
-        $powerOnSuccess = Wait-VMPowerOn -VMName $vmEntry.VMName -TimeoutMinutes 10
-        if (!$powerOnSuccess) {
-            Write-Warning "VM may not have started successfully"
-        }
-        
-        # Step 6: Verify final configuration
-        $vm = Get-VM -Name $vmEntry.VMName
-        $vmView = Get-View -VIObject $vm
-        
-        $vmReport.NewCPUCount = $vmView.Config.Hardware.NumCPU
-        $vmReport.NewCoresPerSocket = $vmView.Config.Hardware.NumCoresPerSocket
-        $vmReport.NewCPUHotAddEnabled = $vmView.Config.CpuHotAddEnabled
-        $vmReport.NewMemoryHotAddEnabled = $vmView.Config.MemoryHotAddEnabled
-        $vmReport.FinalPowerState = $vm.PowerState
-        $vmReport.Status = "Success"
-        
-        Write-Host "VM $($vmEntry.VMName) processed successfully" -ForegroundColor Green
-        Write-Host "Final Config - CPU Count: $($vmReport.NewCPUCount), Cores per Socket: $($vmReport.NewCoresPerSocket)" -ForegroundColor Green
-        
-    } catch {
-        $vmReport.Status = "Failed"
-        $vmReport.ErrorMessage = $_.Exception.Message
-        Write-Error "Failed to process VM $($vmEntry.VMName): $_"
+        $Counter++
     }
     
-    $report += $vmReport
-}
-
-# Generate and save report
-Write-Host "`nGenerating report..." -ForegroundColor Cyan
-$report | Export-Csv -Path $ReportPath -NoTypeInformation
-
-Write-Host "`nProcess Summary:" -ForegroundColor Cyan
-Write-Host "Total VMs processed: $($report.Count)" -ForegroundColor Yellow
-Write-Host "Successful: $($report | Where-Object {$_.Status -eq 'Success'} | Measure-Object).Count" -ForegroundColor Green
-Write-Host "Failed: $($report | Where-Object {$_.Status -eq 'Failed'} | Measure-Object).Count" -ForegroundColor Red
-Write-Host "Report saved to: $ReportPath" -ForegroundColor Yellow
-
-# Display summary table
-Write-Host "`nDetailed Results:" -ForegroundColor Cyan
-$report | Format-Table VMName, Status, NewCPUCount, NewCoresPerSocket, NewCPUHotAddEnabled, NewMemoryHotAddEnabled, FinalPowerState -AutoSize
-
-# Disconnect from vCenter servers
-foreach ($server in $connectedServers) {
-    try {
-        Disconnect-VIServer -Server $server -Confirm:$false
-        Write-Host "Disconnected from $server" -ForegroundColor Green
-    } catch {
-        Write-Warning "Failed to disconnect from $server"
+    # Remove duplicates based on VM Name (in case there are any)
+    Write-Host "Removing duplicates..." -ForegroundColor Yellow
+    $UniqueResults = $Results | Sort-Object VMName -Unique
+    $DuplicatesRemoved = $Results.Count - $UniqueResults.Count
+    
+    if ($DuplicatesRemoved -gt 0) {
+        Write-Host "Removed $DuplicatesRemoved duplicate entries" -ForegroundColor Green
+    } else {
+        Write-Host "No duplicates found" -ForegroundColor Green
+    }
+    
+    # Create output directory if it doesn't exist
+    $OutputDir = Split-Path $OutputPath -Parent
+    if (!(Test-Path $OutputDir)) {
+        New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+    }
+    
+    # Export to CSV
+    Write-Host "Exporting results to CSV: $OutputPath" -ForegroundColor Yellow
+    $UniqueResults | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+    
+    # Display summary
+    Write-Host "`n=== SUMMARY ===" -ForegroundColor Cyan
+    Write-Host "Total VMs processed: $($AllVMs.Count)" -ForegroundColor White
+    Write-Host "Unique VMs in report: $($UniqueResults.Count)" -ForegroundColor White
+    Write-Host "Duplicates removed: $DuplicatesRemoved" -ForegroundColor White
+    
+    # Hot Add Statistics
+    $CPUHotAddEnabled = ($UniqueResults | Where-Object { $_.CPUHotAddEnabled -eq $true }).Count
+    $MemoryHotAddEnabled = ($UniqueResults | Where-Object { $_.MemoryHotAddEnabled -eq $true }).Count
+    $BothHotAddEnabled = ($UniqueResults | Where-Object { $_.CPUHotAddEnabled -eq $true -and $_.MemoryHotAddEnabled -eq $true }).Count
+    
+    Write-Host "`n=== HOT ADD STATISTICS ===" -ForegroundColor Cyan
+    Write-Host "VMs with CPU Hot Add enabled: $CPUHotAddEnabled" -ForegroundColor White
+    Write-Host "VMs with Memory Hot Add enabled: $MemoryHotAddEnabled" -ForegroundColor White
+    Write-Host "VMs with both CPU and Memory Hot Add enabled: $BothHotAddEnabled" -ForegroundColor White
+    
+    # Socket Statistics
+    $SocketStats = $UniqueResults | Where-Object { $_.NumSockets -ne "Error" -and $_.NumSockets -ne "N/A" } | 
+                   Group-Object NumSockets | Sort-Object Name
+    
+    if ($SocketStats.Count -gt 0) {
+        Write-Host "`n=== SOCKET STATISTICS ===" -ForegroundColor Cyan
+        foreach ($Stat in $SocketStats) {
+            Write-Host "VMs with $($Stat.Name) socket(s): $($Stat.Count)" -ForegroundColor White
+        }
+    }
+    
+    Write-Host "`nReport saved to: $OutputPath" -ForegroundColor Green
+    
+    # Ask if user wants to open the CSV file
+    $OpenFile = Read-Host "`nWould you like to open the CSV file? (Y/N)"
+    if ($OpenFile -match "^[Yy]") {
+        Invoke-Item $OutputPath
     }
 }
-
-Write-Host "`nScript completed!" -ForegroundColor Green
+catch {
+    Write-Error "An error occurred: $($_.Exception.Message)"
+}
+finally {
+    # Disconnect from vCenter
+    if ($global:DefaultVIServers.Count -gt 0) {
+        Write-Host "Disconnecting from vCenter..." -ForegroundColor Yellow
+        Disconnect-VIServer -Server * -Confirm:$false
+        Write-Host "Disconnected from vCenter" -ForegroundColor Green
+    }
+}
