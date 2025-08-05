@@ -1,0 +1,137 @@
+# VM Hot Add Status Check Script
+# This script connects to vCenter and checks CPU/Memory hot add status for all VMs
+
+# Import required module
+Import-Module VMware.VimAutomation.Core -ErrorAction SilentlyContinue
+
+# vCenter connection parameters
+$vCenterServer = Read-Host "Enter vCenter Server FQDN or IP"
+$Credential = Get-Credential -Message "Enter vCenter credentials"
+
+# Output file path
+$OutputPath = "C:\Temp\VM_HotAdd_Status.csv"
+
+try {
+    # Connect to vCenter
+    Write-Host "Connecting to vCenter Server: $vCenterServer" -ForegroundColor Yellow
+    Connect-VIServer -Server $vCenterServer -Credential $Credential -ErrorAction Stop
+    Write-Host "Successfully connected to vCenter" -ForegroundColor Green
+    
+    # Get all VMs
+    Write-Host "Retrieving all VMs from vCenter..." -ForegroundColor Yellow
+    $AllVMs = Get-VM | Sort-Object Name
+    Write-Host "Found $($AllVMs.Count) VMs" -ForegroundColor Green
+    
+    # Initialize array to store results
+    $Results = @()
+    
+    # Progress counter
+    $Counter = 1
+    
+    # Check each VM for hot add settings
+    foreach ($VM in $AllVMs) {
+        Write-Progress -Activity "Checking VM Hot Add Settings" -Status "Processing: $($VM.Name)" -PercentComplete (($Counter / $AllVMs.Count) * 100)
+        
+        try {
+            # Get VM configuration
+            $VMConfig = $VM.ExtensionData.Config
+            
+            # Create custom object with VM details
+            $VMInfo = [PSCustomObject]@{
+                VMName = $VM.Name
+                PowerState = $VM.PowerState
+                CPUHotAddEnabled = $VMConfig.CpuHotAddEnabled
+                MemoryHotAddEnabled = $VMConfig.MemoryHotAddEnabled
+                CPUCount = $VM.NumCpu
+                MemoryGB = [math]::Round($VM.MemoryGB, 2)
+                GuestOS = $VM.GuestId
+                VMHost = $VM.VMHost.Name
+                Cluster = if ($VM.VMHost.Parent.GetType().Name -eq "ClusterImpl") { $VM.VMHost.Parent.Name } else { "N/A" }
+                Datacenter = $VM.VMHost.Parent.Parent.Name
+                VMwareTools = $VM.ExtensionData.Guest.ToolsStatus
+                HardwareVersion = $VM.HardwareVersion
+            }
+            
+            $Results += $VMInfo
+        }
+        catch {
+            Write-Warning "Failed to process VM: $($VM.Name) - Error: $($_.Exception.Message)"
+            
+            # Add VM with error status
+            $VMInfo = [PSCustomObject]@{
+                VMName = $VM.Name
+                PowerState = $VM.PowerState
+                CPUHotAddEnabled = "Error retrieving data"
+                MemoryHotAddEnabled = "Error retrieving data"
+                CPUCount = $VM.NumCpu
+                MemoryGB = [math]::Round($VM.MemoryGB, 2)
+                GuestOS = $VM.GuestId
+                VMHost = $VM.VMHost.Name
+                Cluster = if ($VM.VMHost.Parent.GetType().Name -eq "ClusterImpl") { $VM.VMHost.Parent.Name } else { "N/A" }
+                Datacenter = $VM.VMHost.Parent.Parent.Name
+                VMwareTools = $VM.ExtensionData.Guest.ToolsStatus
+                HardwareVersion = $VM.HardwareVersion
+            }
+            
+            $Results += $VMInfo
+        }
+        
+        $Counter++
+    }
+    
+    # Remove duplicates based on VM Name (in case there are any)
+    Write-Host "Removing duplicates..." -ForegroundColor Yellow
+    $UniqueResults = $Results | Sort-Object VMName -Unique
+    $DuplicatesRemoved = $Results.Count - $UniqueResults.Count
+    
+    if ($DuplicatesRemoved -gt 0) {
+        Write-Host "Removed $DuplicatesRemoved duplicate entries" -ForegroundColor Green
+    } else {
+        Write-Host "No duplicates found" -ForegroundColor Green
+    }
+    
+    # Create output directory if it doesn't exist
+    $OutputDir = Split-Path $OutputPath -Parent
+    if (!(Test-Path $OutputDir)) {
+        New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+    }
+    
+    # Export to CSV
+    Write-Host "Exporting results to CSV: $OutputPath" -ForegroundColor Yellow
+    $UniqueResults | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+    
+    # Display summary
+    Write-Host "`n=== SUMMARY ===" -ForegroundColor Cyan
+    Write-Host "Total VMs processed: $($AllVMs.Count)" -ForegroundColor White
+    Write-Host "Unique VMs in report: $($UniqueResults.Count)" -ForegroundColor White
+    Write-Host "Duplicates removed: $DuplicatesRemoved" -ForegroundColor White
+    
+    # Hot Add Statistics
+    $CPUHotAddEnabled = ($UniqueResults | Where-Object { $_.CPUHotAddEnabled -eq $true }).Count
+    $MemoryHotAddEnabled = ($UniqueResults | Where-Object { $_.MemoryHotAddEnabled -eq $true }).Count
+    $BothHotAddEnabled = ($UniqueResults | Where-Object { $_.CPUHotAddEnabled -eq $true -and $_.MemoryHotAddEnabled -eq $true }).Count
+    
+    Write-Host "`n=== HOT ADD STATISTICS ===" -ForegroundColor Cyan
+    Write-Host "VMs with CPU Hot Add enabled: $CPUHotAddEnabled" -ForegroundColor White
+    Write-Host "VMs with Memory Hot Add enabled: $MemoryHotAddEnabled" -ForegroundColor White
+    Write-Host "VMs with both CPU and Memory Hot Add enabled: $BothHotAddEnabled" -ForegroundColor White
+    
+    Write-Host "`nReport saved to: $OutputPath" -ForegroundColor Green
+    
+    # Ask if user wants to open the CSV file
+    $OpenFile = Read-Host "`nWould you like to open the CSV file? (Y/N)"
+    if ($OpenFile -match "^[Yy]") {
+        Invoke-Item $OutputPath
+    }
+}
+catch {
+    Write-Error "An error occurred: $($_.Exception.Message)"
+}
+finally {
+    # Disconnect from vCenter
+    if ($global:DefaultVIServers.Count -gt 0) {
+        Write-Host "Disconnecting from vCenter..." -ForegroundColor Yellow
+        Disconnect-VIServer -Server * -Confirm:$false
+        Write-Host "Disconnected from vCenter" -ForegroundColor Green
+    }
+}
