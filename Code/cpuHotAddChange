@@ -115,10 +115,40 @@ function Wait-VMPowerOn {
     return $false
 }
 
-# Process only the VMs listed in the CSV file
-Write-Host "`nProcessing VMs from CSV file..." -ForegroundColor Cyan
-Write-Host "VMs to process: $($VMList.VMName -join ', ')" -ForegroundColor Yellow
+# Display VMs that will be processed and ask for confirmation
+Write-Host "`n" -ForegroundColor White
+Write-Host "=" * 80 -ForegroundColor Yellow
+Write-Host "VM CONFIGURATION CHANGE CONFIRMATION" -ForegroundColor Yellow
+Write-Host "=" * 80 -ForegroundColor Yellow
+Write-Host "`nThe following VMs from your CSV will be modified:" -ForegroundColor Cyan
+Write-Host ""
 
+# Display each VM with its planned changes
+foreach ($vmEntry in $VMList) {
+    Write-Host "VM Name: $($vmEntry.VMName)" -ForegroundColor White
+    Write-Host "  Current Power State: $($vmEntry.PowerState)" -ForegroundColor Gray
+    Write-Host "  CPU Count: $($vmEntry.CPUCountBefore) -> $($vmEntry.CPUCountAfter)" -ForegroundColor Yellow
+    Write-Host "  Cores per Socket: Will be set to 1" -ForegroundColor Yellow
+    Write-Host "  CPU Hot Add: $($vmEntry.CPUHotAddEnabled) -> TRUE" -ForegroundColor Yellow
+    Write-Host "  Memory Hot Add: $($vmEntry.MemoryHotAddEnabled) -> TRUE" -ForegroundColor Yellow
+    Write-Host "  Actions: Shutdown -> Reconfigure -> Power On" -ForegroundColor Red
+    Write-Host ""
+}
+
+Write-Host "Total VMs to be modified: $($VMList.Count)" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "WARNING: These VMs will be shut down and reconfigured!" -ForegroundColor Red -BackgroundColor Black
+Write-Host ""
+Write-Host "Do you want to proceed with these changes?" -ForegroundColor Yellow
+Write-Host "Press ENTER to continue or CTRL+C to cancel..." -ForegroundColor White
+
+# Wait for user confirmation
+Read-Host
+
+Write-Host "`nProceeding with VM configuration changes..." -ForegroundColor Green
+Write-Host "=" * 80 -ForegroundColor Green
+
+# Process only the VMs listed in the CSV file
 foreach ($vmEntry in $VMList) {
     Write-Host "`nProcessing VM: $($vmEntry.VMName)" -ForegroundColor Cyan
     
