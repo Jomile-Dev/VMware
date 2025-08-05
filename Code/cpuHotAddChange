@@ -10,18 +10,6 @@ $ReportPath = "C:\Reports\VM_Configuration_Report_$(Get-Date -Format 'yyyyMMdd_H
 Write-Host "Starting VM Configuration Update Script..." -ForegroundColor Green
 Write-Host "Script started at: $(Get-Date)" -ForegroundColor Gray
 
-# Import required PowerCLI modules
-Write-Host "Importing PowerCLI modules..." -ForegroundColor Yellow
-try {
-    Import-Module VMware.PowerCLI -ErrorAction Stop
-    Write-Host "PowerCLI module imported successfully" -ForegroundColor Green
-} catch {
-    Write-Error "Failed to import PowerCLI module. Please ensure VMware PowerCLI is installed."
-    Write-Host "Error details: $($_.Exception.Message)" -ForegroundColor Red
-    Read-Host "Press Enter to exit"
-    exit 1
-}
-
 # Set PowerCLI configuration to ignore certificate warnings
 Write-Host "Configuring PowerCLI settings..." -ForegroundColor Yellow
 try {
@@ -192,9 +180,16 @@ Read-Host
 Write-Host "`nProceeding with VM configuration changes..." -ForegroundColor Green
 Write-Host "=" * 80 -ForegroundColor Green
 
-# Process only the VMs listed in the CSV file
-foreach ($vmEntry in $VMList) {
-    Write-Host "`nProcessing VM: $($vmEntry.VMName)" -ForegroundColor Cyan
+# Process VMs in batch mode (parallel processing)
+Write-Host "`nProcessing VMs in batch mode..." -ForegroundColor Green
+Write-Host "=" * 80 -ForegroundColor Green
+
+# Create script block for parallel VM processing
+$vmProcessingScript = {
+    param($vmEntry, $connectedServers)
+    
+    # Import PowerCLI in the background job
+    Import-Module VMware.PowerCLI -ErrorAction SilentlyContinue
     
     $vmReport = [PSCustomObject]@{
         VMName = $vmEntry.VMName
@@ -210,15 +205,18 @@ foreach ($vmEntry in $VMList) {
         FinalPowerState = ""
         Status = ""
         ErrorMessage = ""
+        ProcessingThread = [System.Threading.Thread]::CurrentThread.ManagedThreadId
     }
     
     try {
+        Write-Host "[Thread $([System.Threading.Thread]::CurrentThread.ManagedThreadId)] Processing VM: $($vmEntry.VMName)" -ForegroundColor Cyan
+        
         # Find the specific VM from the CSV across all connected vCenters
         $vm = $null
         foreach ($server in $connectedServers) {
             $vm = Get-VM -Name $vmEntry.VMName -Server $server -ErrorAction SilentlyContinue
             if ($vm) {
-                Write-Host "Found VM $($vmEntry.VMName) on server $server" -ForegroundColor Green
+                Write-Host "[Thread $([System.Threading.Thread]::CurrentThread.ManagedThreadId)] Found VM $($vmEntry.VMName) on server $server" -ForegroundColor Green
                 break
             }
         }
@@ -229,13 +227,22 @@ foreach ($vmEntry in $VMList) {
         
         # Step 1: Shutdown VM if it's powered on
         if ($vm.PowerState -eq "PoweredOn") {
-            Write-Host "Shutting down VM: $($vmEntry.VMName)" -ForegroundColor Yellow
+            Write-Host "[Thread $([System.Threading.Thread]::CurrentThread.ManagedThreadId)] Shutting down VM: $($vmEntry.VMName)" -ForegroundColor Yellow
             Shutdown-VMGuest -VM $vm -Confirm:$false
             
             # Wait for VM to be fully powered off
-            $shutdownSuccess = Wait-VMPowerOff -VMName $vmEntry.VMName -TimeoutMinutes 10
-            if (!$shutdownSuccess) {
-                Write-Warning "VM did not shutdown gracefully, forcing power off"
+            $timeout = (Get-Date).AddMinutes(10)
+            do {
+                Start-Sleep -Seconds 10
+                $vm = Get-VM -Name $vmEntry.VMName -ErrorAction SilentlyContinue
+                if ($vm.PowerState -eq "PoweredOff") {
+                    break
+                }
+                Write-Host "[Thread $([System.Threading.Thread]::CurrentThread.ManagedThreadId)] Waiting for $($vmEntry.VMName) to power off..." -ForegroundColor Yellow
+            } while ((Get-Date) -lt $timeout)
+            
+            if ($vm.PowerState -ne "PoweredOff") {
+                Write-Warning "[Thread $([System.Threading.Thread]::CurrentThread.ManagedThreadId)] VM did not shutdown gracefully, forcing power off"
                 Stop-VM -VM $vm -Confirm:$false
                 Start-Sleep -Seconds 30
             }
@@ -249,11 +256,11 @@ foreach ($vmEntry in $VMList) {
         $currentCoresPerSocket = $vmView.Config.Hardware.NumCoresPerSocket
         $currentCPUCount = $vmView.Config.Hardware.NumCPU
         
-        Write-Host "Current CPU Config - Count: $currentCPUCount, Cores per Socket: $currentCoresPerSocket" -ForegroundColor Yellow
+        Write-Host "[Thread $([System.Threading.Thread]::CurrentThread.ManagedThreadId)] Current CPU Config - Count: $currentCPUCount, Cores per Socket: $currentCoresPerSocket" -ForegroundColor Yellow
         
         # Step 3: Configure CPU settings (1 core per socket, update CPU count)
         $targetCPUCount = [int]$vmEntry.CPUCountAfter
-        Write-Host "Configuring CPU: Count=$targetCPUCount, Cores per Socket=1" -ForegroundColor Yellow
+        Write-Host "[Thread $([System.Threading.Thread]::CurrentThread.ManagedThreadId)] Configuring CPU: Count=$targetCPUCount, Cores per Socket=1" -ForegroundColor Yellow
         
         $vmConfigSpec = New-Object VMware.Vim.VirtualMachineConfigSpec
         $vmConfigSpec.NumCPUs = $targetCPUCount
@@ -265,16 +272,25 @@ foreach ($vmEntry in $VMList) {
         
         # Apply configuration changes
         $vmView.ReconfigVM($vmConfigSpec)
-        Write-Host "Applied CPU and Hot Add configuration" -ForegroundColor Green
+        Write-Host "[Thread $([System.Threading.Thread]::CurrentThread.ManagedThreadId)] Applied CPU and Hot Add configuration" -ForegroundColor Green
         
         # Step 5: Power on the VM
-        Write-Host "Starting VM: $($vmEntry.VMName)" -ForegroundColor Yellow
+        Write-Host "[Thread $([System.Threading.Thread]::CurrentThread.ManagedThreadId)] Starting VM: $($vmEntry.VMName)" -ForegroundColor Yellow
         Start-VM -VM $vm -Confirm:$false
         
         # Wait for VM to be fully powered on
-        $powerOnSuccess = Wait-VMPowerOn -VMName $vmEntry.VMName -TimeoutMinutes 10
-        if (!$powerOnSuccess) {
-            Write-Warning "VM may not have started successfully"
+        $timeout = (Get-Date).AddMinutes(10)
+        do {
+            Start-Sleep -Seconds 10
+            $vm = Get-VM -Name $vmEntry.VMName -ErrorAction SilentlyContinue
+            if ($vm.PowerState -eq "PoweredOn") {
+                break
+            }
+            Write-Host "[Thread $([System.Threading.Thread]::CurrentThread.ManagedThreadId)] Waiting for $($vmEntry.VMName) to power on..." -ForegroundColor Yellow
+        } while ((Get-Date) -lt $timeout)
+        
+        if ($vm.PowerState -ne "PoweredOn") {
+            Write-Warning "[Thread $([System.Threading.Thread]::CurrentThread.ManagedThreadId)] VM may not have started successfully"
         }
         
         # Step 6: Verify final configuration
@@ -288,16 +304,68 @@ foreach ($vmEntry in $VMList) {
         $vmReport.FinalPowerState = $vm.PowerState
         $vmReport.Status = "Success"
         
-        Write-Host "VM $($vmEntry.VMName) processed successfully" -ForegroundColor Green
-        Write-Host "Final Config - CPU Count: $($vmReport.NewCPUCount), Cores per Socket: $($vmReport.NewCoresPerSocket)" -ForegroundColor Green
+        Write-Host "[Thread $([System.Threading.Thread]::CurrentThread.ManagedThreadId)] VM $($vmEntry.VMName) processed successfully" -ForegroundColor Green
+        Write-Host "[Thread $([System.Threading.Thread]::CurrentThread.ManagedThreadId)] Final Config - CPU Count: $($vmReport.NewCPUCount), Cores per Socket: $($vmReport.NewCoresPerSocket)" -ForegroundColor Green
         
     } catch {
         $vmReport.Status = "Failed"
         $vmReport.ErrorMessage = $_.Exception.Message
-        Write-Error "Failed to process VM $($vmEntry.VMName): $_"
+        Write-Error "[Thread $([System.Threading.Thread]::CurrentThread.ManagedThreadId)] Failed to process VM $($vmEntry.VMName): $_"
     }
     
-    $report += $vmReport
+    return $vmReport
+}
+
+# Start parallel processing jobs
+Write-Host "Starting parallel processing of $($VMList.Count) VMs..." -ForegroundColor Cyan
+$jobs = @()
+$maxConcurrentJobs = 5  # Adjust this number based on your environment's capacity
+
+foreach ($vmEntry in $VMList) {
+    # Wait if we've reached the maximum concurrent jobs
+    while ((Get-Job -State Running).Count -ge $maxConcurrentJobs) {
+        Start-Sleep -Seconds 2
+        Write-Host "Waiting for available processing slot... ($((Get-Job -State Running).Count) jobs running)" -ForegroundColor Yellow
+    }
+    
+    # Start background job for this VM
+    $job = Start-Job -ScriptBlock $vmProcessingScript -ArgumentList $vmEntry, $connectedServers
+    $jobs += $job
+    Write-Host "Started processing job for VM: $($vmEntry.VMName) (Job ID: $($job.Id))" -ForegroundColor Gray
+}
+
+# Wait for all jobs to complete and collect results
+Write-Host "`nWaiting for all VM processing jobs to complete..." -ForegroundColor Cyan
+$report = @()
+$completedJobs = 0
+
+while ($jobs) {
+    $finishedJobs = $jobs | Where-Object { $_.State -eq 'Completed' -or $_.State -eq 'Failed' }
+    
+    foreach ($job in $finishedJobs) {
+        $completedJobs++
+        Write-Host "Job $($job.Id) completed ($completedJobs/$($VMList.Count))" -ForegroundColor Green
+        
+        try {
+            $result = Receive-Job -Job $job
+            if ($result) {
+                $report += $result
+            }
+        } catch {
+            Write-Warning "Failed to retrieve results from job $($job.Id): $_"
+        }
+        
+        Remove-Job -Job $job
+        $jobs = $jobs | Where-Object { $_.Id -ne $job.Id }
+    }
+    
+    if ($jobs) {
+        Start-Sleep -Seconds 5
+        $runningJobs = ($jobs | Where-Object { $_.State -eq 'Running' }).Count
+        if ($runningJobs -gt 0) {
+            Write-Host "Still processing... ($runningJobs jobs running, $completedJobs/$($VMList.Count) completed)" -ForegroundColor Yellow
+        }
+    }
 }
 
 # Generate and save report
