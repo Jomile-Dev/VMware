@@ -186,10 +186,11 @@ Write-Host "=" * 80 -ForegroundColor Green
 
 # Create script block for parallel VM processing
 $vmProcessingScript = {
-    param($vmEntry, $connectedServers)
+    param($vmEntry, $vCenterServers, $Credential)
     
     # Import PowerCLI in the background job
     Import-Module VMware.PowerCLI -ErrorAction SilentlyContinue
+    Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session -ErrorAction SilentlyContinue
     
     $vmReport = [PSCustomObject]@{
         VMName = $vmEntry.VMName
@@ -211,9 +212,25 @@ $vmProcessingScript = {
     try {
         Write-Host "[Thread $([System.Threading.Thread]::CurrentThread.ManagedThreadId)] Processing VM: $($vmEntry.VMName)" -ForegroundColor Cyan
         
+        # Connect to vCenter servers in this job
+        $jobConnectedServers = @()
+        foreach ($vc in $vCenterServers) {
+            try {
+                Connect-VIServer -Server $vc -Credential $Credential -ErrorAction Stop
+                Write-Host "[Thread $([System.Threading.Thread]::CurrentThread.ManagedThreadId)] Connected to $vc" -ForegroundColor Green
+                $jobConnectedServers += $vc
+            } catch {
+                Write-Warning "[Thread $([System.Threading.Thread]::CurrentThread.ManagedThreadId)] Failed to connect to $vc : $($_.Exception.Message)"
+            }
+        }
+        
+        if ($jobConnectedServers.Count -eq 0) {
+            throw "Failed to connect to any vCenter servers in background job"
+        }
+        
         # Find the specific VM from the CSV across all connected vCenters
         $vm = $null
-        foreach ($server in $connectedServers) {
+        foreach ($server in $jobConnectedServers) {
             $vm = Get-VM -Name $vmEntry.VMName -Server $server -ErrorAction SilentlyContinue
             if ($vm) {
                 Write-Host "[Thread $([System.Threading.Thread]::CurrentThread.ManagedThreadId)] Found VM $($vmEntry.VMName) on server $server" -ForegroundColor Green
@@ -307,6 +324,15 @@ $vmProcessingScript = {
         Write-Host "[Thread $([System.Threading.Thread]::CurrentThread.ManagedThreadId)] VM $($vmEntry.VMName) processed successfully" -ForegroundColor Green
         Write-Host "[Thread $([System.Threading.Thread]::CurrentThread.ManagedThreadId)] Final Config - CPU Count: $($vmReport.NewCPUCount), Cores per Socket: $($vmReport.NewCoresPerSocket)" -ForegroundColor Green
         
+        # Disconnect from vCenter servers in this job
+        foreach ($server in $jobConnectedServers) {
+            try {
+                Disconnect-VIServer -Server $server -Confirm:$false -ErrorAction SilentlyContinue
+            } catch {
+                # Ignore disconnect errors
+            }
+        }
+        
     } catch {
         $vmReport.Status = "Failed"
         $vmReport.ErrorMessage = $_.Exception.Message
@@ -329,7 +355,7 @@ foreach ($vmEntry in $VMList) {
     }
     
     # Start background job for this VM
-    $job = Start-Job -ScriptBlock $vmProcessingScript -ArgumentList $vmEntry, $connectedServers
+    $job = Start-Job -ScriptBlock $vmProcessingScript -ArgumentList $vmEntry, $vCenterServers, $Credential
     $jobs += $job
     Write-Host "Started processing job for VM: $($vmEntry.VMName) (Job ID: $($job.Id))" -ForegroundColor Gray
 }
