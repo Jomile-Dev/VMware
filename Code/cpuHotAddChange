@@ -115,7 +115,10 @@ function Wait-VMPowerOn {
     return $false
 }
 
-# Process each VM
+# Process only the VMs listed in the CSV file
+Write-Host "`nProcessing VMs from CSV file..." -ForegroundColor Cyan
+Write-Host "VMs to process: $($VMList.VMName -join ', ')" -ForegroundColor Yellow
+
 foreach ($vmEntry in $VMList) {
     Write-Host "`nProcessing VM: $($vmEntry.VMName)" -ForegroundColor Cyan
     
@@ -136,7 +139,7 @@ foreach ($vmEntry in $VMList) {
     }
     
     try {
-        # Find the VM across all connected vCenters
+        # Find the specific VM from the CSV across all connected vCenters
         $vm = $null
         foreach ($server in $connectedServers) {
             $vm = Get-VM -Name $vmEntry.VMName -Server $server -ErrorAction SilentlyContinue
@@ -147,7 +150,7 @@ foreach ($vmEntry in $VMList) {
         }
         
         if (!$vm) {
-            throw "VM '$($vmEntry.VMName)' not found on any connected vCenter server"
+            throw "VM '$($vmEntry.VMName)' from CSV not found on any connected vCenter server"
         }
         
         # Step 1: Shutdown VM if it's powered on
