@@ -167,8 +167,10 @@ $vmProcessingScript = {
                 }
                 
                 Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope AllUsers -ErrorAction SilentlyContinue
+                Set-PowerCLIConfiguration -DisplayDeprecationWarnings $false -Confirm:$false -Scope AllUsers -ErrorAction SilentlyContinue
+                Set-PowerCLIConfiguration -ParticipateInCEIP $false -Confirm:$false -Scope AllUsers -ErrorAction SilentlyContinue
                 $moduleLoaded = $true
-                Add-ProgressLog "INITIALIZED - PowerCLI loaded successfully" "SUCCESS"
+                Add-ProgressLog "INITIALIZED - PowerCLI loaded successfully (messages suppressed)" "SUCCESS"
             } catch {
                 $retryCount++
                 Add-ProgressLog "MODULE_RETRY - Attempt $retryCount failed: $($_.Exception.Message)" "WARN"
@@ -282,6 +284,7 @@ $vmProcessingScript = {
         
         # Log current configuration
         Add-ProgressLog "CONFIG_CURRENT - Current: $($vmView.Config.Hardware.NumCPU) CPUs, $($vmView.Config.Hardware.NumCoresPerSocket) cores/socket" "INFO"
+        Add-ProgressLog "CONFIG_CURRENT - Hot Add CPU: $($vmView.Config.CpuHotAddEnabled), Hot Add Memory: $($vmView.Config.MemoryHotAddEnabled)" "INFO"
         Add-ProgressLog "CONFIG_TARGET - Target: $targetCPUs CPUs, 1 core/socket, Hot Add enabled" "INFO"
         
         $configSpec = New-Object VMware.Vim.VirtualMachineConfigSpec
@@ -290,32 +293,79 @@ $vmProcessingScript = {
         $configSpec.CpuHotAddEnabled = $true
         $configSpec.MemoryHotAddEnabled = $true
         
-        Add-ProgressLog "CONFIG_APPLY - Applying configuration changes via vSphere API" "INFO"
-        $vmView.ReconfigVM($configSpec)
-        Add-ProgressLog "CONFIG_COMPLETE - VM reconfiguration applied successfully" "SUCCESS"
+        Add-ProgressLog "CONFIG_APPLY - Submitting configuration changes to vSphere API..." "INFO"
+        $reconfigStart = Get-Date
         
-        # PHASE 3: Power on
-        Add-ProgressLog "POWERON_START - Starting VM power on sequence" "INFO"
-        Start-VM -VM $targetVM -Confirm:$false
-        
-        $powerOnTimeout = (Get-Date).AddMinutes(8)
-        $powerOnStart = Get-Date
-        
-        while ($targetVM.PowerState -ne "PoweredOn" -and (Get-Date) -lt $powerOnTimeout) {
-            Start-Sleep -Seconds 10
-            $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer
-            $elapsed = [math]::Round(((Get-Date) - $powerOnStart).TotalSeconds)
+        try {
+            # Start the reconfiguration task
+            $task = $vmView.ReconfigVM($configSpec)
+            Add-ProgressLog "CONFIG_TASK - Reconfiguration task submitted (Task ID: $($task.Value))" "INFO"
             
-            if ($elapsed % 30 -eq 0 -or $elapsed -in @(10, 20)) {
-                Add-ProgressLog "POWERON_WAIT - VM starting up (${elapsed}s elapsed, State: $($targetVM.PowerState))" "INFO"
+            # Monitor the task progress
+            $taskInfo = Get-View $task
+            $timeout = (Get-Date).AddMinutes(10)  # 10 minute timeout for reconfig
+            
+            while ($taskInfo.Info.State -eq "running" -and (Get-Date) -lt $timeout) {
+                Start-Sleep -Seconds 5
+                $taskInfo.UpdateViewData()
+                $elapsed = [math]::Round(((Get-Date) - $reconfigStart).TotalSeconds)
+                
+                # Log progress every 15 seconds
+                if ($elapsed % 15 -eq 0) {
+                    Add-ProgressLog "CONFIG_PROGRESS - Reconfiguration in progress (${elapsed}s elapsed, State: $($taskInfo.Info.State))" "INFO"
+                    
+                    # Check if there's any progress info
+                    if ($taskInfo.Info.Progress -ne $null) {
+                        Add-ProgressLog "CONFIG_PROGRESS - Task progress: $($taskInfo.Info.Progress)%" "INFO"
+                    }
+                }
             }
+            
+            # Check final task state
+            $taskInfo.UpdateViewData()
+            $reconfigDuration = [math]::Round(((Get-Date) - $reconfigStart).TotalSeconds)
+            
+            if ($taskInfo.Info.State -eq "success") {
+                Add-ProgressLog "CONFIG_COMPLETE - VM reconfiguration successful (took ${reconfigDuration}s)" "SUCCESS"
+            } elseif ($taskInfo.Info.State -eq "error") {
+                $errorMsg = if ($taskInfo.Info.Error) { $taskInfo.Info.Error.LocalizedMessage } else { "Unknown error" }
+                throw "Reconfiguration failed: $errorMsg"
+            } else {
+                Add-ProgressLog "CONFIG_TIMEOUT - Reconfiguration task timed out after ${reconfigDuration}s (State: $($taskInfo.Info.State))" "WARN"
+                # Don't throw error, continue and see if changes were applied
+            }
+            
+        } catch {
+            Add-ProgressLog "CONFIG_ERROR - Reconfiguration failed: $($_.Exception.Message)" "ERROR"
+            throw $_
         }
         
-        $powerOnDuration = [math]::Round(((Get-Date) - $powerOnStart).TotalSeconds)
-        if ($targetVM.PowerState -eq "PoweredOn") {
-            Add-ProgressLog "POWERON_COMPLETE - VM started successfully (took ${powerOnDuration}s)" "SUCCESS"
+        # PHASE 3: Power on (only if VM was originally powered on)
+        if ($vmData.PowerState -eq "PoweredOn") {
+            Add-ProgressLog "POWERON_START - VM was originally powered on, starting power on sequence" "INFO"
+            Start-VM -VM $targetVM -Confirm:$false
+            
+            $powerOnTimeout = (Get-Date).AddMinutes(8)
+            $powerOnStart = Get-Date
+            
+            while ($targetVM.PowerState -ne "PoweredOn" -and (Get-Date) -lt $powerOnTimeout) {
+                Start-Sleep -Seconds 10
+                $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer
+                $elapsed = [math]::Round(((Get-Date) - $powerOnStart).TotalSeconds)
+                
+                if ($elapsed % 30 -eq 0 -or $elapsed -in @(10, 20)) {
+                    Add-ProgressLog "POWERON_WAIT - VM starting up (${elapsed}s elapsed, State: $($targetVM.PowerState))" "INFO"
+                }
+            }
+            
+            $powerOnDuration = [math]::Round(((Get-Date) - $powerOnStart).TotalSeconds)
+            if ($targetVM.PowerState -eq "PoweredOn") {
+                Add-ProgressLog "POWERON_COMPLETE - VM started successfully (took ${powerOnDuration}s)" "SUCCESS"
+            } else {
+                Add-ProgressLog "POWERON_TIMEOUT - VM did not start within timeout (${powerOnDuration}s)" "WARN"
+            }
         } else {
-            Add-ProgressLog "POWERON_TIMEOUT - VM did not start within timeout (${powerOnDuration}s)" "WARN"
+            Add-ProgressLog "POWERON_SKIP - VM was originally powered off, leaving it powered off" "INFO"
         }
         
         # PHASE 4: Verify and finalize
@@ -622,4 +672,55 @@ if ($results.Count -gt 0) {
     Write-Host "Fastest VM Processing: $minTime minutes" -ForegroundColor Green
     Write-Host "Slowest VM Processing: $maxTime minutes" -ForegroundColor Yellow
     Write-Host "Report File: $ReportPath" -ForegroundColor Cyan
-    Write-Host "=" * 50 -ForegroundColor Cyan$
+    Write-Host "=" * 50 -ForegroundColor Cyan
+    
+    # Detailed results table
+    Write-Host "`nDETAILED RESULTS TABLE:" -ForegroundColor Cyan
+    $results | Select-Object VMName, Status, OriginalCPUCount, NewCPUCount, NewCoresPerSocket, FinalPowerState, ProcessingTimeMinutes | 
+        Format-Table -AutoSize
+    
+    # Show failures if any
+    $failures = $results | Where-Object { $_.Status -eq "Failed" }
+    if ($failures) {
+        Write-Host "`nFAILURE ANALYSIS:" -ForegroundColor Red -BackgroundColor DarkRed
+        Write-Host "=" * 40 -ForegroundColor Red
+        $failures | Select-Object VMName, ErrorMessage, ProcessingTimeMinutes | Format-Table -AutoSize -Wrap
+    }
+    
+    # Performance analysis
+    if ($results.Count -gt 1) {
+        Write-Host "`nPERFORMANCE ANALYSIS:" -ForegroundColor Yellow
+        Write-Host "=" * 30 -ForegroundColor Yellow
+        
+        $fastVMs = $results | Sort-Object ProcessingTimeMinutes | Select-Object -First 3
+        $slowVMs = $results | Sort-Object ProcessingTimeMinutes -Descending | Select-Object -First 3
+        
+        Write-Host "Fastest Processing:" -ForegroundColor Green
+        $fastVMs | Select-Object VMName, ProcessingTimeMinutes, Status | Format-Table -AutoSize
+        
+        Write-Host "Slowest Processing:" -ForegroundColor Yellow
+        $slowVMs | Select-Object VMName, ProcessingTimeMinutes, Status | Format-Table -AutoSize
+    }
+    
+} else {
+    Write-Warning "No results collected! Check for job execution issues."
+}
+
+# Cleanup vCenter connections
+Write-Host "`nCleaning up vCenter connections..." -ForegroundColor Yellow
+foreach ($server in $connectedServers) {
+    try {
+        Disconnect-VIServer -Server $server -Confirm:$false -ErrorAction SilentlyContinue
+        Write-Host "Disconnected from $server" -ForegroundColor Green
+    } catch {
+        Write-Warning "Failed to disconnect from $server"
+    }
+}
+
+Write-Host "`nScript completed at: $(Get-Date)" -ForegroundColor Green
+Write-Host "Total script runtime: $totalScriptTime minutes" -ForegroundColor Cyan
+Write-Host "`nThank you for using the Enhanced VM Configuration Script!" -ForegroundColor Green
+
+# Pause for user review
+Write-Host "`nPress Enter to exit..." -ForegroundColor Yellow
+Read-Host$
