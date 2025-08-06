@@ -81,21 +81,17 @@ if (!$Credential) {
     exit 1
 }
 
-# FIXED: Validate and clean vCenter server list - CRITICAL FIX
+# Simplified validation - no filtering
 Write-Host "Validating vCenter server list..." -ForegroundColor Yellow
 $validVCenterServers = @()
 
 foreach ($server in $vCenterServers) {
-    if (-not [string]::IsNullOrWhiteSpace($server) -and $server.Trim() -ne "") {
+    if (-not [string]::IsNullOrWhiteSpace($server)) {
         $cleanServer = $server.Trim()
-        if ($cleanServer -ne "test.test.test" -and $cleanServer -ne "vcenter1.domain.com" -and $cleanServer -ne "vcenter2.domain.com" -and $cleanServer -ne "vcenter3.domain.com") {
+        if ($cleanServer -ne "") {
             $validVCenterServers += $cleanServer
             Write-Host "  ✓ Added: '$cleanServer'" -ForegroundColor Green
-        } else {
-            Write-Host "  ✗ Skipped placeholder: '$cleanServer'" -ForegroundColor Red
         }
-    } else {
-        Write-Host "  ✗ Skipped empty/null server" -ForegroundColor Red
     }
 }
 
@@ -108,15 +104,10 @@ if ($validVCenterServers.Count -eq 0) {
     exit 1
 }
 
-# CRITICAL FIX: Ensure we pass a proper array to jobs
-Write-Host "DEBUG: Preparing final server list for jobs..." -ForegroundColor Yellow
-$finalServerArray = @()
-foreach ($server in $validVCenterServers) {
-    $finalServerArray += $server
-    Write-Host "  → Will pass to jobs: '$server'" -ForegroundColor Green
-}
-
-Write-Host "DEBUG: Final server array has $($finalServerArray.Count) entries" -ForegroundColor Yellow
+# Use connected servers for jobs
+Write-Host "Preparing server list for jobs..." -ForegroundColor Yellow
+$finalServerArray = $connectedServers
+Write-Host "Will pass $($finalServerArray.Count) servers to jobs: $($finalServerArray -join ', ')" -ForegroundColor Yellow
 
 $connectedServers = @()
 
@@ -799,23 +790,14 @@ $results = @()
 $processedJobs = @()
 $jobStatus = @{}
 
-# CRITICAL FIX: Ensure the final server array is valid and not empty
+# Simple validation
 if ($finalServerArray.Count -eq 0) {
-    Write-Error "CRITICAL ERROR: No valid vCenter servers to pass to jobs!"
-    Write-Host "Available connected servers: $($connectedServers -join ', ')" -ForegroundColor Yellow
-    
-    if ($connectedServers.Count -gt 0) {
-        Write-Host "Using connected servers as fallback..." -ForegroundColor Yellow
-        $finalServerArray = $connectedServers
-    } else {
-        Write-Error "No connected servers available. Cannot proceed with parallel processing."
-        Read-Host "Press Enter to exit"
-        exit 1
-    }
+    Write-Error "No connected vCenter servers available for jobs!"
+    Read-Host "Press Enter to exit"
+    exit 1
 }
 
-Write-Host "DEBUG: Final server array for jobs: $($finalServerArray -join ', ')" -ForegroundColor Green
-Write-Host "DEBUG: Final server array count: $($finalServerArray.Count)" -ForegroundColor Green
+Write-Host "Passing $($finalServerArray.Count) servers to jobs: $($finalServerArray -join ', ')" -ForegroundColor Green
 
 # FIXED: Start jobs in batches with validated server list
 foreach ($vmEntry in $VMList) {
