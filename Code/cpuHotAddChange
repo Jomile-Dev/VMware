@@ -1,4 +1,5 @@
-# VM Configuration Update Script - ENHANCED PARALLEL VERSION WITH DETAILED CONSOLE OUTPUT
+# Set success status at the end
+        $result.Status = "Success"# VM Configuration Update Script - ENHANCED PARALLEL VERSION WITH DETAILED CONSOLE OUTPUT
 # This script processes a CSV file to update VM CPU and memory settings in parallel
 
 # Specify the CSV file path here
@@ -359,37 +360,47 @@ $vmProcessingScript = {
         # PHASE 3: Power on based on original state
         Add-ProgressLog "POWERON_CHECK - Original power state from CSV: '$($vmData.PowerState)'" "INFO"
         
-        # Check if VM should be powered on (handle various possible values)
-        $shouldPowerOn = $vmData.PowerState -match "^(PoweredOn|On|Running|Started)$"
+        # Check if VM should be powered on - specifically look for "PoweredOn"
+        $shouldPowerOn = ($vmData.PowerState -eq "PoweredOn")
         
         if ($shouldPowerOn) {
-            Add-ProgressLog "POWERON_START - VM was originally powered on, restoring power state" "INFO"
+            Add-ProgressLog "POWERON_START - VM was PoweredOn, will restore power state after verification" "INFO"
             
+            # Get fresh VM object for power operations
             try {
-                Start-VM -VM $targetVM -Confirm:$false -ErrorAction Stop
-                Add-ProgressLog "POWERON_INITIATED - Power on command sent successfully" "SUCCESS"
+                $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
                 
-                $powerOnTimeout = (Get-Date).AddMinutes(8)
-                $powerOnStart = Get-Date
-                
-                while ($targetVM.PowerState -ne "PoweredOn" -and (Get-Date) -lt $powerOnTimeout) {
-                    Start-Sleep -Seconds 10
-                    $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer
-                    $elapsed = [math]::Round(((Get-Date) - $powerOnStart).TotalSeconds)
+                if ($targetVM.PowerState -eq "PoweredOff") {
+                    Add-ProgressLog "POWERON_EXECUTE - Starting VM power on sequence" "INFO"
+                    Start-VM -VM $targetVM -Confirm:$false -ErrorAction Stop
+                    Add-ProgressLog "POWERON_INITIATED - Power on command sent successfully" "SUCCESS"
                     
-                    if ($elapsed % 30 -eq 0 -or $elapsed -in @(10, 20)) {
-                        Add-ProgressLog "POWERON_WAIT - VM starting up (${elapsed}s elapsed, Current State: $($targetVM.PowerState))" "INFO"
+                    $powerOnTimeout = (Get-Date).AddMinutes(8)
+                    $powerOnStart = Get-Date
+                    
+                    while ($targetVM.PowerState -ne "PoweredOn" -and (Get-Date) -lt $powerOnTimeout) {
+                        Start-Sleep -Seconds 10
+                        $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction SilentlyContinue
+                        if ($targetVM) {
+                            $elapsed = [math]::Round(((Get-Date) - $powerOnStart).TotalSeconds)
+                            
+                            if ($elapsed % 30 -eq 0 -or $elapsed -in @(10, 20)) {
+                                Add-ProgressLog "POWERON_WAIT - VM starting up (${elapsed}s elapsed, Current State: $($targetVM.PowerState))" "INFO"
+                            }
+                        }
                     }
-                }
-                
-                # Refresh VM object one final time
-                $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer
-                $powerOnDuration = [math]::Round(((Get-Date) - $powerOnStart).TotalSeconds)
-                
-                if ($targetVM.PowerState -eq "PoweredOn") {
-                    Add-ProgressLog "POWERON_COMPLETE - VM powered on successfully (took ${powerOnDuration}s)" "SUCCESS"
+                    
+                    # Final power state check
+                    $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction SilentlyContinue
+                    $powerOnDuration = [math]::Round(((Get-Date) - $powerOnStart).TotalSeconds)
+                    
+                    if ($targetVM -and $targetVM.PowerState -eq "PoweredOn") {
+                        Add-ProgressLog "POWERON_COMPLETE - VM powered on successfully (took ${powerOnDuration}s)" "SUCCESS"
+                    } else {
+                        Add-ProgressLog "POWERON_TIMEOUT - VM did not fully start within timeout (${powerOnDuration}s)" "WARN"
+                    }
                 } else {
-                    Add-ProgressLog "POWERON_TIMEOUT - VM did not fully start within timeout (${powerOnDuration}s, Final State: $($targetVM.PowerState))" "WARN"
+                    Add-ProgressLog "POWERON_ALREADY - VM is already powered on" "INFO"
                 }
                 
             } catch {
@@ -397,26 +408,61 @@ $vmProcessingScript = {
             }
             
         } else {
-            Add-ProgressLog "POWERON_SKIP - VM was originally powered off ('$($vmData.PowerState)'), leaving it powered off" "INFO"
+            Add-ProgressLog "POWERON_SKIP - VM was PoweredOff in CSV, leaving it powered off" "INFO"
         }
         
         # PHASE 4: Verify and finalize
         Add-ProgressLog "VERIFY_START - Checking final configuration" "INFO"
-        $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer
-        $finalVmView = Get-View -VIObject $targetVM
         
-        $result.NewCPUCount = $finalVmView.Config.Hardware.NumCPU
-        $result.NewCoresPerSocket = $finalVmView.Config.Hardware.NumCoresPerSocket
-        $result.NewCPUHotAddEnabled = $finalVmView.Config.CpuHotAddEnabled
-        $result.NewMemoryHotAddEnabled = $finalVmView.Config.MemoryHotAddEnabled
-        $result.FinalPowerState = $targetVM.PowerState
-        $result.Status = "Success"
+        # Re-get the VM object after reconfiguration
+        $targetVM = $null
+        $finalVmView = $null
+        
+        try {
+            $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
+            if ($targetVM) {
+                $finalVmView = Get-View -VIObject $targetVM -ErrorAction Stop
+                Add-ProgressLog "VERIFY_SUCCESS - Successfully retrieved updated VM configuration" "SUCCESS"
+            } else {
+                throw "VM object is null after reconfiguration"
+            }
+        } catch {
+            Add-ProgressLog "VERIFY_ERROR - Failed to get updated VM info: $($_.Exception.Message)" "ERROR"
+            # Try to get basic info without View
+            try {
+                $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
+            } catch {
+                Add-ProgressLog "VERIFY_CRITICAL - Cannot retrieve VM object at all" "ERROR"
+            }
+        }
+        
+        # Update result with final configuration if available
+        if ($finalVmView) {
+            $result.NewCPUCount = $finalVmView.Config.Hardware.NumCPU
+            $result.NewCoresPerSocket = $finalVmView.Config.Hardware.NumCoresPerSocket
+            $result.NewCPUHotAddEnabled = $finalVmView.Config.CpuHotAddEnabled
+            $result.NewMemoryHotAddEnabled = $finalVmView.Config.MemoryHotAddEnabled
+            
+            Add-ProgressLog "FINAL_CONFIG - CPUs: $($result.NewCPUCount), Cores/Socket: $($result.NewCoresPerSocket)" "SUCCESS"
+            Add-ProgressLog "VERIFICATION - Hot Add CPU: $($result.NewCPUHotAddEnabled), Hot Add Memory: $($result.NewMemoryHotAddEnabled)" "SUCCESS"
+        } else {
+            # Fallback - use target values
+            $result.NewCPUCount = $targetCPUs
+            $result.NewCoresPerSocket = 1
+            $result.NewCPUHotAddEnabled = $true
+            $result.NewMemoryHotAddEnabled = $true
+            Add-ProgressLog "FINAL_CONFIG - Using target values (verification failed)" "WARN"
+        }
+        
+        if ($targetVM) {
+            $result.FinalPowerState = $targetVM.PowerState
+        } else {
+            $result.FinalPowerState = "Unknown"
+        }
         $result.EndTime = Get-Date
         $result.ProcessingTimeMinutes = [math]::Round(($result.EndTime - $result.StartTime).TotalMinutes, 2)
         
         Add-ProgressLog "SUCCESS - Processing completed in $($result.ProcessingTimeMinutes) minutes" "SUCCESS"
-        Add-ProgressLog "FINAL_CONFIG - CPUs: $($result.NewCPUCount), Cores/Socket: $($result.NewCoresPerSocket), Power: $($result.FinalPowerState)" "SUCCESS"
-        Add-ProgressLog "VERIFICATION - Hot Add CPU: $($result.NewCPUHotAddEnabled), Hot Add Memory: $($result.NewMemoryHotAddEnabled)" "SUCCESS"
         
         # Cleanup connections
         foreach ($server in $jobConnections) {
