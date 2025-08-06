@@ -16,14 +16,16 @@ try {
     Write-Warning "Failed to set PowerCLI configuration: $($_.Exception.Message)"
 }
 
-# vCenter connection parameters
+# vCenter connection parameters - REPLACE WITH YOUR ACTUAL SERVER NAMES
 $vCenterServers = @(
-    "test.test.test",
-    "test.test.test", 
-    "test.test.test",
-    "test.test.test",
-    "test.test.test"
+    "vcenter1.domain.com",
+    "vcenter2.domain.com", 
+    "vcenter3.domain.com"
 )
+
+# DEBUG: Show what we're working with
+Write-Host "DEBUG: Original vCenter servers:" -ForegroundColor Yellow
+$vCenterServers | ForEach-Object { Write-Host "  - '$_'" -ForegroundColor Gray }
 
 Write-Host "Starting VM Configuration Update Process" -ForegroundColor Cyan
 Write-Host "CSV File: $CSVPath" -ForegroundColor Yellow
@@ -79,18 +81,42 @@ if (!$Credential) {
     exit 1
 }
 
-# FIXED: Validate and clean vCenter server list
-$validVCenterServers = $vCenterServers | Where-Object { 
-    -not [string]::IsNullOrWhiteSpace($_) 
-} | ForEach-Object { $_.Trim() }
+# FIXED: Validate and clean vCenter server list - CRITICAL FIX
+Write-Host "Validating vCenter server list..." -ForegroundColor Yellow
+$validVCenterServers = @()
+
+foreach ($server in $vCenterServers) {
+    if (-not [string]::IsNullOrWhiteSpace($server) -and $server.Trim() -ne "") {
+        $cleanServer = $server.Trim()
+        if ($cleanServer -ne "test.test.test" -and $cleanServer -ne "") {
+            $validVCenterServers += $cleanServer
+            Write-Host "  ✓ Added: '$cleanServer'" -ForegroundColor Green
+        } else {
+            Write-Host "  ✗ Skipped placeholder: '$cleanServer'" -ForegroundColor Red
+        }
+    } else {
+        Write-Host "  ✗ Skipped empty/null server" -ForegroundColor Red
+    }
+}
 
 if ($validVCenterServers.Count -eq 0) {
-    Write-Error "No valid vCenter servers found in the list"
+    Write-Error "No valid vCenter servers found in the list. Please update the vCenterServers array with your actual server names."
+    Write-Host "Current servers in array:" -ForegroundColor Red
+    $vCenterServers | ForEach-Object { Write-Host "  - '$_'" -ForegroundColor Red }
+    Write-Host "Please replace 'test.test.test' with your actual vCenter server FQDNs or IP addresses" -ForegroundColor Yellow
     Read-Host "Press Enter to exit"
     exit 1
 }
 
-Write-Host "Validated vCenter servers: $($validVCenterServers -join ', ')" -ForegroundColor Green
+# CRITICAL FIX: Ensure we pass a proper array to jobs
+Write-Host "DEBUG: Preparing final server list for jobs..." -ForegroundColor Yellow
+$finalServerArray = @()
+foreach ($server in $validVCenterServers) {
+    $finalServerArray += $server
+    Write-Host "  → Will pass to jobs: '$server'" -ForegroundColor Green
+}
+
+Write-Host "DEBUG: Final server array has $($finalServerArray.Count) entries" -ForegroundColor Yellow
 
 $connectedServers = @()
 
@@ -245,32 +271,54 @@ $vmProcessingScript = {
             ProgressLog = $progressLog
         }
         
-        # FIXED: Connect to vCenter servers with validation
+        # FIXED: Connect to vCenter servers with enhanced validation and debugging
         Add-ProgressLog "CONNECTING - Attempting vCenter connections" "INFO"
         $jobConnections = @()
         $vmServer = $null
         
-        # Validate vCenter list is not empty and clean it
+        # DEBUG: Show what we received in the job
+        Add-ProgressLog "DEBUG - Received vCenter list count: $($vCenterList.Count)" "INFO"
+        if ($vCenterList) {
+            for ($i = 0; $i -lt $vCenterList.Count; $i++) {
+                Add-ProgressLog "DEBUG - Server[$i]: '$($vCenterList[$i])'" "INFO"
+            }
+        }
+        
+        # Validate vCenter list is not empty and clean it thoroughly
         if (-not $vCenterList -or $vCenterList.Count -eq 0) {
             throw "vCenter server list is empty or null"
         }
         
-        $validServers = $vCenterList | Where-Object { 
-            -not [string]::IsNullOrWhiteSpace($_) 
-        } | ForEach-Object { $_.Trim() }
-        
-        if ($validServers.Count -eq 0) {
-            throw "No valid vCenter servers in the provided list"
+        $validServers = @()
+        foreach ($server in $vCenterList) {
+            if (-not [string]::IsNullOrWhiteSpace($server) -and $server.Trim() -ne "" -and $server.Trim() -ne "test.test.test") {
+                $cleanServer = $server.Trim()
+                $validServers += $cleanServer
+                Add-ProgressLog "VCENTER_VALID - Added server: '$cleanServer'" "INFO"
+            } else {
+                Add-ProgressLog "VCENTER_SKIP - Skipped invalid server: '$server'" "WARN"
+            }
         }
         
-        Add-ProgressLog "VCENTER_LIST - Will attempt to connect to $($validServers.Count) servers" "INFO"
+        if ($validServers.Count -eq 0) {
+            throw "No valid vCenter servers found after cleaning. Received servers: $($vCenterList -join ', ')"
+        }
+        
+        Add-ProgressLog "VCENTER_LIST - Will attempt to connect to $($validServers.Count) servers: $($validServers -join ', ')" "INFO"
         
         foreach ($vcServer in $validServers) {
             try {
-                Add-ProgressLog "CONNECT_ATTEMPT - Connecting to $vcServer" "INFO"
+                Add-ProgressLog "CONNECT_ATTEMPT - Connecting to '$vcServer'" "INFO"
+                
+                # Additional validation before attempting connection
+                if ([string]::IsNullOrWhiteSpace($vcServer) -or $vcServer -eq "test.test.test") {
+                    Add-ProgressLog "CONNECT_SKIP - Invalid server name: '$vcServer'" "WARN"
+                    continue
+                }
+                
                 $connection = Connect-VIServer -Server $vcServer -Credential $jobCredential -ErrorAction Stop
                 $jobConnections += $vcServer
-                Add-ProgressLog "CONNECTED - Successfully connected to $vcServer" "SUCCESS"
+                Add-ProgressLog "CONNECTED - Successfully connected to '$vcServer'" "SUCCESS"
                 
                 # Try to find VM immediately
                 $testVM = Get-VM -Name $vmData.VMName -Server $vcServer -ErrorAction SilentlyContinue
@@ -828,8 +876,9 @@ foreach ($vmEntry in $VMList) {
         }
     }
     
-    # FIXED: Start new job with validated vCenter server list
-    $job = Start-Job -ScriptBlock $vmProcessingScript -ArgumentList $vmEntry, $validVCenterServers, $Username, $Password, $jobCounter
+    # FIXED: Start new job with properly formatted server array
+    Write-Host "DEBUG: Starting job with server array: $($finalServerArray -join ', ')" -ForegroundColor Gray
+    $job = Start-Job -ScriptBlock $vmProcessingScript -ArgumentList $vmEntry, $finalServerArray, $Username, $Password, $jobCounter
     $jobs += [PSCustomObject]@{
         Job = $job
         VMName = $vmEntry.VMName 
