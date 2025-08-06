@@ -16,14 +16,23 @@ try {
     Write-Warning "Failed to set PowerCLI configuration: $($_.Exception.Message)"
 }
 
-# vCenter connection parameters
+# vCenter connection parameters - FIXED: Remove any empty entries
 $vCenterServers = @(
     "test.test.test",
     "test.test.test", 
     "test.test.test",
     "test.test.test",
     "test.test.test"
-)
+) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+
+# Validate vCenter servers list
+if ($vCenterServers.Count -eq 0) {
+    Write-Error "No valid vCenter servers configured. Please update the vCenterServers array."
+    Read-Host "Press Enter to exit"
+    exit 1
+}
+
+Write-Host "Configured vCenter servers: $($vCenterServers.Count)" -ForegroundColor Green
 
 Write-Host "Starting VM Configuration Update Process" -ForegroundColor Cyan
 Write-Host "CSV File: $CSVPath" -ForegroundColor Yellow
@@ -115,7 +124,7 @@ Write-Host "WARNING: VMs will be shut down and reconfigured!" -ForegroundColor R
 Write-Host "`nPress ENTER to continue or CTRL+C to cancel..." -ForegroundColor White
 Read-Host
 
-# Create robust script block for parallel processing
+# Create robust script block for parallel processing with FIXED connection and object handling
 $vmProcessingScript = {
     param($vmData, $vCenterList, $username, $password, $jobId)
     
@@ -144,6 +153,29 @@ $vmProcessingScript = {
     
     try {
         Add-ProgressLog "STARTING - Initializing job environment" "START"
+        
+        # FIXED: Validate vCenter list parameter early
+        if (-not $vCenterList -or $vCenterList.Count -eq 0) {
+            throw "vCenter server list is null or empty. Cannot proceed with VM operations."
+        }
+        
+        # FIXED: Convert and validate each vCenter server entry
+        $cleanVCenterList = @()
+        foreach ($vcEntry in $vCenterList) {
+            if ($vcEntry -and -not [string]::IsNullOrWhiteSpace($vcEntry.ToString())) {
+                $cleanServer = $vcEntry.ToString().Trim()
+                if ($cleanServer -ne "") {
+                    $cleanVCenterList += $cleanServer
+                    Add-ProgressLog "VCENTER_VALIDATED - Added server: '$cleanServer'" "INFO"
+                }
+            }
+        }
+        
+        if ($cleanVCenterList.Count -eq 0) {
+            throw "No valid vCenter servers found after validation"
+        }
+        
+        Add-ProgressLog "VCENTER_LIST_READY - $($cleanVCenterList.Count) valid servers prepared" "SUCCESS"
         
         # Recreate credential securely
         $securePassword = ConvertTo-SecureString -String $password -AsPlainText -Force
@@ -175,7 +207,7 @@ $vmProcessingScript = {
                 $null = Set-PowerCLIConfiguration -WebOperationTimeoutSeconds 300 -Confirm:$false -Scope Session -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
                 
                 $moduleLoaded = $true
-                Add-ProgressLog "INITIALIZED - PowerCLI loaded successfully (banner completely suppressed)" "SUCCESS"
+                Add-ProgressLog "INITIALIZED - PowerCLI loaded successfully" "SUCCESS"
             } catch {
                 if (Get-Module -ListAvailable -Name VMware.VimAutomation.Core) {
                     try {
@@ -190,7 +222,7 @@ $vmProcessingScript = {
                         $null = Set-PowerCLIConfiguration -DefaultVIServerMode Single -Confirm:$false -Scope Session -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
                         
                         $moduleLoaded = $true
-                        Add-ProgressLog "INITIALIZED - PowerCLI legacy modules loaded (banner completely suppressed)" "SUCCESS"
+                        Add-ProgressLog "INITIALIZED - PowerCLI legacy modules loaded" "SUCCESS"
                     } catch {
                         $retryCount++
                         Add-ProgressLog "MODULE_RETRY - Legacy import attempt $retryCount failed: $($_.Exception.Message)" "WARN"
@@ -232,36 +264,31 @@ $vmProcessingScript = {
             ProgressLog = $progressLog
         }
         
-        # Connect to vCenter servers
-        Add-ProgressLog "CONNECTING - Attempting vCenter connections" "INFO"
+        # FIXED: Connect to vCenter servers with proper error handling
+        Add-ProgressLog "CONNECTING - Attempting vCenter connections to $($cleanVCenterList.Count) servers" "INFO"
         $jobConnections = @()
         $vmServer = $null
         
-        # Validate vCenter list is not empty
-        if (-not $vCenterList -or $vCenterList.Count -eq 0) {
-            throw "vCenter server list is empty or null"
-        }
-        
-        Add-ProgressLog "VCENTER_LIST - Will attempt to connect to $($vCenterList.Count) servers" "INFO"
-        
-        foreach ($vcServer in $vCenterList) {
-            if ([string]::IsNullOrWhiteSpace($vcServer)) {
-                Add-ProgressLog "CONNECT_SKIP - Empty server entry, skipping" "WARN"
-                continue
-            }
-            
+        foreach ($vcServer in $cleanVCenterList) {
             try {
-                Add-ProgressLog "CONNECT_ATTEMPT - Connecting to $vcServer" "INFO"
-                $connection = Connect-VIServer -Server $vcServer -Credential $jobCredential -ErrorAction Stop
-                $jobConnections += $vcServer
-                Add-ProgressLog "CONNECTED - Successfully connected to $vcServer" "SUCCESS"
+                Add-ProgressLog "CONNECT_ATTEMPT - Connecting to '$vcServer'" "INFO"
                 
-                # Try to find VM immediately
-                $testVM = Get-VM -Name $vmData.VMName -Server $vcServer -ErrorAction SilentlyContinue
-                if ($testVM) {
-                    Add-ProgressLog "VM_LOCATED - Found VM on $vcServer" "SUCCESS"
-                    $vmServer = $vcServer
-                    break
+                # FIXED: Explicitly pass server parameter to avoid prompting
+                $connection = Connect-VIServer -Server $vcServer -Credential $jobCredential -Force -ErrorAction Stop
+                
+                if ($connection) {
+                    $jobConnections += $vcServer
+                    Add-ProgressLog "CONNECTED - Successfully connected to $vcServer" "SUCCESS"
+                    
+                    # Try to find VM immediately
+                    $testVM = Get-VM -Name $vmData.VMName -Server $vcServer -ErrorAction SilentlyContinue
+                    if ($testVM) {
+                        Add-ProgressLog "VM_LOCATED - Found VM on $vcServer" "SUCCESS"
+                        $vmServer = $vcServer
+                        break
+                    }
+                } else {
+                    Add-ProgressLog "CONNECT_NULL - Connection to $vcServer returned null" "WARN"
                 }
             } catch {
                 Add-ProgressLog "CONNECT_FAILED - $vcServer : $($_.Exception.Message)" "ERROR"
@@ -269,7 +296,7 @@ $vmProcessingScript = {
         }
         
         if ($jobConnections.Count -eq 0) {
-            throw "No vCenter connections established"
+            throw "No vCenter connections established from list: $($cleanVCenterList -join ', ')"
         }
         
         # Locate the VM with comprehensive error handling
@@ -299,7 +326,7 @@ $vmProcessingScript = {
         }
         
         if (-not $targetVM -or -not $vmServer) {
-            throw "VM '$($vmData.VMName)' not found on any connected vCenter server"
+            throw "VM '$($vmData.VMName)' not found on any connected vCenter server: $($jobConnections -join ', ')"
         }
         
         # Validate VM object before proceeding
@@ -309,7 +336,7 @@ $vmProcessingScript = {
         
         # PHASE 1: Shutdown if needed with null checks
         if ($targetVM -and $targetVM.PowerState -eq "PoweredOn") {
-            Add-ProgressLog "SHUTDOWN_START - Initiating graceful shutdown (VMware Tools required)" "INFO"
+            Add-ProgressLog "SHUTDOWN_START - Initiating graceful shutdown" "INFO"
             
             try {
                 Shutdown-VMGuest -VM $targetVM -Confirm:$false -ErrorAction Stop
@@ -358,52 +385,132 @@ $vmProcessingScript = {
             Add-ProgressLog "SHUTDOWN_SKIP - VM already powered off or invalid, proceeding to reconfiguration" "INFO"
         }
         
-        # PHASE 2: Reconfigure VM with enhanced error handling
+        # PHASE 2: FIXED Reconfigure VM with enhanced error handling
         Add-ProgressLog "CONFIG_START - Beginning VM reconfiguration" "INFO"
         
-        # Wait a moment after shutdown before reconfiguration
-        Start-Sleep -Seconds 3
+        # Wait longer after shutdown before reconfiguration
+        Add-ProgressLog "CONFIG_WAIT - Waiting 15 seconds for VM to fully shutdown..." "INFO"
+        Start-Sleep -Seconds 15
         
-        # Re-get VM object and view before reconfiguration with multiple retry attempts
+        # FIXED: Enhanced VM object retrieval with multiple approaches
         $retryCount = 0
-        $maxRetries = 3
+        $maxRetries = 5
         $vmView = $null
+        $targetVM = $null
         
         while ($retryCount -lt $maxRetries -and -not $vmView) {
             try {
                 Add-ProgressLog "CONFIG_RETRIEVE - Attempt $($retryCount + 1) to get VM object for reconfiguration" "INFO"
                 
-                # Get fresh VM object from vCenter
+                # Clear any cached VM objects
+                $targetVM = $null
+                
+                # FIXED: Get fresh VM object with explicit server and force refresh
                 $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
                 
+                # Enhanced validation checks
                 if (-not $targetVM) {
                     throw "VM object is null after retrieval attempt $($retryCount + 1)"
                 }
                 
-                Add-ProgressLog "CONFIG_VM_OK - VM object retrieved successfully: $($targetVM.Name)" "SUCCESS"
+                if ([string]::IsNullOrEmpty($targetVM.Name)) {
+                    throw "VM object has no name property"
+                }
                 
-                # Validate VM object has required properties
+                if ($targetVM.Name -ne $vmData.VMName) {
+                    throw "VM name mismatch: expected '$($vmData.VMName)', got '$($targetVM.Name)'"
+                }
+                
+                Add-ProgressLog "CONFIG_VM_OK - VM object retrieved: $($targetVM.Name) (ID: $($targetVM.Id))" "SUCCESS"
+                
+                # Validate VM object properties
                 if (-not $targetVM.Id -or [string]::IsNullOrEmpty($targetVM.Id)) {
-                    throw "VM object missing ID property"
+                    throw "VM object missing or empty ID property"
                 }
                 
-                if (-not $targetVM.ExtensionData) {
-                    Add-ProgressLog "CONFIG_EXTENSIONDATA - VM ExtensionData is null, will try direct View approach" "WARN"
+                # FIXED: Multiple methods to get View object with better error handling
+                Add-ProgressLog "CONFIG_VIEW - Attempting to get VM View object for API calls" "INFO"
+                
+                # Method 1: Get-View by MoRef (most reliable)
+                try {
+                    if ($targetVM.ExtensionData -and $targetVM.ExtensionData.MoRef) {
+                        $vmView = Get-View -Id $targetVM.ExtensionData.MoRef -Server $vmServer -ErrorAction Stop
+                        if ($vmView -and $vmView.Config) {
+                            Add-ProgressLog "CONFIG_VIEW_SUCCESS - Method 1 (Get-View by MoRef) succeeded" "SUCCESS"
+                        } else {
+                            $vmView = $null
+                        }
+                    }
+                } catch {
+                    Add-ProgressLog "CONFIG_VIEW_METHOD1_FAILED - Get-View by MoRef failed: $($_.Exception.Message)" "WARN"
+                    $vmView = $null
                 }
                 
-                # Try to get the View object with enhanced error handling
-                Add-ProgressLog "CONFIG_VIEW - Getting VM View object for API calls" "INFO"
-                $vmView = Get-View -VIObject $targetVM -ErrorAction Stop
+                # Method 2: Direct ExtensionData access if Method 1 failed
+                if (-not $vmView -and $targetVM.ExtensionData) {
+                    try {
+                        $vmView = $targetVM.ExtensionData
+                        if ($vmView -and $vmView.Config -and $vmView.Config.Hardware) {
+                            Add-ProgressLog "CONFIG_VIEW_SUCCESS - Method 2 (Direct ExtensionData) succeeded" "SUCCESS"
+                        } else {
+                            $vmView = $null
+                            Add-ProgressLog "CONFIG_VIEW_METHOD2_FAILED - ExtensionData lacks required Config.Hardware" "WARN"
+                        }
+                    } catch {
+                        Add-ProgressLog "CONFIG_VIEW_METHOD2_FAILED - ExtensionData access failed: $($_.Exception.Message)" "WARN"
+                        $vmView = $null
+                    }
+                }
                 
+                # Method 3: Get-View with VIObject if previous methods failed
                 if (-not $vmView) {
-                    throw "VM View object is null after Get-View call"
+                    try {
+                        # FIXED: Only try this if targetVM is valid
+                        if ($targetVM -and $targetVM.Name) {
+                            $vmView = Get-View -VIObject $targetVM -Server $vmServer -ErrorAction Stop
+                            if ($vmView -and $vmView.Config) {
+                                Add-ProgressLog "CONFIG_VIEW_SUCCESS - Method 3 (Get-View VIObject) succeeded" "SUCCESS"
+                            } else {
+                                $vmView = $null
+                            }
+                        }
+                    } catch {
+                        Add-ProgressLog "CONFIG_VIEW_METHOD3_FAILED - Get-View VIObject failed: $($_.Exception.Message)" "WARN"
+                        $vmView = $null
+                    }
+                }
+                
+                # Method 4: Alternative VM retrieval and View approach
+                if (-not $vmView) {
+                    try {
+                        Add-ProgressLog "CONFIG_VIEW_METHOD4 - Trying alternative VM retrieval approach" "INFO"
+                        
+                        # Get VM using different approach
+                        $alternateVM = Get-View -ViewType VirtualMachine -Filter @{"Name" = $vmData.VMName} -Server $vmServer -ErrorAction Stop | Select-Object -First 1
+                        
+                        if ($alternateVM -and $alternateVM.Config) {
+                            $vmView = $alternateVM
+                            Add-ProgressLog "CONFIG_VIEW_SUCCESS - Method 4 (Alternative retrieval) succeeded" "SUCCESS"
+                        }
+                    } catch {
+                        Add-ProgressLog "CONFIG_VIEW_METHOD4_FAILED - Alternative approach failed: $($_.Exception.Message)" "WARN"
+                    }
+                }
+                
+                # Final validation of View object
+                if (-not $vmView) {
+                    throw "All methods to get VM View object failed"
                 }
                 
                 if (-not $vmView.Config) {
                     throw "VM View Config object is null"
                 }
                 
-                Add-ProgressLog "CONFIG_VIEW_OK - VM View object retrieved successfully" "SUCCESS"
+                if (-not $vmView.Config.Hardware) {
+                    throw "VM View Hardware config is null"
+                }
+                
+                Add-ProgressLog "CONFIG_VIEW_VALIDATED - VM View object is valid and ready for reconfiguration" "SUCCESS"
                 break
                 
             } catch {
@@ -411,8 +518,9 @@ $vmProcessingScript = {
                 Add-ProgressLog "CONFIG_RETRY - Attempt $retryCount failed: $($_.Exception.Message)" "WARN"
                 
                 if ($retryCount -lt $maxRetries) {
-                    Add-ProgressLog "CONFIG_WAIT - Waiting 5 seconds before retry..." "INFO"
-                    Start-Sleep -Seconds 5
+                    $waitTime = $retryCount * 5  # Progressive backoff: 5s, 10s, 15s, 20s
+                    Add-ProgressLog "CONFIG_WAIT - Waiting $waitTime seconds before retry..." "INFO"
+                    Start-Sleep -Seconds $waitTime
                 } else {
                     throw "Failed to get VM objects for reconfiguration after $maxRetries attempts: $($_.Exception.Message)"
                 }
@@ -623,8 +731,22 @@ $vmProcessingScript = {
         try {
             $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
             if ($targetVM -and $targetVM.Id) {
-                $finalVmView = Get-View -VIObject $targetVM -ErrorAction Stop
-                Add-ProgressLog "VERIFY_SUCCESS - Successfully retrieved updated VM configuration" "SUCCESS"
+                # Use the same enhanced approach for getting final view
+                try {
+                    if ($targetVM.ExtensionData -and $targetVM.ExtensionData.MoRef) {
+                        $finalVmView = Get-View -Id $targetVM.ExtensionData.MoRef -Server $vmServer -ErrorAction Stop
+                    } else {
+                        $finalVmView = $targetVM.ExtensionData
+                    }
+                } catch {
+                    $finalVmView = Get-View -VIObject $targetVM -Server $vmServer -ErrorAction SilentlyContinue
+                }
+                
+                if ($finalVmView -and $finalVmView.Config) {
+                    Add-ProgressLog "VERIFY_SUCCESS - Successfully retrieved updated VM configuration" "SUCCESS"
+                } else {
+                    Add-ProgressLog "VERIFY_ERROR - Could not get final VM configuration view" "ERROR"
+                }
             } else {
                 Add-ProgressLog "VERIFY_ERROR - VM object or VM ID is invalid after reconfiguration" "ERROR"
             }
@@ -640,7 +762,7 @@ $vmProcessingScript = {
         }
         
         # Update result with final configuration if available
-        if ($finalVmView) {
+        if ($finalVmView -and $finalVmView.Config -and $finalVmView.Config.Hardware) {
             $result.NewCPUCount = $finalVmView.Config.Hardware.NumCPU
             $result.NewCoresPerSocket = $finalVmView.Config.Hardware.NumCoresPerSocket
             $result.NewCPUHotAddEnabled = $finalVmView.Config.CpuHotAddEnabled
@@ -711,9 +833,25 @@ $vmProcessingScript = {
     Write-Output $result
 }
 
-# Extract credentials for job parameters
+# FIXED: Extract credentials for job parameters with validation
 $Username = $Credential.UserName
 $Password = $Credential.GetNetworkCredential().Password
+
+# FIXED: Validate that vCenter servers are properly formatted for job parameters
+$validatedVCenterServers = @()
+foreach ($server in $connectedServers) {
+    if ($server -and -not [string]::IsNullOrWhiteSpace($server)) {
+        $validatedVCenterServers += $server.ToString().Trim()
+    }
+}
+
+if ($validatedVCenterServers.Count -eq 0) {
+    Write-Error "No valid vCenter servers available for job processing"
+    Read-Host "Press Enter to exit"
+    exit 1
+}
+
+Write-Host "Validated vCenter servers for jobs: $($validatedVCenterServers -join ', ')" -ForegroundColor Green
 
 # Start parallel processing with enhanced monitoring
 Write-Host "`n" + "=" * 80 -ForegroundColor Cyan
@@ -805,8 +943,8 @@ foreach ($vmEntry in $VMList) {
         }
     }
     
-    # Start new job
-    $job = Start-Job -ScriptBlock $vmProcessingScript -ArgumentList $vmEntry, $vCenterServers, $Username, $Password, $jobCounter
+    # FIXED: Start new job with validated vCenter server list
+    $job = Start-Job -ScriptBlock $vmProcessingScript -ArgumentList $vmEntry, $validatedVCenterServers, $Username, $Password, $jobCounter
     $jobs += [PSCustomObject]@{
         Job = $job
         VMName = $vmEntry.VMName 
@@ -1020,7 +1158,6 @@ Write-Host "`nScript completed at: $(Get-Date)" -ForegroundColor Green
 Write-Host "Total script runtime: $totalScriptTime minutes" -ForegroundColor Cyan
 Write-Host "`nThank you for using the Enhanced VM Configuration Script!" -ForegroundColor Green
 
-# Pause for user review - FIXED: Removed the erroneous $ at the end
+# Pause for user review
 Write-Host "`nPress Enter to exit..." -ForegroundColor Yellow
 Read-Host
-            
