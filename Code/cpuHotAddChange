@@ -1,4 +1,4 @@
-# Set success status at the end
+        # Set success status at the end
         $result.Status = "Success"# VM Configuration Update Script - ENHANCED PARALLEL VERSION WITH DETAILED CONSOLE OUTPUT
 # This script processes a CSV file to update VM CPU and memory settings in parallel
 
@@ -153,37 +153,48 @@ $vmProcessingScript = {
         $securePassword = ConvertTo-SecureString -String $password -AsPlainText -Force
         $jobCredential = New-Object System.Management.Automation.PSCredential($username, $securePassword)
         
-        # Import PowerCLI with retry logic
+        # Import PowerCLI with complete banner suppression
         $moduleLoaded = $false
         $retryCount = 0
+        
+        # Redirect all output streams to suppress banner
+        $originalVerbosePreference = $VerbosePreference
+        $originalInformationPreference = $InformationPreference
+        $originalWarningPreference = $WarningPreference
+        
+        $VerbosePreference = "SilentlyContinue"
+        $InformationPreference = "SilentlyContinue" 
+        $WarningPreference = "SilentlyContinue"
+        
         while (-not $moduleLoaded -and $retryCount -lt 3) {
             try {
-                # Suppress all PowerCLI output during import
-                $null = Import-Module VMware.PowerCLI -Force -Global -ErrorAction Stop -WarningAction SilentlyContinue -InformationAction SilentlyContinue
+                # Completely suppress all output during module import
+                $null = Import-Module VMware.PowerCLI -Force -Global -ErrorAction Stop -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
                 
-                # Set all PowerCLI configurations to suppress messages
-                $null = Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope AllUsers -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue
-                $null = Set-PowerCLIConfiguration -DisplayDeprecationWarnings $false -Confirm:$false -Scope AllUsers -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue
-                $null = Set-PowerCLIConfiguration -ParticipateInCEIP $false -Confirm:$false -Scope AllUsers -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue
-                $null = Set-PowerCLIConfiguration -DefaultVIServerMode Single -Confirm:$false -Scope AllUsers -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue
+                # Set all PowerCLI configurations immediately to suppress any remaining messages
+                $null = Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
+                $null = Set-PowerCLIConfiguration -DisplayDeprecationWarnings $false -Confirm:$false -Scope Session -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
+                $null = Set-PowerCLIConfiguration -ParticipateInCEIP $false -Confirm:$false -Scope Session -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
+                $null = Set-PowerCLIConfiguration -DefaultVIServerMode Single -Confirm:$false -Scope Session -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
+                $null = Set-PowerCLIConfiguration -WebOperationTimeoutSeconds 300 -Confirm:$false -Scope Session -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
                 
                 $moduleLoaded = $true
-                Add-ProgressLog "INITIALIZED - PowerCLI loaded successfully (all messages suppressed)" "SUCCESS"
+                Add-ProgressLog "INITIALIZED - PowerCLI loaded successfully (banner completely suppressed)" "SUCCESS"
             } catch {
                 if (Get-Module -ListAvailable -Name VMware.VimAutomation.Core) {
                     try {
-                        # Try legacy module import with suppression
-                        $null = Import-Module VMware.VimAutomation.Core -Force -Global -ErrorAction Stop -WarningAction SilentlyContinue -InformationAction SilentlyContinue
-                        $null = Import-Module VMware.VimAutomation.Common -Force -Global -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue
+                        # Try legacy module import with complete suppression
+                        $null = Import-Module VMware.VimAutomation.Core -Force -Global -ErrorAction Stop -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
+                        $null = Import-Module VMware.VimAutomation.Common -Force -Global -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
                         
-                        # Set configurations with full suppression
-                        $null = Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope AllUsers -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue
-                        $null = Set-PowerCLIConfiguration -DisplayDeprecationWarnings $false -Confirm:$false -Scope AllUsers -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue
-                        $null = Set-PowerCLIConfiguration -ParticipateInCEIP $false -Confirm:$false -Scope AllUsers -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue
-                        $null = Set-PowerCLIConfiguration -DefaultVIServerMode Single -Confirm:$false -Scope AllUsers -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue
+                        # Set configurations with complete suppression
+                        $null = Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
+                        $null = Set-PowerCLIConfiguration -DisplayDeprecationWarnings $false -Confirm:$false -Scope Session -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
+                        $null = Set-PowerCLIConfiguration -ParticipateInCEIP $false -Confirm:$false -Scope Session -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
+                        $null = Set-PowerCLIConfiguration -DefaultVIServerMode Single -Confirm:$false -Scope Session -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
                         
                         $moduleLoaded = $true
-                        Add-ProgressLog "INITIALIZED - PowerCLI legacy modules loaded (all messages suppressed)" "SUCCESS"
+                        Add-ProgressLog "INITIALIZED - PowerCLI legacy modules loaded (banner completely suppressed)" "SUCCESS"
                     } catch {
                         $retryCount++
                         Add-ProgressLog "MODULE_RETRY - Legacy import attempt $retryCount failed: $($_.Exception.Message)" "WARN"
@@ -194,6 +205,11 @@ $vmProcessingScript = {
                 }
             }
         }
+        
+        # Restore original preference variables
+        $VerbosePreference = $originalVerbosePreference
+        $InformationPreference = $originalInformationPreference
+        $WarningPreference = $originalWarningPreference
         
         if (-not $moduleLoaded) {
             throw "Failed to load PowerCLI after 3 attempts"
@@ -245,58 +261,105 @@ $vmProcessingScript = {
             throw "No vCenter connections established"
         }
         
-        # Locate the VM
+        # Locate the VM with comprehensive error handling
         Add-ProgressLog "SEARCHING - Looking for VM across $($jobConnections.Count) connected servers" "INFO"
         $targetVM = $null
         $vmServer = $null
         
         foreach ($server in $jobConnections) {
-            $targetVM = Get-VM -Name $vmData.VMName -Server $server -ErrorAction SilentlyContinue
-            if ($targetVM) {
-                $vmServer = $server
-                Add-ProgressLog "VM_FOUND - Located on $server (Current Power: $($targetVM.PowerState), CPUs: $($targetVM.NumCpu))" "SUCCESS"
-                break
+            try {
+                $targetVM = Get-VM -Name $vmData.VMName -Server $server -ErrorAction Stop
+                if ($targetVM -and $targetVM.Name -eq $vmData.VMName) {
+                    $vmServer = $server
+                    Add-ProgressLog "VM_FOUND - Located '$($targetVM.Name)' on $server (Current Power: $($targetVM.PowerState), CPUs: $($targetVM.NumCpu))" "SUCCESS"
+                    break
+                } else {
+                    $targetVM = $null
+                }
+            } catch {
+                Add-ProgressLog "VM_SEARCH - Not found on $server, continuing search..." "INFO"
+                $targetVM = $null
             }
         }
         
-        if (-not $targetVM) {
-            throw "VM '$($vmData.VMName)' not found on any connected vCenter"
+        if (-not $targetVM -or -not $vmServer) {
+            throw "VM '$($vmData.VMName)' not found on any connected vCenter server"
         }
         
-        # PHASE 1: Shutdown if needed
-        if ($targetVM.PowerState -eq "PoweredOn") {
+        # Validate VM object before proceeding
+        if (-not $targetVM.Name) {
+            throw "VM object is invalid - Name property is missing"
+        }
+        
+        # PHASE 1: Shutdown if needed with null checks
+        if ($targetVM -and $targetVM.PowerState -eq "PoweredOn") {
             Add-ProgressLog "SHUTDOWN_START - Initiating graceful shutdown (VMware Tools required)" "INFO"
-            Shutdown-VMGuest -VM $targetVM -Confirm:$false
+            
+            try {
+                Shutdown-VMGuest -VM $targetVM -Confirm:$false -ErrorAction Stop
+                Add-ProgressLog "SHUTDOWN_INITIATED - Graceful shutdown command sent" "SUCCESS"
+            } catch {
+                Add-ProgressLog "SHUTDOWN_FALLBACK - Graceful shutdown failed, will force power off: $($_.Exception.Message)" "WARN"
+                Stop-VM -VM $targetVM -Confirm:$false -ErrorAction Stop
+            }
             
             $shutdownTimeout = (Get-Date).AddMinutes(8)
             $shutdownStart = Get-Date
             
-            while ($targetVM.PowerState -ne "PoweredOff" -and (Get-Date) -lt $shutdownTimeout) {
+            while ($targetVM -and $targetVM.PowerState -ne "PoweredOff" -and (Get-Date) -lt $shutdownTimeout) {
                 Start-Sleep -Seconds 10
-                $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer
-                $elapsed = [math]::Round(((Get-Date) - $shutdownStart).TotalSeconds)
                 
-                if ($elapsed % 30 -eq 0 -or $elapsed -in @(10, 20)) {
-                    Add-ProgressLog "SHUTDOWN_WAIT - Graceful shutdown in progress (${elapsed}s elapsed, State: $($targetVM.PowerState))" "INFO"
+                try {
+                    $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
+                    $elapsed = [math]::Round(((Get-Date) - $shutdownStart).TotalSeconds)
+                    
+                    if ($elapsed % 30 -eq 0) {
+                        Add-ProgressLog "SHUTDOWN_WAIT - Shutdown in progress (${elapsed}s elapsed, State: $($targetVM.PowerState))" "INFO"
+                    }
+                } catch {
+                    Add-ProgressLog "SHUTDOWN_ERROR - Failed to refresh VM status during shutdown" "WARN"
+                    break
                 }
             }
             
-            if ($targetVM.PowerState -ne "PoweredOff") {
-                Add-ProgressLog "SHUTDOWN_FORCE - Graceful timeout reached, forcing power off" "WARN"
-                Stop-VM -VM $targetVM -Confirm:$false
-                Start-Sleep -Seconds 5
-                $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer
+            # Force shutdown if still running
+            if ($targetVM -and $targetVM.PowerState -ne "PoweredOff") {
+                Add-ProgressLog "SHUTDOWN_FORCE - Timeout reached, forcing power off" "WARN"
+                try {
+                    Stop-VM -VM $targetVM -Confirm:$false -ErrorAction Stop
+                    Start-Sleep -Seconds 5
+                    $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
+                } catch {
+                    Add-ProgressLog "SHUTDOWN_FORCE_ERROR - Failed to force power off: $($_.Exception.Message)" "ERROR"
+                }
             }
             
-            $shutdownDuration = [math]::Round(((Get-Date) - $shutdownStart).TotalSeconds)
-            Add-ProgressLog "SHUTDOWN_COMPLETE - VM powered off (took ${shutdownDuration}s)" "SUCCESS"
+            if ($targetVM) {
+                $shutdownDuration = [math]::Round(((Get-Date) - $shutdownStart).TotalSeconds)
+                Add-ProgressLog "SHUTDOWN_COMPLETE - VM powered off (took ${shutdownDuration}s, Final State: $($targetVM.PowerState))" "SUCCESS"
+            }
         } else {
-            Add-ProgressLog "SHUTDOWN_SKIP - VM already powered off, proceeding to reconfiguration" "INFO"
+            Add-ProgressLog "SHUTDOWN_SKIP - VM already powered off or invalid, proceeding to reconfiguration" "INFO"
         }
         
-        # PHASE 2: Reconfigure VM
+        # PHASE 2: Reconfigure VM with enhanced error handling
         Add-ProgressLog "CONFIG_START - Beginning VM reconfiguration" "INFO"
-        $vmView = Get-View -VIObject $targetVM
+        
+        # Re-get VM object before reconfiguration to ensure it's valid
+        try {
+            $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
+            if (-not $targetVM) {
+                throw "VM object is null after retrieval"
+            }
+            
+            $vmView = Get-View -VIObject $targetVM -ErrorAction Stop
+            if (-not $vmView) {
+                throw "VM View object is null"
+            }
+        } catch {
+            throw "Failed to get VM objects for reconfiguration: $($_.Exception.Message)"
+        }
+        
         $targetCPUs = [int]$vmData.CPUCountAfter
         
         # Log current configuration
@@ -319,37 +382,46 @@ $vmProcessingScript = {
             Add-ProgressLog "CONFIG_TASK - Reconfiguration task submitted (Task ID: $($task.Value))" "INFO"
             
             # Monitor the task progress
-            $taskInfo = Get-View $task
+            $taskInfo = Get-View $task -ErrorAction Stop
             $timeout = (Get-Date).AddMinutes(10)  # 10 minute timeout for reconfig
             
             while ($taskInfo.Info.State -eq "running" -and (Get-Date) -lt $timeout) {
                 Start-Sleep -Seconds 5
-                $taskInfo.UpdateViewData()
-                $elapsed = [math]::Round(((Get-Date) - $reconfigStart).TotalSeconds)
-                
-                # Log progress every 15 seconds
-                if ($elapsed % 15 -eq 0) {
-                    Add-ProgressLog "CONFIG_PROGRESS - Reconfiguration in progress (${elapsed}s elapsed, State: $($taskInfo.Info.State))" "INFO"
+                try {
+                    $taskInfo.UpdateViewData()
+                    $elapsed = [math]::Round(((Get-Date) - $reconfigStart).TotalSeconds)
                     
-                    # Check if there's any progress info
-                    if ($taskInfo.Info.Progress -ne $null) {
-                        Add-ProgressLog "CONFIG_PROGRESS - Task progress: $($taskInfo.Info.Progress)%" "INFO"
+                    # Log progress every 15 seconds
+                    if ($elapsed % 15 -eq 0) {
+                        Add-ProgressLog "CONFIG_PROGRESS - Reconfiguration in progress (${elapsed}s elapsed, State: $($taskInfo.Info.State))" "INFO"
+                        
+                        # Check if there's any progress info
+                        if ($taskInfo.Info.Progress -ne $null) {
+                            Add-ProgressLog "CONFIG_PROGRESS - Task progress: $($taskInfo.Info.Progress)%" "INFO"
+                        }
                     }
+                } catch {
+                    Add-ProgressLog "CONFIG_MONITOR_ERROR - Error monitoring task: $($_.Exception.Message)" "WARN"
+                    break
                 }
             }
             
             # Check final task state
-            $taskInfo.UpdateViewData()
-            $reconfigDuration = [math]::Round(((Get-Date) - $reconfigStart).TotalSeconds)
-            
-            if ($taskInfo.Info.State -eq "success") {
-                Add-ProgressLog "CONFIG_COMPLETE - VM reconfiguration successful (took ${reconfigDuration}s)" "SUCCESS"
-            } elseif ($taskInfo.Info.State -eq "error") {
-                $errorMsg = if ($taskInfo.Info.Error) { $taskInfo.Info.Error.LocalizedMessage } else { "Unknown error" }
-                throw "Reconfiguration failed: $errorMsg"
-            } else {
-                Add-ProgressLog "CONFIG_TIMEOUT - Reconfiguration task timed out after ${reconfigDuration}s (State: $($taskInfo.Info.State))" "WARN"
-                # Don't throw error, continue and see if changes were applied
+            try {
+                $taskInfo.UpdateViewData()
+                $reconfigDuration = [math]::Round(((Get-Date) - $reconfigStart).TotalSeconds)
+                
+                if ($taskInfo.Info.State -eq "success") {
+                    Add-ProgressLog "CONFIG_COMPLETE - VM reconfiguration successful (took ${reconfigDuration}s)" "SUCCESS"
+                } elseif ($taskInfo.Info.State -eq "error") {
+                    $errorMsg = if ($taskInfo.Info.Error) { $taskInfo.Info.Error.LocalizedMessage } else { "Unknown error" }
+                    throw "Reconfiguration failed: $errorMsg"
+                } else {
+                    Add-ProgressLog "CONFIG_TIMEOUT - Reconfiguration task timed out after ${reconfigDuration}s (State: $($taskInfo.Info.State))" "WARN"
+                    # Don't throw error, continue and see if changes were applied
+                }
+            } catch {
+                Add-ProgressLog "CONFIG_CHECK_ERROR - Error checking final task state: $($_.Exception.Message)" "WARN"
             }
             
         } catch {
