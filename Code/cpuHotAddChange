@@ -579,25 +579,15 @@ $vmProcessingScript = {
             throw $_
         }
         
-        # PHASE 3: Power on based on original state - MODIFIED FOR FASTER PROCESSING
-        Add-ProgressLog "POWERON_CHECK - Original power state from CSV: '$($vmData.PowerState)'" "INFO"
-
-        # Determine if we should power on the VM
-        $shouldPowerOn = $false
-        if ($vmData.PowerState -match "(?i)power.*on|running|started") {
-            $shouldPowerOn = $true
-            Add-ProgressLog "POWERON_DECISION - Will power on VM (original state was: $($vmData.PowerState))" "INFO"
-        } else {
-            Add-ProgressLog "POWERON_DECISION - Will leave VM powered off (original state was: $($vmData.PowerState))" "INFO"
-        }
-
-        if ($shouldPowerOn) {
-            Add-ProgressLog "POWERON_START - Initiating startup sequence" "INFO"
-            
-            # Wait a moment after reconfiguration before powering on
-            Start-Sleep -Seconds 3
-            
-            try {
+        # PHASE 3: Power on the VM after configuration
+        Add-ProgressLog "POWERON_START - Will power on VM after configuration changes" "INFO"
+        # Always power on the VM after configuration
+        Add-ProgressLog "POWERON_START - Initiating startup sequence" "INFO"
+        
+        # Wait a moment after reconfiguration before powering on
+        Start-Sleep -Seconds 3
+        
+        try {
                 # Get fresh VM object
                 $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
                 
@@ -679,9 +669,6 @@ $vmProcessingScript = {
             } catch {
                 Add-ProgressLog "POWERON_ERROR - Power on failed: $($_.Exception.Message)" "ERROR"
             }
-        } else {
-            Add-ProgressLog "POWERON_SKIP - VM original state was '$($vmData.PowerState)', leaving it powered off" "INFO"
-        }
         
         # PHASE 4: Set final configuration values (skip problematic Get-View validation)
         Add-ProgressLog "FINALIZE - Setting final configuration values" "INFO"
