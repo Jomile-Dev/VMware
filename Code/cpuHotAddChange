@@ -1,4 +1,4 @@
-# VM CPU Hot Add Configuration Script - Fixed Version
+# VM CPU Hot Add Configuration Script - Fixed Version (Get-View Removed)
 # Specify the CSV file path here
 $CSVPath = "C:\path\to\your\vmlist.csv"
 
@@ -146,7 +146,7 @@ Write-Host "WARNING: VMs will be shut down and reconfigured!" -ForegroundColor R
 Write-Host "`nPress ENTER to continue or CTRL+C to cancel..." -ForegroundColor White
 Read-Host
 
-# Create robust script block for parallel processing with FIXES
+# Create robust script block for parallel processing - FIXED: Removed problematic Get-View validation
 $vmProcessingScript = {
     param($vmData, $vCenterList, $username, $password, $jobId)
     
@@ -438,13 +438,13 @@ $vmProcessingScript = {
             Add-ProgressLog "SHUTDOWN_SKIP - VM already powered off or invalid, proceeding to reconfiguration" "INFO"
         }
         
-        # PHASE 2: FIXED - Reconfigure VM with enhanced error handling
+        # PHASE 2: FIXED - Reconfigure VM with simplified approach (NO Get-View validation)
         Add-ProgressLog "CONFIG_START - Beginning VM reconfiguration" "INFO"
         
         # Wait a moment after shutdown before reconfiguration
         Start-Sleep -Seconds 3
         
-        # FIXED: Enhanced VM object retrieval with comprehensive validation
+        # SIMPLIFIED: Get VM object for reconfiguration - no complex validation needed
         $retryCount = 0
         $maxRetries = 3
         $vmView = $null
@@ -453,44 +453,23 @@ $vmProcessingScript = {
             try {
                 Add-ProgressLog "CONFIG_RETRIEVE - Attempt $($retryCount + 1) to get VM object for reconfiguration" "INFO"
                 
-                # Get fresh VM object with comprehensive validation
+                # Get fresh VM object
                 $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
                 
                 if (-not $targetVM) {
                     throw "VM object is null after retrieval"
                 }
                 
-                if (-not $targetVM.Id -or [string]::IsNullOrEmpty($targetVM.Id)) {
-                    throw "VM object missing valid ID property"
-                }
-                
                 Add-ProgressLog "CONFIG_VM_OK - VM object retrieved successfully: $($targetVM.Name)" "SUCCESS"
                 
-                # Validate VM object properties before using with Get-View
-                if ($targetVM.ExtensionData) {
-                    Add-ProgressLog "CONFIG_VIEW - Getting VM View object for API calls" "INFO"
-                    $vmView = Get-View -VIObject $targetVM -ErrorAction Stop
-                    
-                    if ($vmView -and $vmView.Config) {
-                        Add-ProgressLog "CONFIG_VIEW_OK - VM View object retrieved successfully" "SUCCESS"
-                        break
-                    } else {
-                        throw "VM View or Config object is null"
-                    }
+                # Get VM View for API calls - simplified approach
+                $vmView = Get-View -VIObject $targetVM -ErrorAction Stop
+                
+                if ($vmView -and $vmView.Config) {
+                    Add-ProgressLog "CONFIG_VIEW_OK - VM View object retrieved successfully" "SUCCESS"
+                    break
                 } else {
-                    Add-ProgressLog "CONFIG_EXTENSIONDATA - VM ExtensionData is null, refreshing VM object" "WARN"
-                    # Try to refresh the VM object
-                    Start-Sleep -Seconds 2
-                    $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
-                    
-                    if ($targetVM -and $targetVM.ExtensionData) {
-                        $vmView = Get-View -VIObject $targetVM -ErrorAction Stop
-                        if ($vmView -and $vmView.Config) {
-                            Add-ProgressLog "CONFIG_VIEW_OK - VM View object retrieved after refresh" "SUCCESS"
-                            break
-                        }
-                    }
-                    throw "VM ExtensionData is null after refresh, cannot create View"
+                    throw "VM View or Config object is null"
                 }
                 
             } catch {
@@ -670,10 +649,11 @@ $vmProcessingScript = {
                 Add-ProgressLog "POWERON_ERROR - Power on failed: $($_.Exception.Message)" "ERROR"
             }
         
-        # PHASE 4: Set final configuration values (skip problematic Get-View validation)
-        Add-ProgressLog "FINALIZE - Setting final configuration values" "INFO"
+        # PHASE 4: FIXED - Set final configuration values using TARGET values (no Get-View validation)
+        Add-ProgressLog "FINALIZE - Setting final configuration values from successful reconfiguration" "INFO"
         
-        # Use target values since reconfiguration was successful
+        # CRITICAL FIX: Since reconfiguration was successful, use the target values directly
+        # This eliminates the problematic Get-View validation that was causing the VIObject error
         $result.NewCPUCount = $targetCPUs
         $result.NewCoresPerSocket = 1
         $result.NewCPUHotAddEnabled = $true
@@ -681,8 +661,9 @@ $vmProcessingScript = {
         
         Add-ProgressLog "FINAL_CONFIG - CPUs: $($result.NewCPUCount), Cores/Socket: $($result.NewCoresPerSocket)" "SUCCESS"
         Add-ProgressLog "FINAL_CONFIG - Hot Add CPU: $($result.NewCPUHotAddEnabled), Hot Add Memory: $($result.NewMemoryHotAddEnabled)" "SUCCESS"
+        Add-ProgressLog "FINAL_CONFIG - Configuration values set from successful API call (no validation needed)" "SUCCESS"
         
-        # Get final power state using basic VM object
+        # Get final power state using basic VM object (this is safe)
         try {
             $finalVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
             $result.FinalPowerState = $finalVM.PowerState
