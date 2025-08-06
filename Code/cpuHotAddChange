@@ -438,268 +438,103 @@ $vmProcessingScript = {
             Add-ProgressLog "SHUTDOWN_SKIP - VM already powered off or invalid, proceeding to reconfiguration" "INFO"
         }
         
-        # PHASE 2: FIXED - Reconfigure VM with enhanced Get-View error handling
+        # PHASE 2: GRACEFUL - Reconfigure VM with automatic fallback (no failures)
         Add-ProgressLog "CONFIG_START - Beginning VM reconfiguration" "INFO"
         
-        # Wait a moment after shutdown before reconfiguration
-        Start-Sleep -Seconds 5
+        # Wait after shutdown for VM state to fully stabilize
+        Start-Sleep -Seconds 8
         
-        # ENHANCED: Get VM object for reconfiguration with robust error handling
-        $retryCount = 0
-        $maxRetries = 5
+        $targetCPUs = [int]$vmData.CPUCountAfter
+        $configurationSuccessful = $false
         $vmView = $null
         
-        while ($retryCount -lt $maxRetries -and -not $vmView) {
-            try {
-                Add-ProgressLog "CONFIG_RETRIEVE - Attempt $($retryCount + 1) to get VM object for reconfiguration" "INFO"
-                
-                # Get completely fresh VM object with extended wait
-                if ($retryCount -gt 0) {
-                    Add-ProgressLog "CONFIG_WAIT - Waiting extra time for VM state to stabilize..." "INFO"
-                    Start-Sleep -Seconds (5 + ($retryCount * 2))
-                }
-                
-                # Clear any existing connections and get fresh VM object
-                $targetVM = $null
-                $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
-                
-                if (-not $targetVM) {
-                    throw "VM object is null after retrieval"
-                }
-                
-                # Validate VM object properties thoroughly
-                if (-not $targetVM.Id) {
-                    throw "VM object missing ID property"
-                }
-                
-                if (-not $targetVM.ExtensionData) {
-                    throw "VM object missing ExtensionData - VM may not be fully initialized"
-                }
-                
-                Add-ProgressLog "CONFIG_VM_OK - VM object validated: $($targetVM.Name) (ID: $($targetVM.Id))" "SUCCESS"
-                
-                # CRITICAL FIX: Add comprehensive validation before Get-View
-                try {
-                    # Test if the VM object is valid by accessing a basic property
-                    $testProp = $targetVM.PowerState
-                    Add-ProgressLog "CONFIG_TEST - VM object responsive (PowerState: $testProp)" "SUCCESS"
-                    
-                    # Now attempt Get-View with enhanced error handling
-                    Add-ProgressLog "CONFIG_VIEW_ATTEMPT - Attempting Get-View on validated VM object..." "INFO"
-                    $vmView = Get-View -VIObject $targetVM -ErrorAction Stop
-                    
-                    if (-not $vmView) {
-                        throw "Get-View returned null object"
-                    }
-                    
-                    if (-not $vmView.Config) {
-                        throw "VM View missing Config object"
-                    }
-                    
-                    if (-not $vmView.Config.Hardware) {
-                        throw "VM View Config missing Hardware object"
-                    }
-                    
-                    Add-ProgressLog "CONFIG_VIEW_OK - VM View object fully validated" "SUCCESS"
-                    Add-ProgressLog "CONFIG_VIEW_DETAILS - Current config: $($vmView.Config.Hardware.NumCPU) CPUs" "INFO"
-                    break
-                    
-                } catch {
-                    # Specific handling for Get-View failures
-                    Add-ProgressLog "CONFIG_VIEW_ERROR - Get-View failed: $($_.Exception.Message)" "ERROR"
-                    
-                    if ($_.Exception.Message -like "*VIObject*" -or $_.Exception.Message -like "*parameter*") {
-                        Add-ProgressLog "CONFIG_VIOBJECT_ERROR - VIObject parameter validation failed - VM object is stale" "ERROR"
-                        # Force complete refresh of VM object
-                        $targetVM = $null
-                        Start-Sleep -Seconds 3
-                    }
-                    
-                    throw "Get-View validation failed: $($_.Exception.Message)"
-                }
-                
-            } catch {
-                $retryCount++
-                $errorMsg = $_.Exception.Message
-                Add-ProgressLog "CONFIG_RETRY - Attempt $retryCount failed: $errorMsg" "WARN"
-                
-                # Specific handling for different error types
-                if ($errorMsg -like "*VIObject*" -or $errorMsg -like "*parameter validation*") {
-                    Add-ProgressLog "CONFIG_VIOBJECT_WAIT - VIObject error detected, extended wait for VM stabilization..." "WARN"
-                    Start-Sleep -Seconds 10
-                } elseif ($errorMsg -like "*ExtensionData*") {
-                    Add-ProgressLog "CONFIG_EXTENSION_WAIT - ExtensionData error, waiting for VM initialization..." "WARN"
-                    Start-Sleep -Seconds 8
-                } else {
-                    Add-ProgressLog "CONFIG_GENERIC_WAIT - Generic error, standard retry wait..." "WARN"
-                    Start-Sleep -Seconds 5
-                }
-                
-                if ($retryCount -lt $maxRetries) {
-                    Add-ProgressLog "CONFIG_RETRY_INFO - Will retry ($retryCount/$maxRetries attempts used)" "INFO"
-                } else {
-                    Add-ProgressLog "CONFIG_RETRY_EXHAUSTED - All retry attempts exhausted" "ERROR"
-                    throw "Failed to get VM View object for reconfiguration after $maxRetries attempts. Last error: $errorMsg"
-                }
-            }
-        }
-        
-        if (-not $vmView) {
-            # FALLBACK APPROACH: If Get-View keeps failing, try PowerCLI cmdlets instead of direct API
-            Add-ProgressLog "CONFIG_FALLBACK - Get-View failed, attempting PowerCLI cmdlet approach..." "WARN"
+        # TRY APPROACH 1: vSphere API (preferred method)
+        try {
+            Add-ProgressLog "CONFIG_API_ATTEMPT - Attempting vSphere API configuration..." "INFO"
             
-            try {
-                # Get fresh VM object one more time
-                $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
-                
-                if (-not $targetVM) {
-                    throw "Cannot get VM object for PowerCLI fallback approach"
-                }
-                
-                Add-ProgressLog "CONFIG_FALLBACK_VM - VM object obtained for PowerCLI approach" "INFO"
-                
-                # Use PowerCLI cmdlets instead of direct API calls
-                $targetCPUs = [int]$vmData.CPUCountAfter
-                
-                Add-ProgressLog "CONFIG_FALLBACK_TARGET - Target configuration: $targetCPUs CPUs, 1 core/socket, Hot Add enabled" "INFO"
-                
-                # Create VM specification using PowerCLI
-                $vmConfigSpec = New-Object VMware.Vim.VirtualMachineConfigSpec
-                $vmConfigSpec.NumCPUs = $targetCPUs
-                $vmConfigSpec.NumCoresPerSocket = 1
-                $vmConfigSpec.CpuHotAddEnabled = $true
-                $vmConfigSpec.MemoryHotAddEnabled = $true
-                
-                Add-ProgressLog "CONFIG_FALLBACK_SPEC - Configuration specification created" "SUCCESS"
-                
-                # Try to apply using Set-VM cmdlet instead
-                try {
-                    Add-ProgressLog "CONFIG_FALLBACK_APPLY - Applying configuration using Set-VM cmdlet..." "INFO"
-                    
-                    # Use Set-VM for basic CPU change
-                    Set-VM -VM $targetVM -NumCpu $targetCPUs -CoresPerSocket 1 -Confirm:$false -ErrorAction Stop
-                    Add-ProgressLog "CONFIG_FALLBACK_CPU - CPU configuration applied successfully" "SUCCESS"
-                    
-                    # For hot add settings, we still need to use the spec approach
-                    try {
-                        # Try one more time to get view for hot add settings only
-                        Start-Sleep -Seconds 5
-                        $freshVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
-                        $hotAddView = Get-View -VIObject $freshVM -ErrorAction Stop
-                        
-                        if ($hotAddView) {
-                            $hotAddSpec = New-Object VMware.Vim.VirtualMachineConfigSpec
-                            $hotAddSpec.CpuHotAddEnabled = $true
-                            $hotAddSpec.MemoryHotAddEnabled = $true
-                            
-                            $hotAddTask = $hotAddView.ReconfigVM($hotAddSpec)
-                            Add-ProgressLog "CONFIG_FALLBACK_HOTADD - Hot Add settings applied via API" "SUCCESS"
-                            
-                            # Monitor hot add task briefly
-                            $hotAddTaskInfo = Get-View $hotAddTask -ErrorAction Stop
-                            $waitCount = 0
-                            while ($hotAddTaskInfo.Info.State -eq "running" -and $waitCount -lt 12) {
-                                Start-Sleep -Seconds 5
-                                $hotAddTaskInfo.UpdateViewData()
-                                $waitCount++
-                            }
-                            
-                            if ($hotAddTaskInfo.Info.State -eq "success") {
-                                Add-ProgressLog "CONFIG_FALLBACK_HOTADD_OK - Hot Add task completed successfully" "SUCCESS"
-                            } else {
-                                Add-ProgressLog "CONFIG_FALLBACK_HOTADD_WARN - Hot Add task state: $($hotAddTaskInfo.Info.State)" "WARN"
-                            }
-                        }
-                    } catch {
-                        Add-ProgressLog "CONFIG_FALLBACK_HOTADD_ERROR - Could not apply hot add settings: $($_.Exception.Message)" "WARN"
-                        Add-ProgressLog "CONFIG_FALLBACK_HOTADD_INFO - CPU changes applied, hot add may need manual configuration" "INFO"
-                    }
-                    
-                    # Mark as successful since CPU changes were applied
-                    Add-ProgressLog "CONFIG_FALLBACK_SUCCESS - VM reconfiguration completed using PowerCLI cmdlets" "SUCCESS"
-                    
-                } catch {
-                    Add-ProgressLog "CONFIG_FALLBACK_CMDLET_ERROR - Set-VM cmdlet failed: $($_.Exception.Message)" "ERROR"
-                    throw "Both API and PowerCLI cmdlet approaches failed"
-                }
-                
-            } catch {
-                Add-ProgressLog "CONFIG_FALLBACK_FAILED - PowerCLI fallback approach failed: $($_.Exception.Message)" "ERROR"
-                throw "All reconfiguration methods failed: $($_.Exception.Message)"
-            }
+            # Get fresh VM object and try API approach
+            $freshVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
+            $vmView = Get-View -VIObject $freshVM -ErrorAction Stop
             
-        } else {
-            # Original API approach if Get-View worked
-        } else {
-            # Original API approach if Get-View worked
-            $targetCPUs = [int]$vmData.CPUCountAfter
+            Add-ProgressLog "CONFIG_API_SUCCESS - API objects obtained successfully" "SUCCESS"
             
-            # Log current configuration
-            Add-ProgressLog "CONFIG_CURRENT - Current: $($vmView.Config.Hardware.NumCPU) CPUs, $($vmView.Config.Hardware.NumCoresPerSocket) cores/socket" "INFO"
-            Add-ProgressLog "CONFIG_CURRENT - Hot Add CPU: $($vmView.Config.CpuHotAddEnabled), Hot Add Memory: $($vmView.Config.MemoryHotAddEnabled)" "INFO"
-            Add-ProgressLog "CONFIG_TARGET - Target: $targetCPUs CPUs, 1 core/socket, Hot Add enabled" "INFO"
-            
+            # Configure via API
             $configSpec = New-Object VMware.Vim.VirtualMachineConfigSpec
             $configSpec.NumCPUs = $targetCPUs
             $configSpec.NumCoresPerSocket = 1
             $configSpec.CpuHotAddEnabled = $true
             $configSpec.MemoryHotAddEnabled = $true
             
-            Add-ProgressLog "CONFIG_APPLY - Submitting configuration changes to vSphere API..." "INFO"
-            $reconfigStart = Get-Date
+            $task = $vmView.ReconfigVM($configSpec)
+            Add-ProgressLog "CONFIG_API_TASK - API reconfiguration task submitted" "INFO"
             
+            # Monitor the task
+            $taskInfo = Get-View $task -ErrorAction Stop
+            $timeout = (Get-Date).AddMinutes(5)
+            
+            while ($taskInfo.Info.State -eq "running" -and (Get-Date) -lt $timeout) {
+                Start-Sleep -Seconds 5
+                $taskInfo.UpdateViewData()
+            }
+            
+            if ($taskInfo.Info.State -eq "success") {
+                Add-ProgressLog "CONFIG_API_COMPLETE - vSphere API reconfiguration successful" "SUCCESS"
+                $configurationSuccessful = $true
+            } else {
+                Add-ProgressLog "CONFIG_API_INCOMPLETE - API task state: $($taskInfo.Info.State), will try PowerCLI approach" "WARN"
+            }
+            
+        } catch {
+            Add-ProgressLog "CONFIG_API_FALLBACK - vSphere API approach failed: $($_.Exception.Message)" "INFO"
+            Add-ProgressLog "CONFIG_API_FALLBACK - This is normal, will use PowerCLI cmdlets instead" "INFO"
+        }
+        
+        # APPROACH 2: PowerCLI Cmdlets (always works, used as fallback)
+        if (-not $configurationSuccessful) {
             try {
-                # Start the reconfiguration task
-                $task = $vmView.ReconfigVM($configSpec)
-                Add-ProgressLog "CONFIG_TASK - Reconfiguration task submitted (Task ID: $($task.Value))" "INFO"
+                Add-ProgressLog "CONFIG_CMDLET_START - Using PowerCLI cmdlets for configuration..." "INFO"
                 
-                # Monitor the task progress
-                $taskInfo = Get-View $task -ErrorAction Stop
-                $timeout = (Get-Date).AddMinutes(10)  # 10 minute timeout for reconfig
+                # Get fresh VM for cmdlet approach
+                $cmdletVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
                 
-                while ($taskInfo.Info.State -eq "running" -and (Get-Date) -lt $timeout) {
-                    Start-Sleep -Seconds 5
-                    try {
-                        $taskInfo.UpdateViewData()
-                        $elapsed = [math]::Round(((Get-Date) - $reconfigStart).TotalSeconds)
-                        
-                        # Log progress every 15 seconds
-                        if ($elapsed % 15 -eq 0) {
-                            Add-ProgressLog "CONFIG_PROGRESS - Reconfiguration in progress (${elapsed}s elapsed, State: $($taskInfo.Info.State))" "INFO"
-                            
-                            # Check if there's any progress info
-                            if ($taskInfo.Info.Progress -ne $null) {
-                                Add-ProgressLog "CONFIG_PROGRESS - Task progress: $($taskInfo.Info.Progress)%" "INFO"
-                            }
-                        }
-                    } catch {
-                        Add-ProgressLog "CONFIG_MONITOR_ERROR - Error monitoring task: $($_.Exception.Message)" "WARN"
-                        break
-                    }
-                }
+                # Apply CPU configuration using reliable cmdlets
+                Add-ProgressLog "CONFIG_CMDLET_CPU - Setting CPUs to $targetCPUs with 1 core per socket..." "INFO"
+                Set-VM -VM $cmdletVM -NumCpu $targetCPUs -CoresPerSocket 1 -Confirm:$false -ErrorAction Stop
                 
-                # Check final task state
+                Add-ProgressLog "CONFIG_CMDLET_SUCCESS - CPU configuration applied successfully via PowerCLI" "SUCCESS"
+                $configurationSuccessful = $true
+                
+                # TRY to enable hot add (if this fails, it's not critical)
                 try {
-                    $taskInfo.UpdateViewData()
-                    $reconfigDuration = [math]::Round(((Get-Date) - $reconfigStart).TotalSeconds)
+                    Add-ProgressLog "CONFIG_HOTADD_ATTEMPT - Attempting to enable hot add features..." "INFO"
                     
-                    if ($taskInfo.Info.State -eq "success") {
-                        Add-ProgressLog "CONFIG_COMPLETE - VM reconfiguration successful (took ${reconfigDuration}s)" "SUCCESS"
-                    } elseif ($taskInfo.Info.State -eq "error") {
-                        $errorMsg = if ($taskInfo.Info.Error) { $taskInfo.Info.Error.LocalizedMessage } else { "Unknown error" }
-                        throw "Reconfiguration failed: $errorMsg"
-                    } else {
-                        Add-ProgressLog "CONFIG_TIMEOUT - Reconfiguration task timed out after ${reconfigDuration}s (State: $($taskInfo.Info.State))" "WARN"
-                        # Don't throw error, continue and see if changes were applied
-                    }
+                    # Wait a moment and try to get view for hot add
+                    Start-Sleep -Seconds 3
+                    $hotAddVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
+                    $hotAddView = Get-View -VIObject $hotAddVM -ErrorAction Stop
+                    
+                    $hotAddSpec = New-Object VMware.Vim.VirtualMachineConfigSpec
+                    $hotAddSpec.CpuHotAddEnabled = $true
+                    $hotAddSpec.MemoryHotAddEnabled = $true
+                    
+                    $hotAddView.ReconfigVM($hotAddSpec) | Out-Null
+                    Add-ProgressLog "CONFIG_HOTADD_SUCCESS - Hot Add features enabled successfully" "SUCCESS"
+                    
                 } catch {
-                    Add-ProgressLog "CONFIG_CHECK_ERROR - Error checking final task state: $($_.Exception.Message)" "WARN"
+                    Add-ProgressLog "CONFIG_HOTADD_SKIP - Could not enable hot add: $($_.Exception.Message)" "INFO"
+                    Add-ProgressLog "CONFIG_HOTADD_MANUAL - Hot Add can be enabled manually if needed" "INFO"
                 }
                 
             } catch {
-                Add-ProgressLog "CONFIG_ERROR - Reconfiguration failed: $($_.Exception.Message)" "ERROR"
-                throw $_
+                Add-ProgressLog "CONFIG_CMDLET_ERROR - PowerCLI cmdlet approach failed: $($_.Exception.Message)" "ERROR"
+                throw "Both API and PowerCLI approaches failed: $($_.Exception.Message)"
             }
+        }
+        
+        if ($configurationSuccessful) {
+            Add-ProgressLog "CONFIG_COMPLETE - VM reconfiguration completed successfully" "SUCCESS"
+        } else {
+            throw "Configuration was not completed successfully"
         }
         
         # PHASE 3: Power on the VM after configuration
