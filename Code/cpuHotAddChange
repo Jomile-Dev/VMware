@@ -237,8 +237,21 @@ $vmProcessingScript = {
         $jobConnections = @()
         $vmServer = $null
         
+        # Validate vCenter list is not empty
+        if (-not $vCenterList -or $vCenterList.Count -eq 0) {
+            throw "vCenter server list is empty or null"
+        }
+        
+        Add-ProgressLog "VCENTER_LIST - Will attempt to connect to $($vCenterList.Count) servers" "INFO"
+        
         foreach ($vcServer in $vCenterList) {
+            if ([string]::IsNullOrWhiteSpace($vcServer)) {
+                Add-ProgressLog "CONNECT_SKIP - Empty server entry, skipping" "WARN"
+                continue
+            }
+            
             try {
+                Add-ProgressLog "CONNECT_ATTEMPT - Connecting to $vcServer" "INFO"
                 $connection = Connect-VIServer -Server $vcServer -Credential $jobCredential -ErrorAction Stop
                 $jobConnections += $vcServer
                 Add-ProgressLog "CONNECTED - Successfully connected to $vcServer" "SUCCESS"
@@ -348,24 +361,66 @@ $vmProcessingScript = {
         # PHASE 2: Reconfigure VM with enhanced error handling
         Add-ProgressLog "CONFIG_START - Beginning VM reconfiguration" "INFO"
         
-        # Re-get VM object and view before reconfiguration to ensure it's valid
-        try {
-            $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
-            if (-not $targetVM) {
-                throw "VM object is null after retrieval"
-            }
-            
-            # Enhanced null checks for Get-View
-            if ($targetVM -and $targetVM.Id) {
-                $vmView = Get-View -VIObject $targetVM -ErrorAction Stop
-                if (-not $vmView) {
-                    throw "VM View object is null"
+        # Wait a moment after shutdown before reconfiguration
+        Start-Sleep -Seconds 3
+        
+        # Re-get VM object and view before reconfiguration with multiple retry attempts
+        $retryCount = 0
+        $maxRetries = 3
+        $vmView = $null
+        
+        while ($retryCount -lt $maxRetries -and -not $vmView) {
+            try {
+                Add-ProgressLog "CONFIG_RETRIEVE - Attempt $($retryCount + 1) to get VM object for reconfiguration" "INFO"
+                
+                # Get fresh VM object from vCenter
+                $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
+                
+                if (-not $targetVM) {
+                    throw "VM object is null after retrieval attempt $($retryCount + 1)"
                 }
-            } else {
-                throw "VM object or VM ID is invalid"
+                
+                Add-ProgressLog "CONFIG_VM_OK - VM object retrieved successfully: $($targetVM.Name)" "SUCCESS"
+                
+                # Validate VM object has required properties
+                if (-not $targetVM.Id -or [string]::IsNullOrEmpty($targetVM.Id)) {
+                    throw "VM object missing ID property"
+                }
+                
+                if (-not $targetVM.ExtensionData) {
+                    Add-ProgressLog "CONFIG_EXTENSIONDATA - VM ExtensionData is null, will try direct View approach" "WARN"
+                }
+                
+                # Try to get the View object with enhanced error handling
+                Add-ProgressLog "CONFIG_VIEW - Getting VM View object for API calls" "INFO"
+                $vmView = Get-View -VIObject $targetVM -ErrorAction Stop
+                
+                if (-not $vmView) {
+                    throw "VM View object is null after Get-View call"
+                }
+                
+                if (-not $vmView.Config) {
+                    throw "VM View Config object is null"
+                }
+                
+                Add-ProgressLog "CONFIG_VIEW_OK - VM View object retrieved successfully" "SUCCESS"
+                break
+                
+            } catch {
+                $retryCount++
+                Add-ProgressLog "CONFIG_RETRY - Attempt $retryCount failed: $($_.Exception.Message)" "WARN"
+                
+                if ($retryCount -lt $maxRetries) {
+                    Add-ProgressLog "CONFIG_WAIT - Waiting 5 seconds before retry..." "INFO"
+                    Start-Sleep -Seconds 5
+                } else {
+                    throw "Failed to get VM objects for reconfiguration after $maxRetries attempts: $($_.Exception.Message)"
+                }
             }
-        } catch {
-            throw "Failed to get VM objects for reconfiguration: $($_.Exception.Message)"
+        }
+        
+        if (-not $vmView) {
+            throw "Could not obtain VM View object after $maxRetries attempts"
         }
         
         $targetCPUs = [int]$vmData.CPUCountAfter
@@ -440,66 +495,122 @@ $vmProcessingScript = {
         # PHASE 3: Power on based on original state
         Add-ProgressLog "POWERON_CHECK - Original power state from CSV: '$($vmData.PowerState)'" "INFO"
         
-        # Check if VM should be powered on - specifically look for "PoweredOn"
-        $shouldPowerOn = ($vmData.PowerState -eq "PoweredOn")
+        # Check if VM should be powered on - specifically look for "PoweredOn" (case insensitive)
+        $shouldPowerOn = ($vmData.PowerState -match "^PoweredOn$|^poweredon$|^On$|^on$")
+        
+        Add-ProgressLog "POWERON_DECISION - Should power on: $shouldPowerOn (CSV value: '$($vmData.PowerState)')" "INFO"
         
         if ($shouldPowerOn) {
-            Add-ProgressLog "POWERON_START - VM was PoweredOn in CSV, will restore power state after verification" "INFO"
+            Add-ProgressLog "POWERON_START - VM should be powered on, initiating startup sequence" "INFO"
+            
+            # Wait a moment after reconfiguration before powering on
+            Start-Sleep -Seconds 2
             
             # Get fresh VM object for power operations with enhanced error handling
-            try {
-                $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
-                
-                if (-not $targetVM) {
-                    Add-ProgressLog "POWERON_ERROR - Cannot retrieve VM object for power operations" "ERROR"
-                } elseif ($targetVM.PowerState -eq "PoweredOff") {
-                    Add-ProgressLog "POWERON_EXECUTE - Starting VM power on sequence" "INFO"
-                    Start-VM -VM $targetVM -Confirm:$false -ErrorAction Stop
-                    Add-ProgressLog "POWERON_INITIATED - Power on command sent successfully" "SUCCESS"
+            $powerOnRetries = 0
+            $maxPowerOnRetries = 3
+            $powerOnSuccess = $false
+            
+            while ($powerOnRetries -lt $maxPowerOnRetries -and -not $powerOnSuccess) {
+                try {
+                    Add-ProgressLog "POWERON_GET_VM - Attempt $($powerOnRetries + 1) to get VM for power operations" "INFO"
+                    $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
                     
-                    $powerOnTimeout = (Get-Date).AddMinutes(8)
-                    $powerOnStart = Get-Date
+                    if (-not $targetVM) {
+                        throw "Cannot retrieve VM object for power operations"
+                    }
                     
-                    while ($targetVM.PowerState -ne "PoweredOn" -and (Get-Date) -lt $powerOnTimeout) {
-                        Start-Sleep -Seconds 10
+                    Add-ProgressLog "POWERON_VM_STATE - Current VM state: $($targetVM.PowerState)" "INFO"
+                    
+                    if ($targetVM.PowerState -eq "PoweredOff") {
+                        Add-ProgressLog "POWERON_EXECUTE - VM is PoweredOff, starting power on sequence" "INFO"
+                        
+                        # Start the VM
+                        $powerOnTask = Start-VM -VM $targetVM -Confirm:$false -RunAsync -ErrorAction Stop
+                        Add-ProgressLog "POWERON_INITIATED - Power on task started successfully" "SUCCESS"
+                        
+                        # Monitor power on progress
+                        $powerOnTimeout = (Get-Date).AddMinutes(10)
+                        $powerOnStart = Get-Date
+                        
+                        while ($targetVM.PowerState -ne "PoweredOn" -and (Get-Date) -lt $powerOnTimeout) {
+                            Start-Sleep -Seconds 10
+                            try {
+                                $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
+                                if ($targetVM) {
+                                    $elapsed = [math]::Round(((Get-Date) - $powerOnStart).TotalSeconds)
+                                    
+                                    if ($elapsed % 30 -eq 0 -or $elapsed -in @(10, 20)) {
+                                        Add-ProgressLog "POWERON_WAIT - VM starting up (${elapsed}s elapsed, Current State: $($targetVM.PowerState))" "INFO"
+                                    }
+                                    
+                                    # Check if VM is now powered on
+                                    if ($targetVM.PowerState -eq "PoweredOn") {
+                                        $powerOnSuccess = $true
+                                        break
+                                    }
+                                }
+                            } catch {
+                                Add-ProgressLog "POWERON_STATUS_ERROR - Error checking power status: $($_.Exception.Message)" "WARN"
+                                break
+                            }
+                        }
+                        
+                        # Final power state check
                         try {
                             $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
-                            if ($targetVM) {
-                                $elapsed = [math]::Round(((Get-Date) - $powerOnStart).TotalSeconds)
+                            $powerOnDuration = [math]::Round(((Get-Date) - $powerOnStart).TotalSeconds)
+                            
+                            if ($targetVM -and $targetVM.PowerState -eq "PoweredOn") {
+                                Add-ProgressLog "POWERON_COMPLETE - VM powered on successfully (took ${powerOnDuration}s)" "SUCCESS"
+                                $powerOnSuccess = $true
+                            } else {
+                                Add-ProgressLog "POWERON_TIMEOUT - VM did not fully start within timeout (${powerOnDuration}s, Final State: $($targetVM.PowerState))" "WARN"
                                 
-                                if ($elapsed % 30 -eq 0 -or $elapsed -in @(10, 20)) {
-                                    Add-ProgressLog "POWERON_WAIT - VM starting up (${elapsed}s elapsed, Current State: $($targetVM.PowerState))" "INFO"
+                                # If we're on the last retry, don't retry again
+                                if ($powerOnRetries -eq $maxPowerOnRetries - 1) {
+                                    Add-ProgressLog "POWERON_FINAL_ATTEMPT - This was the final power-on attempt" "WARN"
+                                    break
                                 }
                             }
                         } catch {
-                            Add-ProgressLog "POWERON_STATUS_ERROR - Error checking power status: $($_.Exception.Message)" "WARN"
-                            break
+                            Add-ProgressLog "POWERON_FINAL_CHECK_ERROR - Error during final power state check: $($_.Exception.Message)" "WARN"
+                        }
+                        
+                    } elseif ($targetVM.PowerState -eq "PoweredOn") {
+                        Add-ProgressLog "POWERON_ALREADY - VM is already powered on" "SUCCESS"
+                        $powerOnSuccess = $true
+                    } else {
+                        Add-ProgressLog "POWERON_UNEXPECTED_STATE - VM is in unexpected state: $($targetVM.PowerState)" "WARN"
+                        $powerOnSuccess = $true  # Don't retry for unexpected states
+                    }
+                    
+                    # If we got here without error and didn't succeed, increment retry counter
+                    if (-not $powerOnSuccess) {
+                        $powerOnRetries++
+                        if ($powerOnRetries -lt $maxPowerOnRetries) {
+                            Add-ProgressLog "POWERON_RETRY - Power on attempt $powerOnRetries failed, will retry..." "WARN"
+                            Start-Sleep -Seconds 5
                         }
                     }
                     
-                    # Final power state check
-                    try {
-                        $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
-                        $powerOnDuration = [math]::Round(((Get-Date) - $powerOnStart).TotalSeconds)
-                        
-                        if ($targetVM -and $targetVM.PowerState -eq "PoweredOn") {
-                            Add-ProgressLog "POWERON_COMPLETE - VM powered on successfully (took ${powerOnDuration}s)" "SUCCESS"
-                        } else {
-                            Add-ProgressLog "POWERON_TIMEOUT - VM did not fully start within timeout (${powerOnDuration}s, Final State: $($targetVM.PowerState))" "WARN"
-                        }
-                    } catch {
-                        Add-ProgressLog "POWERON_FINAL_CHECK_ERROR - Error during final power state check: $($_.Exception.Message)" "WARN"
+                } catch {
+                    $powerOnRetries++
+                    Add-ProgressLog "POWERON_ERROR - Power on attempt $powerOnRetries failed: $($_.Exception.Message)" "ERROR"
+                    
+                    if ($powerOnRetries -lt $maxPowerOnRetries) {
+                        Add-ProgressLog "POWERON_RETRY_WAIT - Waiting 5 seconds before retry..." "INFO"
+                        Start-Sleep -Seconds 5
                     }
-                } else {
-                    Add-ProgressLog "POWERON_ALREADY - VM is already in state: $($targetVM.PowerState)" "INFO"
                 }
-                
-            } catch {
-                Add-ProgressLog "POWERON_ERROR - Failed to power on VM: $($_.Exception.Message)" "ERROR"
+            }
+            
+            if (-not $powerOnSuccess) {
+                Add-ProgressLog "POWERON_FAILED - Failed to power on VM after $maxPowerOnRetries attempts" "ERROR"
             }
             
         } else {
-            Add-ProgressLog "POWERON_SKIP - VM was '$($vmData.PowerState)' in CSV, leaving it powered off" "INFO"
+            Add-ProgressLog "POWERON_SKIP - VM original state was '$($vmData.PowerState)', leaving it powered off" "INFO"
         }
         
         # PHASE 4: Verify and finalize with enhanced error handling
@@ -912,3 +1023,4 @@ Write-Host "`nThank you for using the Enhanced VM Configuration Script!" -Foregr
 # Pause for user review - FIXED: Removed the erroneous $ at the end
 Write-Host "`nPress Enter to exit..." -ForegroundColor Yellow
 Read-Host
+            
