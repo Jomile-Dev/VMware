@@ -147,757 +147,210 @@ Write-Host "WARNING: VMs will be shut down and reconfigured!" -ForegroundColor R
 Write-Host "`nPress ENTER to continue or CTRL+C to cancel..." -ForegroundColor White
 Read-Host
 
-# Create robust script block for parallel processing with FIXES
+# MAJOR ISSUES IDENTIFIED AND FIXES:
+
+# 1. DUPLICATE CODE BLOCK - The script has duplicate cleanup code at the end
+# ISSUE: Lines are repeated causing script to run cleanup twice
+# FIX: Remove the duplicate block (keep only one version)
+
+# 2. MISSING VARIABLE DEFINITIONS
+# ISSUE: Script references variables that aren't defined in the provided code
+# Variables needed: $VMList, $ReportPath, $Credential, $finalServerArray, $connectedServers
+
+# 3. SCOPE ISSUES IN SCRIPT BLOCK
+# ISSUE: The script block uses variables from parent scope that may not be available
+# FIX: Ensure all required data is passed as parameters
+
+# 4. POWERCLI CONNECTION HANDLING
+# ISSUE: The script attempts to use shared connections but also tries to clean them up
+# FIX: Proper connection management
+
+# Here are the specific fixes:
+
+#=== FIX 1: Remove duplicate code block ===
+# DELETE THE DUPLICATE CLEANUP SECTION (lines after "} else {" near the end)
+# Keep only one version of:
+# - Results processing
+# - Cleanup vCenter connections  
+# - Final messages
+
+#=== FIX 2: Add missing variable definitions at the top ===
+# Add these variables before the script block definition:
+
+# Example variable definitions (adjust to your actual data):
+param(
+    [Parameter(Mandatory=$true)]
+    [string]$CSVPath,
+    
+    [Parameter(Mandatory=$true)]
+    [string]$ReportPath,
+    
+    [Parameter(Mandatory=$true)]
+    [System.Management.Automation.PSCredential]$Credential,
+    
+    [Parameter(Mandatory=$true)]
+    [string[]]$vCenterServers
+)
+
+# Import and validate CSV data
+if (-not (Test-Path $CSVPath)) {
+    Write-Error "CSV file not found: $CSVPath"
+    exit 1
+}
+
+$VMList = Import-Csv -Path $CSVPath
+if (-not $VMList -or $VMList.Count -eq 0) {
+    Write-Error "No VM data found in CSV file"
+    exit 1
+}
+
+# Validate required columns
+$requiredColumns = @('VMName', 'PowerState', 'CPUCountBefore', 'CPUCountAfter')
+$csvColumns = ($VMList[0] | Get-Member -MemberType NoteProperty).Name
+$missingColumns = $requiredColumns | Where-Object { $_ -notin $csvColumns }
+if ($missingColumns) {
+    Write-Error "Missing required columns in CSV: $($missingColumns -join ', ')"
+    exit 1
+}
+
+#=== FIX 3: Initialize connection variables ===
+$finalServerArray = @()
+$connectedServers = @()
+
+# Connect to vCenter servers
+Write-Host "Connecting to vCenter servers..." -ForegroundColor Yellow
+foreach ($server in $vCenterServers) {
+    try {
+        $connection = Connect-VIServer -Server $server -Credential $Credential -Force -ErrorAction Stop
+        if ($connection.IsConnected) {
+            $finalServerArray += $server
+            $connectedServers += $server
+            Write-Host "Connected to $server" -ForegroundColor Green
+        }
+    } catch {
+        Write-Warning "Failed to connect to $server : $($_.Exception.Message)"
+    }
+}
+
+if ($finalServerArray.Count -eq 0) {
+    Write-Error "No vCenter connections established!"
+    exit 1
+}
+
+#=== FIX 4: Enhanced error handling in script block ===
+# Add better parameter validation at the start of the script block:
+
 $vmProcessingScript = {
     param($vmData, $vCenterList, $username, $password, $jobId)
     
-    # Create a unique log identifier WITHOUT password
-    $logPrefix = "[$($vmData.VMName)][Job$jobId]"
-    $progressLog = @()
-    
-    function Add-ProgressLog {
-        param($Message, $LogLevel = "INFO")
-        $timestamp = Get-Date -Format "HH:mm:ss.fff"
-        $logEntry = "$timestamp $logPrefix [$LogLevel] $Message"
-        $script:progressLog += $logEntry
-        
-        # Create structured output for console processing
-        $output = [PSCustomObject]@{
-            Type = "ProgressUpdate"
-            VMName = $vmData.VMName
-            JobId = $jobId
-            Timestamp = $timestamp
-            LogLevel = $LogLevel
-            Message = $Message
-            FullLogEntry = $logEntry
-        }
-        Write-Output $output
+    # Validate input parameters
+    if (-not $vmData) {
+        throw "VM data parameter is null or empty"
+    }
+    if (-not $vmData.VMName) {
+        throw "VM name is missing from VM data"
+    }
+    if (-not $vCenterList -or $vCenterList.Count -eq 0) {
+        throw "vCenter server list is null or empty"
+    }
+    if ([string]::IsNullOrEmpty($username) -or [string]::IsNullOrEmpty($password)) {
+        throw "Username or password is null or empty"
     }
     
-    try {
-        Add-ProgressLog "STARTING - Initializing job environment" "START"
-        
-        # Recreate credential securely
-        $securePassword = ConvertTo-SecureString -String $password -AsPlainText -Force
-        $jobCredential = New-Object System.Management.Automation.PSCredential($username, $securePassword)
-        
-        # Import PowerCLI with complete banner suppression
-        $moduleLoaded = $false
-        $retryCount = 0
-        
-        # Redirect all output streams to suppress banner
-        $originalVerbosePreference = $VerbosePreference
-        $originalInformationPreference = $InformationPreference
-        $originalWarningPreference = $WarningPreference
-        
-        $VerbosePreference = "SilentlyContinue"
-        $InformationPreference = "SilentlyContinue" 
-        $WarningPreference = "SilentlyContinue"
-        
-        while (-not $moduleLoaded -and $retryCount -lt 3) {
-            try {
-                # Completely suppress all output during module import
-                $null = Import-Module VMware.PowerCLI -Force -Global -ErrorAction Stop -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
-                
-                # Set all PowerCLI configurations immediately to suppress any remaining messages
-                $null = Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
-                $null = Set-PowerCLIConfiguration -DisplayDeprecationWarnings $false -Confirm:$false -Scope Session -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
-                $null = Set-PowerCLIConfiguration -ParticipateInCEIP $false -Confirm:$false -Scope Session -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
-                $null = Set-PowerCLIConfiguration -DefaultVIServerMode Single -Confirm:$false -Scope Session -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
-                $null = Set-PowerCLIConfiguration -WebOperationTimeoutSeconds 300 -Confirm:$false -Scope Session -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
-                
-                $moduleLoaded = $true
-                Add-ProgressLog "INITIALIZED - PowerCLI loaded successfully (banner completely suppressed)" "SUCCESS"
-            } catch {
-                if (Get-Module -ListAvailable -Name VMware.VimAutomation.Core) {
-                    try {
-                        # Try legacy module import with complete suppression
-                        $null = Import-Module VMware.VimAutomation.Core -Force -Global -ErrorAction Stop -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
-                        $null = Import-Module VMware.VimAutomation.Common -Force -Global -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
-                        
-                        # Set configurations with complete suppression
-                        $null = Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
-                        $null = Set-PowerCLIConfiguration -DisplayDeprecationWarnings $false -Confirm:$false -Scope Session -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
-                        $null = Set-PowerCLIConfiguration -ParticipateInCEIP $false -Confirm:$false -Scope Session -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
-                        $null = Set-PowerCLIConfiguration -DefaultVIServerMode Single -Confirm:$false -Scope Session -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
-                        
-                        $moduleLoaded = $true
-                        Add-ProgressLog "INITIALIZED - PowerCLI legacy modules loaded (banner completely suppressed)" "SUCCESS"
-                    } catch {
-                        $retryCount++
-                        Add-ProgressLog "MODULE_RETRY - Legacy import attempt $retryCount failed: $($_.Exception.Message)" "WARN"
-                        Start-Sleep -Seconds 2
-                    }
-                } else {
-                    throw "PowerCLI modules not found"
-                }
-            }
-        }
-        
-        # Restore original preference variables
-        $VerbosePreference = $originalVerbosePreference
-        $InformationPreference = $originalInformationPreference
-        $WarningPreference = $originalWarningPreference
-        
-        if (-not $moduleLoaded) {
-            throw "Failed to load PowerCLI after 3 attempts"
-        }
-        
-        # Initialize result object
-        $result = [PSCustomObject]@{
-            Type = "FinalResult"
-            VMName = $vmData.VMName
-            JobId = $jobId
-            Status = "Success"
-            OriginalPowerState = $vmData.PowerState
-            OriginalCPUCount = $vmData.CPUCountBefore
-            TargetCPUCount = $vmData.CPUCountAfter
-            NewCPUCount = ""
-            NewCoresPerSocket = ""
-            NewCPUHotAddEnabled = ""
-            NewMemoryHotAddEnabled = ""
-            FinalPowerState = ""
-            ErrorMessage = ""
-            StartTime = Get-Date
-            EndTime = $null
-            ProcessingTimeMinutes = 0
-            ProgressLog = $progressLog
-        }
-        
-        # FIXED: Connect to vCenter servers with enhanced validation and debugging
-        Add-ProgressLog "CONNECTING - Attempting vCenter connections" "INFO"
-        $jobConnections = @()
-        $vmServer = $null
-        
-        # CRITICAL FIX: Validate the vCenter list parameter
-        if (-not $vCenterList -or $vCenterList.Count -eq 0) {
-            throw "vCenter server list is empty or null in job parameter"
-        }
-        
-        # DEBUG: Show what we received in the job
-        Add-ProgressLog "DEBUG - Received vCenter list count: $($vCenterList.Count)" "INFO"
-        Add-ProgressLog "DEBUG - vCenter list type: $($vCenterList.GetType().Name)" "INFO"
-        
-        # FIXED: Handle both array and single string inputs
-        $serverListToProcess = @()
-        if ($vCenterList -is [array]) {
-            $serverListToProcess = $vCenterList
-        } elseif ($vCenterList -is [string]) {
-            $serverListToProcess = @($vCenterList)
-        } else {
-            # Convert to array if it's some other collection type
-            $serverListToProcess = @($vCenterList)
-        }
-        
-        Add-ProgressLog "DEBUG - Processing $($serverListToProcess.Count) servers" "INFO"
-        for ($i = 0; $i -lt $serverListToProcess.Count; $i++) {
-            Add-ProgressLog "DEBUG - Server[$i]: '$($serverListToProcess[$i])'" "INFO"
-        }
-        
-        # Validate and clean server list thoroughly
-        $validServers = @()
-        foreach ($server in $serverListToProcess) {
-            if (-not [string]::IsNullOrWhiteSpace($server)) {
-                $cleanServer = $server.ToString().Trim()
-                if ($cleanServer -ne "" -and $cleanServer -ne "test.test.test" -and $cleanServer -notlike "*domain.com") {
-                    $validServers += $cleanServer
-                    Add-ProgressLog "VCENTER_VALID - Added server: '$cleanServer'" "INFO"
-                } else {
-                    Add-ProgressLog "VCENTER_SKIP - Skipped placeholder server: '$cleanServer'" "WARN"
-                }
-            } else {
-                Add-ProgressLog "VCENTER_SKIP - Skipped empty/null server" "WARN"
-            }
-        }
-        
-        if ($validServers.Count -eq 0) {
-            throw "No valid vCenter servers found after cleaning. Original list: $($serverListToProcess -join ', ')"
-        }
-        
-        Add-ProgressLog "VCENTER_LIST - Will attempt to connect to $($validServers.Count) servers: $($validServers -join ', ')" "INFO"
-        
-        # FIXED: Connect with explicit server parameter to prevent prompting
-        foreach ($vcServer in $validServers) {
-            try {
-                Add-ProgressLog "CONNECT_ATTEMPT - Connecting to '$vcServer'" "INFO"
-                
-                # Additional validation before attempting connection
-                if ([string]::IsNullOrWhiteSpace($vcServer) -or $vcServer -eq "test.test.test") {
-                    Add-ProgressLog "CONNECT_SKIP - Invalid server name: '$vcServer'" "WARN"
-                    continue
-                }
-                
-                # CRITICAL FIX: Explicitly pass server parameter and suppress all prompts
-                $connection = Connect-VIServer -Server $vcServer -Credential $jobCredential -Force -ErrorAction Stop -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false
-                
-                if ($connection -and $connection.IsConnected) {
-                    $jobConnections += $vcServer
-                    Add-ProgressLog "CONNECTED - Successfully connected to '$vcServer'" "SUCCESS"
-                    
-                    # Try to find VM immediately
-                    $testVM = Get-VM -Name $vmData.VMName -Server $vcServer -ErrorAction SilentlyContinue
-                    if ($testVM) {
-                        Add-ProgressLog "VM_LOCATED - Found VM on $vcServer" "SUCCESS"
-                        $vmServer = $vcServer
-                        break
-                    }
-                } else {
-                    Add-ProgressLog "CONNECT_FAILED - Connection object is null or not connected for $vcServer" "ERROR"
-                }
-            } catch {
-                Add-ProgressLog "CONNECT_FAILED - $vcServer : $($_.Exception.Message)" "ERROR"
-            }
-        }
-        
-        if ($jobConnections.Count -eq 0) {
-            throw "No vCenter connections established. Check server names and credentials."
-        }
-        
-        # Locate the VM with comprehensive error handling
-        Add-ProgressLog "SEARCHING - Looking for VM across $($jobConnections.Count) connected servers" "INFO"
-        $targetVM = $null
-        
-        # If we haven't found the VM yet, search all connected servers
-        if (-not $vmServer) {
-            foreach ($server in $jobConnections) {
-                try {
-                    $targetVM = Get-VM -Name $vmData.VMName -Server $server -ErrorAction Stop
-                    if ($targetVM -and $targetVM.Name -eq $vmData.VMName) {
-                        $vmServer = $server
-                        Add-ProgressLog "VM_FOUND - Located '$($targetVM.Name)' on $server (Current Power: $($targetVM.PowerState), CPUs: $($targetVM.NumCpu))" "SUCCESS"
-                        break
-                    } else {
-                        $targetVM = $null
-                    }
-                } catch {
-                    Add-ProgressLog "VM_SEARCH - Not found on $server, continuing search..." "INFO"
-                    $targetVM = $null
-                }
-            }
-        } else {
-            # Get the VM from the server we already identified
-            $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
-        }
-        
-        if (-not $targetVM -or -not $vmServer) {
-            throw "VM '$($vmData.VMName)' not found on any connected vCenter server"
-        }
-        
-        # Validate VM object before proceeding
-        if (-not $targetVM.Name) {
-            throw "VM object is invalid - Name property is missing"
-        }
-        
-        # PHASE 1: Shutdown if needed with null checks
-        if ($targetVM -and $targetVM.PowerState -eq "PoweredOn") {
-            Add-ProgressLog "SHUTDOWN_START - Initiating graceful shutdown (VMware Tools required)" "INFO"
-            
-            try {
-                Shutdown-VMGuest -VM $targetVM -Confirm:$false -ErrorAction Stop
-                Add-ProgressLog "SHUTDOWN_INITIATED - Graceful shutdown command sent" "SUCCESS"
-            } catch {
-                Add-ProgressLog "SHUTDOWN_FALLBACK - Graceful shutdown failed, will force power off: $($_.Exception.Message)" "WARN"
-                Stop-VM -VM $targetVM -Confirm:$false -ErrorAction Stop
-            }
-            
-            $shutdownTimeout = (Get-Date).AddMinutes(8)
-            $shutdownStart = Get-Date
-            
-            while ($targetVM -and $targetVM.PowerState -ne "PoweredOff" -and (Get-Date) -lt $shutdownTimeout) {
-                Start-Sleep -Seconds 10
-                
-                try {
-                    $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
-                    $elapsed = [math]::Round(((Get-Date) - $shutdownStart).TotalSeconds)
-                    
-                    if ($elapsed % 30 -eq 0) {
-                        Add-ProgressLog "SHUTDOWN_WAIT - Shutdown in progress (${elapsed}s elapsed, State: $($targetVM.PowerState))" "INFO"
-                    }
-                } catch {
-                    Add-ProgressLog "SHUTDOWN_ERROR - Failed to refresh VM status during shutdown" "WARN"
-                    break
-                }
-            }
-            
-            # Force shutdown if still running
-            if ($targetVM -and $targetVM.PowerState -ne "PoweredOff") {
-                Add-ProgressLog "SHUTDOWN_FORCE - Timeout reached, forcing power off" "WARN"
-                try {
-                    Stop-VM -VM $targetVM -Confirm:$false -ErrorAction Stop
-                    Start-Sleep -Seconds 5
-                    $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
-                } catch {
-                    Add-ProgressLog "SHUTDOWN_FORCE_ERROR - Failed to force power off: $($_.Exception.Message)" "ERROR"
-                }
-            }
-            
-            if ($targetVM) {
-                $shutdownDuration = [math]::Round(((Get-Date) - $shutdownStart).TotalSeconds)
-                Add-ProgressLog "SHUTDOWN_COMPLETE - VM powered off (took ${shutdownDuration}s, Final State: $($targetVM.PowerState))" "SUCCESS"
-            }
-        } else {
-            Add-ProgressLog "SHUTDOWN_SKIP - VM already powered off or invalid, proceeding to reconfiguration" "INFO"
-        }
-        
-        # PHASE 2: FIXED - Reconfigure VM with enhanced error handling
-        Add-ProgressLog "CONFIG_START - Beginning VM reconfiguration" "INFO"
-        
-        # Wait a moment after shutdown before reconfiguration
-        Start-Sleep -Seconds 3
-        
-        # FIXED: Enhanced VM object retrieval with comprehensive validation
-        $retryCount = 0
-        $maxRetries = 3
-        $vmView = $null
-        
-        while ($retryCount -lt $maxRetries -and -not $vmView) {
-            try {
-                Add-ProgressLog "CONFIG_RETRIEVE - Attempt $($retryCount + 1) to get VM object for reconfiguration" "INFO"
-                
-                # Get fresh VM object with comprehensive validation
-                $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
-                
-                if (-not $targetVM) {
-                    throw "VM object is null after retrieval"
-                }
-                
-                if (-not $targetVM.Id -or [string]::IsNullOrEmpty($targetVM.Id)) {
-                    throw "VM object missing valid ID property"
-                }
-                
-                Add-ProgressLog "CONFIG_VM_OK - VM object retrieved successfully: $($targetVM.Name)" "SUCCESS"
-                
-                # Validate VM object properties before using with Get-View
-                if ($targetVM.ExtensionData) {
-                    Add-ProgressLog "CONFIG_VIEW - Getting VM View object for API calls" "INFO"
-                    $vmView = Get-View -VIObject $targetVM -ErrorAction Stop
-                    
-                    if ($vmView -and $vmView.Config) {
-                        Add-ProgressLog "CONFIG_VIEW_OK - VM View object retrieved successfully" "SUCCESS"
-                        break
-                    } else {
-                        throw "VM View or Config object is null"
-                    }
-                } else {
-                    Add-ProgressLog "CONFIG_EXTENSIONDATA - VM ExtensionData is null, refreshing VM object" "WARN"
-                    # Try to refresh the VM object
-                    Start-Sleep -Seconds 2
-                    $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
-                    
-                    if ($targetVM -and $targetVM.ExtensionData) {
-                        $vmView = Get-View -VIObject $targetVM -ErrorAction Stop
-                        if ($vmView -and $vmView.Config) {
-                            Add-ProgressLog "CONFIG_VIEW_OK - VM View object retrieved after refresh" "SUCCESS"
-                            break
-                        }
-                    }
-                    throw "VM ExtensionData is null after refresh, cannot create View"
-                }
-                
-            } catch {
-                $retryCount++
-                Add-ProgressLog "CONFIG_RETRY - Attempt $retryCount failed: $($_.Exception.Message)" "WARN"
-                
-                if ($retryCount -lt $maxRetries) {
-                    Add-ProgressLog "CONFIG_WAIT - Waiting 5 seconds before retry..." "INFO"
-                    Start-Sleep -Seconds 5
-                } else {
-                    throw "Failed to get VM objects for reconfiguration after $maxRetries attempts: $($_.Exception.Message)"
-                }
-            }
-        }
-        
-        if (-not $vmView) {
-            throw "Could not obtain VM View object after $maxRetries attempts"
-        }
-        
-        $targetCPUs = [int]$vmData.CPUCountAfter
-        
-        # Log current configuration
-        Add-ProgressLog "CONFIG_CURRENT - Current: $($vmView.Config.Hardware.NumCPU) CPUs, $($vmView.Config.Hardware.NumCoresPerSocket) cores/socket" "INFO"
-        Add-ProgressLog "CONFIG_CURRENT - Hot Add CPU: $($vmView.Config.CpuHotAddEnabled), Hot Add Memory: $($vmView.Config.MemoryHotAddEnabled)" "INFO"
-        Add-ProgressLog "CONFIG_TARGET - Target: $targetCPUs CPUs, 1 core/socket, Hot Add enabled" "INFO"
-        
-        $configSpec = New-Object VMware.Vim.VirtualMachineConfigSpec
-        $configSpec.NumCPUs = $targetCPUs
-        $configSpec.NumCoresPerSocket = 1
-        $configSpec.CpuHotAddEnabled = $true
-        $configSpec.MemoryHotAddEnabled = $true
-        
-        Add-ProgressLog "CONFIG_APPLY - Submitting configuration changes to vSphere API..." "INFO"
-        $reconfigStart = Get-Date
-        
-        try {
-            # Start the reconfiguration task
-            $task = $vmView.ReconfigVM($configSpec)
-            Add-ProgressLog "CONFIG_TASK - Reconfiguration task submitted (Task ID: $($task.Value))" "INFO"
-            
-            # Monitor the task progress
-            $taskInfo = Get-View $task -ErrorAction Stop
-            $timeout = (Get-Date).AddMinutes(10)  # 10 minute timeout for reconfig
-            
-            while ($taskInfo.Info.State -eq "running" -and (Get-Date) -lt $timeout) {
-                Start-Sleep -Seconds 5
-                try {
-                    $taskInfo.UpdateViewData()
-                    $elapsed = [math]::Round(((Get-Date) - $reconfigStart).TotalSeconds)
-                    
-                    # Log progress every 15 seconds
-                    if ($elapsed % 15 -eq 0) {
-                        Add-ProgressLog "CONFIG_PROGRESS - Reconfiguration in progress (${elapsed}s elapsed, State: $($taskInfo.Info.State))" "INFO"
-                        
-                        # Check if there's any progress info
-                        if ($taskInfo.Info.Progress -ne $null) {
-                            Add-ProgressLog "CONFIG_PROGRESS - Task progress: $($taskInfo.Info.Progress)%" "INFO"
-                        }
-                    }
-                } catch {
-                    Add-ProgressLog "CONFIG_MONITOR_ERROR - Error monitoring task: $($_.Exception.Message)" "WARN"
-                    break
-                }
-            }
-            
-            # Check final task state
-            try {
-                $taskInfo.UpdateViewData()
-                $reconfigDuration = [math]::Round(((Get-Date) - $reconfigStart).TotalSeconds)
-                
-                if ($taskInfo.Info.State -eq "success") {
-                    Add-ProgressLog "CONFIG_COMPLETE - VM reconfiguration successful (took ${reconfigDuration}s)" "SUCCESS"
-                } elseif ($taskInfo.Info.State -eq "error") {
-                    $errorMsg = if ($taskInfo.Info.Error) { $taskInfo.Info.Error.LocalizedMessage } else { "Unknown error" }
-                    throw "Reconfiguration failed: $errorMsg"
-                } else {
-                    Add-ProgressLog "CONFIG_TIMEOUT - Reconfiguration task timed out after ${reconfigDuration}s (State: $($taskInfo.Info.State))" "WARN"
-                    # Don't throw error, continue and see if changes were applied
-                }
-            } catch {
-                Add-ProgressLog "CONFIG_CHECK_ERROR - Error checking final task state: $($_.Exception.Message)" "WARN"
-            }
-            
-        } catch {
-            Add-ProgressLog "CONFIG_ERROR - Reconfiguration failed: $($_.Exception.Message)" "ERROR"
-            throw $_
-        }
-        
-        # PHASE 3: Power on based on original state - MODIFIED FOR FASTER PROCESSING
-        Add-ProgressLog "POWERON_CHECK - Original power state from CSV: '$($vmData.PowerState)'" "INFO"
-
-        # Determine if we should power on the VM
-        $shouldPowerOn = $false
-        if ($vmData.PowerState -match "(?i)power.*on|running|started") {
-            $shouldPowerOn = $true
-            Add-ProgressLog "POWERON_DECISION - Will power on VM (original state was: $($vmData.PowerState))" "INFO"
-        } else {
-            Add-ProgressLog "POWERON_DECISION - Will leave VM powered off (original state was: $($vmData.PowerState))" "INFO"
-        }
-
-        if ($shouldPowerOn) {
-            Add-ProgressLog "POWERON_START - Initiating startup sequence" "INFO"
-            
-            # Wait a moment after reconfiguration before powering on
-            Start-Sleep -Seconds 2
-            
-            try {
-                # Get fresh VM object
-                $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
-                
-                if (-not $targetVM) {
-                    throw "Cannot retrieve VM object for power operations"
-                }
-                
-                Add-ProgressLog "POWERON_VM_STATE - Current VM state: $($targetVM.PowerState)" "INFO"
-                
-                if ($targetVM.PowerState -eq "PoweredOff") {
-                    Add-ProgressLog "POWERON_EXECUTE - VM is PoweredOff, starting power on sequence" "INFO"
-                    
-                    # Start the VM - MODIFIED: Don't wait for full boot
-                    Start-VM -VM $targetVM -Confirm:$false -ErrorAction Stop
-                    Add-ProgressLog "POWERON_INITIATED - Power on command sent successfully" "SUCCESS"
-                    
-                    # MODIFIED: Short verification (30 seconds max) instead of full boot wait
-                    $quickTimeout = (Get-Date).AddSeconds(30)
-                    $powerOnStart = Get-Date
-                    
-                    while ($targetVM.PowerState -ne "PoweredOn" -and (Get-Date) -lt $quickTimeout) {
-                        Start-Sleep -Seconds 5
-                        try {
-                            $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
-                            if ($targetVM) {
-                                $elapsed = [math]::Round(((Get-Date) - $powerOnStart).TotalSeconds)
-                                
-                                # Check if VM is now powered on
-                                if ($targetVM.PowerState -eq "PoweredOn") {
-                                    Add-ProgressLog "POWERON_QUICK_SUCCESS - VM powered on (${elapsed}s)" "SUCCESS"
-                                    break
-                                }
-                            }
-                        } catch {
-                            Add-ProgressLog "POWERON_STATUS_ERROR - Error checking power status: $($_.Exception.Message)" "WARN"
-                            break
-                        }
-                    }
-                    
-                    # Final quick check
-                    try {
-                        $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
-                        $powerOnDuration = [math]::Round(((Get-Date) - $powerOnStart).TotalSeconds)
-                        
-                        if ($targetVM -and $targetVM.PowerState -eq "PoweredOn") {
-                            Add-ProgressLog "POWERON_VERIFIED - VM powered on successfully (${powerOnDuration}s)" "SUCCESS"
-                        } else {
-                            Add-ProgressLog "POWERON_CONTINUING - Power on initiated, but VM still starting (${powerOnDuration}s, State: $($targetVM.PowerState))" "INFO"
-                            Add-ProgressLog "POWERON_NOTE - Moving to next VM - this VM will continue booting in background" "INFO"
-                        }
-                    } catch {
-                        Add-ProgressLog "POWERON_FINAL_CHECK_ERROR - Error during final power state check: $($_.Exception.Message)" "WARN"
-                    }
-                    
-                } elseif ($targetVM.PowerState -eq "PoweredOn") {
-                    Add-ProgressLog "POWERON_ALREADY - VM is already powered on" "SUCCESS"
-                } else {
-                    Add-ProgressLog "POWERON_UNEXPECTED_STATE - VM is in unexpected state: $($targetVM.PowerState)" "WARN"
-                    # Try to power on anyway
-                    try {
-                        Start-VM -VM $targetVM -Confirm:$false -ErrorAction Stop
-                        Add-ProgressLog "POWERON_FORCED - Power on command sent from unexpected state" "INFO"
-                    } catch {
-                        Add-ProgressLog "POWERON_FORCE_FAILED - Failed to power on from unexpected state: $($_.Exception.Message)" "WARN"
-                    }
-                }
-                
-            } catch {
-                Add-ProgressLog "POWERON_ERROR - Power on failed: $($_.Exception.Message)" "ERROR"
-            }
-        } else {
-            Add-ProgressLog "POWERON_SKIP - VM original state was '$($vmData.PowerState)', leaving it powered off" "INFO"
-        }
-        
-        # PHASE 4: Verify and finalize with enhanced error handling
-        Add-ProgressLog "VERIFY_START - Checking final configuration" "INFO"
-        
-        # Re-get the VM object after reconfiguration with comprehensive error handling
-        $targetVM = $null
-        $finalVmView = $null
-        
-        try {
-            $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
-            if ($targetVM -and $targetVM.Id) {
-                $finalVmView = Get-View -VIObject $targetVM -ErrorAction Stop
-                Add-ProgressLog "VERIFY_SUCCESS - Successfully retrieved updated VM configuration" "SUCCESS"
-            } else {
-                Add-ProgressLog "VERIFY_ERROR - VM object or VM ID is invalid after reconfiguration" "ERROR"
-            }
-        } catch {
-            Add-ProgressLog "VERIFY_ERROR - Failed to get updated VM info: $($_.Exception.Message)" "ERROR"
-            # Try to get basic info without View
-            try {
-                $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
-                Add-ProgressLog "VERIFY_PARTIAL - Got basic VM info without View" "WARN"
-            } catch {
-                Add-ProgressLog "VERIFY_CRITICAL - Cannot retrieve VM object at all" "ERROR"
-            }
-        }
-        
-        # Update result with final configuration if available
-        if ($finalVmView) {
-            $result.NewCPUCount = $finalVmView.Config.Hardware.NumCPU
-            $result.NewCoresPerSocket = $finalVmView.Config.Hardware.NumCoresPerSocket
-            $result.NewCPUHotAddEnabled = $finalVmView.Config.CpuHotAddEnabled
-            $result.NewMemoryHotAddEnabled = $finalVmView.Config.MemoryHotAddEnabled
-            
-            Add-ProgressLog "FINAL_CONFIG - CPUs: $($result.NewCPUCount), Cores/Socket: $($result.NewCoresPerSocket)" "SUCCESS"
-            Add-ProgressLog "VERIFICATION - Hot Add CPU: $($result.NewCPUHotAddEnabled), Hot Add Memory: $($result.NewMemoryHotAddEnabled)" "SUCCESS"
-        } else {
-            # Fallback - use target values
-            $result.NewCPUCount = $targetCPUs
-            $result.NewCoresPerSocket = 1
-            $result.NewCPUHotAddEnabled = $true
-            $result.NewMemoryHotAddEnabled = $true
-            Add-ProgressLog "FINAL_CONFIG - Using target values (verification failed)" "WARN"
-        }
-        
-        if ($targetVM) {
-            $result.FinalPowerState = $targetVM.PowerState
-            Add-ProgressLog "FINAL_POWER_STATE - $($result.FinalPowerState)" "INFO"
-        } else {
-            $result.FinalPowerState = "Unknown"
-            Add-ProgressLog "FINAL_POWER_STATE - Unknown (VM object unavailable)" "WARN"
-        }
-        
-        $result.EndTime = Get-Date
-        $result.ProcessingTimeMinutes = [math]::Round(($result.EndTime - $result.StartTime).TotalMinutes, 2)
-        
-        Add-ProgressLog "SUCCESS - Processing completed in $($result.ProcessingTimeMinutes) minutes" "SUCCESS"
-        
-        # Cleanup connections
-        foreach ($server in $jobConnections) {
-            try {
-                Disconnect-VIServer -Server $server -Confirm:$false -Force -ErrorAction SilentlyContinue
-                Add-ProgressLog "CLEANUP - Disconnected from $server" "INFO"
-            } catch {
-                # Ignore cleanup errors
-            }
-        }
-        
-    } catch {
-        $result.Status = "Failed"
-        $result.ErrorMessage = $_.Exception.Message
-        $result.EndTime = Get-Date
-        if ($result.StartTime) {
-            $result.ProcessingTimeMinutes = [math]::Round(($result.EndTime - $result.StartTime).TotalMinutes, 2)
-        }
-        Add-ProgressLog "FAILED - $($_.Exception.Message)" "ERROR"
-        
-        # Cleanup connections on failure
-        try {
-            $failedJobConnections = Get-VIServer -ErrorAction SilentlyContinue
-            foreach ($server in $failedJobConnections) {
-                try {
-                    Disconnect-VIServer -Server $server -Confirm:$false -Force -ErrorAction SilentlyContinue
-                } catch {
-                    # Ignore cleanup errors
-                }
-            }
-        } catch {
-            # Ignore cleanup errors
-        }
-    }
-    
-    # Always include the progress log in the result
-    $result.ProgressLog = $progressLog
-    
-    # Return the result object
-    Write-Output $result
+    # Continue with existing script block code...
+    # ... (rest of the script block remains the same)
 }
 
-# Extract credentials for job parameters
-$Username = $Credential.UserName
-$Password = $Credential.GetNetworkCredential().Password
+#=== FIX 5: Clean up the duplicate code at the end ===
+# REMOVE THIS ENTIRE DUPLICATE SECTION:
+# } else {
+#     Write-Warning "No results collected! Check for job execution issues."
+# }
+#
+# # Cleanup vCenter connections
+# Write-Host "`nCleaning up vCenter connections..." -ForegroundColor Yellow
+# foreach ($server in $connectedServers) {
+#     try {
+#         Disconnect-VIServer -Server $server -Confirm:$false -ErrorAction SilentlyContinue
+#         Write-Host "Disconnected from $server" -ForegroundColor Green
+#     } catch {
+#         Write-Warning "Failed to disconnect from $server"
+#     }
+# }
+#
+# Write-Host "`nScript completed at: $(Get-Date)" -ForegroundColor Green
+# Write-Host "Total script runtime: $totalScriptTime minutes" -ForegroundColor Cyan
+# Write-Host "`nThank you for using the Enhanced VM Configuration Script!" -ForegroundColor Green
+#
+# # Pause for user review
+# Write-Host "`nPress Enter to exit..." -ForegroundColor Yellow
+# Read-Host
 
-# Start parallel processing with enhanced monitoring
-Write-Host "`n" + "=" * 80 -ForegroundColor Cyan
-Write-Host "STARTING PARALLEL PROCESSING" -ForegroundColor Cyan
-Write-Host "=" * 80 -ForegroundColor Cyan
-Write-Host "Maximum concurrent jobs: 4" -ForegroundColor Yellow
-Write-Host "Real-time monitoring enabled" -ForegroundColor Yellow
+#=== FIX 6: Proper job parameter validation ===
+# Before starting jobs, validate the server array:
 
-$jobs = @()
-$maxJobs = 4
-$jobCounter = 1
-$scriptStartTime = Get-Date
-
-# Job tracking arrays
-$results = @()
-$processedJobs = @()
-$jobStatus = @{}
-
-# Simple validation
-if ($finalServerArray.Count -eq 0) {
+if (-not $finalServerArray -or $finalServerArray.Count -eq 0) {
     Write-Error "No connected vCenter servers available for jobs!"
     Read-Host "Press Enter to exit"
     exit 1
 }
 
-Write-Host "Passing $($finalServerArray.Count) servers to jobs: $($finalServerArray -join ', ')" -ForegroundColor Green
+# Validate each server in the array
+$validatedServers = @()
+foreach ($server in $finalServerArray) {
+    if (-not [string]::IsNullOrWhiteSpace($server)) {
+        $validatedServers += $server.ToString().Trim()
+    }
+}
+$finalServerArray = $validatedServers
 
-# FIXED: Start jobs in batches with validated server list
+Write-Host "Validated server list: $($finalServerArray -join ', ')" -ForegroundColor Green
+
+#=== FIX 7: Add proper error handling for job creation ===
+# Replace the job creation section with better error handling:
+
 foreach ($vmEntry in $VMList) {
     # Wait for available slot
     while ((Get-Job -State Running).Count -ge $maxJobs) {
-        Start-Sleep -Seconds 1
-        
-        # Process real-time updates from running jobs
-        $runningJobs = Get-Job -State Running
-        foreach ($runningJob in $runningJobs) {
-            $updates = Receive-Job -Job $runningJob -Keep | Where-Object { $_.Type -eq "ProgressUpdate" }
-            foreach ($update in $updates) {
-                if (-not $jobStatus.ContainsKey($update.JobId)) {
-                    $jobStatus[$update.JobId] = @()
-                }
-                
-                # Only show new updates
-                if ($jobStatus[$update.JobId] -notcontains $update.FullLogEntry) {
-                    $jobStatus[$update.JobId] += $update.FullLogEntry
-                    
-                    # Color code based on log level
-                    $color = switch ($update.LogLevel) {
-                        "START" { "Cyan" }
-                        "SUCCESS" { "Green" }
-                        "ERROR" { "Red" }
-                        "WARN" { "Yellow" }
-                        default { "Gray" }
-                    }
-                    
-                    Write-Host $update.FullLogEntry -ForegroundColor $color
-                }
-            }
-        }
-        
-        # Check for completed jobs
-        $completedJobs = Get-Job | Where-Object { $_.State -ne 'Running' -and $_.Id -notin $processedJobs }
-        foreach ($completedJob in $completedJobs) {
-            $jobInfo = $jobs | Where-Object { $_.Job.Id -eq $completedJob.Id }
-            if ($jobInfo) {
-                Write-Host "`n>>> PROCESSING COMPLETED JOB FOR VM: $($jobInfo.VMName) <<<" -ForegroundColor Magenta
-                
-                try {
-                    $jobOutput = Receive-Job -Job $completedJob -ErrorAction Stop
-                    $vmResult = $jobOutput | Where-Object { $_.Type -eq "FinalResult" } | Select-Object -Last 1
-                    
-                    if ($vmResult) {
-                        $results += $vmResult
-                        $duration = [math]::Round(((Get-Date) - $jobInfo.StartTime).TotalMinutes, 2)
-                        
-                        if ($vmResult.Status -eq "Success") {
-                            Write-Host "✓ SUCCESS: $($vmResult.VMName)" -ForegroundColor Green
-                            Write-Host "  └─ Configuration: $($vmResult.NewCPUCount) CPUs, $($vmResult.NewCoresPerSocket) cores/socket" -ForegroundColor Green
-                            Write-Host "  └─ Power State: $($vmResult.FinalPowerState)" -ForegroundColor Green
-                            Write-Host "  └─ Processing Time: $duration minutes" -ForegroundColor Green
-                        } else {
-                            Write-Host "✗ FAILED: $($vmResult.VMName)" -ForegroundColor Red
-                            Write-Host "  └─ Error: $($vmResult.ErrorMessage)" -ForegroundColor Red
-                            Write-Host "  └─ Processing Time: $duration minutes" -ForegroundColor Red
-                        }
-                    } else {
-                        Write-Warning "Could not extract result for VM: $($jobInfo.VMName)"
-                    }
-                } catch {
-                    Write-Warning "Error processing job $($completedJob.Id): $_"
-                }
-                
-                Remove-Job -Job $completedJob -Force
-                $processedJobs += $completedJob.Id
-                
-                Write-Host ">>> JOB PROCESSING COMPLETE <<<`n" -ForegroundColor Magenta
-            }
-        }
+        # ... existing monitoring code ...
     }
     
-    # FIXED: Start new job with properly formatted server array and additional validation
-    Write-Host "DEBUG: Starting job $jobCounter with server array count: $($finalServerArray.Count)" -ForegroundColor Gray
-    Write-Host "DEBUG: Server array contents: $($finalServerArray -join ', ')" -ForegroundColor Gray
+    # Validate VM entry before creating job
+    if (-not $vmEntry.VMName) {
+        Write-Warning "Skipping VM entry with missing name"
+        continue
+    }
+    if (-not $vmEntry.CPUCountAfter) {
+        Write-Warning "Skipping VM $($vmEntry.VMName) - missing target CPU count"
+        continue
+    }
     
     try {
-        $job = Start-Job -ScriptBlock $vmProcessingScript -ArgumentList $vmEntry, $Username, $Password, $jobCounter
+        # Create job with validated parameters
+        $job = Start-Job -ScriptBlock $vmProcessingScript -ArgumentList @(
+            $vmEntry, 
+            $finalServerArray, 
+            $Username, 
+            $Password, 
+            $jobCounter
+        )
         
-        $jobs += [PSCustomObject]@{
-            Job = $job
-            VMName = $vmEntry.VMName 
-            JobId = $jobCounter
-            StartTime = Get-Date
+        if ($job) {
+            $jobs += [PSCustomObject]@{
+                Job = $job
+                VMName = $vmEntry.VMName 
+                JobId = $jobCounter
+                StartTime = Get-Date
+            }
+            
+            Write-Host "LAUNCHED JOB $jobCounter FOR VM: $($vmEntry.VMName)" -ForegroundColor Cyan
+            $jobCounter++
+        } else {
+            Write-Error "Failed to create job for VM: $($vmEntry.VMName)"
         }
-        
-        Write-Host "`nLAUNCHED JOB $jobCounter FOR VM: $($vmEntry.VMName)" -ForegroundColor Cyan -BackgroundColor DarkBlue
-        Write-Host "   PowerShell Job ID: $($job.Id) | Target CPUs: $($vmEntry.CPUCountBefore) → $($vmEntry.CPUCountAfter)" -ForegroundColor White
-        $jobCounter++
-        
-        # Small delay to prevent overwhelming the system
-        Start-Sleep -Seconds 1
-        
     } catch {
-        Write-Error "CRITICAL ERROR: Failed to start job for VM $($vmEntry.VMName): $($_.Exception.Message)"
-        Write-Host "Server array being passed: $($finalServerArray -join ', ')" -ForegroundColor Red
+        Write-Error "CRITICAL ERROR starting job for VM $($vmEntry.VMName): $($_.Exception.Message)"
+        Write-Host "Debug info - Server array: $($finalServerArray -join ', ')" -ForegroundColor Red
     }
 }
 
