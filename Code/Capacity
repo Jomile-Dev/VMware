@@ -1,12 +1,11 @@
-        # Warnings and recommendations
-        Write-Host "  RECOMMENDATIONS:" -ForegroundColor Cyan# VMware Cluster Capacity Analysis Script - Simplified Approach
+# VMware Cluster Capacity Analysis Script - Simplified Approach
 # Calculates how many hosts can be down before performance degradation
 
-# Connection to multiple vCenter Servers
+# Connection to multiple vCenter Servers - Ordered as requested
 $vCenterServers = @(
-    "vcenter1.domain.com",
-    "vcenter2.domain.com", 
-    "vcenter3.domain.com"
+    "vcenter-domain1.com",
+    "vcenter-domain2.com",
+    "vcenter-domain3.com"
 )
 
 # Configuration - Modify these values as needed
@@ -25,7 +24,7 @@ $UseSSL = $true                        # Use SSL encryption
 $SMTPCredentials = $null               # No SMTP authentication required
 
 # Get credentials once at the start
-Write-Host "Please enter your vCenter credentials:" -ForegroundColor Yellow
+Write-Host "Please enter your vCenter credentials:"
 $Credential = Get-Credential
 
 # Suppress certificate warnings (optional)
@@ -33,18 +32,18 @@ Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scop
 
 try {
     # Connect to vCenter Servers
-    Write-Host "Connecting to vCenter Servers:" -ForegroundColor Green
+    Write-Host "Connecting to vCenter Servers:"
     
     foreach ($server in $vCenterServers) {
         if (-not [string]::IsNullOrWhiteSpace($server)) {
             $cleanServer = $server.Trim()
             if ($cleanServer -ne "") {
-                Write-Host "  Attempting connection to: $cleanServer" -ForegroundColor Cyan
+                Write-Host "  Attempting connection to: $cleanServer"
                 try {
                     Connect-VIServer -Server $cleanServer -Credential $Credential -ErrorAction Stop
-                    Write-Host "    ✓ Connected successfully" -ForegroundColor Green
+                    Write-Host "    ✓ Connected successfully"
                 } catch {
-                    Write-Host "    ✗ Failed to connect: $($_.Exception.Message)" -ForegroundColor Red
+                    Write-Host "    ✗ Failed to connect: $($_.Exception.Message)"
                     continue
                 }
             }
@@ -58,15 +57,15 @@ try {
     $emailResults = @()
     $summaryTable = @()
     
-    Write-Host "`nAnalyzing cluster capacity across all vCenter servers..." -ForegroundColor Yellow
+    Write-Host "`nAnalyzing cluster capacity across all vCenter servers..."
     Write-Host "=" * 80
     
     foreach ($cluster in $clusters) {
         # Get the vCenter server this cluster belongs to
         $vCenterName = $cluster.Uid.Split('@')[1].Split(':')[0]
         
-        Write-Host "`nvCenter: $vCenterName" -ForegroundColor Magenta
-        Write-Host "Cluster: $($cluster.Name)" -ForegroundColor Cyan
+        Write-Host "`nvCenter: $vCenterName"
+        Write-Host "Cluster: $($cluster.Name)"
         Write-Host "-" * 50
         
         # Get all connected hosts in cluster
@@ -74,7 +73,7 @@ try {
         $totalHosts = $hosts.Count
         
         if ($totalHosts -lt 2) {
-            Write-Host "  Insufficient hosts for analysis (need at least 2)" -ForegroundColor Red
+            Write-Host "  Insufficient hosts for analysis (need at least 2)"
             continue
         }
         
@@ -84,7 +83,7 @@ try {
         $totalCpuCores = ($hosts | Measure-Object -Property NumCpu -Sum).Sum
         
         # Get all powered-on VMs in the cluster
-        Write-Host "  Analyzing VM resource allocation..." -ForegroundColor Gray
+        Write-Host "  Analyzing VM resource allocation..."
         $vms = $cluster | Get-VM | Where-Object { $_.PowerState -eq "PoweredOn" }
         $totalVMs = $vms.Count
         
@@ -121,7 +120,7 @@ try {
         $haFailoverHosts = if ($cluster.HAAdmissionControlEnabled) { $cluster.HAFailoverLevel } else { 0 }
         
         # Calculate effective capacity for 2 nodes down scenario
-        Write-Host "  Calculating 2-node failure scenario..." -ForegroundColor Gray
+        Write-Host "  Calculating 2-node failure scenario..."
         $capacityTable = @()
         
         # Only calculate for 2 hosts down scenario
@@ -164,43 +163,40 @@ try {
                 RiskLevel = $riskLevel
             }
         } else {
-            Write-Host "  Insufficient hosts for 2-node failure analysis (need at least 3)" -ForegroundColor Yellow
+            Write-Host "  Insufficient hosts for 2-node failure analysis (need at least 3)"
+        }
         
         # Display results
-        Write-Host "`n  CLUSTER SUMMARY:" -ForegroundColor White
-        Write-Host "  Total Hosts: $totalHosts" -ForegroundColor White
-        Write-Host "  Total VMs: $totalVMs" -ForegroundColor White
-        Write-Host "  Total CPU: $([math]::Round($totalCpuMhz/1000, 1)) GHz ($totalCpuCores cores)" -ForegroundColor Gray
-        Write-Host "  Total Memory: $([math]::Round($totalMemoryMB/1024, 1)) GB" -ForegroundColor Gray
+        Write-Host "`n  CLUSTER SUMMARY:"
+        Write-Host "  Total Hosts: $totalHosts"
+        Write-Host "  Total VMs: $totalVMs"
+        Write-Host "  Total CPU: $([math]::Round($totalCpuMhz/1000, 1)) GHz ($totalCpuCores cores)"
+        Write-Host "  Total Memory: $([math]::Round($totalMemoryMB/1024, 1)) GB"
         
-        Write-Host "`n  CURRENT UTILIZATION (Estimated):" -ForegroundColor White
-        Write-Host "  CPU Demand: $([math]::Round($estimatedCpuDemandMhz/1000, 1)) GHz ($currentCpuUtilPct%)" -ForegroundColor White
-        Write-Host "  Memory Demand: $([math]::Round($estimatedMemoryDemandMB/1024, 1)) GB ($currentMemUtilPct%)" -ForegroundColor White
-        Write-Host "  vCPU:pCPU Ratio: $([math]::Round($allocatedCpuCores / $totalCpuCores, 2)):1" -ForegroundColor Gray
+        Write-Host "`n  CURRENT UTILIZATION (Estimated):"
+        Write-Host "  CPU Demand: $([math]::Round($estimatedCpuDemandMhz/1000, 1)) GHz ($currentCpuUtilPct%)"
+        Write-Host "  Memory Demand: $([math]::Round($estimatedMemoryDemandMB/1024, 1)) GB ($currentMemUtilPct%)"
+        Write-Host "  vCPU:pCPU Ratio: $([math]::Round($allocatedCpuCores / $totalCpuCores, 2)):1"
         
-        Write-Host "`n  CAPACITY ANALYSIS:" -ForegroundColor Yellow
-        Write-Host "  Max hosts you can lose: $maxHostsCanLose hosts" -ForegroundColor $(
-            if ($maxHostsCanLose -gt 2) { "Green" } 
-            elseif ($maxHostsCanLose -ge 1) { "Yellow" } 
-            else { "Red" }
-        )
-        Write-Host "  Limiting factor: $limitingFactor" -ForegroundColor White
-        Write-Host "  Min hosts needed: $minHostsNeeded (for performance thresholds)" -ForegroundColor Gray
+        Write-Host "`n  CAPACITY ANALYSIS:"
+        Write-Host "  Max hosts you can lose: $maxHostsCanLose hosts"
+        Write-Host "  Limiting factor: $limitingFactor"
+        Write-Host "  Min hosts needed: $minHostsNeeded (for performance thresholds)"
         
         if ($haFailoverHosts -gt 0) {
             $haConstraint = [math]::Max(0, $totalHosts - $haFailoverHosts - 1)
-            Write-Host "  HA Failover Level: $haFailoverHosts hosts" -ForegroundColor Cyan
+            Write-Host "  HA Failover Level: $haFailoverHosts hosts"
             if ($haConstraint -lt $maxHostsCanLose) {
-                Write-Host "  HA limits you to: $haConstraint hosts down" -ForegroundColor Yellow
+                Write-Host "  HA limits you to: $haConstraint hosts down"
                 $maxHostsCanLose = $haConstraint
             }
         }
         
-        Write-Host "`n  FAILURE IMPACT ANALYSIS (2 Hosts Down):" -ForegroundColor Yellow
+        Write-Host "`n  FAILURE IMPACT ANALYSIS (2 Hosts Down):"
         if ($capacityTable.Count -gt 0) {
             $capacityTable | Format-Table -AutoSize
         } else {
-            Write-Host "  N/A - Insufficient hosts for 2-node failure analysis" -ForegroundColor Gray
+            Write-Host "  N/A - Insufficient hosts for 2-node failure analysis"
         }
         
         # Add to email results collection
@@ -230,22 +226,23 @@ try {
                 RiskLevel = $scenario.RiskLevel
             }
         }
-        Write-Host "  RECOMMENDATIONS:" -ForegroundColor Cyan
+        
+        Write-Host "  RECOMMENDATIONS:"
         if ($maxHostsCanLose -le 0) {
-            Write-Host "  ⚠️  CRITICAL: Cluster is at or over capacity!" -ForegroundColor Red
-            Write-Host "      - Consider adding hosts or migrating VMs" -ForegroundColor Red
+            Write-Host "  ⚠️  CRITICAL: Cluster is at or over capacity!"
+            Write-Host "      - Consider adding hosts or migrating VMs"
         } elseif ($maxHostsCanLose -eq 1) {
-            Write-Host "  ⚠️  CAUTION: Limited redundancy available" -ForegroundColor Yellow
-            Write-Host "      - Single host failure will impact performance" -ForegroundColor Yellow
+            Write-Host "  ⚠️  CAUTION: Limited redundancy available"
+            Write-Host "      - Single host failure will impact performance"
         } else {
-            Write-Host "  ✅ Good redundancy: Can handle $maxHostsCanLose host failures" -ForegroundColor Green
+            Write-Host "  ✅ Good redundancy: Can handle $maxHostsCanLose host failures"
         }
         
         if ($currentCpuUtilPct -gt 60) {
-            Write-Host "  💡 Consider CPU optimization or additional hosts" -ForegroundColor Cyan
+            Write-Host "  💡 Consider CPU optimization or additional hosts"
         }
         if ($currentMemUtilPct -gt 75) {
-            Write-Host "  💡 Memory utilization is high - monitor closely" -ForegroundColor Cyan
+            Write-Host "  💡 Memory utilization is high - monitor closely"
         }
         
         Write-Host ""
@@ -253,7 +250,7 @@ try {
     
     # Send email report if configured
     if ($SendEmail -and $summaryTable.Count -gt 0) {
-        Write-Host "`nGenerating email report..." -ForegroundColor Green
+        Write-Host "`nGenerating email report..."
         
         # Create HTML email content
         $htmlBody = @"
@@ -321,6 +318,8 @@ try {
         foreach ($vcServer in $vCenterOrder) {
             $sortedEmailResults += $emailResults | Where-Object { $_.vCenter -eq $vcServer }
         }
+        
+        foreach ($row in $sortedSummaryTable) {
             $riskClass = $row.OverallRisk.ToLower()
             $htmlBody += "<tr class='$riskClass'>"
             $htmlBody += "<td>$($row.vCenter)</td>"
@@ -353,7 +352,7 @@ try {
         </tr>
 "@
         
-        foreach ($row in $emailResults) {
+        foreach ($row in $sortedEmailResults) {
             $riskClass = $row.RiskLevel.ToLower() -replace ' ', ''
             $htmlBody += "<tr class='$riskClass'>"
             $htmlBody += "<td>$($row.vCenter)</td>"
@@ -406,10 +405,10 @@ try {
             
             # No credentials needed - anonymous SMTP with SSL
             Send-MailMessage @emailParams
-            Write-Host "  ✓ Email report sent successfully to $EmailTo via SSL" -ForegroundColor Green
+            Write-Host "  ✓ Email report sent successfully to $EmailTo via SSL"
             
         } catch {
-            Write-Host "  ✗ Failed to send email: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "  ✗ Failed to send email: $($_.Exception.Message)"
         }
     }
     
@@ -418,11 +417,11 @@ try {
 } finally {
     # Disconnect from vCenter
     if ($global:DefaultVIServers) {
-        Write-Host "`nDisconnecting from vCenter..." -ForegroundColor Green
+        Write-Host "`nDisconnecting from vCenter..."
         Disconnect-VIServer -Server * -Confirm:$false
     }
 }
 
-Write-Host "`nCapacity analysis complete!" -ForegroundColor Green
-Write-Host "`nNote: Analysis based on allocated resources and typical overcommit ratios." -ForegroundColor Gray
-Write-Host "For more precise results, monitor actual performance during peak hours." -ForegroundColor Gray
+Write-Host "`nCapacity analysis complete!"
+Write-Host "`nNote: Analysis based on allocated resources and typical overcommit ratios."
+Write-Host "For more precise results, monitor actual performance during peak hours."
