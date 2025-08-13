@@ -158,7 +158,7 @@ try {
             TotalVMs = $totalVMs
             pCPU = $totalCpuCores
             vCPU = $allocatedCpuCores
-            CPURatio = "$($vCpuToPcpuRatio):1"
+            vCpuToPcpuRatio = "$($vCpuToPcpuRatio):1"
             CurrentCPU = "$currentCpuUtilPct%"
             CurrentMemory = "$currentMemUtilPct%"
             MaxHostsDown = $maxHostsCanLose
@@ -212,7 +212,7 @@ try {
             <th>Total VMs</th>
             <th>pCPU Cores</th>
             <th>vCPU Assigned</th>
-            <th>CPU Ratio</th>
+            <th>vCPU:pCPU Ratio</th>
             <th>Current CPU</th>
             <th>Current Memory</th>
             <th>Host Failure Capacity</th>
@@ -227,7 +227,7 @@ try {
             $htmlBody += "<td>$($row.TotalVMs)</td>"
             $htmlBody += "<td>$($row.pCPU)</td>"
             $htmlBody += "<td>$($row.vCPU)</td>"
-            $htmlBody += "<td>$($row.CPURatio)</td>"
+            $htmlBody += "<td>$($row.vCpuToPcpuRatio)</td>"
             $htmlBody += "<td>$($row.CurrentCPU)</td>"
             $htmlBody += "<td>$($row.CurrentMemory)</td>"
             $htmlBody += "<td>$($row.HostsDownMessage)</td>"
@@ -237,7 +237,44 @@ try {
         $htmlBody += @"
     </table>
 
-    <h2>Failure Impact Analysis (Maximum 2 Hosts Down)</h2>
+    <h2>Detailed Failure Scenarios by Cluster</h2>
+"@
+        
+        # Group failure analysis by cluster for detailed breakdown
+        $clustersForAnalysis = $failureAnalysis | Group-Object {$_.vCenter + " - " + $_.Cluster}
+        
+        foreach ($clusterGroup in $clustersForAnalysis) {
+            $clusterName = $clusterGroup.Name
+            $scenarios = $clusterGroup.Group
+            
+            $htmlBody += @"
+    <h3>$clusterName</h3>
+    <table>
+        <tr>
+            <th>Hosts Down</th>
+            <th>Remaining Hosts</th>
+            <th>CPU Utilization</th>
+            <th>Memory Utilization</th>
+            <th>Status</th>
+        </tr>
+"@
+            
+            foreach ($scenario in $scenarios) {
+                $htmlBody += "<tr>"
+                $htmlBody += "<td>$($scenario.HostsDown)</td>"
+                $htmlBody += "<td>$($scenario.RemainingHosts)</td>"
+                $htmlBody += "<td>$($scenario.CPUUtilization)</td>"
+                $htmlBody += "<td>$($scenario.MemoryUtilization)</td>"
+                $htmlBody += "<td>$($scenario.Status)</td>"
+                $htmlBody += "</tr>"
+            }
+            
+            $htmlBody += "</table>"
+        }
+        
+        $htmlBody += @"
+
+    <h2>Summary Failure Impact Analysis</h2>
     <table>
         <tr>
             <th>vCenter</th>
