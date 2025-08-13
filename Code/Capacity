@@ -18,21 +18,39 @@ $CpuThresholdPct = 0.80               # 80% CPU threshold before performance iss
 Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session
 
 try {
-    # Connect to multiple vCenter Servers
-    Write-Host "Connecting to vCenter Servers:" -ForegroundColor Green
-    $vCenterServers | ForEach-Object { Write-Host "  - '$_'" -ForegroundColor Gray }
+    # Validate and clean vCenter server list
+    Write-Host "Validating vCenter Servers:" -ForegroundColor Green
+    $validVCenterServers = @()
     
-    foreach ($vCenterServer in $vCenterServers) {
-        Write-Host "`nConnecting to: $vCenterServer" -ForegroundColor Yellow
+    foreach ($server in $vCenterServers) {
+        if (-not [string]::IsNullOrWhiteSpace($server)) {
+            $cleanServer = $server.Trim()
+            if ($cleanServer -ne "") {
+                $validVCenterServers += $cleanServer
+                Write-Host "  ✓ Added: '$cleanServer'" -ForegroundColor Green
+            }
+        }
+    }
+    
+    if ($validVCenterServers.Count -eq 0) {
+        Write-Host "No valid vCenter servers found in the list!" -ForegroundColor Red
+        return
+    }
+    
+    # Connect to validated vCenter Servers
+    Write-Host "`nConnecting to vCenter Servers..." -ForegroundColor Yellow
+    
+    foreach ($vCenterServer in $validVCenterServers) {
+        Write-Host "  Attempting connection to: $vCenterServer" -ForegroundColor Cyan
         try {
             if ($Credential) {
                 Connect-VIServer -Server $vCenterServer -Credential $Credential -ErrorAction Stop
             } else {
                 Connect-VIServer -Server $vCenterServer -ErrorAction Stop
             }
-            Write-Host "  ✓ Connected successfully" -ForegroundColor Green
+            Write-Host "    ✓ Connected successfully" -ForegroundColor Green
         } catch {
-            Write-Host "  ✗ Failed to connect: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "    ✗ Failed to connect: $($_.Exception.Message)" -ForegroundColor Red
             continue
         }
     }
