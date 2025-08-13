@@ -1,4 +1,4 @@
-# VMware Cluster Capacity Analysis Script
+# VMware Cluster Capacity Analysis Script - Simplified Approach
 # Calculates how many hosts can be down before performance degradation
 
 # Connection to multiple vCenter Servers
@@ -10,7 +10,13 @@ $vCenterServers = @(
 
 param(
     [Parameter(Mandatory=$false)]
-    [PSCredential]$Credential
+    [PSCredential]$Credential,
+    [Parameter(Mandatory=$false)]
+    [double]$CpuOvercommitRatio = 2.0,  # How much you typically overcommit CPU (2:1 is common)
+    [Parameter(Mandatory=$false)]
+    [double]$MemoryBufferPct = 0.15,    # 15% memory buffer for performance
+    [Parameter(Mandatory=$false)]
+    [double]$CpuThresholdPct = 0.80     # 80% CPU threshold before performance issues
 )
 
 # Suppress certificate warnings (optional)
@@ -50,8 +56,8 @@ try {
         Write-Host "Cluster: $($cluster.Name)" -ForegroundColor Cyan
         Write-Host "-" * 50
         
-        # Get all hosts in cluster
-        $hosts = $cluster | Get-VMHost | Where-Object { $_.ConnectionState -eq "Connected" }
+        # Get all connected hosts in cluster
+        $hosts = $cluster | Get-VMHost | Where-Object { $_.ConnectionState -eq "Connected" -and $_.PowerState -eq "PoweredOn" }
         $totalHosts = $hosts.Count
         
         if ($totalHosts -lt 2) {
@@ -62,91 +68,121 @@ try {
         # Calculate total cluster resources
         $totalCpuMhz = ($hosts | Measure-Object -Property CpuTotalMhz -Sum).Sum
         $totalMemoryMB = ($hosts | Measure-Object -Property MemoryTotalMB -Sum).Sum
+        $totalCpuCores = ($hosts | Measure-Object -Property NumCpu -Sum).Sum
         
-        # Get VM resource usage (active/demand metrics)
+        # Get all powered-on VMs in the cluster
+        Write-Host "  Analyzing VM resource allocation..." -ForegroundColor Gray
         $vms = $cluster | Get-VM | Where-Object { $_.PowerState -eq "PoweredOn" }
+        $totalVMs = $vms.Count
         
-        # Use current real-time stats instead of historical data for faster execution
-        Write-Host "  Getting current resource utilization..." -ForegroundColor Gray
+        # Calculate VM resource demands (allocated resources)
+        $allocatedCpuCores = ($vms | Measure-Object -Property NumCpu -Sum).Sum
+        $allocatedMemoryMB = ($vms | Measure-Object -Property MemoryMB -Sum).Sum
         
-        # Get current CPU and Memory usage (much faster than historical stats)
-        Write-Host "    - CPU statistics..." -ForegroundColor DarkGray
-        $cpuStats = $vms | Get-Stat -Stat "cpu.usagemhz.average" -MaxSamples 1 -Realtime -ErrorAction SilentlyContinue
-        $currentCpuDemand = if ($cpuStats) { 
-            ($cpuStats | Measure-Object -Property Value -Sum).Sum
-        } else { 
-            # Fallback: estimate based on allocated vCPUs (conservative estimate)
-            ($vms | Measure-Object -Property NumCpu -Sum).Sum * 1500  # Assume 1.5 GHz average per vCPU
-        }
+        # Estimate actual CPU demand (accounting for typical overcommit)
+        $estimatedCpuDemandMhz = ($allocatedCpuCores * ($totalCpuMhz / $totalCpuCores)) / $CpuOvercommitRatio
         
-        Write-Host "    - Memory statistics..." -ForegroundColor DarkGray
-        # Get Memory usage statistics (active memory) - current only
-        $memStats = $vms | Get-Stat -Stat "mem.active.average" -MaxSamples 1 -Realtime -ErrorAction SilentlyContinue
-        $currentMemDemand = if ($memStats) { 
-            ($memStats | Measure-Object -Property Value -Sum).Sum / 1KB  # Convert to MB
-        } else { 
-            # Fallback: estimate based on allocated memory
-            ($vms | Measure-Object -Property MemoryMB -Sum).Sum * 0.7  # Assume 70% active if no stats
-        }
+        # Memory demand (VMs typically use most of their allocated memory)
+        $estimatedMemoryDemandMB = $allocatedMemoryMB * (1 - $MemoryBufferPct)
         
-
+        # Calculate current utilization percentages
+        $currentCpuUtilPct = [math]::Round(($estimatedCpuDemandMhz / $totalCpuMhz) * 100, 2)
+        $currentMemUtilPct = [math]::Round(($estimatedMemoryDemandMB / $totalMemoryMB) * 100, 2)
         
-        # Performance thresholds (configurable)
-        $cpuThreshold = 0.80  # 80% CPU utilization threshold
-        $memThreshold = 0.85  # 85% Memory utilization threshold
+        # Calculate how much capacity we need per host (average)
+        $avgCpuPerHost = $totalCpuMhz / $totalHosts
+        $avgMemoryPerHost = $totalMemoryMB / $totalHosts
         
-        # Calculate available resources after threshold
-        $availableCpuMhz = $totalCpuMhz * $cpuThreshold
-        $availableMemoryMB = $totalMemoryMB * $memThreshold
+        # Calculate minimum hosts needed to handle current workload within thresholds
+        $minHostsForCpu = [math]::Ceiling($estimatedCpuDemandMhz / ($avgCpuPerHost * $CpuThresholdPct))
+        $minHostsForMemory = [math]::Ceiling($estimatedMemoryDemandMB / ($avgMemoryPerHost * (1 - $MemoryBufferPct)))
         
-        # Current utilization percentages
-        $cpuUtilPct = [math]::Round(($currentCpuDemand / $totalCpuMhz) * 100, 2)
-        $memUtilPct = [math]::Round(($currentMemDemand / $totalMemoryMB) * 100, 2)
+        # Most restrictive requirement
+        $minHostsNeeded = [math]::Max($minHostsForCpu, $minHostsForMemory)
+        $maxHostsCanLose = [math]::Max(0, $totalHosts - $minHostsNeeded)
         
-        # Calculate maximum hosts that can be lost
-        # This considers that remaining hosts must handle current workload within thresholds
+        # Determine limiting factor
+        $limitingFactor = if ($minHostsForCpu -gt $minHostsForMemory) { "CPU" } else { "Memory" }
         
-        # CPU-based calculation
-        $minHostsForCpu = [math]::Ceiling($currentCpuDemand / ($availableCpuMhz / $totalHosts))
-        $maxHostsDownCpu = $totalHosts - $minHostsForCpu
+        # HA considerations
+        $haFailoverHosts = if ($cluster.HAAdmissionControlEnabled) { $cluster.HAFailoverLevel } else { 0 }
         
-        # Memory-based calculation  
-        $minHostsForMem = [math]::Ceiling($currentMemDemand / ($availableMemoryMB / $totalHosts))
-        $maxHostsDownMem = $totalHosts - $minHostsForMem
+        # Calculate effective capacity per host failure
+        Write-Host "  Calculating failure scenarios..." -ForegroundColor Gray
+        $capacityTable = @()
         
-        # Most restrictive limit
-        $maxHostsDown = [math]::Min($maxHostsDownCpu, $maxHostsDownMem)
-        $limitingFactor = if ($maxHostsDownCpu -lt $maxHostsDownMem) { "CPU" } else { "Memory" }
-        
-        # HA slot calculation for additional context
-        $haAdmissionControl = $cluster.HAAdmissionControlEnabled
-        $haFailoverLevel = $cluster.HAFailoverLevel
-        
-        # Display results
-        Write-Host "  Total Hosts: $totalHosts" -ForegroundColor White
-        Write-Host "  Current CPU Demand: $([math]::Round($currentCpuDemand, 0)) MHz ($cpuUtilPct%)" -ForegroundColor White
-        Write-Host "  Current Memory Demand: $([math]::Round($currentMemDemand, 0)) MB ($memUtilPct%)" -ForegroundColor White
-        Write-Host "  Total CPU: $([math]::Round($totalCpuMhz, 0)) MHz" -ForegroundColor Gray
-        Write-Host "  Total Memory: $([math]::Round($totalMemoryMB, 0)) MB" -ForegroundColor Gray
-        
-        Write-Host "`n  CAPACITY ANALYSIS:" -ForegroundColor Yellow
-        Write-Host "  Max hosts you can lose: $maxHostsDown hosts" -ForegroundColor $(if ($maxHostsDown -gt 1) { "Green" } elseif ($maxHostsDown -eq 1) { "Yellow" } else { "Red" })
-        Write-Host "  Limiting factor: $limitingFactor" -ForegroundColor White
-        Write-Host "  Performance thresholds: CPU $($cpuThreshold*100)%, Memory $($memThreshold*100)%" -ForegroundColor Gray
-        
-        if ($haAdmissionControl) {
-            Write-Host "  HA Failover Level: $haFailoverLevel" -ForegroundColor Cyan
-            $haConstraint = [math]::Max(0, $totalHosts - $haFailoverLevel - 1)
-            if ($haConstraint -lt $maxHostsDown) {
-                Write-Host "  HA Admission Control limits you to: $haConstraint hosts down" -ForegroundColor Red
+        for ($hostsDown = 0; $hostsDown -le [math]::Min(3, $totalHosts - 1); $hostsDown++) {
+            $remainingHosts = $totalHosts - $hostsDown
+            $remainingCpuMhz = $remainingHosts * $avgCpuPerHost
+            $remainingMemoryMB = $remainingHosts * $avgMemoryPerHost
+            
+            $cpuUtilAfterFailure = [math]::Round(($estimatedCpuDemandMhz / $remainingCpuMhz) * 100, 2)
+            $memUtilAfterFailure = [math]::Round(($estimatedMemoryDemandMB / $remainingMemoryMB) * 100, 2)
+            
+            $status = "OK"
+            if ($cpuUtilAfterFailure -gt ($CpuThresholdPct * 100) -or $memUtilAfterFailure -gt ((1 - $MemoryBufferPct) * 100)) {
+                $status = "PERFORMANCE RISK"
+            }
+            
+            $capacityTable += [PSCustomObject]@{
+                HostsDown = $hostsDown
+                RemainingHosts = $remainingHosts
+                CPUUtil = "$cpuUtilAfterFailure%"
+                MemoryUtil = "$memUtilAfterFailure%"
+                Status = $status
             }
         }
         
-        # Warnings
-        if ($maxHostsDown -le 0) {
-            Write-Host "  WARNING: Cluster is already at or over capacity!" -ForegroundColor Red
-        } elseif ($maxHostsDown -eq 1) {
-            Write-Host "  CAUTION: Limited redundancy available" -ForegroundColor Yellow
+        # Display results
+        Write-Host "`n  CLUSTER SUMMARY:" -ForegroundColor White
+        Write-Host "  Total Hosts: $totalHosts" -ForegroundColor White
+        Write-Host "  Total VMs: $totalVMs" -ForegroundColor White
+        Write-Host "  Total CPU: $([math]::Round($totalCpuMhz/1000, 1)) GHz ($totalCpuCores cores)" -ForegroundColor Gray
+        Write-Host "  Total Memory: $([math]::Round($totalMemoryMB/1024, 1)) GB" -ForegroundColor Gray
+        
+        Write-Host "`n  CURRENT UTILIZATION (Estimated):" -ForegroundColor White
+        Write-Host "  CPU Demand: $([math]::Round($estimatedCpuDemandMhz/1000, 1)) GHz ($currentCpuUtilPct%)" -ForegroundColor White
+        Write-Host "  Memory Demand: $([math]::Round($estimatedMemoryDemandMB/1024, 1)) GB ($currentMemUtilPct%)" -ForegroundColor White
+        Write-Host "  vCPU:pCPU Ratio: $([math]::Round($allocatedCpuCores / $totalCpuCores, 2)):1" -ForegroundColor Gray
+        
+        Write-Host "`n  CAPACITY ANALYSIS:" -ForegroundColor Yellow
+        Write-Host "  Max hosts you can lose: $maxHostsCanLose hosts" -ForegroundColor $(
+            if ($maxHostsCanLose -gt 2) { "Green" } 
+            elseif ($maxHostsCanLose -ge 1) { "Yellow" } 
+            else { "Red" }
+        )
+        Write-Host "  Limiting factor: $limitingFactor" -ForegroundColor White
+        Write-Host "  Min hosts needed: $minHostsNeeded (for performance thresholds)" -ForegroundColor Gray
+        
+        if ($haFailoverHosts -gt 0) {
+            $haConstraint = [math]::Max(0, $totalHosts - $haFailoverHosts - 1)
+            Write-Host "  HA Failover Level: $haFailoverHosts hosts" -ForegroundColor Cyan
+            if ($haConstraint -lt $maxHostsCanLose) {
+                Write-Host "  HA limits you to: $haConstraint hosts down" -ForegroundColor Yellow
+                $maxHostsCanLose = $haConstraint
+            }
+        }
+        
+        Write-Host "`n  FAILURE IMPACT ANALYSIS:" -ForegroundColor Yellow
+        $capacityTable | Format-Table -AutoSize
+        
+        # Warnings and recommendations
+        Write-Host "  RECOMMENDATIONS:" -ForegroundColor Cyan
+        if ($maxHostsCanLose -le 0) {
+            Write-Host "  ⚠️  CRITICAL: Cluster is at or over capacity!" -ForegroundColor Red
+            Write-Host "      - Consider adding hosts or migrating VMs" -ForegroundColor Red
+        } elseif ($maxHostsCanLose -eq 1) {
+            Write-Host "  ⚠️  CAUTION: Limited redundancy available" -ForegroundColor Yellow
+            Write-Host "      - Single host failure will impact performance" -ForegroundColor Yellow
+        } else {
+            Write-Host "  ✅ Good redundancy: Can handle $maxHostsCanLose host failures" -ForegroundColor Green
+        }
+        
+        if ($currentCpuUtilPct -gt 60) {
+            Write-Host "  💡 Consider CPU optimization or additional hosts" -ForegroundColor Cyan
+        }
+        if ($currentMemUtilPct -gt 75) {
+            Write-Host "  💡 Memory utilization is high - monitor closely" -ForegroundColor Cyan
         }
         
         Write-Host ""
@@ -163,3 +199,5 @@ try {
 }
 
 Write-Host "`nCapacity analysis complete!" -ForegroundColor Green
+Write-Host "`nNote: Analysis based on allocated resources and typical overcommit ratios." -ForegroundColor Gray
+Write-Host "For more precise results, monitor actual performance during peak hours." -ForegroundColor Gray
