@@ -24,7 +24,7 @@ $UseSSL = $true                        # Use SSL encryption
 $SMTPCredentials = $null               # No SMTP authentication required
 
 # Get credentials once at the start
-Write-Host "Please enter your vCenter credentials:"
+Write-Host "Please enter your vCenter credentials:" -ForegroundColor Yellow
 $Credential = Get-Credential
 
 # Suppress certificate warnings (optional)
@@ -32,18 +32,18 @@ Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scop
 
 try {
     # Connect to vCenter Servers
-    Write-Host "Connecting to vCenter Servers:"
+    Write-Host "Connecting to vCenter Servers:" -ForegroundColor Green
     
     foreach ($server in $vCenterServers) {
         if (-not [string]::IsNullOrWhiteSpace($server)) {
             $cleanServer = $server.Trim()
             if ($cleanServer -ne "") {
-                Write-Host "  Attempting connection to: $cleanServer"
+                Write-Host "  Attempting connection to: $cleanServer" -ForegroundColor Cyan
                 try {
                     Connect-VIServer -Server $cleanServer -Credential $Credential -ErrorAction Stop
-                    Write-Host "    Connected successfully"
+                    Write-Host "    ✓ Connected successfully" -ForegroundColor Green
                 } catch {
-                    Write-Host "    Failed to connect: $($_.Exception.Message)"
+                    Write-Host "    ✗ Failed to connect: $($_.Exception.Message)" -ForegroundColor Red
                     continue
                 }
             }
@@ -56,20 +56,20 @@ try {
     # Initialize results collection for email
     $summaryTable = @()
     
-    Write-Host "`nAnalyzing cluster capacity across all vCenter servers..."
+    Write-Host "`nAnalyzing cluster capacity across all vCenter servers..." -ForegroundColor Yellow
     
     foreach ($cluster in $clusters) {
         # Get the vCenter server this cluster belongs to
         $vCenterName = $cluster.Uid.Split('@')[1].Split(':')[0]
         
-        Write-Host "Processing vCenter: $vCenterName, Cluster: $($cluster.Name)"
+        Write-Host "Processing vCenter: $vCenterName, Cluster: $($cluster.Name)" -ForegroundColor Cyan
         
         # Get all connected hosts in cluster
         $hosts = $cluster | Get-VMHost | Where-Object { $_.ConnectionState -eq "Connected" -and $_.PowerState -eq "PoweredOn" }
         $totalHosts = $hosts.Count
         
         if ($totalHosts -lt 2) {
-            Write-Host "  Insufficient hosts for analysis (need at least 2)"
+            Write-Host "  Insufficient hosts for analysis (need at least 2)" -ForegroundColor Yellow
             continue
         }
         
@@ -123,15 +123,23 @@ try {
             Cluster = $cluster.Name
             TotalHosts = $totalHosts
             TotalVMs = $totalVMs
+            pCPU = $totalCpuCores
+            vCPU = $allocatedCpuCores
             CurrentCPU = "$currentCpuUtilPct%"
             CurrentMemory = "$currentMemUtilPct%"
             MaxHostsDown = $maxHostsCanLose
+            HostsDownMessage = if ($maxHostsCanLose -eq 0) { "No hosts can fail" } 
+                              elseif ($maxHostsCanLose -eq 1) { "1 host can fail" } 
+                              else { "$maxHostsCanLose hosts can fail" }
         }
     }
     
+    # Sort the summary table by vCenter and Cluster name
+    $summaryTable = $summaryTable | Sort-Object vCenter, Cluster
+    
     # Send email report if configured
     if ($SendEmail -and $summaryTable.Count -gt 0) {
-        Write-Host "`nGenerating email report..."
+        Write-Host "`nGenerating email report..." -ForegroundColor Green
         
         # Create HTML email content
         $htmlBody = @"
@@ -167,9 +175,11 @@ try {
             <th>Cluster</th>
             <th>Total Hosts</th>
             <th>Total VMs</th>
+            <th>pCPU Cores</th>
+            <th>vCPU Assigned</th>
             <th>Current CPU</th>
             <th>Current Memory</th>
-            <th>Max Hosts Down</th>
+            <th>Host Failure Capacity</th>
         </tr>
 "@
         
@@ -179,9 +189,11 @@ try {
             $htmlBody += "<td>$($row.Cluster)</td>"
             $htmlBody += "<td>$($row.TotalHosts)</td>"
             $htmlBody += "<td>$($row.TotalVMs)</td>"
+            $htmlBody += "<td>$($row.pCPU)</td>"
+            $htmlBody += "<td>$($row.vCPU)</td>"
             $htmlBody += "<td>$($row.CurrentCPU)</td>"
             $htmlBody += "<td>$($row.CurrentMemory)</td>"
-            $htmlBody += "<td>$($row.MaxHostsDown)</td>"
+            $htmlBody += "<td>$($row.HostsDownMessage)</td>"
             $htmlBody += "</tr>"
         }
         
@@ -206,10 +218,10 @@ try {
             }
             
             Send-MailMessage @emailParams
-            Write-Host "Email report sent successfully to $EmailTo"
+            Write-Host "✓ Email report sent successfully to $EmailTo" -ForegroundColor Green
             
         } catch {
-            Write-Host "Failed to send email: $($_.Exception.Message)"
+            Write-Host "✗ Failed to send email: $($_.Exception.Message)" -ForegroundColor Red
         }
     }
     
@@ -218,9 +230,9 @@ try {
 } finally {
     # Disconnect from vCenter
     if ($global:DefaultVIServers) {
-        Write-Host "`nDisconnecting from vCenter..."
+        Write-Host "`nDisconnecting from vCenter..." -ForegroundColor Green
         Disconnect-VIServer -Server * -Confirm:$false
     }
 }
 
-Write-Host "`nCapacity analysis complete!"
+Write-Host "`nCapacity analysis complete!" -ForegroundColor Green
