@@ -1,4 +1,5 @@
-# VMware Cluster Capacity Analysis Script - Simplified Approach
+# Warnings and recommendations
+        Write-Host "  RECOMMENDATIONS:" -ForegroundColor Cyan# VMware Cluster Capacity Analysis Script - Simplified Approach
 # Calculates how many hosts can be down before performance degradation
 
 # Connection to multiple vCenter Servers
@@ -19,8 +20,9 @@ $EmailTo = "admin@company.com"         # Recipient email
 $EmailFrom = "vmware-reports@company.com" # Sender email
 $EmailSubject = "VMware Cluster Capacity Analysis - $(Get-Date -Format 'yyyy-MM-dd')"
 $SMTPServer = "mail.company.com"       # Your SMTP server
-$SMTPPort = 587                        # SMTP port (587 for TLS, 25 for unencrypted)
-$SMTPCredentials = $null               # Set to Get-Credential if SMTP requires authentication
+$SMTPPort = 465                        # SSL port (465 for SSL, 587 for TLS)
+$UseSSL = $true                        # Use SSL encryption
+$SMTPCredentials = $null               # No SMTP authentication required
 
 # Get credentials once at the start
 Write-Host "Please enter your vCenter credentials:" -ForegroundColor Yellow
@@ -240,6 +242,151 @@ try {
         }
         
         Write-Host ""
+    }
+    
+    # Send email report if configured
+    if ($SendEmail -and $summaryTable.Count -gt 0) {
+        Write-Host "`nGenerating email report..." -ForegroundColor Green
+        
+        # Create HTML email content
+        $htmlBody = @"
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        h1 { color: #2E8B57; }
+        h2 { color: #4682B4; margin-top: 30px; }
+        table { border-collapse: collapse; width: 100%; margin: 15px 0; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        th { background-color: #f2f2f2; font-weight: bold; }
+        .critical { background-color: #ffebee; color: #c62828; }
+        .high { background-color: #fff3e0; color: #ef6c00; }
+        .medium { background-color: #fff8e1; color: #f57f17; }
+        .low { background-color: #e8f5e8; color: #2e7d32; }
+        .summary { background-color: #f5f5f5; padding: 10px; margin: 20px 0; }
+    </style>
+</head>
+<body>
+    <h1>VMware Cluster Capacity Analysis Report</h1>
+    <p><strong>Generated:</strong> $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</p>
+    
+    <div class="summary">
+        <h3>Analysis Parameters</h3>
+        <ul>
+            <li>CPU Overcommit Ratio: $($CpuOvercommitRatio):1</li>
+            <li>CPU Threshold: $($CpuThresholdPct * 100)%</li>
+            <li>Memory Buffer: $($MemoryBufferPct * 100)%</li>
+        </ul>
+    </div>
+
+    <h2>Cluster Summary</h2>
+    <table>
+        <tr>
+            <th>vCenter</th>
+            <th>Cluster</th>
+            <th>Total Hosts</th>
+            <th>Total VMs</th>
+            <th>Current CPU</th>
+            <th>Current Memory</th>
+            <th>vCPU:pCPU</th>
+            <th>Max Hosts Down</th>
+            <th>Limiting Factor</th>
+            <th>Risk Level</th>
+        </tr>
+"@
+        
+        foreach ($row in $summaryTable) {
+            $riskClass = $row.OverallRisk.ToLower()
+            $htmlBody += "<tr class='$riskClass'>"
+            $htmlBody += "<td>$($row.vCenter)</td>"
+            $htmlBody += "<td>$($row.Cluster)</td>"
+            $htmlBody += "<td>$($row.TotalHosts)</td>"
+            $htmlBody += "<td>$($row.TotalVMs)</td>"
+            $htmlBody += "<td>$($row.CurrentCPU)</td>"
+            $htmlBody += "<td>$($row.CurrentMemory)</td>"
+            $htmlBody += "<td>$($row.vCpuToPcpu)</td>"
+            $htmlBody += "<td>$($row.MaxHostsDown)</td>"
+            $htmlBody += "<td>$($row.LimitingFactor)</td>"
+            $htmlBody += "<td>$($row.OverallRisk)</td>"
+            $htmlBody += "</tr>"
+        }
+        
+        $htmlBody += @"
+    </table>
+
+    <h2>Detailed Failure Scenarios</h2>
+    <table>
+        <tr>
+            <th>vCenter</th>
+            <th>Cluster</th>
+            <th>Hosts Down</th>
+            <th>Remaining Hosts</th>
+            <th>CPU Utilization</th>
+            <th>Memory Utilization</th>
+            <th>Status</th>
+            <th>Risk Level</th>
+        </tr>
+"@
+        
+        foreach ($row in $emailResults) {
+            $riskClass = $row.RiskLevel.ToLower() -replace ' ', ''
+            $htmlBody += "<tr class='$riskClass'>"
+            $htmlBody += "<td>$($row.vCenter)</td>"
+            $htmlBody += "<td>$($row.Cluster)</td>"
+            $htmlBody += "<td>$($row.HostsDown)</td>"
+            $htmlBody += "<td>$($row.RemainingHosts)</td>"
+            $htmlBody += "<td>$($row.CPUUtilization)</td>"
+            $htmlBody += "<td>$($row.MemoryUtilization)</td>"
+            $htmlBody += "<td>$($row.Status)</td>"
+            $htmlBody += "<td>$($row.RiskLevel)</td>"
+            $htmlBody += "</tr>"
+        }
+        
+        $htmlBody += @"
+    </table>
+
+    <h2>Performance Risk Explanation</h2>
+    <div class="summary">
+        <p><strong>Performance Risk is determined by:</strong></p>
+        <ul>
+            <li><strong>CPU Threshold:</strong> When CPU utilization exceeds $($CpuThresholdPct * 100)% after host failure</li>
+            <li><strong>Memory Threshold:</strong> When memory utilization exceeds $((1-$MemoryBufferPct) * 100)% after host failure</li>
+            <li><strong>Overcommit Risk:</strong> When vCPU:pCPU ratio exceeds $($CpuOvercommitRatio):1 AND CPU utilization > 60%</li>
+        </ul>
+        <p><strong>Risk Levels:</strong></p>
+        <ul>
+            <li><span class="critical"><strong>Critical:</strong></span> Cannot lose any hosts without performance impact</li>
+            <li><span class="high"><strong>High:</strong></span> Can lose 1 host or high overcommit with elevated utilization</li>
+            <li><span class="medium"><strong>Medium:</strong></span> Current utilization >70% CPU or >80% Memory</li>
+            <li><span class="low"><strong>Low:</strong></span> Good capacity headroom available</li>
+        </ul>
+    </div>
+
+    <p><em>Report generated by VMware Capacity Analysis Script</em></p>
+</body>
+</html>
+"@
+        
+        try {
+            $emailParams = @{
+                To = $EmailTo
+                From = $EmailFrom
+                Subject = $EmailSubject
+                Body = $htmlBody
+                BodyAsHtml = $true
+                SmtpServer = $SMTPServer
+                Port = $SMTPPort
+                UseSsl = $UseSSL
+            }
+            
+            # No credentials needed - anonymous SMTP with SSL
+            Send-MailMessage @emailParams
+            Write-Host "  ✓ Email report sent successfully to $EmailTo via SSL" -ForegroundColor Green
+            
+        } catch {
+            Write-Host "  ✗ Failed to send email: $($_.Exception.Message)" -ForegroundColor Red
+        }
     }
     
 } catch {
