@@ -1,0 +1,141 @@
+# Connection to vCenter
+param(
+    [Parameter(Mandatory=$true)]
+    [string]$vCenterServer,
+    [Parameter(Mandatory=$false)]
+    [PSCredential]$Credential
+)
+
+# Suppress certificate warnings (optional)
+Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session
+
+try {
+    # Connect to vCenter
+    Write-Host "Connecting to vCenter Server: $vCenterServer" -ForegroundColor Green
+    if ($Credential) {
+        Connect-VIServer -Server $vCenterServer -Credential $Credential -ErrorAction Stop
+    } else {
+        Connect-VIServer -Server $vCenterServer -ErrorAction Stop
+    }
+
+    # Get all clusters
+    $clusters = Get-Cluster | Where-Object { $_.HAEnabled -eq $true }
+    
+    Write-Host "`nAnalyzing cluster capacity..." -ForegroundColor Yellow
+    Write-Host "=" * 80
+    
+    foreach ($cluster in $clusters) {
+        Write-Host "`nCluster: $($cluster.Name)" -ForegroundColor Cyan
+        Write-Host "-" * 50
+        
+        # Get all hosts in cluster
+        $hosts = $cluster | Get-VMHost | Where-Object { $_.ConnectionState -eq "Connected" }
+        $totalHosts = $hosts.Count
+        
+        if ($totalHosts -lt 2) {
+            Write-Host "  Insufficient hosts for analysis (need at least 2)" -ForegroundColor Red
+            continue
+        }
+        
+        # Calculate total cluster resources
+        $totalCpuMhz = ($hosts | Measure-Object -Property CpuTotalMhz -Sum).Sum
+        $totalMemoryMB = ($hosts | Measure-Object -Property MemoryTotalMB -Sum).Sum
+        
+        # Get VM resource usage (active/demand metrics)
+        $vms = $cluster | Get-VM | Where-Object { $_.PowerState -eq "PoweredOn" }
+        
+        # Calculate 95th percentile CPU and Memory demand
+        Write-Host "  Calculating 95th percentile resource demand..." -ForegroundColor Gray
+        
+        # Get CPU usage statistics (last 24 hours)
+        $cpuStats = $vms | Get-Stat -Stat "cpu.usagemhz.average" -Start (Get-Date).AddDays(-1) -Finish (Get-Date) -MaxSamples 144
+        $cpuDemand95th = if ($cpuStats) { 
+            ($cpuStats | Sort-Object Value | Select-Object -Last ([math]::Ceiling($cpuStats.Count * 0.95)) | Select-Object -First 1).Value 
+        } else { 
+            ($vms | Measure-Object -Property NumCpu -Sum).Sum * 2000  # Estimate if no stats
+        }
+        
+        # Get Memory usage statistics (active memory)
+        $memStats = $vms | Get-Stat -Stat "mem.active.average" -Start (Get-Date).AddDays(-1) -Finish (Get-Date) -MaxSamples 144
+        $memDemand95th = if ($memStats) { 
+            ($memStats | Sort-Object Value | Select-Object -Last ([math]::Ceiling($memStats.Count * 0.95)) | Select-Object -First 1).Value / 1KB  # Convert to MB
+        } else { 
+            ($vms | Measure-Object -Property MemoryMB -Sum).Sum * 0.8  # Estimate 80% active if no stats
+        }
+        
+        # Current utilization
+        $currentCpuUsage = ($hosts | Get-Stat -Stat "cpu.usagemhz.average" -MaxSamples 1 | Measure-Object -Property Value -Sum).Sum
+        $currentMemUsage = ($hosts | Get-Stat -Stat "mem.active.average" -MaxSamples 1 | Measure-Object -Property Value -Sum).Sum / 1KB
+        
+        # Performance thresholds (configurable)
+        $cpuThreshold = 0.80  # 80% CPU utilization threshold
+        $memThreshold = 0.85  # 85% Memory utilization threshold
+        
+        # Calculate available resources after threshold
+        $availableCpuMhz = $totalCpuMhz * $cpuThreshold
+        $availableMemoryMB = $totalMemoryMB * $memThreshold
+        
+        # Current utilization percentages
+        $cpuUtilPct = [math]::Round(($currentCpuUsage / $totalCpuMhz) * 100, 2)
+        $memUtilPct = [math]::Round(($currentMemUsage / $totalMemoryMB) * 100, 2)
+        
+        # Calculate maximum hosts that can be lost
+        # This considers that remaining hosts must handle current workload within thresholds
+        
+        # CPU-based calculation
+        $minHostsForCpu = [math]::Ceiling($currentCpuUsage / ($availableCpuMhz / $totalHosts))
+        $maxHostsDownCpu = $totalHosts - $minHostsForCpu
+        
+        # Memory-based calculation  
+        $minHostsForMem = [math]::Ceiling($currentMemUsage / ($availableMemoryMB / $totalHosts))
+        $maxHostsDownMem = $totalHosts - $minHostsForMem
+        
+        # Most restrictive limit
+        $maxHostsDown = [math]::Min($maxHostsDownCpu, $maxHostsDownMem)
+        $limitingFactor = if ($maxHostsDownCpu -lt $maxHostsDownMem) { "CPU" } else { "Memory" }
+        
+        # HA slot calculation for additional context
+        $haAdmissionControl = $cluster.HAAdmissionControlEnabled
+        $haFailoverLevel = $cluster.HAFailoverLevel
+        
+        # Display results
+        Write-Host "  Total Hosts: $totalHosts" -ForegroundColor White
+        Write-Host "  Current CPU Usage: $([math]::Round($currentCpuUsage, 0)) MHz ($cpuUtilPct%)" -ForegroundColor White
+        Write-Host "  Current Memory Usage: $([math]::Round($currentMemUsage, 0)) MB ($memUtilPct%)" -ForegroundColor White
+        Write-Host "  Total CPU: $([math]::Round($totalCpuMhz, 0)) MHz" -ForegroundColor Gray
+        Write-Host "  Total Memory: $([math]::Round($totalMemoryMB, 0)) MB" -ForegroundColor Gray
+        
+        Write-Host "`n  CAPACITY ANALYSIS:" -ForegroundColor Yellow
+        Write-Host "  Max hosts you can lose: $maxHostsDown hosts" -ForegroundColor $(if ($maxHostsDown -gt 1) { "Green" } elseif ($maxHostsDown -eq 1) { "Yellow" } else { "Red" })
+        Write-Host "  Limiting factor: $limitingFactor" -ForegroundColor White
+        Write-Host "  Performance thresholds: CPU $($cpuThreshold*100)%, Memory $($memThreshold*100)%" -ForegroundColor Gray
+        
+        if ($haAdmissionControl) {
+            Write-Host "  HA Failover Level: $haFailoverLevel" -ForegroundColor Cyan
+            $haConstraint = [math]::Max(0, $totalHosts - $haFailoverLevel - 1)
+            if ($haConstraint -lt $maxHostsDown) {
+                Write-Host "  HA Admission Control limits you to: $haConstraint hosts down" -ForegroundColor Red
+            }
+        }
+        
+        # Warnings
+        if ($maxHostsDown -le 0) {
+            Write-Host "  WARNING: Cluster is already at or over capacity!" -ForegroundColor Red
+        } elseif ($maxHostsDown -eq 1) {
+            Write-Host "  CAUTION: Limited redundancy available" -ForegroundColor Yellow
+        }
+        
+        Write-Host ""
+    }
+    
+} catch {
+    Write-Error "Error: $($_.Exception.Message)"
+} finally {
+    # Disconnect from vCenter
+    if ($global:DefaultVIServers) {
+        Write-Host "`nDisconnecting from vCenter..." -ForegroundColor Green
+        Disconnect-VIServer -Server * -Confirm:$false
+    }
+}
+
+Write-Host "`nCapacity analysis complete!" -ForegroundColor Green
