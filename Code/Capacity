@@ -1,7 +1,14 @@
-# Connection to vCenter
+# VMware Cluster Capacity Analysis Script
+# Calculates how many hosts can be down before performance degradation
+
+# Connection to multiple vCenter Servers
+$vCenterServers = @(
+    "vcenter1.domain.com",
+    "vcenter2.domain.com", 
+    "vcenter3.domain.com"
+)
+
 param(
-    [Parameter(Mandatory=$true)]
-    [string]$vCenterServer,
     [Parameter(Mandatory=$false)]
     [PSCredential]$Credential
 )
@@ -10,22 +17,37 @@ param(
 Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session
 
 try {
-    # Connect to vCenter
-    Write-Host "Connecting to vCenter Server: $vCenterServer" -ForegroundColor Green
-    if ($Credential) {
-        Connect-VIServer -Server $vCenterServer -Credential $Credential -ErrorAction Stop
-    } else {
-        Connect-VIServer -Server $vCenterServer -ErrorAction Stop
+    # Connect to multiple vCenter Servers
+    Write-Host "Connecting to vCenter Servers:" -ForegroundColor Green
+    $vCenterServers | ForEach-Object { Write-Host "  - '$_'" -ForegroundColor Gray }
+    
+    foreach ($vCenterServer in $vCenterServers) {
+        Write-Host "`nConnecting to: $vCenterServer" -ForegroundColor Yellow
+        try {
+            if ($Credential) {
+                Connect-VIServer -Server $vCenterServer -Credential $Credential -ErrorAction Stop
+            } else {
+                Connect-VIServer -Server $vCenterServer -ErrorAction Stop
+            }
+            Write-Host "  ✓ Connected successfully" -ForegroundColor Green
+        } catch {
+            Write-Host "  ✗ Failed to connect: $($_.Exception.Message)" -ForegroundColor Red
+            continue
+        }
     }
 
-    # Get all clusters
+    # Get all clusters from all connected vCenter servers
     $clusters = Get-Cluster | Where-Object { $_.HAEnabled -eq $true }
     
-    Write-Host "`nAnalyzing cluster capacity..." -ForegroundColor Yellow
+    Write-Host "`nAnalyzing cluster capacity across all vCenter servers..." -ForegroundColor Yellow
     Write-Host "=" * 80
     
     foreach ($cluster in $clusters) {
-        Write-Host "`nCluster: $($cluster.Name)" -ForegroundColor Cyan
+        # Get the vCenter server this cluster belongs to
+        $vCenterName = $cluster.Uid.Split('@')[1].Split(':')[0]
+        
+        Write-Host "`nvCenter: $vCenterName" -ForegroundColor Magenta
+        Write-Host "Cluster: $($cluster.Name)" -ForegroundColor Cyan
         Write-Host "-" * 50
         
         # Get all hosts in cluster
