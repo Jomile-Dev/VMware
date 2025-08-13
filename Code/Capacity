@@ -13,6 +13,15 @@ $CpuOvercommitRatio = 2.0             # How much you typically overcommit CPU (2
 $MemoryBufferPct = 0.15               # 15% memory buffer for performance
 $CpuThresholdPct = 0.80               # 80% CPU threshold before performance issues
 
+# Email Configuration
+$SendEmail = $true                     # Set to $false to disable email
+$EmailTo = "admin@company.com"         # Recipient email
+$EmailFrom = "vmware-reports@company.com" # Sender email
+$EmailSubject = "VMware Cluster Capacity Analysis - $(Get-Date -Format 'yyyy-MM-dd')"
+$SMTPServer = "mail.company.com"       # Your SMTP server
+$SMTPPort = 587                        # SMTP port (587 for TLS, 25 for unencrypted)
+$SMTPCredentials = $null               # Set to Get-Credential if SMTP requires authentication
+
 # Get credentials once at the start
 Write-Host "Please enter your vCenter credentials:" -ForegroundColor Yellow
 $Credential = Get-Credential
@@ -42,6 +51,10 @@ try {
 
     # Get all clusters from all connected vCenter servers
     $clusters = Get-Cluster | Where-Object { $_.HAEnabled -eq $true }
+    
+    # Initialize results collection for email
+    $emailResults = @()
+    $summaryTable = @()
     
     Write-Host "`nAnalyzing cluster capacity across all vCenter servers..." -ForegroundColor Yellow
     Write-Host "=" * 80
@@ -117,9 +130,25 @@ try {
             $cpuUtilAfterFailure = [math]::Round(($estimatedCpuDemandMhz / $remainingCpuMhz) * 100, 2)
             $memUtilAfterFailure = [math]::Round(($estimatedMemoryDemandMB / $remainingMemoryMB) * 100, 2)
             
+            # Performance risk assessment
             $status = "OK"
-            if ($cpuUtilAfterFailure -gt ($CpuThresholdPct * 100) -or $memUtilAfterFailure -gt ((1 - $MemoryBufferPct) * 100)) {
-                $status = "PERFORMANCE RISK"
+            $riskLevel = "Low"
+            
+            # Determine performance risk based on multiple factors
+            if ($cpuUtilAfterFailure -gt ($CpuThresholdPct * 100)) {
+                $status = "CPU PERFORMANCE RISK"
+                $riskLevel = "High"
+            }
+            if ($memUtilAfterFailure -gt ((1 - $MemoryBufferPct) * 100)) {
+                $status = if ($status -eq "OK") { "MEMORY PERFORMANCE RISK" } else { "CPU & MEMORY RISK" }
+                $riskLevel = "High"
+            }
+            
+            # Additional risk factors based on overcommit ratio
+            $vCpuToPcpuRatio = $allocatedCpuCores / $totalCpuCores
+            if ($vCpuToPcpuRatio -gt $CpuOvercommitRatio -and $cpuUtilAfterFailure -gt 60) {
+                $riskLevel = "Very High"
+                $status += " (HIGH OVERCOMMIT)"
             }
             
             $capacityTable += [PSCustomObject]@{
@@ -128,6 +157,7 @@ try {
                 CPUUtil = "$cpuUtilAfterFailure%"
                 MemoryUtil = "$memUtilAfterFailure%"
                 Status = $status
+                RiskLevel = $riskLevel
             }
         }
         
@@ -164,7 +194,33 @@ try {
         Write-Host "`n  FAILURE IMPACT ANALYSIS:" -ForegroundColor Yellow
         $capacityTable | Format-Table -AutoSize
         
-        # Warnings and recommendations
+        # Add to email results collection
+        $summaryTable += [PSCustomObject]@{
+            vCenter = $vCenterName
+            Cluster = $cluster.Name
+            TotalHosts = $totalHosts
+            TotalVMs = $totalVMs
+            CurrentCPU = "$currentCpuUtilPct%"
+            CurrentMemory = "$currentMemUtilPct%"
+            vCpuToPcpu = "$([math]::Round($allocatedCpuCores / $totalCpuCores, 2)):1"
+            MaxHostsDown = $maxHostsCanLose
+            LimitingFactor = $limitingFactor
+            OverallRisk = if ($maxHostsCanLose -le 0) { "Critical" } elseif ($maxHostsCanLose -eq 1) { "High" } elseif ($currentCpuUtilPct -gt 70 -or $currentMemUtilPct -gt 80) { "Medium" } else { "Low" }
+        }
+        
+        # Add detailed failure scenarios to email results
+        foreach ($scenario in $capacityTable) {
+            $emailResults += [PSCustomObject]@{
+                vCenter = $vCenterName
+                Cluster = $cluster.Name
+                HostsDown = $scenario.HostsDown
+                RemainingHosts = $scenario.RemainingHosts
+                CPUUtilization = $scenario.CPUUtil
+                MemoryUtilization = $scenario.MemoryUtil
+                Status = $scenario.Status
+                RiskLevel = $scenario.RiskLevel
+            }
+        }
         Write-Host "  RECOMMENDATIONS:" -ForegroundColor Cyan
         if ($maxHostsCanLose -le 0) {
             Write-Host "  ⚠️  CRITICAL: Cluster is at or over capacity!" -ForegroundColor Red
