@@ -240,21 +240,19 @@ try {
     <h2>Detailed Failure Scenarios by Cluster</h2>
 "@
         
-        # Group failure analysis by cluster for detailed breakdown
-        $clustersForAnalysis = @{}
-        foreach ($item in $failureAnalysis) {
-            $clusterKey = "$($item.vCenter) - $($item.Cluster)"
-            if (-not $clustersForAnalysis.ContainsKey($clusterKey)) {
-                $clustersForAnalysis[$clusterKey] = @()
-            }
-            $clustersForAnalysis[$clusterKey] += $item
-        }
+        # Get unique clusters and process each one individually
+        $uniqueClusters = $failureAnalysis | Select-Object vCenter, Cluster -Unique | Sort-Object vCenter, Cluster
         
-        foreach ($clusterKey in ($clustersForAnalysis.Keys | Sort-Object)) {
-            $scenarios = $clustersForAnalysis[$clusterKey]
+        foreach ($uniqueCluster in $uniqueClusters) {
+            $vCenterName = $uniqueCluster.vCenter
+            $clusterName = $uniqueCluster.Cluster
+            $displayName = "$vCenterName - $clusterName"
+            
+            # Get scenarios for this specific cluster
+            $clusterScenarios = $failureAnalysis | Where-Object { $_.vCenter -eq $vCenterName -and $_.Cluster -eq $clusterName } | Sort-Object HostsDown
             
             $htmlBody += @"
-    <h3>$clusterKey</h3>
+    <h3>$displayName</h3>
     <table>
         <tr>
             <th>Hosts Down</th>
@@ -265,7 +263,7 @@ try {
         </tr>
 "@
             
-            foreach ($scenario in $scenarios) {
+            foreach ($scenario in $clusterScenarios) {
                 $htmlBody += "<tr>"
                 $htmlBody += "<td>$($scenario.HostsDown)</td>"
                 $htmlBody += "<td>$($scenario.RemainingHosts)</td>"
