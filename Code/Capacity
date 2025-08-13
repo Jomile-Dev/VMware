@@ -1,17 +1,15 @@
-# VMware Cluster Capacity Analysis Script - Simplified Approach
+# VMware Cluster Capacity Analysis Script - Email Only Version
 # Calculates how many hosts can be down before performance degradation
 
-# Connection to multiple vCenter Servers - Ordered as requested
+# Connection to multiple vCenter Servers
 $vCenterServers = @(
-    "M01-VC01",
-    "W01-VC01",
-    "W02-VC01", 
-    "W03-VC01",
-    "W04-VC01"
+    "vcenter1.domain.com",
+    "vcenter2.domain.com", 
+    "vcenter3.domain.com"
 )
 
 # Configuration - Modify these values as needed
-$CpuOvercommitRatio = 4.0             # How much you typically overcommit CPU (4:1 ratio)
+$CpuOvercommitRatio = 2.0             # How much you typically overcommit CPU (2:1 is common)
 $MemoryBufferPct = 0.15               # 15% memory buffer for performance
 $CpuThresholdPct = 0.80               # 80% CPU threshold before performance issues
 
@@ -43,9 +41,9 @@ try {
                 Write-Host "  Attempting connection to: $cleanServer"
                 try {
                     Connect-VIServer -Server $cleanServer -Credential $Credential -ErrorAction Stop
-                    Write-Host "    ✓ Connected successfully"
+                    Write-Host "    Connected successfully"
                 } catch {
-                    Write-Host "    ✗ Failed to connect: $($_.Exception.Message)"
+                    Write-Host "    Failed to connect: $($_.Exception.Message)"
                     continue
                 }
             }
@@ -56,19 +54,15 @@ try {
     $clusters = Get-Cluster | Where-Object { $_.HAEnabled -eq $true }
     
     # Initialize results collection for email
-    $emailResults = @()
     $summaryTable = @()
     
     Write-Host "`nAnalyzing cluster capacity across all vCenter servers..."
-    Write-Host "=" * 80
     
     foreach ($cluster in $clusters) {
         # Get the vCenter server this cluster belongs to
         $vCenterName = $cluster.Uid.Split('@')[1].Split(':')[0]
         
-        Write-Host "`nvCenter: $vCenterName"
-        Write-Host "Cluster: $($cluster.Name)"
-        Write-Host "-" * 50
+        Write-Host "Processing vCenter: $vCenterName, Cluster: $($cluster.Name)"
         
         # Get all connected hosts in cluster
         $hosts = $cluster | Get-VMHost | Where-Object { $_.ConnectionState -eq "Connected" -and $_.PowerState -eq "PoweredOn" }
@@ -85,7 +79,6 @@ try {
         $totalCpuCores = ($hosts | Measure-Object -Property NumCpu -Sum).Sum
         
         # Get all powered-on VMs in the cluster
-        Write-Host "  Analyzing VM resource allocation..."
         $vms = $cluster | Get-VM | Where-Object { $_.PowerState -eq "PoweredOn" }
         $totalVMs = $vms.Count
         
@@ -115,105 +108,16 @@ try {
         $minHostsNeeded = [math]::Max($minHostsForCpu, $minHostsForMemory)
         $maxHostsCanLose = [math]::Max(0, $totalHosts - $minHostsNeeded)
         
-        # Determine limiting factor
-        $limitingFactor = if ($minHostsForCpu -gt $minHostsForMemory) { "CPU" } else { "Memory" }
-        
         # HA considerations
         $haFailoverHosts = if ($cluster.HAAdmissionControlEnabled) { $cluster.HAFailoverLevel } else { 0 }
-        
-        # Calculate effective capacity for multiple failure scenarios
-        Write-Host "  Calculating failure scenarios..."
-        $capacityTable = @()
-        
-        # Calculate scenarios: 0, 1, and 2 hosts down
-        for ($hostsDown = 0; $hostsDown -le 2; $hostsDown++) {
-            # Skip scenarios where we don't have enough hosts
-            if ($hostsDown -ge $totalHosts) {
-                continue
-            }
-            
-            $remainingHosts = $totalHosts - $hostsDown
-            $remainingCpuMhz = $remainingHosts * $avgCpuPerHost
-            $remainingMemoryMB = $remainingHosts * $avgMemoryPerHost
-            
-            $cpuUtilAfterFailure = [math]::Round(($estimatedCpuDemandMhz / $remainingCpuMhz) * 100, 2)
-            $memUtilAfterFailure = [math]::Round(($estimatedMemoryDemandMB / $remainingMemoryMB) * 100, 2)
-            
-            # Performance risk assessment
-            $status = "OK"
-            $riskLevel = "Low"
-            
-            # Determine performance risk based on multiple factors
-            if ($cpuUtilAfterFailure -gt ($CpuThresholdPct * 100)) {
-                $status = "CPU PERFORMANCE RISK"
-                $riskLevel = "High"
-            }
-            if ($memUtilAfterFailure -gt ((1 - $MemoryBufferPct) * 100)) {
-                $status = if ($status -eq "OK") { "MEMORY PERFORMANCE RISK" } else { "CPU & MEMORY RISK" }
-                $riskLevel = "High"
-            }
-            
-            # Additional risk factors based on overcommit ratio
-            $vCpuToPcpuRatio = $allocatedCpuCores / $totalCpuCores
-            if ($vCpuToPcpuRatio -gt $CpuOvercommitRatio -and $cpuUtilAfterFailure -gt 60) {
-                $riskLevel = "Very High"
-                $status += " (HIGH OVERCOMMIT)"
-            }
-            
-            # Special case for 0 hosts down (current state)
-            if ($hostsDown -eq 0) {
-                $status = "CURRENT STATE"
-                if ($cpuUtilAfterFailure -gt 70 -or $memUtilAfterFailure -gt 80) {
-                    $riskLevel = "Medium"
-                } else {
-                    $riskLevel = "Low"
-                }
-            }
-            
-            $capacityTable += [PSCustomObject]@{
-                HostsDown = $hostsDown
-                RemainingHosts = $remainingHosts
-                CPUUtil = "$cpuUtilAfterFailure%"
-                MemoryUtil = "$memUtilAfterFailure%"
-                Status = $status
-                RiskLevel = $riskLevel
-            }
-        }
-        
-        # Display results
-        Write-Host "`n  CLUSTER SUMMARY:"
-        Write-Host "  Total Hosts: $totalHosts"
-        Write-Host "  Total VMs: $totalVMs"
-        Write-Host "  Total CPU: $([math]::Round($totalCpuMhz/1000, 1)) GHz ($totalCpuCores cores)"
-        Write-Host "  Total Memory: $([math]::Round($totalMemoryMB/1024, 1)) GB"
-        
-        Write-Host "`n  CURRENT UTILIZATION (Estimated):"
-        Write-Host "  CPU Demand: $([math]::Round($estimatedCpuDemandMhz/1000, 1)) GHz ($currentCpuUtilPct%)"
-        Write-Host "  Memory Demand: $([math]::Round($estimatedMemoryDemandMB/1024, 1)) GB ($currentMemUtilPct%)"
-        Write-Host "  vCPU:pCPU Ratio: $([math]::Round($allocatedCpuCores / $totalCpuCores, 2)):1"
-        
-        Write-Host "`n  CAPACITY ANALYSIS:"
-        Write-Host "  Max hosts you can lose: $maxHostsCanLose hosts"
-        Write-Host "  Limiting factor: $limitingFactor"
-        Write-Host "  Min hosts needed: $minHostsNeeded (for performance thresholds)"
-        
         if ($haFailoverHosts -gt 0) {
             $haConstraint = [math]::Max(0, $totalHosts - $haFailoverHosts - 1)
-            Write-Host "  HA Failover Level: $haFailoverHosts hosts"
             if ($haConstraint -lt $maxHostsCanLose) {
-                Write-Host "  HA limits you to: $haConstraint hosts down"
                 $maxHostsCanLose = $haConstraint
             }
         }
         
-        Write-Host "`n  FAILURE IMPACT ANALYSIS (0, 1, and 2 Hosts Down):"
-        if ($capacityTable.Count -gt 0) {
-            $capacityTable | Format-Table -AutoSize
-        } else {
-            Write-Host "  N/A - Insufficient hosts for failure analysis"
-        }
-        
-        # Add to email results collection
+        # Add to summary table for email
         $summaryTable += [PSCustomObject]@{
             vCenter = $vCenterName
             Cluster = $cluster.Name
@@ -221,45 +125,8 @@ try {
             TotalVMs = $totalVMs
             CurrentCPU = "$currentCpuUtilPct%"
             CurrentMemory = "$currentMemUtilPct%"
-            vCpuToPcpu = "$([math]::Round($allocatedCpuCores / $totalCpuCores, 2)):1"
             MaxHostsDown = $maxHostsCanLose
-            LimitingFactor = $limitingFactor
-            OverallRisk = if ($maxHostsCanLose -le 0) { "Critical" } elseif ($maxHostsCanLose -eq 1) { "High" } elseif ($currentCpuUtilPct -gt 70 -or $currentMemUtilPct -gt 80) { "Medium" } else { "Low" }
         }
-        
-        # Add detailed failure scenarios to email results (for all calculated scenarios)
-        foreach ($scenario in $capacityTable) {
-            $emailResults += [PSCustomObject]@{
-                vCenter = $vCenterName
-                Cluster = $cluster.Name
-                HostsDown = $scenario.HostsDown
-                RemainingHosts = $scenario.RemainingHosts
-                CPUUtilization = $scenario.CPUUtil
-                MemoryUtilization = $scenario.MemoryUtil
-                Status = $scenario.Status
-                RiskLevel = $scenario.RiskLevel
-            }
-        }
-        
-        Write-Host "  RECOMMENDATIONS:"
-        if ($maxHostsCanLose -le 0) {
-            Write-Host "  ⚠️  CRITICAL: Cluster is at or over capacity!"
-            Write-Host "      - Consider adding hosts or migrating VMs"
-        } elseif ($maxHostsCanLose -eq 1) {
-            Write-Host "  ⚠️  CAUTION: Limited redundancy available"
-            Write-Host "      - Single host failure will impact performance"
-        } else {
-            Write-Host "  ✅ Good redundancy: Can handle $maxHostsCanLose host failures"
-        }
-        
-        if ($currentCpuUtilPct -gt 60) {
-            Write-Host "  💡 Consider CPU optimization or additional hosts"
-        }
-        if ($currentMemUtilPct -gt 75) {
-            Write-Host "  💡 Memory utilization is high - monitor closely"
-        }
-        
-        Write-Host ""
     }
     
     # Send email report if configured
@@ -274,7 +141,6 @@ try {
     <style>
         body { font-family: Arial, sans-serif; margin: 20px; }
         h1 { color: #2E8B57; }
-        h2 { color: #4682B4; margin-top: 30px; }
         table { border-collapse: collapse; width: 100%; margin: 15px 0; }
         th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
         th { background-color: #f2f2f2; font-weight: bold; }
@@ -303,80 +169,19 @@ try {
             <th>Total VMs</th>
             <th>Current CPU</th>
             <th>Current Memory</th>
-            <th>vCPU:pCPU</th>
             <th>Max Hosts Down</th>
-            <th>Limiting Factor</th>
-            <th>Risk Level</th>
         </tr>
 "@
         
-        # Sort results by vCenter order (matching connection order)
-        $vCenterOrder = @()
-        foreach ($server in $vCenterServers) {
-            if (-not [string]::IsNullOrWhiteSpace($server)) {
-                $cleanServer = $server.Trim()
-                if ($cleanServer -ne "") {
-                    $vCenterOrder += $cleanServer
-                }
-            }
-        }
-        
-        # Sort summary table by vCenter connection order
-        $sortedSummaryTable = @()
-        foreach ($vcServer in $vCenterOrder) {
-            $sortedSummaryTable += $summaryTable | Where-Object { $_.vCenter -eq $vcServer }
-        }
-        
-        # Sort email results by vCenter connection order  
-        $sortedEmailResults = @()
-        foreach ($vcServer in $vCenterOrder) {
-            $sortedEmailResults += $emailResults | Where-Object { $_.vCenter -eq $vcServer }
-        }
-        
-        foreach ($row in $sortedSummaryTable) {
-            $riskClass = $row.OverallRisk.ToLower()
-            $htmlBody += "<tr class='$riskClass'>"
+        foreach ($row in $summaryTable) {
+            $htmlBody += "<tr>"
             $htmlBody += "<td>$($row.vCenter)</td>"
             $htmlBody += "<td>$($row.Cluster)</td>"
             $htmlBody += "<td>$($row.TotalHosts)</td>"
             $htmlBody += "<td>$($row.TotalVMs)</td>"
             $htmlBody += "<td>$($row.CurrentCPU)</td>"
             $htmlBody += "<td>$($row.CurrentMemory)</td>"
-            $htmlBody += "<td>$($row.vCpuToPcpu)</td>"
             $htmlBody += "<td>$($row.MaxHostsDown)</td>"
-            $htmlBody += "<td>$($row.LimitingFactor)</td>"
-            $htmlBody += "<td>$($row.OverallRisk)</td>"
-            $htmlBody += "</tr>"
-        }
-        
-        $htmlBody += @"
-    </table>
-
-    <h2>Detailed Failure Scenarios</h2>
-    <table>
-        <tr>
-            <th>vCenter</th>
-            <th>Cluster</th>
-            <th>Hosts Down</th>
-            <th>Remaining Hosts</th>
-            <th>CPU Utilization</th>
-            <th>Memory Utilization</th>
-            <th>Status</th>
-            <th>Risk Level</th>
-        </tr>
-"@
-        
-        foreach ($row in $sortedEmailResults) {
-            $riskClass = $row.RiskLevel.ToLower() -replace ' ', ''
-            $htmlBody += "<tr class='$riskClass'>"
-            $htmlBody += "<td>$($row.vCenter)</td>"
-            $htmlBody += "<td>$($row.Cluster)</td>"
-            $htmlBody += "<td>$($row.HostsDown)</td>"
-            $htmlBody += "<td>$($row.RemainingHosts)</td>"
-            $htmlBody += "<td>$($row.CPUUtilization)</td>"
-            $htmlBody += "<td>$($row.MemoryUtilization)</td>"
-            $htmlBody += "<td>$($row.Status)</td>"
-            $htmlBody += "<td>$($row.RiskLevel)</td>"
             $htmlBody += "</tr>"
         }
         
@@ -400,12 +205,11 @@ try {
                 UseSsl = $UseSSL
             }
             
-            # No credentials needed - anonymous SMTP with SSL
             Send-MailMessage @emailParams
-            Write-Host "  ✓ Email report sent successfully to $EmailTo via SSL"
+            Write-Host "Email report sent successfully to $EmailTo"
             
         } catch {
-            Write-Host "  ✗ Failed to send email: $($_.Exception.Message)"
+            Write-Host "Failed to send email: $($_.Exception.Message)"
         }
     }
     
@@ -420,5 +224,3 @@ try {
 }
 
 Write-Host "`nCapacity analysis complete!"
-Write-Host "`nNote: Analysis based on allocated resources and typical overcommit ratios."
-Write-Host "For more precise results, monitor actual performance during peak hours."
