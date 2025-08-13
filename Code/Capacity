@@ -48,12 +48,101 @@ try {
                 }
             }
         }
+    }
+
+    # Get all clusters from all connected vCenter servers
+    $clusters = Get-Cluster | Where-Object { $_.HAEnabled -eq $true }
+    
+    # Initialize results collection for email
+    $allResults = @()
+    
+    Write-Host "`nAnalyzing cluster capacity across all vCenter servers..." -ForegroundColor Yellow
+    
+    foreach ($cluster in $clusters) {
+        # Get the vCenter server this cluster belongs to
+        $vCenterName = [string]($cluster.Uid.Split('@')[1].Split(':')[0])
+        
+        Write-Host "Processing vCenter: $vCenterName, Cluster: $($cluster.Name)" -ForegroundColor Cyan
+        
+        # Get all connected hosts in cluster
+        $hosts = $cluster | Get-VMHost | Where-Object { $_.ConnectionState -eq "Connected" -and $_.PowerState -eq "PoweredOn" }
+        $totalHosts = [int]$hosts.Count
+        
+        if ($totalHosts -lt 2) {
+            Write-Host "  Insufficient hosts for analysis (need at least 2)" -ForegroundColor Yellow
+            continue
+        }
+        
+        # Calculate total cluster resources - convert to proper numeric types
+        $totalCpuMhz = [double](($hosts | Measure-Object -Property CpuTotalMhz -Sum).Sum)
+        $totalMemoryMB = [double](($hosts | Measure-Object -Property MemoryTotalMB -Sum).Sum)
+        $totalCpuCores = [int](($hosts | Measure-Object -Property NumCpu -Sum).Sum)
+        
+        # Get all powered-on VMs in the cluster
+        $vms = $cluster | Get-VM | Where-Object { $_.PowerState -eq "PoweredOn" }
+        $totalVMs = [int]$vms.Count
+        
+        # Calculate VM resource demands (allocated resources) - convert to proper numeric types
+        $allocatedCpuCores = [int](($vms | Measure-Object -Property NumCpu -Sum).Sum)
+        $allocatedMemoryMB = [double](($vms | Measure-Object -Property MemoryMB -Sum).Sum)
+        
+        # Estimate actual CPU demand (accounting for typical overcommit)
+        $estimatedCpuDemandMhz = [double](($allocatedCpuCores * ($totalCpuMhz / $totalCpuCores)) / $CpuOvercommitRatio)
+        
+        # Memory demand (VMs typically use most of their allocated memory)
+        $estimatedMemoryDemandMB = [double]($allocatedMemoryMB * (1 - $MemoryBufferPct))
+        
+        # Calculate current utilization percentages
+        $currentCpuUtilPct = [math]::Round(($estimatedCpuDemandMhz / $totalCpuMhz) * 100, 2)
+        $currentMemUtilPct = [math]::Round(($estimatedMemoryDemandMB / $totalMemoryMB) * 100, 2)
+        
+        # Calculate how much capacity we need per host (average)
+        $avgCpuPerHost = [double]($totalCpuMhz / $totalHosts)
+        $avgMemoryPerHost = [double]($totalMemoryMB / $totalHosts)
+        
+        # Calculate vCPU to pCPU ratio
+        $vCpuToPcpuRatio = [math]::Round([double]$allocatedCpuCores / [double]$totalCpuCores, 2)
+        
+        # Calculate minimum hosts needed to handle current workload within thresholds
+        $minHostsForCpu = [math]::Ceiling($estimatedCpuDemandMhz / ($avgCpuPerHost * $CpuThresholdPct))
+        $minHostsForMemory = [math]::Ceiling($estimatedMemoryDemandMB / ($avgMemoryPerHost * (1 - $MemoryBufferPct)))
+        
+        # Most restrictive requirement
+        $minHostsNeeded = [math]::Max($minHostsForCpu, $minHostsForMemory)
+        $maxHostsCanLose = [math]::Max(0, $totalHosts - $minHostsNeeded)
+        
+        # HA considerations
+        $haFailoverHosts = if ($cluster.HAAdmissionControlEnabled) { [int]$cluster.HAFailoverLevel } else { 0 }
+        if ($haFailoverHosts -gt 0) {
+            $haConstraint = [math]::Max(0, $totalHosts - $haFailoverHosts - 1)
+            if ($haConstraint -lt $maxHostsCanLose) {
+                $maxHostsCanLose = $haConstraint
+            }
+        }
+        
+        # Create the main cluster result object
+        $clusterResult = @{
+            vCenter = $vCenterName
+            Cluster = [string]$cluster.Name
+            TotalHosts = $totalHosts
+            TotalVMs = $totalVMs
+            pCPU = $totalCpuCores
+            vCPU = $allocatedCpuCores
+            vCpuToPcpuRatio = "$($vCpuToPcpuRatio):1"
+            CurrentCPU = "$($currentCpuUtilPct)%"
+            CurrentMemory = "$($currentMemUtilPct)%"
+            MaxHostsDown = $maxHostsCanLose
+            HostsDownMessage = if ($maxHostsCanLose -eq 0) { "No hosts can fail" } 
+                              elseif ($maxHostsCanLose -eq 1) { "1 host can fail" } 
+                              else { "$maxHostsCanLose hosts can fail" }
+            FailureScenarios = @()
+        }
         
         # Calculate failure scenarios for up to 2 hosts down
         for ($hostsDown = 0; $hostsDown -le [math]::Min(2, $totalHosts - 1); $hostsDown++) {
-            $remainingHosts = $totalHosts - $hostsDown
-            $remainingCpuMhz = $remainingHosts * $avgCpuPerHost
-            $remainingMemoryMB = $remainingHosts * $avgMemoryPerHost
+            $remainingHosts = [int]($totalHosts - $hostsDown)
+            $remainingCpuMhz = [double]($remainingHosts * $avgCpuPerHost)
+            $remainingMemoryMB = [double]($remainingHosts * $avgMemoryPerHost)
             
             $cpuUtilAfterFailure = [math]::Round(($estimatedCpuDemandMhz / $remainingCpuMhz) * 100, 2)
             $memUtilAfterFailure = [math]::Round(($estimatedMemoryDemandMB / $remainingMemoryMB) * 100, 2)
@@ -67,113 +156,25 @@ try {
                 $status = if ($status -eq "OK") { "MEMORY PERFORMANCE RISK" } else { "CPU & MEMORY RISK" }
             }
             
-            $failureAnalysis += [PSCustomObject]@{
-                vCenter = $vCenterName
-                Cluster = $cluster.Name
+            $scenario = @{
                 HostsDown = $hostsDown
                 RemainingHosts = $remainingHosts
-                CPUUtilization = "$cpuUtilAfterFailure%"
-                MemoryUtilization = "$memUtilAfterFailure%"
+                CPUUtilization = "$($cpuUtilAfterFailure)%"
+                MemoryUtilization = "$($memUtilAfterFailure)%"
                 Status = $status
             }
-        }
-    }
-
-    # Get all clusters from all connected vCenter servers
-    $clusters = Get-Cluster | Where-Object { $_.HAEnabled -eq $true }
-    
-    # Initialize results collection for email
-    $summaryTable = @()
-    $failureAnalysis = @()
-    
-    Write-Host "`nAnalyzing cluster capacity across all vCenter servers..." -ForegroundColor Yellow
-    
-    foreach ($cluster in $clusters) {
-        # Get the vCenter server this cluster belongs to
-        $vCenterName = $cluster.Uid.Split('@')[1].Split(':')[0]
-        
-        Write-Host "Processing vCenter: $vCenterName, Cluster: $($cluster.Name)" -ForegroundColor Cyan
-        
-        # Get all connected hosts in cluster
-        $hosts = $cluster | Get-VMHost | Where-Object { $_.ConnectionState -eq "Connected" -and $_.PowerState -eq "PoweredOn" }
-        $totalHosts = $hosts.Count
-        
-        if ($totalHosts -lt 2) {
-            Write-Host "  Insufficient hosts for analysis (need at least 2)" -ForegroundColor Yellow
-            continue
+            
+            $clusterResult.FailureScenarios += $scenario
         }
         
-        # Calculate total cluster resources
-        $totalCpuMhz = ($hosts | Measure-Object -Property CpuTotalMhz -Sum).Sum
-        $totalMemoryMB = ($hosts | Measure-Object -Property MemoryTotalMB -Sum).Sum
-        $totalCpuCores = ($hosts | Measure-Object -Property NumCpu -Sum).Sum
-        
-        # Get all powered-on VMs in the cluster
-        $vms = $cluster | Get-VM | Where-Object { $_.PowerState -eq "PoweredOn" }
-        $totalVMs = $vms.Count
-        
-        # Calculate VM resource demands (allocated resources)
-        $allocatedCpuCores = ($vms | Measure-Object -Property NumCpu -Sum).Sum
-        $allocatedMemoryMB = ($vms | Measure-Object -Property MemoryMB -Sum).Sum
-        
-        # Estimate actual CPU demand (accounting for typical overcommit)
-        $estimatedCpuDemandMhz = ($allocatedCpuCores * ($totalCpuMhz / $totalCpuCores)) / $CpuOvercommitRatio
-        
-        # Memory demand (VMs typically use most of their allocated memory)
-        $estimatedMemoryDemandMB = $allocatedMemoryMB * (1 - $MemoryBufferPct)
-        
-        # Calculate current utilization percentages
-        $currentCpuUtilPct = [math]::Round(($estimatedCpuDemandMhz / $totalCpuMhz) * 100, 2)
-        $currentMemUtilPct = [math]::Round(($estimatedMemoryDemandMB / $totalMemoryMB) * 100, 2)
-        
-        # Calculate how much capacity we need per host (average)
-        $avgCpuPerHost = $totalCpuMhz / $totalHosts
-        $avgMemoryPerHost = $totalMemoryMB / $totalHosts
-        
-        # Calculate vCPU to pCPU ratio
-        $vCpuToPcpuRatio = [math]::Round($allocatedCpuCores / $totalCpuCores, 2)
-        
-        # Calculate minimum hosts needed to handle current workload within thresholds
-        $minHostsForCpu = [math]::Ceiling($estimatedCpuDemandMhz / ($avgCpuPerHost * $CpuThresholdPct))
-        $minHostsForMemory = [math]::Ceiling($estimatedMemoryDemandMB / ($avgMemoryPerHost * (1 - $MemoryBufferPct)))
-        
-        # Most restrictive requirement
-        $minHostsNeeded = [math]::Max($minHostsForCpu, $minHostsForMemory)
-        $maxHostsCanLose = [math]::Max(0, $totalHosts - $minHostsNeeded)
-        
-        # HA considerations
-        $haFailoverHosts = if ($cluster.HAAdmissionControlEnabled) { $cluster.HAFailoverLevel } else { 0 }
-        if ($haFailoverHosts -gt 0) {
-            $haConstraint = [math]::Max(0, $totalHosts - $haFailoverHosts - 1)
-            if ($haConstraint -lt $maxHostsCanLose) {
-                $maxHostsCanLose = $haConstraint
-            }
-        }
-        
-        # Add to summary table for email
-        $summaryTable += [PSCustomObject]@{
-            vCenter = $vCenterName
-            Cluster = $cluster.Name
-            TotalHosts = $totalHosts
-            TotalVMs = $totalVMs
-            pCPU = $totalCpuCores
-            vCPU = $allocatedCpuCores
-            vCpuToPcpuRatio = "$($vCpuToPcpuRatio):1"
-            CurrentCPU = "$currentCpuUtilPct%"
-            CurrentMemory = "$currentMemUtilPct%"
-            MaxHostsDown = $maxHostsCanLose
-            HostsDownMessage = if ($maxHostsCanLose -eq 0) { "No hosts can fail" } 
-                              elseif ($maxHostsCanLose -eq 1) { "1 host can fail" } 
-                              else { "$maxHostsCanLose hosts can fail" }
-        }
+        $allResults += $clusterResult
     }
     
-    # Sort the summary table by vCenter and Cluster name
-    $summaryTable = $summaryTable | Sort-Object vCenter, Cluster
-    $failureAnalysis = $failureAnalysis | Sort-Object vCenter, Cluster, HostsDown
+    # Sort results by vCenter and Cluster name
+    $sortedResults = $allResults | Sort-Object { $_.vCenter }, { $_.Cluster }
     
     # Send email report if configured
-    if ($SendEmail -and $summaryTable.Count -gt 0) {
+    if ($SendEmail -and $sortedResults.Count -gt 0) {
         Write-Host "`nGenerating email report..." -ForegroundColor Green
         
         # Create HTML email content
@@ -184,10 +185,13 @@ try {
     <style>
         body { font-family: Arial, sans-serif; margin: 20px; }
         h1 { color: #2E8B57; }
+        h2 { color: #4682B4; margin-top: 30px; }
+        h3 { color: #333; margin-top: 20px; }
         table { border-collapse: collapse; width: 100%; margin: 15px 0; }
         th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
         th { background-color: #f2f2f2; font-weight: bold; }
         .summary { background-color: #f5f5f5; padding: 10px; margin: 20px 0; }
+        .cluster-detail { margin-bottom: 30px; }
     </style>
 </head>
 <body>
@@ -219,18 +223,18 @@ try {
         </tr>
 "@
         
-        foreach ($row in $summaryTable) {
+        foreach ($result in $sortedResults) {
             $htmlBody += "<tr>"
-            $htmlBody += "<td>$($row.vCenter)</td>"
-            $htmlBody += "<td>$($row.Cluster)</td>"
-            $htmlBody += "<td>$($row.TotalHosts)</td>"
-            $htmlBody += "<td>$($row.TotalVMs)</td>"
-            $htmlBody += "<td>$($row.pCPU)</td>"
-            $htmlBody += "<td>$($row.vCPU)</td>"
-            $htmlBody += "<td>$($row.vCpuToPcpuRatio)</td>"
-            $htmlBody += "<td>$($row.CurrentCPU)</td>"
-            $htmlBody += "<td>$($row.CurrentMemory)</td>"
-            $htmlBody += "<td>$($row.HostsDownMessage)</td>"
+            $htmlBody += "<td>$($result.vCenter)</td>"
+            $htmlBody += "<td>$($result.Cluster)</td>"
+            $htmlBody += "<td>$($result.TotalHosts)</td>"
+            $htmlBody += "<td>$($result.TotalVMs)</td>"
+            $htmlBody += "<td>$($result.pCPU)</td>"
+            $htmlBody += "<td>$($result.vCPU)</td>"
+            $htmlBody += "<td>$($result.vCpuToPcpuRatio)</td>"
+            $htmlBody += "<td>$($result.CurrentCPU)</td>"
+            $htmlBody += "<td>$($result.CurrentMemory)</td>"
+            $htmlBody += "<td>$($result.HostsDownMessage)</td>"
             $htmlBody += "</tr>"
         }
         
@@ -240,30 +244,24 @@ try {
     <h2>Detailed Failure Scenarios by Cluster</h2>
 "@
         
-        # Get unique clusters and process each one individually
-        $uniqueClusters = $failureAnalysis | Select-Object vCenter, Cluster -Unique | Sort-Object vCenter, Cluster
-        
-        foreach ($uniqueCluster in $uniqueClusters) {
-            $vCenterName = $uniqueCluster.vCenter
-            $clusterName = $uniqueCluster.Cluster
-            $displayName = "$vCenterName - $clusterName"
-            
-            # Get scenarios for this specific cluster
-            $clusterScenarios = $failureAnalysis | Where-Object { $_.vCenter -eq $vCenterName -and $_.Cluster -eq $clusterName } | Sort-Object HostsDown
+        # Add detailed scenarios for each cluster
+        foreach ($result in $sortedResults) {
+            $clusterDisplayName = "$($result.vCenter) - $($result.Cluster)"
             
             $htmlBody += @"
-    <h3>$displayName</h3>
-    <table>
-        <tr>
-            <th>Hosts Down</th>
-            <th>Remaining Hosts</th>
-            <th>CPU Utilization</th>
-            <th>Memory Utilization</th>
-            <th>Status</th>
-        </tr>
+    <div class="cluster-detail">
+        <h3>$clusterDisplayName</h3>
+        <table>
+            <tr>
+                <th>Hosts Down</th>
+                <th>Remaining Hosts</th>
+                <th>CPU Utilization</th>
+                <th>Memory Utilization</th>
+                <th>Status</th>
+            </tr>
 "@
             
-            foreach ($scenario in $clusterScenarios) {
+            foreach ($scenario in $result.FailureScenarios) {
                 $htmlBody += "<tr>"
                 $htmlBody += "<td>$($scenario.HostsDown)</td>"
                 $htmlBody += "<td>$($scenario.RemainingHosts)</td>"
@@ -273,38 +271,10 @@ try {
                 $htmlBody += "</tr>"
             }
             
-            $htmlBody += "</table>"
+            $htmlBody += "</table></div>"
         }
         
         $htmlBody += @"
-
-    <h2>Summary Failure Impact Analysis</h2>
-    <table>
-        <tr>
-            <th>vCenter</th>
-            <th>Cluster</th>
-            <th>Hosts Down</th>
-            <th>Remaining Hosts</th>
-            <th>CPU Utilization</th>
-            <th>Memory Utilization</th>
-            <th>Status</th>
-        </tr>
-"@
-        
-        foreach ($row in $failureAnalysis) {
-            $htmlBody += "<tr>"
-            $htmlBody += "<td>$($row.vCenter)</td>"
-            $htmlBody += "<td>$($row.Cluster)</td>"
-            $htmlBody += "<td>$($row.HostsDown)</td>"
-            $htmlBody += "<td>$($row.RemainingHosts)</td>"
-            $htmlBody += "<td>$($row.CPUUtilization)</td>"
-            $htmlBody += "<td>$($row.MemoryUtilization)</td>"
-            $htmlBody += "<td>$($row.Status)</td>"
-            $htmlBody += "</tr>"
-        }
-        
-        $htmlBody += @"
-    </table>
 
     <p><em>Report generated by VMware Capacity Analysis Script</em></p>
 </body>
