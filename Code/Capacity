@@ -132,9 +132,6 @@ try {
             CurrentCPU = "$($currentCpuUtilPct)%"
             CurrentMemory = "$($currentMemUtilPct)%"
             MaxHostsDown = $maxHostsCanLose
-            HostsDownMessage = if ($maxHostsCanLose -eq 0) { "No hosts can fail" } 
-                              elseif ($maxHostsCanLose -eq 1) { "1 host can fail" } 
-                              else { "$maxHostsCanLose hosts can fail" }
             FailureScenarios = @()
         }
         
@@ -161,7 +158,6 @@ try {
                 RemainingHosts = $remainingHosts
                 CPUUtilization = "$($cpuUtilAfterFailure)%"
                 MemoryUtilization = "$($memUtilAfterFailure)%"
-                Status = $status
             }
             
             $clusterResult.FailureScenarios += $scenario
@@ -219,7 +215,6 @@ try {
             <th>vCPU:pCPU Ratio</th>
             <th>Current CPU</th>
             <th>Current Memory</th>
-            <th>Host Failure Capacity</th>
         </tr>
 "@
         
@@ -234,7 +229,6 @@ try {
             $htmlBody += "<td>$($result.vCpuToPcpuRatio)</td>"
             $htmlBody += "<td>$($result.CurrentCPU)</td>"
             $htmlBody += "<td>$($result.CurrentMemory)</td>"
-            $htmlBody += "<td>$($result.HostsDownMessage)</td>"
             $htmlBody += "</tr>"
         }
         
@@ -257,7 +251,6 @@ try {
                 <th>Remaining Hosts</th>
                 <th>CPU Utilization</th>
                 <th>Memory Utilization</th>
-                <th>Status</th>
             </tr>
 "@
             
@@ -267,7 +260,6 @@ try {
                 $htmlBody += "<td>$($scenario.RemainingHosts)</td>"
                 $htmlBody += "<td>$($scenario.CPUUtilization)</td>"
                 $htmlBody += "<td>$($scenario.MemoryUtilization)</td>"
-                $htmlBody += "<td>$($scenario.Status)</td>"
                 $htmlBody += "</tr>"
             }
             
