@@ -66,28 +66,30 @@ try {
         # Get VM resource usage (active/demand metrics)
         $vms = $cluster | Get-VM | Where-Object { $_.PowerState -eq "PoweredOn" }
         
-        # Calculate 95th percentile CPU and Memory demand
-        Write-Host "  Calculating 95th percentile resource demand..." -ForegroundColor Gray
+        # Use current real-time stats instead of historical data for faster execution
+        Write-Host "  Getting current resource utilization..." -ForegroundColor Gray
         
-        # Get CPU usage statistics (last 24 hours)
-        $cpuStats = $vms | Get-Stat -Stat "cpu.usagemhz.average" -Start (Get-Date).AddDays(-1) -Finish (Get-Date) -MaxSamples 144
-        $cpuDemand95th = if ($cpuStats) { 
-            ($cpuStats | Sort-Object Value | Select-Object -Last ([math]::Ceiling($cpuStats.Count * 0.95)) | Select-Object -First 1).Value 
+        # Get current CPU and Memory usage (much faster than historical stats)
+        Write-Host "    - CPU statistics..." -ForegroundColor DarkGray
+        $cpuStats = $vms | Get-Stat -Stat "cpu.usagemhz.average" -MaxSamples 1 -Realtime -ErrorAction SilentlyContinue
+        $currentCpuDemand = if ($cpuStats) { 
+            ($cpuStats | Measure-Object -Property Value -Sum).Sum
         } else { 
-            ($vms | Measure-Object -Property NumCpu -Sum).Sum * 2000  # Estimate if no stats
+            # Fallback: estimate based on allocated vCPUs (conservative estimate)
+            ($vms | Measure-Object -Property NumCpu -Sum).Sum * 1500  # Assume 1.5 GHz average per vCPU
         }
         
-        # Get Memory usage statistics (active memory)
-        $memStats = $vms | Get-Stat -Stat "mem.active.average" -Start (Get-Date).AddDays(-1) -Finish (Get-Date) -MaxSamples 144
-        $memDemand95th = if ($memStats) { 
-            ($memStats | Sort-Object Value | Select-Object -Last ([math]::Ceiling($memStats.Count * 0.95)) | Select-Object -First 1).Value / 1KB  # Convert to MB
+        Write-Host "    - Memory statistics..." -ForegroundColor DarkGray
+        # Get Memory usage statistics (active memory) - current only
+        $memStats = $vms | Get-Stat -Stat "mem.active.average" -MaxSamples 1 -Realtime -ErrorAction SilentlyContinue
+        $currentMemDemand = if ($memStats) { 
+            ($memStats | Measure-Object -Property Value -Sum).Sum / 1KB  # Convert to MB
         } else { 
-            ($vms | Measure-Object -Property MemoryMB -Sum).Sum * 0.8  # Estimate 80% active if no stats
+            # Fallback: estimate based on allocated memory
+            ($vms | Measure-Object -Property MemoryMB -Sum).Sum * 0.7  # Assume 70% active if no stats
         }
         
-        # Current utilization
-        $currentCpuUsage = ($hosts | Get-Stat -Stat "cpu.usagemhz.average" -MaxSamples 1 | Measure-Object -Property Value -Sum).Sum
-        $currentMemUsage = ($hosts | Get-Stat -Stat "mem.active.average" -MaxSamples 1 | Measure-Object -Property Value -Sum).Sum / 1KB
+
         
         # Performance thresholds (configurable)
         $cpuThreshold = 0.80  # 80% CPU utilization threshold
@@ -98,18 +100,18 @@ try {
         $availableMemoryMB = $totalMemoryMB * $memThreshold
         
         # Current utilization percentages
-        $cpuUtilPct = [math]::Round(($currentCpuUsage / $totalCpuMhz) * 100, 2)
-        $memUtilPct = [math]::Round(($currentMemUsage / $totalMemoryMB) * 100, 2)
+        $cpuUtilPct = [math]::Round(($currentCpuDemand / $totalCpuMhz) * 100, 2)
+        $memUtilPct = [math]::Round(($currentMemDemand / $totalMemoryMB) * 100, 2)
         
         # Calculate maximum hosts that can be lost
         # This considers that remaining hosts must handle current workload within thresholds
         
         # CPU-based calculation
-        $minHostsForCpu = [math]::Ceiling($currentCpuUsage / ($availableCpuMhz / $totalHosts))
+        $minHostsForCpu = [math]::Ceiling($currentCpuDemand / ($availableCpuMhz / $totalHosts))
         $maxHostsDownCpu = $totalHosts - $minHostsForCpu
         
         # Memory-based calculation  
-        $minHostsForMem = [math]::Ceiling($currentMemUsage / ($availableMemoryMB / $totalHosts))
+        $minHostsForMem = [math]::Ceiling($currentMemDemand / ($availableMemoryMB / $totalHosts))
         $maxHostsDownMem = $totalHosts - $minHostsForMem
         
         # Most restrictive limit
@@ -122,8 +124,8 @@ try {
         
         # Display results
         Write-Host "  Total Hosts: $totalHosts" -ForegroundColor White
-        Write-Host "  Current CPU Usage: $([math]::Round($currentCpuUsage, 0)) MHz ($cpuUtilPct%)" -ForegroundColor White
-        Write-Host "  Current Memory Usage: $([math]::Round($currentMemUsage, 0)) MB ($memUtilPct%)" -ForegroundColor White
+        Write-Host "  Current CPU Demand: $([math]::Round($currentCpuDemand, 0)) MHz ($cpuUtilPct%)" -ForegroundColor White
+        Write-Host "  Current Memory Demand: $([math]::Round($currentMemDemand, 0)) MB ($memUtilPct%)" -ForegroundColor White
         Write-Host "  Total CPU: $([math]::Round($totalCpuMhz, 0)) MHz" -ForegroundColor Gray
         Write-Host "  Total Memory: $([math]::Round($totalMemoryMB, 0)) MB" -ForegroundColor Gray
         
