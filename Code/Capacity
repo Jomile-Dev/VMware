@@ -296,7 +296,28 @@ try {
         </tr>
 "@
         
-        foreach ($row in $summaryTable) {
+        # Sort results by vCenter order (matching connection order)
+        $vCenterOrder = @()
+        foreach ($server in $vCenterServers) {
+            if (-not [string]::IsNullOrWhiteSpace($server)) {
+                $cleanServer = $server.Trim()
+                if ($cleanServer -ne "") {
+                    $vCenterOrder += $cleanServer
+                }
+            }
+        }
+        
+        # Sort summary table by vCenter connection order
+        $sortedSummaryTable = @()
+        foreach ($vcServer in $vCenterOrder) {
+            $sortedSummaryTable += $summaryTable | Where-Object { $_.vCenter -eq $vcServer }
+        }
+        
+        # Sort email results by vCenter connection order  
+        $sortedEmailResults = @()
+        foreach ($vcServer in $vCenterOrder) {
+            $sortedEmailResults += $emailResults | Where-Object { $_.vCenter -eq $vcServer }
+        }
             $riskClass = $row.OverallRisk.ToLower()
             $htmlBody += "<tr class='$riskClass'>"
             $htmlBody += "<td>$($row.vCenter)</td>"
