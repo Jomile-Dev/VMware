@@ -241,14 +241,20 @@ try {
 "@
         
         # Group failure analysis by cluster for detailed breakdown
-        $clustersForAnalysis = $failureAnalysis | Group-Object {"$($_.vCenter) - $($_.Cluster)"}
+        $clustersForAnalysis = @{}
+        foreach ($item in $failureAnalysis) {
+            $clusterKey = "$($item.vCenter) - $($item.Cluster)"
+            if (-not $clustersForAnalysis.ContainsKey($clusterKey)) {
+                $clustersForAnalysis[$clusterKey] = @()
+            }
+            $clustersForAnalysis[$clusterKey] += $item
+        }
         
-        foreach ($clusterGroup in $clustersForAnalysis) {
-            $clusterName = $clusterGroup.Name
-            $scenarios = $clusterGroup.Group
+        foreach ($clusterKey in ($clustersForAnalysis.Keys | Sort-Object)) {
+            $scenarios = $clustersForAnalysis[$clusterKey]
             
             $htmlBody += @"
-    <h3>$clusterName</h3>
+    <h3>$clusterKey</h3>
     <table>
         <tr>
             <th>Hosts Down</th>
