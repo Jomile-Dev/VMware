@@ -48,6 +48,35 @@ try {
                 }
             }
         }
+        
+        # Calculate failure scenarios for up to 2 hosts down
+        for ($hostsDown = 0; $hostsDown -le [math]::Min(2, $totalHosts - 1); $hostsDown++) {
+            $remainingHosts = $totalHosts - $hostsDown
+            $remainingCpuMhz = $remainingHosts * $avgCpuPerHost
+            $remainingMemoryMB = $remainingHosts * $avgMemoryPerHost
+            
+            $cpuUtilAfterFailure = [math]::Round(($estimatedCpuDemandMhz / $remainingCpuMhz) * 100, 2)
+            $memUtilAfterFailure = [math]::Round(($estimatedMemoryDemandMB / $remainingMemoryMB) * 100, 2)
+            
+            # Performance risk assessment
+            $status = "OK"
+            if ($cpuUtilAfterFailure -gt ($CpuThresholdPct * 100)) {
+                $status = "CPU PERFORMANCE RISK"
+            }
+            if ($memUtilAfterFailure -gt ((1 - $MemoryBufferPct) * 100)) {
+                $status = if ($status -eq "OK") { "MEMORY PERFORMANCE RISK" } else { "CPU & MEMORY RISK" }
+            }
+            
+            $failureAnalysis += [PSCustomObject]@{
+                vCenter = $vCenterName
+                Cluster = $cluster.Name
+                HostsDown = $hostsDown
+                RemainingHosts = $remainingHosts
+                CPUUtilization = "$cpuUtilAfterFailure%"
+                MemoryUtilization = "$memUtilAfterFailure%"
+                Status = $status
+            }
+        }
     }
 
     # Get all clusters from all connected vCenter servers
@@ -55,6 +84,7 @@ try {
     
     # Initialize results collection for email
     $summaryTable = @()
+    $failureAnalysis = @()
     
     Write-Host "`nAnalyzing cluster capacity across all vCenter servers..." -ForegroundColor Yellow
     
@@ -100,6 +130,9 @@ try {
         $avgCpuPerHost = $totalCpuMhz / $totalHosts
         $avgMemoryPerHost = $totalMemoryMB / $totalHosts
         
+        # Calculate vCPU to pCPU ratio
+        $vCpuToPcpuRatio = [math]::Round($allocatedCpuCores / $totalCpuCores, 2)
+        
         # Calculate minimum hosts needed to handle current workload within thresholds
         $minHostsForCpu = [math]::Ceiling($estimatedCpuDemandMhz / ($avgCpuPerHost * $CpuThresholdPct))
         $minHostsForMemory = [math]::Ceiling($estimatedMemoryDemandMB / ($avgMemoryPerHost * (1 - $MemoryBufferPct)))
@@ -125,6 +158,7 @@ try {
             TotalVMs = $totalVMs
             pCPU = $totalCpuCores
             vCPU = $allocatedCpuCores
+            CPURatio = "$($vCpuToPcpuRatio):1"
             CurrentCPU = "$currentCpuUtilPct%"
             CurrentMemory = "$currentMemUtilPct%"
             MaxHostsDown = $maxHostsCanLose
@@ -136,6 +170,7 @@ try {
     
     # Sort the summary table by vCenter and Cluster name
     $summaryTable = $summaryTable | Sort-Object vCenter, Cluster
+    $failureAnalysis = $failureAnalysis | Sort-Object vCenter, Cluster, HostsDown
     
     # Send email report if configured
     if ($SendEmail -and $summaryTable.Count -gt 0) {
@@ -177,6 +212,7 @@ try {
             <th>Total VMs</th>
             <th>pCPU Cores</th>
             <th>vCPU Assigned</th>
+            <th>CPU Ratio</th>
             <th>Current CPU</th>
             <th>Current Memory</th>
             <th>Host Failure Capacity</th>
@@ -191,9 +227,38 @@ try {
             $htmlBody += "<td>$($row.TotalVMs)</td>"
             $htmlBody += "<td>$($row.pCPU)</td>"
             $htmlBody += "<td>$($row.vCPU)</td>"
+            $htmlBody += "<td>$($row.CPURatio)</td>"
             $htmlBody += "<td>$($row.CurrentCPU)</td>"
             $htmlBody += "<td>$($row.CurrentMemory)</td>"
             $htmlBody += "<td>$($row.HostsDownMessage)</td>"
+            $htmlBody += "</tr>"
+        }
+        
+        $htmlBody += @"
+    </table>
+
+    <h2>Failure Impact Analysis (Maximum 2 Hosts Down)</h2>
+    <table>
+        <tr>
+            <th>vCenter</th>
+            <th>Cluster</th>
+            <th>Hosts Down</th>
+            <th>Remaining Hosts</th>
+            <th>CPU Utilization</th>
+            <th>Memory Utilization</th>
+            <th>Status</th>
+        </tr>
+"@
+        
+        foreach ($row in $failureAnalysis) {
+            $htmlBody += "<tr>"
+            $htmlBody += "<td>$($row.vCenter)</td>"
+            $htmlBody += "<td>$($row.Cluster)</td>"
+            $htmlBody += "<td>$($row.HostsDown)</td>"
+            $htmlBody += "<td>$($row.RemainingHosts)</td>"
+            $htmlBody += "<td>$($row.CPUUtilization)</td>"
+            $htmlBody += "<td>$($row.MemoryUtilization)</td>"
+            $htmlBody += "<td>$($row.Status)</td>"
             $htmlBody += "</tr>"
         }
         
