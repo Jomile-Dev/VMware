@@ -1,4 +1,4 @@
-# Warnings and recommendations
+        # Warnings and recommendations
         Write-Host "  RECOMMENDATIONS:" -ForegroundColor Cyan# VMware Cluster Capacity Analysis Script - Simplified Approach
 # Calculates how many hosts can be down before performance degradation
 
@@ -120,11 +120,13 @@ try {
         # HA considerations
         $haFailoverHosts = if ($cluster.HAAdmissionControlEnabled) { $cluster.HAFailoverLevel } else { 0 }
         
-        # Calculate effective capacity per host failure
-        Write-Host "  Calculating failure scenarios..." -ForegroundColor Gray
+        # Calculate effective capacity for 2 nodes down scenario
+        Write-Host "  Calculating 2-node failure scenario..." -ForegroundColor Gray
         $capacityTable = @()
         
-        for ($hostsDown = 0; $hostsDown -le [math]::Min(3, $totalHosts - 1); $hostsDown++) {
+        # Only calculate for 2 hosts down scenario
+        $hostsDown = 2
+        if ($totalHosts -gt 2) {
             $remainingHosts = $totalHosts - $hostsDown
             $remainingCpuMhz = $remainingHosts * $avgCpuPerHost
             $remainingMemoryMB = $remainingHosts * $avgMemoryPerHost
@@ -161,7 +163,8 @@ try {
                 Status = $status
                 RiskLevel = $riskLevel
             }
-        }
+        } else {
+            Write-Host "  Insufficient hosts for 2-node failure analysis (need at least 3)" -ForegroundColor Yellow
         
         # Display results
         Write-Host "`n  CLUSTER SUMMARY:" -ForegroundColor White
@@ -193,8 +196,12 @@ try {
             }
         }
         
-        Write-Host "`n  FAILURE IMPACT ANALYSIS:" -ForegroundColor Yellow
-        $capacityTable | Format-Table -AutoSize
+        Write-Host "`n  FAILURE IMPACT ANALYSIS (2 Hosts Down):" -ForegroundColor Yellow
+        if ($capacityTable.Count -gt 0) {
+            $capacityTable | Format-Table -AutoSize
+        } else {
+            Write-Host "  N/A - Insufficient hosts for 2-node failure analysis" -ForegroundColor Gray
+        }
         
         # Add to email results collection
         $summaryTable += [PSCustomObject]@{
@@ -210,7 +217,7 @@ try {
             OverallRisk = if ($maxHostsCanLose -le 0) { "Critical" } elseif ($maxHostsCanLose -eq 1) { "High" } elseif ($currentCpuUtilPct -gt 70 -or $currentMemUtilPct -gt 80) { "Medium" } else { "Low" }
         }
         
-        # Add detailed failure scenarios to email results
+        # Add detailed 2-node failure scenario to email results (only if capacity table has data)
         foreach ($scenario in $capacityTable) {
             $emailResults += [PSCustomObject]@{
                 vCenter = $vCenterName
@@ -260,10 +267,6 @@ try {
         table { border-collapse: collapse; width: 100%; margin: 15px 0; }
         th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
         th { background-color: #f2f2f2; font-weight: bold; }
-        .critical { background-color: #ffebee; color: #c62828; }
-        .high { background-color: #fff3e0; color: #ef6c00; }
-        .medium { background-color: #fff8e1; color: #f57f17; }
-        .low { background-color: #e8f5e8; color: #2e7d32; }
         .summary { background-color: #f5f5f5; padding: 10px; margin: 20px 0; }
     </style>
 </head>
@@ -377,10 +380,10 @@ try {
         </ul>
         <p><strong>Risk Levels:</strong></p>
         <ul>
-            <li><span class="critical"><strong>Critical:</strong></span> Cannot lose any hosts without performance impact</li>
-            <li><span class="high"><strong>High:</strong></span> Can lose 1 host or high overcommit with elevated utilization</li>
-            <li><span class="medium"><strong>Medium:</strong></span> Current utilization >70% CPU or >80% Memory</li>
-            <li><span class="low"><strong>Low:</strong></span> Good capacity headroom available</li>
+            <li><strong>Critical:</strong> Cannot lose any hosts without performance impact</li>
+            <li><strong>High:</strong> Can lose 1 host or high overcommit with elevated utilization</li>
+            <li><strong>Medium:</strong> Current utilization >70% CPU or >80% Memory</li>
+            <li><strong>Low:</strong> Good capacity headroom available</li>
         </ul>
     </div>
 
