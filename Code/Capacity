@@ -1,4 +1,16 @@
-# VMware Cluster Capacity Analysis Script - N-2 Version
+foreach ($result in $sortedResults) {
+            $n2vSanUtilDisplay = if ($result.N2_vSAN_Usable -gt 0) { $result.N2_vSAN_Util } else { "N/A" }
+            
+            $htmlBody += "<tr>"
+            $htmlBody += "<td>$($result.vCenter)</td>"
+            $htmlBody += "<td>$($result.Cluster)</td>"
+            $htmlBody += "<td>$($result.N2_CPU_Util)</td>"
+            $htmlBody += "<td>$($result.N2_Memory_Util)</td>"
+            $htmlBody += "<td>$n2vSanUtilDisplay</td>"
+            $htmlBody += "</tr>"
+        }
+        
+        $htmlBody += "</table>"# VMware Cluster Capacity Analysis Script - N-2 Version
 # Calculates cluster capacity based on N-2 availability model
 
 # Connection to multiple vCenter Servers
@@ -89,15 +101,17 @@ try {
         
         # Get vSAN datastore info if available
         $vSanDatastore = $cluster | Get-Datastore | Where-Object { $_.Type -eq "vsan" } | Select-Object -First 1
-        $totalvSanGB = 0
-        $n2vSanUsableGB = 0
+        $totalvSanTB = 0
+        $n2vSanUsableTB = 0
+        $vSanUsedTB = 0
         
         if ($vSanDatastore) {
-            $totalvSanGB = [math]::Round($vSanDatastore.CapacityGB, 2)
+            $totalvSanTB = [math]::Round($vSanDatastore.CapacityGB / 1024, 2)  # Convert to TB
+            $vSanUsedTB = [math]::Round(($vSanDatastore.CapacityGB - $vSanDatastore.FreeSpaceGB) / 1024, 2)  # Used space in TB
             # For vSAN N-2, typically lose ~2 hosts worth of capacity
             # This is a simplified calculation - actual vSAN capacity depends on policy and configuration
-            $avgStoragePerHost = $totalvSanGB / $totalHosts
-            $n2vSanUsableGB = [math]::Round($totalvSanGB - (2 * $avgStoragePerHost), 2)
+            $avgStoragePerHostTB = $totalvSanTB / $totalHosts
+            $n2vSanUsableTB = [math]::Round($totalvSanTB - (2 * $avgStoragePerHostTB), 2)
         }
         
         # Get all powered-on VMs in the cluster
@@ -111,9 +125,18 @@ try {
         # Calculate vCPU to pCPU ratio
         $vCpuToPcpuRatio = [math]::Round([double]$allocatedCpuCores / [double]$totalCpuCores, 2)
         
-        # Calculate N-2 utilization percentages based on cores
-        $n2CpuUtilPct = if ($n2CpuCores -gt 0) { [math]::Round(([double]$allocatedCpuCores / [double]$n2CpuCores) * 100, 2) } else { 0 }
+        # Calculate total usable CPU cores with 3:1 overcommit
+        $totalUsableCpuCores = [double]($totalCpuCores * $CpuOvercommitRatio)
+        
+        # Calculate utilization percentages based on 3:1 overcommit
+        $totalCpuUtilPct = if ($totalUsableCpuCores -gt 0) { [math]::Round(([double]$allocatedCpuCores / [double]$totalUsableCpuCores) * 100, 2) } else { 0 }
+        $totalMemUtilPct = if ($totalMemoryMB -gt 0) { [math]::Round(($allocatedMemoryMB / $totalMemoryMB) * 100, 2) } else { 0 }
+        $totalvSanUtilPct = if ($totalvSanTB -gt 0) { [math]::Round(($vSanUsedTB / $totalvSanTB) * 100, 2) } else { 0 }
+        
+        # Calculate N-2 utilization percentages based on 3:1 overcommit
+        $n2CpuUtilPct = if ($n2UsableCpuCores -gt 0) { [math]::Round(([double]$allocatedCpuCores / [double]$n2UsableCpuCores) * 100, 2) } else { 0 }
         $n2MemUtilPct = if ($n2MemoryMB -gt 0) { [math]::Round(($allocatedMemoryMB / $n2MemoryMB) * 100, 2) } else { 0 }
+        $n2vSanUtilPct = if ($n2vSanUsableTB -gt 0) { [math]::Round(($vSanUsedTB / $n2vSanUsableTB) * 100, 2) } else { 0 }
         
         # Create the cluster result object
         $clusterResult = @{
@@ -121,17 +144,25 @@ try {
             Cluster = [string]$cluster.Name
             TotalHosts = $totalHosts
             TotalVMs = $totalVMs
-            pCPU_Total = $totalCpuCores
-            vCPU_Assigned = $allocatedCpuCores
             vCpuToPcpuRatio = "$($vCpuToPcpuRatio):1"
+            
+            # Total capacity (without N-2)
+            Total_CPU_Cores = $totalCpuCores
+            Total_CPU_Usable = $totalUsableCpuCores
+            Total_Memory = [math]::Round($totalMemoryMB / 1024, 2)    # Convert to GB
+            Total_vSAN = $totalvSanTB
+            Total_CPU_Util = "$($totalCpuUtilPct)%"
+            Total_Memory_Util = "$($totalMemUtilPct)%"
+            Total_vSAN_Util = "$($totalvSanUtilPct)%"
+            
+            # N-2 capacity
             N2_CPU_Cores = $n2CpuCores
             N2_CPU_Usable = $n2UsableCpuCores
-            N2_Memory_Total = [math]::Round($n2MemoryMB / 1024, 2)   # Convert to GB
-            N2_Memory_Usable = [math]::Round($n2MemoryMB / 1024, 2)  # For memory, total = usable
-            Total_vSAN = $totalvSanGB
-            N2_vSAN_Usable = $n2vSanUsableGB
+            N2_Memory = [math]::Round($n2MemoryMB / 1024, 2)         # Convert to GB
+            N2_vSAN_Usable = $n2vSanUsableTB
             N2_CPU_Util = "$($n2CpuUtilPct)%"
             N2_Memory_Util = "$($n2MemUtilPct)%"
+            N2_vSAN_Util = "$($n2vSanUtilPct)%"
         }
         
         $allResults += $clusterResult
@@ -174,27 +205,35 @@ try {
         </ul>
     </div>
 
-    <h2>Cluster Summary (N-2 Usable Capacity)</h2>
+    <h2>Cluster Summary - Total vs N-2 Capacity</h2>
     <table>
         <tr>
-            <th>vCenter</th>
-            <th>Cluster</th>
-            <th>Total Hosts</th>
-            <th>Total VMs</th>
-            <th>vCPU:pCPU Ratio</th>
-            <th class="small-text">N-2 CPU Cores<br>(Physical)</th>
-            <th class="small-text">N-2 CPU Usable<br>(w/ 3:1 Overcommit)</th>
-            <th class="small-text">N-2 Memory Total<br>(GB)</th>
-            <th class="small-text">Total vSAN<br>(GB)</th>
-            <th class="small-text">N-2 vSAN Usable<br>(GB)</th>
-            <th class="small-text">N-2 CPU<br>Utilization</th>
-            <th class="small-text">N-2 Memory<br>Utilization</th>
+            <th rowspan="2">vCenter</th>
+            <th rowspan="2">Cluster</th>
+            <th rowspan="2">Total Hosts</th>
+            <th rowspan="2">Total VMs</th>
+            <th rowspan="2">vCPU:pCPU<br>Ratio</th>
+            <th colspan="3" style="background-color: #e6f3ff; text-align: center;">Total Cluster Capacity</th>
+            <th colspan="3" style="background-color: #ffe6e6; text-align: center;">N-2 Capacity</th>
+            <th colspan="3" style="background-color: #f0f8e6; text-align: center;">Utilization %</th>
+        </tr>
+        <tr>
+            <th class="small-text" style="background-color: #e6f3ff;">CPU Cores<br>(w/ 3:1)</th>
+            <th class="small-text" style="background-color: #e6f3ff;">Memory<br>(GB)</th>
+            <th class="small-text" style="background-color: #e6f3ff;">vSAN<br>(TB)</th>
+            <th class="small-text" style="background-color: #ffe6e6;">CPU Cores<br>(w/ 3:1)</th>
+            <th class="small-text" style="background-color: #ffe6e6;">Memory<br>(GB)</th>
+            <th class="small-text" style="background-color: #ffe6e6;">vSAN<br>(TB)</th>
+            <th class="small-text" style="background-color: #f0f8e6;">Total CPU</th>
+            <th class="small-text" style="background-color: #f0f8e6;">Total Mem</th>
+            <th class="small-text" style="background-color: #f0f8e6;">Total vSAN</th>
         </tr>
 "@
         
         foreach ($result in $sortedResults) {
-            $vSanTotalDisplay = if ($result.Total_vSAN -gt 0) { $result.Total_vSAN } else { "N/A" }
-            $vSanUsableDisplay = if ($result.N2_vSAN_Usable -gt 0) { $result.N2_vSAN_Usable } else { "N/A" }
+            $totalvSanDisplay = if ($result.Total_vSAN -gt 0) { $result.Total_vSAN } else { "N/A" }
+            $n2vSanDisplay = if ($result.N2_vSAN_Usable -gt 0) { $result.N2_vSAN_Usable } else { "N/A" }
+            $totalvSanUtilDisplay = if ($result.Total_vSAN -gt 0) { $result.Total_vSAN_Util } else { "N/A" }
             
             $htmlBody += "<tr>"
             $htmlBody += "<td>$($result.vCenter)</td>"
@@ -202,13 +241,18 @@ try {
             $htmlBody += "<td>$($result.TotalHosts)</td>"
             $htmlBody += "<td>$($result.TotalVMs)</td>"
             $htmlBody += "<td>$($result.vCpuToPcpuRatio)</td>"
-            $htmlBody += "<td>$($result.N2_CPU_Cores)</td>"
-            $htmlBody += "<td>$($result.N2_CPU_Usable)</td>"
-            $htmlBody += "<td>$($result.N2_Memory_Total)</td>"
-            $htmlBody += "<td>$vSanTotalDisplay</td>"
-            $htmlBody += "<td>$vSanUsableDisplay</td>"
-            $htmlBody += "<td>$($result.N2_CPU_Util)</td>"
-            $htmlBody += "<td>$($result.N2_Memory_Util)</td>"
+            # Total capacity
+            $htmlBody += "<td style='background-color: #f9fdff;'>$($result.Total_CPU_Usable)</td>"
+            $htmlBody += "<td style='background-color: #f9fdff;'>$($result.Total_Memory)</td>"
+            $htmlBody += "<td style='background-color: #f9fdff;'>$totalvSanDisplay</td>"
+            # N-2 capacity
+            $htmlBody += "<td style='background-color: #fff9f9;'>$($result.N2_CPU_Usable)</td>"
+            $htmlBody += "<td style='background-color: #fff9f9;'>$($result.N2_Memory)</td>"
+            $htmlBody += "<td style='background-color: #fff9f9;'>$n2vSanDisplay</td>"
+            # Utilization
+            $htmlBody += "<td style='background-color: #f8fdf8;'>$($result.Total_CPU_Util)</td>"
+            $htmlBody += "<td style='background-color: #f8fdf8;'>$($result.Total_Memory_Util)</td>"
+            $htmlBody += "<td style='background-color: #f8fdf8;'>$totalvSanUtilDisplay</td>"
             $htmlBody += "</tr>"
         }
         
@@ -218,12 +262,13 @@ try {
     <div class="summary">
         <h3>Notes</h3>
         <ul>
-            <li>N-2 capacity assumes the two largest hosts in each cluster fail simultaneously</li>
-            <li>CPU cores show physical cores available after N-2, with usable including $($CpuOvercommitRatio):1 overcommit ratio</li>
-            <li>CPU utilization is based on allocated vCPU cores vs. physical N-2 CPU cores</li>
-            <li>Total vSAN shows entire datastore capacity, N-2 vSAN usable is estimated capacity after 2 host failure</li>
-            <li>vSAN usable capacity is estimated and may vary based on storage policies and configuration</li>
-            <li>Memory utilization shows current workload against N-2 available memory</li>
+            <li>All capacity metrics show both total cluster capacity and N-2 capacity (assumes 2 largest hosts fail)</li>
+            <li>CPU capacity includes 3:1 overcommit ratio for both total and N-2 calculations</li>
+            <li>CPU utilization is based on allocated vCPU cores vs. usable CPU cores (with 3:1 overcommit)</li>
+            <li>vSAN capacity is shown in TB, with N-2 estimates based on average storage per host</li>
+            <li>Total utilization shows current usage against full cluster capacity</li>
+            <li>N-2 utilization shows how resources would be utilized if 2 largest hosts failed</li>
+            <li>vSAN utilization is based on actual used space vs. available capacity</li>
         </ul>
     </div>
 
