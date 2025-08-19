@@ -6,114 +6,132 @@ $vCenterServer = "your-vcenter-server.domain.com"
 $Credential = Get-Credential
 Connect-VIServer -Server $vCenterServer -Credential $Credential
 
-# Function to check if VM is on external SAN storage (excludes vSAN, local storage, NFS)
-function Test-VMOnSAN {
+# Function to get detailed storage usage for a VM across all storage types
+function Get-VMStorageDetails {
     param($VM)
     
     $vmDisks = Get-HardDisk -VM $VM
-    $sanConnected = $false
-    $sanDetails = @()
+    $storageDetails = @{
+        SAN = @{
+            UsedSpaceGB = 0
+            ProvisionedSpaceGB = 0
+            Datastores = @()
+        }
+        vSAN = @{
+            UsedSpaceGB = 0
+            ProvisionedSpaceGB = 0
+            Datastores = @()
+        }
+        NFS = @{
+            UsedSpaceGB = 0
+            ProvisionedSpaceGB = 0
+            Datastores = @()
+        }
+        Local = @{
+            UsedSpaceGB = 0
+            ProvisionedSpaceGB = 0
+            Datastores = @()
+        }
+        HasSAN = $false
+    }
     
     foreach ($disk in $vmDisks) {
         $datastore = Get-Datastore -Name $disk.Filename.Split('[')[1].Split(']')[0]
         $datastoreView = $datastore | Get-View
         
-        $isSAN = $false
-        $sanType = "Unknown"
+        # Get actual disk usage (this can take time, so we'll use disk capacity for provisioned)
+        $diskUsedGB = [math]::Round($disk.CapacityGB, 2)  # Provisioned space
+        $diskProvisionedGB = [math]::Round($disk.CapacityGB, 2)
         
-        # EXCLUDE vSAN, NFS, and local storage
+        # Try to get actual used space from VM statistics
+        try {
+            $vmView = $VM | Get-View
+            $diskUsedGB = [math]::Round(($vmView.Summary.Storage.Committed / 1GB), 2)
+        }
+        catch {
+            # Fallback to disk capacity if we can't get committed storage
+        }
+        
+        $storageType = "Unknown"
+        $isExternalSAN = $false
+        
+        # Categorize storage type
         if ($datastore.Type -eq "vsan") {
-            Write-Verbose "Excluding vSAN datastore: $($datastore.Name)"
-            continue
+            $storageType = "vSAN"
+            $storageDetails.vSAN.UsedSpaceGB += $diskUsedGB
+            $storageDetails.vSAN.ProvisionedSpaceGB += $diskProvisionedGB
+            $storageDetails.vSAN.Datastores += $datastore.Name
         }
-        
-        if ($datastore.Type -eq "NFS" -or $datastore.Type -eq "NFS41") {
-            Write-Verbose "Excluding NFS datastore: $($datastore.Name)"
-            continue
+        elseif ($datastore.Type -eq "NFS" -or $datastore.Type -eq "NFS41") {
+            $storageType = "NFS"
+            $storageDetails.NFS.UsedSpaceGB += $diskUsedGB
+            $storageDetails.NFS.ProvisionedSpaceGB += $diskProvisionedGB
+            $storageDetails.NFS.Datastores += $datastore.Name
         }
-        
-        # Only check VMFS datastores for external SAN
-        if ($datastore.Type -eq "VMFS") {
-            
-            # Check the underlying storage devices
+        elseif ($datastore.Type -eq "VMFS") {
+            # Determine if it's external SAN or local
             if ($datastoreView.Info.Vmfs.Extent) {
                 foreach ($extent in $datastoreView.Info.Vmfs.Extent) {
-                    # Get the SCSI LUN details
                     $scsiLuns = Get-VMHost -VM $VM | Get-ScsiLun
                     $device = $scsiLuns | Where-Object { $_.CanonicalName -eq $extent.DiskName }
                     
                     if ($device) {
-                        # Check if it's external SAN storage
-                        # Exclude local disks and vSAN
-                        if ($device.LunType -eq "disk") {
-                            
-                            # Check vendor - external SAN vendors
-                            $sanVendors = @("PURE", "NETAPP", "EMC", "HP", "DELL", "IBM", "HITACHI", "COMPELLENT", "EQUALLOGIC", "NIMBLE", "3PAR")
-                            $isExternalSAN = $false
-                            
-                            foreach ($vendor in $sanVendors) {
-                                if ($device.Vendor -match $vendor) {
+                        # Check for external SAN vendors
+                        $sanVendors = @("PURE", "NETAPP", "EMC", "HP", "DELL", "IBM", "HITACHI", "COMPELLENT", "EQUALLOGIC", "NIMBLE", "3PAR", "HUAWEI", "FUJITSU")
+                        
+                        foreach ($vendor in $sanVendors) {
+                            if ($device.Vendor -match $vendor) {
+                                $isExternalSAN = $true
+                                break
+                            }
+                        }
+                        
+                        # Additional check for FC/iSCSI connectivity
+                        if (!$isExternalSAN) {
+                            $paths = $device | Get-ScsiLunPath
+                            foreach ($path in $paths) {
+                                if ($path.TransportType -eq "fc" -or $path.TransportType -eq "iscsi") {
                                     $isExternalSAN = $true
-                                    $sanType = "External SAN - $($device.Vendor)"
                                     break
                                 }
                             }
-                            
-                            # Additional check for FC/iSCSI paths (external connectivity)
-                            if (!$isExternalSAN) {
-                                $paths = $device | Get-ScsiLunPath
-                                foreach ($path in $paths) {
-                                    if ($path.TransportType -eq "fc" -or $path.TransportType -eq "iscsi") {
-                                        # Further verify it's not local by checking if multiple hosts can see it
-                                        $allHosts = Get-VMHost
-                                        $hostsSeeingLun = 0
-                                        
-                                        foreach ($vmHost in $allHosts) {
-                                            $hostLuns = $vmHost | Get-ScsiLun
-                                            if ($hostLuns | Where-Object { $_.CanonicalName -eq $device.CanonicalName }) {
-                                                $hostsSeeingLun++
-                                            }
-                                        }
-                                        
-                                        # If multiple hosts see the same LUN, it's likely external SAN
-                                        if ($hostsSeeingLun -gt 1) {
-                                            $isExternalSAN = $true
-                                            $sanType = "External SAN - $($path.TransportType.ToUpper())"
-                                            break
-                                        }
-                                    }
-                                }
-                            }
-                            
-                            # Exclude VMware vSAN devices explicitly
-                            if ($device.Vendor -match "VMware" -and $device.Model -match "Virtual") {
-                                $isExternalSAN = $false
-                            }
-                            
-                            if ($isExternalSAN) {
-                                $isSAN = $true
-                            }
+                        }
+                        
+                        # Exclude VMware virtual devices
+                        if ($device.Vendor -match "VMware" -and $device.Model -match "Virtual") {
+                            $isExternalSAN = $false
                         }
                     }
                 }
             }
-        }
-        
-        if ($isSAN) {
-            $sanConnected = $true
-            $sanDetails += @{
-                DiskLabel = $disk.Name
-                Datastore = $datastore.Name
-                DatastoreType = $datastore.Type
-                SANType = $sanType
-                CapacityGB = [math]::Round($disk.CapacityGB, 2)
+            
+            if ($isExternalSAN) {
+                $storageType = "SAN"
+                $storageDetails.SAN.UsedSpaceGB += $diskUsedGB
+                $storageDetails.SAN.ProvisionedSpaceGB += $diskProvisionedGB
+                $storageDetails.SAN.Datastores += $datastore.Name
+                $storageDetails.HasSAN = $true
+            }
+            else {
+                $storageType = "Local"
+                $storageDetails.Local.UsedSpaceGB += $diskUsedGB
+                $storageDetails.Local.ProvisionedSpaceGB += $diskProvisionedGB
+                $storageDetails.Local.Datastores += $datastore.Name
             }
         }
     }
     
+    return $storageDetails
+}
+
+# Function to check if VM has any SAN storage
+function Test-VMOnSAN {
+    param($VM)
+    
+    $storageDetails = Get-VMStorageDetails -VM $VM
     return @{
-        IsSAN = $sanConnected
-        Details = $sanDetails
+        IsSAN = $storageDetails.HasSAN
+        Details = $storageDetails
     }
 }
 
@@ -137,10 +155,12 @@ foreach ($vm in $allVMs) {
 
 Write-Progress -Completed -Activity "Checking VMs for SAN connectivity"
 
-# Collect VM information
-Write-Host "Collecting VM CPU and Memory information..." -ForegroundColor Green
+# Collect VM information with detailed storage breakdown
+Write-Host "Collecting VM CPU, Memory, and Storage information..." -ForegroundColor Green
 $vmInfo = foreach ($vm in $sanVMs) {
     $vmView = $vm | Get-View
+    $sanResult = Test-VMOnSAN -VM $vm
+    $storageDetails = $sanResult.Details
     
     [PSCustomObject]@{
         VMName = $vm.Name
@@ -151,30 +171,89 @@ $vmInfo = foreach ($vm in $sanVMs) {
         MemoryGB = [math]::Round($vm.MemoryGB, 2)
         MemoryMB = $vm.MemoryMB
         MemoryHotAddEnabled = $vm.ExtensionData.Config.MemoryHotAddEnabled
+        
+        # SAN Storage Details
+        SAN_UsedSpaceGB = $storageDetails.SAN.UsedSpaceGB
+        SAN_ProvisionedSpaceGB = $storageDetails.SAN.ProvisionedSpaceGB
+        SAN_Datastores = ($storageDetails.SAN.Datastores | Select-Object -Unique) -join ", "
+        
+        # vSAN Storage Details  
+        vSAN_UsedSpaceGB = $storageDetails.vSAN.UsedSpaceGB
+        vSAN_ProvisionedSpaceGB = $storageDetails.vSAN.ProvisionedSpaceGB
+        vSAN_Datastores = ($storageDetails.vSAN.Datastores | Select-Object -Unique) -join ", "
+        
+        # NFS Storage Details
+        NFS_UsedSpaceGB = $storageDetails.NFS.UsedSpaceGB
+        NFS_ProvisionedSpaceGB = $storageDetails.NFS.ProvisionedSpaceGB
+        NFS_Datastores = ($storageDetails.NFS.Datastores | Select-Object -Unique) -join ", "
+        
+        # Local Storage Details
+        Local_UsedSpaceGB = $storageDetails.Local.UsedSpaceGB
+        Local_ProvisionedSpaceGB = $storageDetails.Local.ProvisionedSpaceGB
+        Local_Datastores = ($storageDetails.Local.Datastores | Select-Object -Unique) -join ", "
+        
+        # Total Storage Calculations
+        Total_UsedSpaceGB = [math]::Round(($storageDetails.SAN.UsedSpaceGB + $storageDetails.vSAN.UsedSpaceGB + $storageDetails.NFS.UsedSpaceGB + $storageDetails.Local.UsedSpaceGB), 2)
+        Total_ProvisionedSpaceGB = [math]::Round(($storageDetails.SAN.ProvisionedSpaceGB + $storageDetails.vSAN.ProvisionedSpaceGB + $storageDetails.NFS.ProvisionedSpaceGB + $storageDetails.Local.ProvisionedSpaceGB), 2)
+        
+        # VM Metadata
         GuestOS = $vm.GuestId
         VMwareTools = $vm.ExtensionData.Summary.Guest.ToolsStatus
         Host = $vm.VMHost.Name
         Cluster = (Get-Cluster -VM $vm).Name
-        Datastore = ($vm | Get-Datastore | Select-Object -First 1).Name
-        UsedSpaceGB = [math]::Round($vm.UsedSpaceGB, 2)
-        ProvisionedSpaceGB = [math]::Round($vm.ProvisionedSpaceGB, 2)
+        
+        # Primary storage type (where most data resides)
+        PrimaryStorageType = if ($storageDetails.SAN.ProvisionedSpaceGB -gt $storageDetails.vSAN.ProvisionedSpaceGB -and 
+                                 $storageDetails.SAN.ProvisionedSpaceGB -gt $storageDetails.NFS.ProvisionedSpaceGB -and 
+                                 $storageDetails.SAN.ProvisionedSpaceGB -gt $storageDetails.Local.ProvisionedSpaceGB) { "SAN" }
+                             elseif ($storageDetails.vSAN.ProvisionedSpaceGB -gt 0) { "vSAN" }
+                             elseif ($storageDetails.NFS.ProvisionedSpaceGB -gt 0) { "NFS" }
+                             else { "Local" }
     }
 }
 
 # Display results
-Write-Host "`nVMs connected to SAN storage:" -ForegroundColor Yellow
-$vmInfo | Format-Table -AutoSize
+Write-Host "`nVMs with SAN storage (showing all storage types):" -ForegroundColor Yellow
+$vmInfo | Format-Table VMName, PowerState, CPUs, MemoryGB, SAN_ProvisionedSpaceGB, vSAN_ProvisionedSpaceGB, Total_ProvisionedSpaceGB, PrimaryStorageType -AutoSize
+
+# Detailed storage breakdown
+Write-Host "`nDetailed Storage Breakdown:" -ForegroundColor Yellow
+$vmInfo | ForEach-Object {
+    Write-Host "`n--- $($_.VMName) ---" -ForegroundColor Cyan
+    Write-Host "  SAN Storage: $($_.SAN_ProvisionedSpaceGB) GB ($($_.SAN_Datastores))" -ForegroundColor Green
+    Write-Host "  vSAN Storage: $($_.vSAN_ProvisionedSpaceGB) GB ($($_.vSAN_Datastores))" -ForegroundColor Magenta
+    if ($_.NFS_ProvisionedSpaceGB -gt 0) {
+        Write-Host "  NFS Storage: $($_.NFS_ProvisionedSpaceGB) GB ($($_.NFS_Datastores))" -ForegroundColor Yellow
+    }
+    if ($_.Local_ProvisionedSpaceGB -gt 0) {
+        Write-Host "  Local Storage: $($_.Local_ProvisionedSpaceGB) GB ($($_.Local_Datastores))" -ForegroundColor Gray
+    }
+    Write-Host "  Total: $($_.Total_ProvisionedSpaceGB) GB" -ForegroundColor White
+}
 
 # Export to CSV (optional)
-$exportPath = "C:\temp\SAN_VMs_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+$exportPath = "C:\temp\SAN_VMs_Storage_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
 $vmInfo | Export-Csv -Path $exportPath -NoTypeInformation
 Write-Host "`nResults exported to: $exportPath" -ForegroundColor Green
 
-# Summary
-Write-Host "`nSummary:" -ForegroundColor Cyan
-Write-Host "Total VMs on SAN: $($vmInfo.Count)"
+# Summary with storage type breakdown
+Write-Host "`nStorage Summary:" -ForegroundColor Cyan
+Write-Host "Total VMs with SAN storage: $($vmInfo.Count)"
 Write-Host "Total CPU cores: $(($vmInfo | Measure-Object -Property CPUs -Sum).Sum)"
 Write-Host "Total Memory GB: $(($vmInfo | Measure-Object -Property MemoryGB -Sum).Sum)"
+
+$totalSAN = ($vmInfo | Measure-Object -Property SAN_ProvisionedSpaceGB -Sum).Sum
+$totalvSAN = ($vmInfo | Measure-Object -Property vSAN_ProvisionedSpaceGB -Sum).Sum
+$totalNFS = ($vmInfo | Measure-Object -Property NFS_ProvisionedSpaceGB -Sum).Sum
+$totalLocal = ($vmInfo | Measure-Object -Property Local_ProvisionedSpaceGB -Sum).Sum
+$grandTotal = ($vmInfo | Measure-Object -Property Total_ProvisionedSpaceGB -Sum).Sum
+
+Write-Host "`nStorage Breakdown:" -ForegroundColor White
+Write-Host "  SAN Storage: $totalSAN GB" -ForegroundColor Green
+Write-Host "  vSAN Storage: $totalvSAN GB" -ForegroundColor Magenta
+Write-Host "  NFS Storage: $totalNFS GB" -ForegroundColor Yellow
+Write-Host "  Local Storage: $totalLocal GB" -ForegroundColor Gray
+Write-Host "  Total Storage: $grandTotal GB" -ForegroundColor White
 
 # Disconnect from vCenter
 Disconnect-VIServer -Confirm:$false
