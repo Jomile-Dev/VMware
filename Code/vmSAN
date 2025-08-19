@@ -56,101 +56,113 @@ function Get-VMStorageBreakdown {
         HasSAN = $false
     }
     
-    # Get all VM disks at once
+    # Get VM view for storage information
+    $vmView = $VM | Get-View
     $vmDisks = Get-HardDisk -VM $VM
     
+    # Calculate total used space from VM summary
+    $totalUsedGB = 0
+    $totalProvisionedGB = 0
+    
+    if ($vmView.Summary.Storage.Committed) {
+        $totalUsedGB = [math]::Round(($vmView.Summary.Storage.Committed / 1GB), 2)
+    }
+    if ($vmView.Summary.Storage.Provisioned) {
+        $totalProvisionedGB = [math]::Round(($vmView.Summary.Storage.Provisioned / 1GB), 2)
+    }
+    
+    # Get datastore usage breakdown
+    $datastoreUsage = @{}
+    $totalDiskProvisioned = 0
+    
+    # First pass: calculate provisioned space per datastore
     foreach ($disk in $vmDisks) {
         try {
-            # Extract datastore name from path
             $datastoreName = $disk.Filename.Split('[')[1].Split(']')[0]
+            $diskProvisionedGB = [math]::Round($disk.CapacityGB, 2)
+            $totalDiskProvisioned += $diskProvisionedGB
+            
+            if (-not $datastoreUsage[$datastoreName]) {
+                $datastoreUsage[$datastoreName] = @{
+                    Provisioned = 0
+                    Used = 0
+                    Type = "Unknown"
+                }
+            }
+            
+            $datastoreUsage[$datastoreName].Provisioned += $diskProvisionedGB
+            
+            # Get datastore info from cache
             $dsInfo = $datastoreInfo[$datastoreName]
-            
-            if (-not $dsInfo) {
-                Write-Warning "Datastore $datastoreName not found in cache"
-                continue
-            }
-            
-            # Get actual disk usage - this is the key fix!
-            $diskProvisioned = [math]::Round($disk.CapacityGB, 2)
-            
-            # For thin provisioned disks, get actual used space
-            $diskUsed = $diskProvisioned  # Default fallback
-            
-            # Try to get actual used space from disk statistics
-            try {
-                $diskStats = $disk | Get-Stat -Stat "virtualDisk.used.latest" -MaxSamples 1 -ErrorAction SilentlyContinue
-                if ($diskStats -and $diskStats.Value) {
-                    $diskUsed = [math]::Round(($diskStats.Value / 1024 / 1024 / 1024), 2)  # Convert KB to GB
-                }
-                else {
-                    # Alternative method - use datastore browser for actual file sizes
-                    $vmPath = $disk.Filename
-                    $vmDir = $vmPath.Substring(0, $vmPath.LastIndexOf('/'))
-                    
-                    # Get the actual VMDK file size (this is more accurate)
-                    $datastoreObj = Get-Datastore -Name $datastoreName
-                    $dsBrowser = Get-View $datastoreObj.ExtensionData.Browser
-                    
-                    $spec = New-Object VMware.Vim.HostDatastoreBrowserSearchSpec
-                    $spec.MatchPattern = @("*.vmdk")
-                    
-                    try {
-                        $searchResult = $dsBrowser.SearchDatastoreSubFolders($vmDir, $spec)
-                        foreach ($result in $searchResult) {
-                            foreach ($file in $result.File) {
-                                if ($file.Path -eq ($disk.Filename.Split('/') | Select-Object -Last 1)) {
-                                    $diskUsed = [math]::Round(($file.FileSize / 1GB), 2)
-                                    break
-                                }
-                            }
-                        }
-                    }
-                    catch {
-                        # Keep using provisioned if we can't get actual size
-                    }
-                }
-            }
-            catch {
-                # Keep using provisioned space
-            }
-            
-            # Categorize by storage type
-            switch ($dsInfo.StorageType) {
-                "SAN" {
-                    $storageBreakdown.SAN.Used += $diskUsed
-                    $storageBreakdown.SAN.Provisioned += $diskProvisioned
-                    if ($storageBreakdown.SAN.Datastores -notcontains $datastoreName) {
-                        $storageBreakdown.SAN.Datastores += $datastoreName
-                    }
-                    $storageBreakdown.HasSAN = $true
-                }
-                "vSAN" {
-                    $storageBreakdown.vSAN.Used += $diskUsed
-                    $storageBreakdown.vSAN.Provisioned += $diskProvisioned
-                    if ($storageBreakdown.vSAN.Datastores -notcontains $datastoreName) {
-                        $storageBreakdown.vSAN.Datastores += $datastoreName
-                    }
-                }
-                "NFS" {
-                    $storageBreakdown.NFS.Used += $diskUsed
-                    $storageBreakdown.NFS.Provisioned += $diskProvisioned
-                    if ($storageBreakdown.NFS.Datastores -notcontains $datastoreName) {
-                        $storageBreakdown.NFS.Datastores += $datastoreName
-                    }
-                }
-                default {
-                    $storageBreakdown.Local.Used += $diskUsed
-                    $storageBreakdown.Local.Provisioned += $diskProvisioned
-                    if ($storageBreakdown.Local.Datastores -notcontains $datastoreName) {
-                        $storageBreakdown.Local.Datastores += $datastoreName
-                    }
-                }
+            if ($dsInfo) {
+                $datastoreUsage[$datastoreName].Type = $dsInfo.StorageType
             }
         }
         catch {
-            Write-Warning "Error processing disk $($disk.Name) for VM $($VM.Name): $($_.Exception.Message)"
+            Write-Warning "Error processing disk $($disk.Name): $($_.Exception.Message)"
         }
     }
+    
+    # Calculate used space proportionally based on provisioned space
+    if ($totalDiskProvisioned -gt 0 -and $totalUsedGB -gt 0) {
+        foreach ($dsName in $datastoreUsage.Keys) {
+            $provisionedRatio = $datastoreUsage[$dsName].Provisioned / $totalDiskProvisioned
+            $datastoreUsage[$dsName].Used = [math]::Round(($totalUsedGB * $provisionedRatio), 2)
+        }
+    }
+    else {
+        # If we can't get used space, use provisioned as fallback
+        foreach ($dsName in $datastoreUsage.Keys) {
+            $datastoreUsage[$dsName].Used = $datastoreUsage[$dsName].Provisioned
+        }
+    }
+    
+    # Categorize by storage type
+    foreach ($dsName in $datastoreUsage.Keys) {
+        $usage = $datastoreUsage[$dsName]
+        
+        switch ($usage.Type) {
+            "SAN" {
+                $storageBreakdown.SAN.Used += $usage.Used
+                $storageBreakdown.SAN.Provisioned += $usage.Provisioned
+                if ($storageBreakdown.SAN.Datastores -notcontains $dsName) {
+                    $storageBreakdown.SAN.Datastores += $dsName
+                }
+                $storageBreakdown.HasSAN = $true
+            }
+            "vSAN" {
+                $storageBreakdown.vSAN.Used += $usage.Used
+                $storageBreakdown.vSAN.Provisioned += $usage.Provisioned
+                if ($storageBreakdown.vSAN.Datastores -notcontains $dsName) {
+                    $storageBreakdown.vSAN.Datastores += $dsName
+                }
+            }
+            "NFS" {
+                $storageBreakdown.NFS.Used += $usage.Used
+                $storageBreakdown.NFS.Provisioned += $usage.Provisioned
+                if ($storageBreakdown.NFS.Datastores -notcontains $dsName) {
+                    $storageBreakdown.NFS.Datastores += $dsName
+                }
+            }
+            default {
+                $storageBreakdown.Local.Used += $usage.Used
+                $storageBreakdown.Local.Provisioned += $usage.Provisioned
+                if ($storageBreakdown.Local.Datastores -notcontains $dsName) {
+                    $storageBreakdown.Local.Datastores += $dsName
+                }
+            }
+        }
+    }
+    
+    # Round all values
+    $storageBreakdown.SAN.Used = [math]::Round($storageBreakdown.SAN.Used, 2)
+    $storageBreakdown.SAN.Provisioned = [math]::Round($storageBreakdown.SAN.Provisioned, 2)
+    $storageBreakdown.vSAN.Used = [math]::Round($storageBreakdown.vSAN.Used, 2)
+    $storageBreakdown.vSAN.Provisioned = [math]::Round($storageBreakdown.vSAN.Provisioned, 2)
+    $storageBreakdown.NFS.Used = [math]::Round($storageBreakdown.NFS.Used, 2)
+    $storageBreakdown.NFS.Provisioned = [math]::Round($storageBreakdown.NFS.Provisioned, 2)
+    $storageBreakdown.Local.Used = [math]::Round($storageBreakdown.Local.Used, 2)
+    $storageBreakdown.Local.Provisioned = [math]::Round($storageBreakdown.Local.Provisioned, 2)
     
     return $storageBreakdown
 }
