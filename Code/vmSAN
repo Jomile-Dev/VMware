@@ -6,45 +6,136 @@ $vCenterServer = "your-vcenter-server.domain.com"
 $Credential = Get-Credential
 Connect-VIServer -Server $vCenterServer -Credential $Credential
 
-# Function to check if VM is on SAN storage
+# Function to check if VM is on external SAN storage (excludes vSAN, local storage, NFS)
 function Test-VMOnSAN {
     param($VM)
     
     $vmDisks = Get-HardDisk -VM $VM
     $sanConnected = $false
+    $sanDetails = @()
     
     foreach ($disk in $vmDisks) {
         $datastore = Get-Datastore -Name $disk.Filename.Split('[')[1].Split(']')[0]
+        $datastoreView = $datastore | Get-View
         
-        # Check if datastore is SAN-based (you may need to adjust these conditions)
-        if ($datastore.Type -eq "VMFS" -and $datastore.ExtensionData.Summary.MultipleHostAccess) {
-            $sanConnected = $true
-            break
+        $isSAN = $false
+        $sanType = "Unknown"
+        
+        # EXCLUDE vSAN, NFS, and local storage
+        if ($datastore.Type -eq "vsan") {
+            Write-Verbose "Excluding vSAN datastore: $($datastore.Name)"
+            continue
         }
         
-        # Alternative: Check by datastore name pattern (adjust regex as needed)
-        if ($datastore.Name -match "(SAN|FC|iSCSI|VMFS)") {
+        if ($datastore.Type -eq "NFS" -or $datastore.Type -eq "NFS41") {
+            Write-Verbose "Excluding NFS datastore: $($datastore.Name)"
+            continue
+        }
+        
+        # Only check VMFS datastores for external SAN
+        if ($datastore.Type -eq "VMFS") {
+            
+            # Check the underlying storage devices
+            if ($datastoreView.Info.Vmfs.Extent) {
+                foreach ($extent in $datastoreView.Info.Vmfs.Extent) {
+                    # Get the SCSI LUN details
+                    $scsiLuns = Get-VMHost -VM $VM | Get-ScsiLun
+                    $device = $scsiLuns | Where-Object { $_.CanonicalName -eq $extent.DiskName }
+                    
+                    if ($device) {
+                        # Check if it's external SAN storage
+                        # Exclude local disks and vSAN
+                        if ($device.LunType -eq "disk") {
+                            
+                            # Check vendor - external SAN vendors
+                            $sanVendors = @("PURE", "NETAPP", "EMC", "HP", "DELL", "IBM", "HITACHI", "COMPELLENT", "EQUALLOGIC", "NIMBLE", "3PAR")
+                            $isExternalSAN = $false
+                            
+                            foreach ($vendor in $sanVendors) {
+                                if ($device.Vendor -match $vendor) {
+                                    $isExternalSAN = $true
+                                    $sanType = "External SAN - $($device.Vendor)"
+                                    break
+                                }
+                            }
+                            
+                            # Additional check for FC/iSCSI paths (external connectivity)
+                            if (!$isExternalSAN) {
+                                $paths = $device | Get-ScsiLunPath
+                                foreach ($path in $paths) {
+                                    if ($path.TransportType -eq "fc" -or $path.TransportType -eq "iscsi") {
+                                        # Further verify it's not local by checking if multiple hosts can see it
+                                        $allHosts = Get-VMHost
+                                        $hostsSeeingLun = 0
+                                        
+                                        foreach ($vmHost in $allHosts) {
+                                            $hostLuns = $vmHost | Get-ScsiLun
+                                            if ($hostLuns | Where-Object { $_.CanonicalName -eq $device.CanonicalName }) {
+                                                $hostsSeeingLun++
+                                            }
+                                        }
+                                        
+                                        # If multiple hosts see the same LUN, it's likely external SAN
+                                        if ($hostsSeeingLun -gt 1) {
+                                            $isExternalSAN = $true
+                                            $sanType = "External SAN - $($path.TransportType.ToUpper())"
+                                            break
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            # Exclude VMware vSAN devices explicitly
+                            if ($device.Vendor -match "VMware" -and $device.Model -match "Virtual") {
+                                $isExternalSAN = $false
+                            }
+                            
+                            if ($isExternalSAN) {
+                                $isSAN = $true
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        if ($isSAN) {
             $sanConnected = $true
-            break
+            $sanDetails += @{
+                DiskLabel = $disk.Name
+                Datastore = $datastore.Name
+                DatastoreType = $datastore.Type
+                SANType = $sanType
+                CapacityGB = [math]::Round($disk.CapacityGB, 2)
+            }
         }
     }
     
-    return $sanConnected
+    return @{
+        IsSAN = $sanConnected
+        Details = $sanDetails
+    }
 }
 
 # Get all VMs
 Write-Host "Retrieving all VMs..." -ForegroundColor Green
 $allVMs = Get-VM
 
-# Filter VMs connected to SAN storage
-Write-Host "Filtering VMs connected to SAN storage..." -ForegroundColor Green
+# Filter VMs connected to external SAN storage (excludes vSAN)
+Write-Host "Filtering VMs connected to external SAN storage (excluding vSAN, NFS, local)..." -ForegroundColor Green
 $sanVMs = @()
 
 foreach ($vm in $allVMs) {
-    if (Test-VMOnSAN -VM $vm) {
+    Write-Progress -Activity "Checking VMs for SAN connectivity" -Status "Processing $($vm.Name)" -PercentComplete (($allVMs.IndexOf($vm) / $allVMs.Count) * 100)
+    
+    $sanResult = Test-VMOnSAN -VM $vm
+    if ($sanResult.IsSAN) {
         $sanVMs += $vm
+        Write-Host "Found SAN VM: $($vm.Name)" -ForegroundColor Yellow
     }
 }
+
+Write-Progress -Completed -Activity "Checking VMs for SAN connectivity"
 
 # Collect VM information
 Write-Host "Collecting VM CPU and Memory information..." -ForegroundColor Green
