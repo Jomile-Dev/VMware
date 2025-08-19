@@ -1,0 +1,89 @@
+# VMware PowerCLI Script to get VMs on SAN storage with CPU/Memory info
+# Requires VMware PowerCLI module
+
+# Connect to vCenter (replace with your vCenter details)
+$vCenterServer = "your-vcenter-server.domain.com"
+$Credential = Get-Credential
+Connect-VIServer -Server $vCenterServer -Credential $Credential
+
+# Function to check if VM is on SAN storage
+function Test-VMOnSAN {
+    param($VM)
+    
+    $vmDisks = Get-HardDisk -VM $VM
+    $sanConnected = $false
+    
+    foreach ($disk in $vmDisks) {
+        $datastore = Get-Datastore -Name $disk.Filename.Split('[')[1].Split(']')[0]
+        
+        # Check if datastore is SAN-based (you may need to adjust these conditions)
+        if ($datastore.Type -eq "VMFS" -and $datastore.ExtensionData.Summary.MultipleHostAccess) {
+            $sanConnected = $true
+            break
+        }
+        
+        # Alternative: Check by datastore name pattern (adjust regex as needed)
+        if ($datastore.Name -match "(SAN|FC|iSCSI|VMFS)") {
+            $sanConnected = $true
+            break
+        }
+    }
+    
+    return $sanConnected
+}
+
+# Get all VMs
+Write-Host "Retrieving all VMs..." -ForegroundColor Green
+$allVMs = Get-VM
+
+# Filter VMs connected to SAN storage
+Write-Host "Filtering VMs connected to SAN storage..." -ForegroundColor Green
+$sanVMs = @()
+
+foreach ($vm in $allVMs) {
+    if (Test-VMOnSAN -VM $vm) {
+        $sanVMs += $vm
+    }
+}
+
+# Collect VM information
+Write-Host "Collecting VM CPU and Memory information..." -ForegroundColor Green
+$vmInfo = foreach ($vm in $sanVMs) {
+    $vmView = $vm | Get-View
+    
+    [PSCustomObject]@{
+        VMName = $vm.Name
+        PowerState = $vm.PowerState
+        CPUs = $vm.NumCpu
+        CPUCoresPerSocket = $vm.CoresPerSocket
+        CPUHotAddEnabled = $vm.ExtensionData.Config.CpuHotAddEnabled
+        MemoryGB = [math]::Round($vm.MemoryGB, 2)
+        MemoryMB = $vm.MemoryMB
+        MemoryHotAddEnabled = $vm.ExtensionData.Config.MemoryHotAddEnabled
+        GuestOS = $vm.GuestId
+        VMwareTools = $vm.ExtensionData.Summary.Guest.ToolsStatus
+        Host = $vm.VMHost.Name
+        Cluster = (Get-Cluster -VM $vm).Name
+        Datastore = ($vm | Get-Datastore | Select-Object -First 1).Name
+        UsedSpaceGB = [math]::Round($vm.UsedSpaceGB, 2)
+        ProvisionedSpaceGB = [math]::Round($vm.ProvisionedSpaceGB, 2)
+    }
+}
+
+# Display results
+Write-Host "`nVMs connected to SAN storage:" -ForegroundColor Yellow
+$vmInfo | Format-Table -AutoSize
+
+# Export to CSV (optional)
+$exportPath = "C:\temp\SAN_VMs_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+$vmInfo | Export-Csv -Path $exportPath -NoTypeInformation
+Write-Host "`nResults exported to: $exportPath" -ForegroundColor Green
+
+# Summary
+Write-Host "`nSummary:" -ForegroundColor Cyan
+Write-Host "Total VMs on SAN: $($vmInfo.Count)"
+Write-Host "Total CPU cores: $(($vmInfo | Measure-Object -Property CPUs -Sum).Sum)"
+Write-Host "Total Memory GB: $(($vmInfo | Measure-Object -Property MemoryGB -Sum).Sum)"
+
+# Disconnect from vCenter
+Disconnect-VIServer -Confirm:$false
