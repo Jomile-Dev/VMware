@@ -39,9 +39,6 @@ foreach ($ds in $allDatastores) {
     elseif ($ds.Type -eq "NFS" -or $ds.Type -eq "NFS41") {
         $datastoreInfo[$ds.Name].StorageType = "NFS"
     }
-    else {
-        $datastoreInfo[$ds.Name].StorageType = "Local"
-    }
 }
 
 # Function to get VM storage breakdown quickly
@@ -52,7 +49,6 @@ function Get-VMStorageBreakdown {
         SAN = @{ Used = 0; Provisioned = 0; Datastores = @() }
         vSAN = @{ Used = 0; Provisioned = 0; Datastores = @() }
         NFS = @{ Used = 0; Provisioned = 0; Datastores = @() }
-        Local = @{ Used = 0; Provisioned = 0; Datastores = @() }
         HasSAN = $false
     }
     
@@ -144,13 +140,7 @@ function Get-VMStorageBreakdown {
                     $storageBreakdown.NFS.Datastores += $dsName
                 }
             }
-            default {
-                $storageBreakdown.Local.Used += $usage.Used
-                $storageBreakdown.Local.Provisioned += $usage.Provisioned
-                if ($storageBreakdown.Local.Datastores -notcontains $dsName) {
-                    $storageBreakdown.Local.Datastores += $dsName
-                }
-            }
+            # Skip local storage - not tracked
         }
     }
     
@@ -161,8 +151,6 @@ function Get-VMStorageBreakdown {
     $storageBreakdown.vSAN.Provisioned = [math]::Round($storageBreakdown.vSAN.Provisioned, 2)
     $storageBreakdown.NFS.Used = [math]::Round($storageBreakdown.NFS.Used, 2)
     $storageBreakdown.NFS.Provisioned = [math]::Round($storageBreakdown.NFS.Provisioned, 2)
-    $storageBreakdown.Local.Used = [math]::Round($storageBreakdown.Local.Used, 2)
-    $storageBreakdown.Local.Provisioned = [math]::Round($storageBreakdown.Local.Provisioned, 2)
     
     return $storageBreakdown
 }
@@ -209,14 +197,9 @@ foreach ($vm in $allVMs) {
             NFS_ProvisionedGB = $storageBreakdown.NFS.Provisioned
             NFS_Datastores = ($storageBreakdown.NFS.Datastores -join ", ")
             
-            # Local Storage
-            Local_UsedGB = $storageBreakdown.Local.Used
-            Local_ProvisionedGB = $storageBreakdown.Local.Provisioned
-            Local_Datastores = ($storageBreakdown.Local.Datastores -join ", ")
-            
             # Totals
-            Total_UsedGB = [math]::Round(($storageBreakdown.SAN.Used + $storageBreakdown.vSAN.Used + $storageBreakdown.NFS.Used + $storageBreakdown.Local.Used), 2)
-            Total_ProvisionedGB = [math]::Round(($storageBreakdown.SAN.Provisioned + $storageBreakdown.vSAN.Provisioned + $storageBreakdown.NFS.Provisioned + $storageBreakdown.Local.Provisioned), 2)
+            Total_UsedGB = [math]::Round(($storageBreakdown.SAN.Used + $storageBreakdown.vSAN.Used + $storageBreakdown.NFS.Used), 2)
+            Total_ProvisionedGB = [math]::Round(($storageBreakdown.SAN.Provisioned + $storageBreakdown.vSAN.Provisioned + $storageBreakdown.NFS.Provisioned), 2)
             
             # Metadata
             Host = $vm.VMHost.Name
@@ -246,9 +229,6 @@ foreach ($vm in $vmResults) {
     if ($vm.NFS_ProvisionedGB -gt 0) {
         Write-Host "  NFS Storage: $($vm.NFS_UsedGB) GB used / $($vm.NFS_ProvisionedGB) GB provisioned ($($vm.NFS_Datastores))" -ForegroundColor Yellow
     }
-    if ($vm.Local_ProvisionedGB -gt 0) {
-        Write-Host "  Local Storage: $($vm.Local_UsedGB) GB used / $($vm.Local_ProvisionedGB) GB provisioned ($($vm.Local_Datastores))" -ForegroundColor Gray
-    }
     Write-Host "  Total: $($vm.Total_UsedGB) GB used / $($vm.Total_ProvisionedGB) GB provisioned" -ForegroundColor White
 }
 
@@ -269,17 +249,14 @@ $totalvSANUsed = ($vmResults | Measure-Object -Property vSAN_UsedGB -Sum).Sum
 $totalvSANProvisioned = ($vmResults | Measure-Object -Property vSAN_ProvisionedGB -Sum).Sum
 $totalNFSUsed = ($vmResults | Measure-Object -Property NFS_UsedGB -Sum).Sum
 $totalNFSProvisioned = ($vmResults | Measure-Object -Property NFS_ProvisionedGB -Sum).Sum
-$totalLocalUsed = ($vmResults | Measure-Object -Property Local_UsedGB -Sum).Sum
-$totalLocalProvisioned = ($vmResults | Measure-Object -Property Local_ProvisionedGB -Sum).Sum
 
-$grandTotalUsed = $totalSANUsed + $totalvSANUsed + $totalNFSUsed + $totalLocalUsed
-$grandTotalProvisioned = $totalSANProvisioned + $totalvSANProvisioned + $totalNFSProvisioned + $totalLocalProvisioned
+$grandTotalUsed = $totalSANUsed + $totalvSANUsed + $totalNFSUsed
+$grandTotalProvisioned = $totalSANProvisioned + $totalvSANProvisioned + $totalNFSProvisioned
 
 Write-Host "`nStorage Usage Breakdown:" -ForegroundColor White
 Write-Host "  SAN Storage: $totalSANUsed GB used / $totalSANProvisioned GB provisioned" -ForegroundColor Green
 Write-Host "  vSAN Storage: $totalvSANUsed GB used / $totalvSANProvisioned GB provisioned" -ForegroundColor Magenta
 Write-Host "  NFS Storage: $totalNFSUsed GB used / $totalNFSProvisioned GB provisioned" -ForegroundColor Yellow
-Write-Host "  Local Storage: $totalLocalUsed GB used / $totalLocalProvisioned GB provisioned" -ForegroundColor Gray
 Write-Host "  TOTAL: $grandTotalUsed GB used / $grandTotalProvisioned GB provisioned" -ForegroundColor White
 
 if ($grandTotalProvisioned -gt 0) {
