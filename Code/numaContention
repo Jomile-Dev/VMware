@@ -1,0 +1,164 @@
+# VCF 5.2 Multiple vCenter NUMA and Contention Stats Collection
+# Define your vCenter servers
+$vCenters = @(
+    "vcenter01.domain.com",
+    "vcenter02.domain.com", 
+    "vcenter03.domain.com"
+)
+
+# Metrics to collect
+$numaMetrics = @(
+    "numa.memLocalKB.average",
+    "numa.memRemoteKB.average", 
+    "numa.localityPercentage.average"
+)
+
+$contentionMetrics = @(
+    "cpu.ready.summation",
+    "cpu.wait.summation", 
+    "cpu.costop.summation",
+    "mem.vmmemctl.average",
+    "mem.swapinRate.average",
+    "mem.swapoutRate.average"
+)
+
+# Initialize result arrays
+$allNumaResults = @()
+$allContentionResults = @()
+$summaryResults = @()
+
+# Get credentials for each vCenter
+$credentials = @{}
+foreach ($vcenter in $vCenters) {
+    Write-Host "Enter credentials for $vcenter" -ForegroundColor Yellow
+    $credentials[$vcenter] = Get-Credential -Message "Credentials for $vcenter"
+}
+
+# Process each vCenter
+foreach ($vcenter in $vCenters) {
+    Write-Host "`nProcessing $vcenter..." -ForegroundColor Green
+    
+    try {
+        # Connect to vCenter
+        Connect-VIServer -Server $vcenter -Credential $credentials[$vcenter] -Force
+        
+        # Get all hosts and VMs
+        $vmHosts = Get-VMHost
+        $vms = Get-VM
+        
+        Write-Host "Found $($vmHosts.Count) hosts and $($vms.Count) VMs"
+        
+        # Collect NUMA stats
+        Write-Host "Collecting NUMA statistics..." -ForegroundColor Cyan
+        $numaStats = Get-Stat -Entity $vmHosts -Stat $numaMetrics -Realtime -ErrorAction SilentlyContinue
+        
+        foreach ($stat in $numaStats) {
+            $allNumaResults += [PSCustomObject]@{
+                vCenter = $vcenter
+                Host = $stat.Entity.Name
+                Cluster = (Get-VMHost $stat.Entity.Name | Get-Cluster).Name
+                MetricId = $stat.MetricId
+                Instance = $stat.Instance
+                Value = $stat.Value
+                Unit = $stat.Unit
+                Timestamp = $stat.Timestamp
+            }
+        }
+        
+        # Collect contention stats
+        Write-Host "Collecting contention statistics..." -ForegroundColor Cyan
+        $contentionStats = Get-Stat -Entity $vms -Stat $contentionMetrics -Realtime -ErrorAction SilentlyContinue
+        
+        foreach ($stat in $contentionStats) {
+            $vm = Get-VM $stat.Entity.Name
+            $allContentionResults += [PSCustomObject]@{
+                vCenter = $vcenter
+                VM = $stat.Entity.Name
+                Host = $vm.VMHost.Name
+                Cluster = (Get-Cluster -VM $vm).Name
+                MetricId = $stat.MetricId
+                Instance = $stat.Instance
+                Value = $stat.Value
+                Unit = $stat.Unit
+                Timestamp = $stat.Timestamp
+            }
+        }
+        
+        # Create summary for this vCenter
+        $clusters = Get-Cluster
+        foreach ($cluster in $clusters) {
+            $clusterHosts = $cluster | Get-VMHost
+            $clusterVMs = $cluster | Get-VM
+            
+            # Calculate averages
+            $avgNumaLocal = ($numaStats | Where-Object {$_.MetricId -eq "numa.memLocalKB.average" -and $_.Entity.Name -in $clusterHosts.Name} | Measure-Object -Property Value -Average).Average
+            $avgNumaRemote = ($numaStats | Where-Object {$_.MetricId -eq "numa.memRemoteKB.average" -and $_.Entity.Name -in $clusterHosts.Name} | Measure-Object -Property Value -Average).Average
+            $avgCpuReady = ($contentionStats | Where-Object {$_.MetricId -eq "cpu.ready.summation" -and $_.Entity.Name -in $clusterVMs.Name} | Measure-Object -Property Value -Average).Average
+            
+            $summaryResults += [PSCustomObject]@{
+                vCenter = $vcenter
+                Cluster = $cluster.Name
+                HostCount = $clusterHosts.Count
+                VMCount = $clusterVMs.Count
+                AvgNumaLocalKB = [Math]::Round($avgNumaLocal, 2)
+                AvgNumaRemoteKB = [Math]::Round($avgNumaRemote, 2)
+                AvgCpuReadyTime = [Math]::Round($avgCpuReady, 2)
+                NumaLocalityPct = if($avgNumaLocal -and $avgNumaRemote) { [Math]::Round(($avgNumaLocal / ($avgNumaLocal + $avgNumaRemote)) * 100, 2) } else { 0 }
+                CollectionTime = Get-Date
+            }
+        }
+        
+        Write-Host "Completed $vcenter" -ForegroundColor Green
+        
+    } catch {
+        Write-Error "Failed to process $vcenter : $($_.Exception.Message)"
+    } finally {
+        # Disconnect from current vCenter
+        if ($global:DefaultVIServers.Count -gt 0) {
+            Disconnect-VIServer -Server $vcenter -Confirm:$false -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+# Generate timestamp for filenames
+$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+
+# Export all results to CSV
+Write-Host "`nExporting results to CSV files..." -ForegroundColor Yellow
+
+# Export detailed NUMA stats
+$numaExportPath = "NUMA_Stats_$timestamp.csv"
+$allNumaResults | Export-Csv -Path $numaExportPath -NoTypeInformation
+Write-Host "NUMA stats exported to: $numaExportPath"
+
+# Export detailed contention stats  
+$contentionExportPath = "Contention_Stats_$timestamp.csv"
+$allContentionResults | Export-Csv -Path $contentionExportPath -NoTypeInformation
+Write-Host "Contention stats exported to: $contentionExportPath"
+
+# Export summary
+$summaryExportPath = "VCF_Summary_$timestamp.csv"
+$summaryResults | Export-Csv -Path $summaryExportPath -NoTypeInformation
+Write-Host "Summary exported to: $summaryExportPath"
+
+# Display summary on screen
+Write-Host "`n=== COLLECTION SUMMARY ===" -ForegroundColor Magenta
+$summaryResults | Format-Table -AutoSize
+
+Write-Host "`n=== HIGH CPU READY TIME VMs (>5%) ===" -ForegroundColor Red
+$highContentionVMs = $allContentionResults | Where-Object {$_.MetricId -eq "cpu.ready.summation" -and $_.Value -gt 5}
+if ($highContentionVMs) {
+    $highContentionVMs | Select-Object vCenter, VM, Host, Cluster, Value | Format-Table -AutoSize
+} else {
+    Write-Host "No VMs with high CPU ready time detected." -ForegroundColor Green
+}
+
+Write-Host "`n=== NUMA REMOTE MEMORY USAGE ===" -ForegroundColor Yellow
+$highRemoteNuma = $allNumaResults | Where-Object {$_.MetricId -eq "numa.memRemoteKB.average" -and $_.Value -gt 1000}
+if ($highRemoteNuma) {
+    $highRemoteNuma | Select-Object vCenter, Host, Cluster, Value | Format-Table -AutoSize
+} else {
+    Write-Host "No hosts with significant remote NUMA memory usage." -ForegroundColor Green
+}
+
+Write-Host "`nCollection completed. Files saved to current directory." -ForegroundColor Green
