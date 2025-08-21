@@ -23,55 +23,62 @@ foreach ($vc in $vCenterServer) {
         Connect-VIServer -Server $vc -Credential $Credential -ErrorAction Stop
         Write-Host "Connected to $vc" -ForegroundColor Green
         
-        # Get basic inventory (faster queries)
-        $vmHosts = Get-VMHost
+        # Get VMs only
         $vms = Get-VM
+        Write-Host "Found VMs: $($vms.Count)" -ForegroundColor White
         
-        Write-Host "Found: Clusters: $((Get-Cluster).Count) | Hosts: $($vmHosts.Count) | VMs: $($vms.Count)" -ForegroundColor White
-        
-        if ($vmHosts.Count -eq 0) {
-            Write-Warning "No hosts found! Check permissions."
+        if ($vms.Count -eq 0) {
+            Write-Warning "No VMs found! Check permissions."
             continue
         }
         
-        # Quick metric availability check
-        $testHost = $vmHosts[0]
-        $availableMetrics = Get-StatType -Entity $testHost
+        # Get available metrics from first VM
+        $testVM = $vms[0]
+        $availableMetrics = Get-StatType -Entity $testVM
         $numaMetrics = $availableMetrics | Where-Object {$_.Name -like "*numa*"}
+        $contentionMetrics = $availableMetrics | Where-Object {$_.Name -like "*cpu*ready*" -or $_.Name -like "*cpu*wait*" -or $_.Name -like "*cpu*costop*"}
         
-        Write-Host "Available metrics: $($availableMetrics.Count) | NUMA metrics: $($numaMetrics.Count)" -ForegroundColor White
+        Write-Host "NUMA metrics: $($numaMetrics.Count) | Contention metrics: $($contentionMetrics.Count)" -ForegroundColor White
         
-        # Quick test of basic metrics
-        $basicStats = Get-Stat -Entity $testHost -Stat "cpu.usage.average" -Start (Get-Date).AddHours(-1) -MaxSamples 3 -ErrorAction SilentlyContinue
-        Write-Host "Basic stats test: $($basicStats.Count) data points" -ForegroundColor Green
+        # Test VM metrics
+        $basicStats = Get-Stat -Entity $testVM -Stat "cpu.usage.average" -Start (Get-Date).AddHours(-1) -MaxSamples 3 -ErrorAction SilentlyContinue
+        Write-Host "Basic VM stats test: $($basicStats.Count) data points" -ForegroundColor Green
         
-        # Collect actual data (streamlined)
-        $metricsToTry = @("cpu.usage.average", "mem.usage.average", "cpu.ready.summation")
-        if ($numaMetrics.Count -gt 0) { $metricsToTry += $numaMetrics[0].Name }
+        # Collect NUMA and contention data for VMs only
+        $metricsToCollect = @()
         
-        foreach ($metric in $metricsToTry) {
-            # Hosts
-            $hostStats = Get-Stat -Entity $vmHosts -Stat $metric -Start (Get-Date).AddHours(-1) -MaxSamples 5 -ErrorAction SilentlyContinue
-            foreach ($stat in $hostStats) {
-                $allResults += [PSCustomObject]@{
-                    vCenter = $vc
-                    EntityType = "Host"
-                    EntityName = $stat.Entity.Name
-                    MetricId = $stat.MetricId
-                    Value = $stat.Value
-                    Unit = $stat.Unit
-                    Timestamp = $stat.Timestamp
-                }
-            }
+        # Add NUMA metrics if available
+        if ($numaMetrics.Count -gt 0) {
+            $metricsToCollect += $numaMetrics.Name
+        }
+        
+        # Add contention metrics if available
+        if ($contentionMetrics.Count -gt 0) {
+            $metricsToCollect += $contentionMetrics.Name
+        }
+        
+        # Add essential VM metrics
+        $metricsToCollect += @("cpu.ready.summation", "cpu.wait.summation", "cpu.costop.summation")
+        
+        # Remove duplicates
+        $metricsToCollect = $metricsToCollect | Sort-Object -Unique
+        
+        foreach ($metric in $metricsToCollect) {
+            $vmStats = Get-Stat -Entity $vms -Stat $metric -Start (Get-Date).AddHours(-1) -MaxSamples 5 -ErrorAction SilentlyContinue
             
-            # VMs for CPU/Memory metrics
-            if ($metric -like "*cpu*" -or $metric -like "*mem*") {
-                $vmStats = Get-Stat -Entity $vms -Stat $metric -Start (Get-Date).AddHours(-1) -MaxSamples 5 -ErrorAction SilentlyContinue
-                foreach ($stat in $vmStats) {
+            foreach ($stat in $vmStats) {
+                # Check for duplicate before adding
+                $duplicate = $allResults | Where-Object {
+                    $_.vCenter -eq $vc -and 
+                    $_.EntityName -eq $stat.Entity.Name -and 
+                    $_.MetricId -eq $stat.MetricId -and 
+                    $_.Timestamp -eq $stat.Timestamp
+                }
+                
+                if (-not $duplicate) {
                     $allResults += [PSCustomObject]@{
                         vCenter = $vc
-                        EntityType = "VM"
-                        EntityName = $stat.Entity.Name
+                        VM = $stat.Entity.Name
                         MetricId = $stat.MetricId
                         Value = $stat.Value
                         Unit = $stat.Unit
@@ -92,21 +99,12 @@ foreach ($vc in $vCenterServer) {
 
 # Export results
 $exportPath = Join-Path $OutputDir "VCF_Diagnostic_Stats_$timestamp.csv"
-Write-Host "`n=== EXPORT RESULTS ===" -ForegroundColor Magenta
-Write-Host "Total data points collected: $($allResults.Count)" -ForegroundColor White
+Write-Host "`nTotal data points collected: $($allResults.Count)" -ForegroundColor White
 
 if ($allResults.Count -gt 0) {
     $allResults | Export-Csv -Path $exportPath -NoTypeInformation
     Write-Host "Data exported to: $exportPath" -ForegroundColor Green
-    
-    # Show summary
-    Write-Host "`nData Summary:" -ForegroundColor White
-    $allResults | Group-Object EntityType, MetricId | Select-Object Name, Count | Format-Table -AutoSize
-    
+    $allResults | Group-Object MetricId | Select-Object Name, Count | Format-Table -AutoSize
 } else {
-    Write-Warning "No data collected! Check the diagnostic output above."
-    # Create empty file with diagnostic info
-    "No data collected - see PowerShell output for diagnostics" | Out-File $exportPath
+    Write-Warning "No data collected!"
 }
-
-Write-Host "`nDiagnostic collection completed!" -ForegroundColor Green
