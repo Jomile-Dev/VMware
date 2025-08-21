@@ -3,183 +3,89 @@
 $OutputDir = "D:\VMware_Stats"
 
 # Define your vCenter servers
-$vCenters = @(
-    "vcenter01.domain.com",
-    "vcenter02.domain.com"
-    # Add your actual vCenter FQDNs here
-)
+$vCenterServer = @("test.test.test",
+                   "test.test.test",
+                   "test.test.test",
+                   "test.test.test",
+                   "test.test.test")
 
-Write-Host "=== VCF DIAGNOSTIC COLLECTION ===" -ForegroundColor Magenta
-
-# Get credentials
-$credentials = @{}
-foreach ($vcenter in $vCenters) {
-    Write-Host "Enter credentials for $vcenter" -ForegroundColor Yellow
-    $credentials[$vcenter] = Get-Credential -Message "Credentials for $vcenter"
-}
+# Get single credential for all vCenters
+$Credential = Get-Credential -Message "Enter vCenter credentials"
 
 $allResults = @()
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 
-foreach ($vcenter in $vCenters) {
-    Write-Host "`n=== PROCESSING $vcenter ===" -ForegroundColor Green
+foreach ($vc in $vCenterServer) {
+    Write-Host "`n=== PROCESSING $vc ===" -ForegroundColor Green
     
     try {
         # Connect
-        Write-Host "Connecting..." -ForegroundColor Cyan
-        $connection = Connect-VIServer -Server $vcenter -Credential $credentials[$vcenter] -Force
-        Write-Host "Connected successfully to $($connection.Name)" -ForegroundColor Green
+        Connect-VIServer -Server $vc -Credential $Credential -ErrorAction Stop
+        Write-Host "Connected to $vc" -ForegroundColor Green
         
-        # Get basic inventory
-        Write-Host "Getting inventory..." -ForegroundColor Cyan
+        # Get basic inventory (faster queries)
         $vmHosts = Get-VMHost
         $vms = Get-VM
-        $clusters = Get-Cluster
         
-        Write-Host "Found:" -ForegroundColor White
-        Write-Host "  - Clusters: $($clusters.Count)" -ForegroundColor White
-        Write-Host "  - Hosts: $($vmHosts.Count)" -ForegroundColor White
-        Write-Host "  - VMs: $($vms.Count)" -ForegroundColor White
+        Write-Host "Found: Clusters: $((Get-Cluster).Count) | Hosts: $($vmHosts.Count) | VMs: $($vms.Count)" -ForegroundColor White
         
         if ($vmHosts.Count -eq 0) {
             Write-Warning "No hosts found! Check permissions."
             continue
         }
         
-        # Check statistics level
-        Write-Host "Checking statistics configuration..." -ForegroundColor Cyan
-        $statsManager = Get-View ServiceInstance | Select-Object -ExpandProperty Content | Select-Object -ExpandProperty PerfManager
-        $statsLevels = $statsManager.HistoricalInterval
-        Write-Host "Statistics Levels:" -ForegroundColor White
-        foreach ($level in $statsLevels) {
-            Write-Host "  - Level $($level.Level): $($level.Name) (Enabled: $($level.Enabled))" -ForegroundColor White
-        }
-        
-        # Test with one host first
+        # Quick metric availability check
         $testHost = $vmHosts[0]
-        Write-Host "`nTesting metrics on host: $($testHost.Name)" -ForegroundColor Cyan
-        
-        # Get available metrics for this host
-        Write-Host "Getting available metrics..." -ForegroundColor Cyan
         $availableMetrics = Get-StatType -Entity $testHost
-        Write-Host "Available metrics count: $($availableMetrics.Count)" -ForegroundColor White
-        
-        # Show some NUMA and CPU metrics if available
         $numaMetrics = $availableMetrics | Where-Object {$_.Name -like "*numa*"}
-        $cpuMetrics = $availableMetrics | Where-Object {$_.Name -like "*cpu*ready*" -or $_.Name -like "*cpu*wait*"}
         
-        Write-Host "NUMA metrics available: $($numaMetrics.Count)" -ForegroundColor White
-        if ($numaMetrics.Count -gt 0) {
-            Write-Host "  NUMA metrics: $($numaMetrics.Name -join ', ')" -ForegroundColor Gray
-        }
+        Write-Host "Available metrics: $($availableMetrics.Count) | NUMA metrics: $($numaMetrics.Count)" -ForegroundColor White
         
-        Write-Host "CPU contention metrics available: $($cpuMetrics.Count)" -ForegroundColor White
-        if ($cpuMetrics.Count -gt 0) {
-            Write-Host "  CPU metrics: $($cpuMetrics.Name -join ', ')" -ForegroundColor Gray
-        }
+        # Quick test of basic metrics
+        $basicStats = Get-Stat -Entity $testHost -Stat "cpu.usage.average" -Start (Get-Date).AddHours(-1) -MaxSamples 3 -ErrorAction SilentlyContinue
+        Write-Host "Basic stats test: $($basicStats.Count) data points" -ForegroundColor Green
         
-        # Try basic metrics first
-        Write-Host "`nTesting basic metrics collection..." -ForegroundColor Cyan
-        $basicMetrics = @("cpu.usage.average", "mem.usage.average")
-        
-        try {
-            $basicStats = Get-Stat -Entity $testHost -Stat $basicMetrics -Start (Get-Date).AddHours(-1) -MaxSamples 5
-            Write-Host "Basic stats collected: $($basicStats.Count) data points" -ForegroundColor Green
-            
-            if ($basicStats.Count -gt 0) {
-                Write-Host "Sample data:" -ForegroundColor White
-                $basicStats | Select-Object -First 3 | Format-Table Entity, MetricId, Value, Unit, Timestamp -AutoSize
-            }
-        } catch {
-            Write-Error "Basic stats failed: $($_.Exception.Message)"
-        }
-        
-        # Try NUMA metrics if available
-        if ($numaMetrics.Count -gt 0) {
-            Write-Host "`nTesting NUMA metrics..." -ForegroundColor Cyan
-            try {
-                $testNumaStats = Get-Stat -Entity $testHost -Stat $numaMetrics[0].Name -Start (Get-Date).AddHours(-1) -MaxSamples 5
-                Write-Host "NUMA stats collected: $($testNumaStats.Count) data points" -ForegroundColor Green
-            } catch {
-                Write-Warning "NUMA stats failed: $($_.Exception.Message)"
-            }
-        }
-        
-        # Test VM metrics
-        if ($vms.Count -gt 0) {
-            $testVM = $vms[0]
-            Write-Host "`nTesting VM metrics on: $($testVM.Name)" -ForegroundColor Cyan
-            
-            try {
-                $vmStats = Get-Stat -Entity $testVM -Stat "cpu.usage.average" -Start (Get-Date).AddHours(-1) -MaxSamples 5
-                Write-Host "VM stats collected: $($vmStats.Count) data points" -ForegroundColor Green
-            } catch {
-                Write-Warning "VM stats failed: $($_.Exception.Message)"
-            }
-        }
-        
-        # Collect actual data for export
-        Write-Host "`nCollecting data for all entities..." -ForegroundColor Cyan
-        
-        # Collect what we can
-        $metricsToTry = @()
-        
-        # Add basic metrics
-        $metricsToTry += "cpu.usage.average", "mem.usage.average", "cpu.ready.summation"
-        
-        # Add NUMA if available
-        if ($numaMetrics.Count -gt 0) {
-            $metricsToTry += $numaMetrics[0..2].Name  # First 3 NUMA metrics
-        }
+        # Collect actual data (streamlined)
+        $metricsToTry = @("cpu.usage.average", "mem.usage.average", "cpu.ready.summation")
+        if ($numaMetrics.Count -gt 0) { $metricsToTry += $numaMetrics[0].Name }
         
         foreach ($metric in $metricsToTry) {
-            try {
-                Write-Host "  Collecting $metric..." -ForegroundColor Gray
-                
-                # Try hosts
-                $hostStats = Get-Stat -Entity $vmHosts -Stat $metric -Start (Get-Date).AddHours(-1) -MaxSamples 10 -ErrorAction SilentlyContinue
-                foreach ($stat in $hostStats) {
+            # Hosts
+            $hostStats = Get-Stat -Entity $vmHosts -Stat $metric -Start (Get-Date).AddHours(-1) -MaxSamples 5 -ErrorAction SilentlyContinue
+            foreach ($stat in $hostStats) {
+                $allResults += [PSCustomObject]@{
+                    vCenter = $vc
+                    EntityType = "Host"
+                    EntityName = $stat.Entity.Name
+                    MetricId = $stat.MetricId
+                    Value = $stat.Value
+                    Unit = $stat.Unit
+                    Timestamp = $stat.Timestamp
+                }
+            }
+            
+            # VMs for CPU/Memory metrics
+            if ($metric -like "*cpu*" -or $metric -like "*mem*") {
+                $vmStats = Get-Stat -Entity $vms -Stat $metric -Start (Get-Date).AddHours(-1) -MaxSamples 5 -ErrorAction SilentlyContinue
+                foreach ($stat in $vmStats) {
                     $allResults += [PSCustomObject]@{
-                        vCenter = $vcenter
-                        EntityType = "Host"
+                        vCenter = $vc
+                        EntityType = "VM"
                         EntityName = $stat.Entity.Name
                         MetricId = $stat.MetricId
-                        Instance = $stat.Instance
                         Value = $stat.Value
                         Unit = $stat.Unit
                         Timestamp = $stat.Timestamp
                     }
                 }
-                
-                # Try VMs for VM-specific metrics
-                if ($metric -like "*cpu*" -or $metric -like "*mem*") {
-                    $vmStats = Get-Stat -Entity $vms -Stat $metric -Start (Get-Date).AddHours(-1) -MaxSamples 10 -ErrorAction SilentlyContinue
-                    foreach ($stat in $vmStats) {
-                        $allResults += [PSCustomObject]@{
-                            vCenter = $vcenter
-                            EntityType = "VM"
-                            EntityName = $stat.Entity.Name
-                            MetricId = $stat.MetricId
-                            Instance = $stat.Instance
-                            Value = $stat.Value
-                            Unit = $stat.Unit
-                            Timestamp = $stat.Timestamp
-                        }
-                    }
-                }
-                
-                Write-Host "    Collected $($hostStats.Count + $vmStats.Count) data points" -ForegroundColor Green
-                
-            } catch {
-                Write-Warning "  Failed to collect $metric : $($_.Exception.Message)"
             }
         }
         
     } catch {
-        Write-Error "Failed to process $vcenter : $($_.Exception.Message)"
+        Write-Warning "Failed to connect to $vc : $_"
     } finally {
         if ($global:DefaultVIServers.Count -gt 0) {
-            Disconnect-VIServer -Server $vcenter -Confirm:$false -Force -ErrorAction SilentlyContinue
+            Disconnect-VIServer -Server $vc -Confirm:$false -Force -ErrorAction SilentlyContinue
         }
     }
 }
