@@ -99,14 +99,86 @@ foreach ($vc in $vCenterServer) {
     }
 }
 
-# Export results
-$exportPath = Join-Path $OutputDir "VCF_Diagnostic_Stats_$timestamp.csv"
+# Export results and analysis
+$exportPath = Join-Path $OutputDir "VCF_VM_Analysis_$timestamp.csv"
 Write-Host "`nTotal data points collected: $($allResults.Count)" -ForegroundColor White
 
 if ($allResults.Count -gt 0) {
     $allResults | Export-Csv -Path $exportPath -NoTypeInformation
     Write-Host "Data exported to: $exportPath" -ForegroundColor Green
-    $allResults | Group-Object MetricId | Select-Object Name, Count | Format-Table -AutoSize
+    
+    # VM contention analysis
+    Write-Host "`n=== VM CONTENTION DATA ===" -ForegroundColor Yellow
+    
+    $vmContentionData = $allResults | Where-Object {$_.EntityType -eq "VM" -and $_.MetricId -eq "cpu.ready.summation"}
+    
+    if ($vmContentionData.Count -gt 0) {
+        # Calculate metrics per VM
+        $vmAnalysis = $vmContentionData | Group-Object EntityName | ForEach-Object {
+            $avgReady = ($_.Group | Measure-Object -Property Value -Average).Average
+            $maxReady = ($_.Group | Measure-Object -Property Value -Maximum).Maximum
+            $vmHost = ($_.Group | Select-Object -First 1).VMHost
+            
+            [PSCustomObject]@{
+                VM = $_.Name
+                VMHost = $vmHost
+                AvgCpuReadyMs = [Math]::Round($avgReady, 2)
+                MaxCpuReadyMs = [Math]::Round($maxReady, 2)
+            }
+        } | Sort-Object AvgCpuReadyMs -Descending
+        
+        $vmAnalysis | Format-Table -AutoSize
+        
+        # Export VM analysis
+        $vmAnalysisPath = Join-Path $OutputDir "VM_Contention_Analysis_$timestamp.csv"
+        $vmAnalysis | Export-Csv -Path $vmAnalysisPath -NoTypeInformation
+        Write-Host "VM analysis exported to: $vmAnalysisPath" -ForegroundColor Green
+        
+    } else {
+        Write-Host "No CPU ready time data collected."
+    }
+    
+    # NUMA analysis
+    Write-Host "`n=== NUMA DATA ===" -ForegroundColor Yellow
+    
+    $numaData = $allResults | Where-Object {$_.EntityType -eq "Host" -and $_.MetricId -like "*numa*"}
+    
+    if ($numaData.Count -gt 0) {
+        # Group NUMA data by host
+        $hostNumaAnalysis = $numaData | Group-Object EntityName | ForEach-Object {
+            $hostName = $_.Name
+            $hostData = $_.Group
+            
+            foreach ($metric in ($hostData | Group-Object MetricId)) {
+                $avgValue = ($metric.Group | Measure-Object -Property Value -Average).Average
+                $maxValue = ($metric.Group | Measure-Object -Property Value -Maximum).Maximum
+                
+                [PSCustomObject]@{
+                    Host = $hostName
+                    MetricId = $metric.Name
+                    AvgValue = [Math]::Round($avgValue, 2)
+                    MaxValue = [Math]::Round($maxValue, 2)
+                    Unit = ($metric.Group | Select-Object -First 1).Unit
+                }
+            }
+        } | Sort-Object Host, MetricId
+        
+        $hostNumaAnalysis | Format-Table -AutoSize
+        
+        # Export NUMA analysis
+        $numaAnalysisPath = Join-Path $OutputDir "NUMA_Analysis_$timestamp.csv"
+        $hostNumaAnalysis | Export-Csv -Path $numaAnalysisPath -NoTypeInformation
+        Write-Host "NUMA analysis exported to: $numaAnalysisPath" -ForegroundColor Green
+        
+    } else {
+        Write-Host "No NUMA data collected."
+    }
+    
+    # Summary counts
+    Write-Host "`n=== SUMMARY ===" -ForegroundColor Magenta
+    Write-Host "Total VMs: $($vmAnalysis.Count)" -ForegroundColor White
+    Write-Host "Total hosts with NUMA data: $(($hostNumaAnalysis | Group-Object Host).Count)" -ForegroundColor White
+    
 } else {
     Write-Warning "No data collected!"
 }
