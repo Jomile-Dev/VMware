@@ -16,8 +16,6 @@ $allResults = @()
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 
 foreach ($vc in $vCenterServer) {
-    Write-Host "`n=== PROCESSING $vc ===" -ForegroundColor Green
-    
     try {
         # Connect
         Connect-VIServer -Server $vc -Credential $Credential -ErrorAction Stop
@@ -39,10 +37,6 @@ foreach ($vc in $vCenterServer) {
         $contentionMetrics = $availableMetrics | Where-Object {$_.Name -like "*cpu*ready*" -or $_.Name -like "*cpu*wait*" -or $_.Name -like "*cpu*costop*"}
         
         Write-Host "NUMA metrics: $($numaMetrics.Count) | Contention metrics: $($contentionMetrics.Count)" -ForegroundColor White
-        
-        # Test VM metrics
-        $basicStats = Get-Stat -Entity $testVM -Stat "cpu.usage.average" -Start (Get-Date).AddHours(-1) -MaxSamples 3 -ErrorAction SilentlyContinue
-        Write-Host "Basic VM stats test: $($basicStats.Count) data points" -ForegroundColor Green
         
         # Collect NUMA and contention data for VMs only
         $metricsToCollect = @()
