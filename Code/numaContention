@@ -22,6 +22,7 @@ foreach ($vc in $vCenterServer) {
         Write-Host "Connected to $vc" -ForegroundColor Green
         
         # Get VMs and their hosts
+        Write-Host "Getting VMs and hosts..." -ForegroundColor Cyan
         $vms = Get-VM
         $vmHosts = Get-VMHost
         Write-Host "Found VMs: $($vms.Count) | Hosts: $($vmHosts.Count)" -ForegroundColor White
@@ -31,12 +32,33 @@ foreach ($vc in $vCenterServer) {
             continue
         }
         
+        if ($vmHosts.Count -eq 0) {
+            Write-Warning "No hosts found! Check permissions."
+            continue
+        }
+        
         # Check available metrics
+        Write-Host "Checking available metrics..." -ForegroundColor Cyan
         $testVM = $vms[0]
         $testHost = $vmHosts[0]
         
-        $vmMetrics = Get-StatType -Entity $testVM
-        $hostMetrics = Get-StatType -Entity $testHost
+        Write-Host "Testing metric discovery on VM: $($testVM.Name)" -ForegroundColor Gray
+        try {
+            $vmMetrics = Get-StatType -Entity $testVM
+            Write-Host "VM metrics available: $($vmMetrics.Count)" -ForegroundColor White
+        } catch {
+            Write-Warning "Failed to get VM metrics: $_"
+            continue
+        }
+        
+        Write-Host "Testing metric discovery on Host: $($testHost.Name)" -ForegroundColor Gray  
+        try {
+            $hostMetrics = Get-StatType -Entity $testHost
+            Write-Host "Host metrics available: $($hostMetrics.Count)" -ForegroundColor White
+        } catch {
+            Write-Warning "Failed to get host metrics: $_"
+            continue
+        }
         
         # NUMA metrics are on hosts
         $numaMetrics = $hostMetrics | Where-Object {$_.Name -like "*numa*"}
@@ -45,6 +67,17 @@ foreach ($vc in $vCenterServer) {
         $vmContentionMetrics = $vmMetrics | Where-Object {$_.Name -like "*cpu.ready*" -or $_.Name -like "*cpu.wait*" -or $_.Name -like "*cpu.costop*"}
         
         Write-Host "Host NUMA: $($numaMetrics.Count) | VM Contention: $($vmContentionMetrics.Count)" -ForegroundColor White
+        
+        # Show some actual metric names for debugging
+        if ($vmMetrics.Count -gt 0) {
+            Write-Host "Sample VM metrics:" -ForegroundColor Gray
+            $vmMetrics | Where-Object {$_.Name -like "*cpu*"} | Select-Object -First 5 | ForEach-Object { Write-Host "  $($_.Name)" -ForegroundColor DarkGray }
+        }
+        
+        if ($numaMetrics.Count -gt 0) {
+            Write-Host "Available NUMA metrics:" -ForegroundColor Gray
+            $numaMetrics | Select-Object -First 3 | ForEach-Object { Write-Host "  $($_.Name)" -ForegroundColor DarkGray }
+        }
         
         # Collect NUMA and contention data for VMs only
         $metricsToCollect = @()
