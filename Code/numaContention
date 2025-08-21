@@ -21,22 +21,30 @@ foreach ($vc in $vCenterServer) {
         Connect-VIServer -Server $vc -Credential $Credential -ErrorAction Stop
         Write-Host "Connected to $vc" -ForegroundColor Green
         
-        # Get VMs only
+        # Get VMs and their hosts
         $vms = Get-VM
-        Write-Host "Found VMs: $($vms.Count)" -ForegroundColor White
+        $vmHosts = Get-VMHost
+        Write-Host "Found VMs: $($vms.Count) | Hosts: $($vmHosts.Count)" -ForegroundColor White
         
         if ($vms.Count -eq 0) {
             Write-Warning "No VMs found! Check permissions."
             continue
         }
         
-        # Get available metrics from first VM
+        # Check available metrics
         $testVM = $vms[0]
-        $availableMetrics = Get-StatType -Entity $testVM
-        $numaMetrics = $availableMetrics | Where-Object {$_.Name -like "*numa*"}
-        $contentionMetrics = $availableMetrics | Where-Object {$_.Name -like "*cpu*ready*" -or $_.Name -like "*cpu*wait*" -or $_.Name -like "*cpu*costop*"}
+        $testHost = $vmHosts[0]
         
-        Write-Host "NUMA metrics: $($numaMetrics.Count) | Contention metrics: $($contentionMetrics.Count)" -ForegroundColor White
+        $vmMetrics = Get-StatType -Entity $testVM
+        $hostMetrics = Get-StatType -Entity $testHost
+        
+        # NUMA metrics are on hosts
+        $numaMetrics = $hostMetrics | Where-Object {$_.Name -like "*numa*"}
+        
+        # VM contention metrics
+        $vmContentionMetrics = $vmMetrics | Where-Object {$_.Name -like "*cpu.ready*" -or $_.Name -like "*cpu.wait*" -or $_.Name -like "*cpu.costop*"}
+        
+        Write-Host "Host NUMA: $($numaMetrics.Count) | VM Contention: $($vmContentionMetrics.Count)" -ForegroundColor White
         
         # Collect NUMA and contention data for VMs only
         $metricsToCollect = @()
