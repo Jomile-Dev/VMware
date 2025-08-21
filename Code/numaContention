@@ -9,6 +9,9 @@ $vCenterServer = @("test.test.test",
                    "test.test.test",
                    "test.test.test")
 
+Write-Host "vCenter servers to process: $($vCenterServer.Count)" -ForegroundColor White
+$vCenterServer | ForEach-Object { Write-Host "  - $_" -ForegroundColor Gray }
+
 # Get single credential for all vCenters
 $Credential = Get-Credential -Message "Enter vCenter credentials"
 
@@ -17,9 +20,15 @@ $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 
 foreach ($vc in $vCenterServer) {
     try {
-        # Connect
+        # Connect to individual vCenter
+        Write-Host "Connecting to $vc..." -ForegroundColor Cyan
         Connect-VIServer -Server $vc -Credential $Credential -ErrorAction Stop
         Write-Host "Connected to $vc" -ForegroundColor Green
+        
+        # Test connection
+        Write-Host "Testing connection..." -ForegroundColor Gray
+        $connectionTest = Get-View ServiceInstance
+        Write-Host "Connection test passed" -ForegroundColor Green
         
         # Get VMs and their hosts
         Write-Host "Getting VMs and hosts..." -ForegroundColor Cyan
@@ -99,7 +108,7 @@ foreach ($vc in $vCenterServer) {
         $metricsToCollect = $metricsToCollect | Sort-Object -Unique
         
         foreach ($metric in $metricsToCollect) {
-            $vmStats = Get-Stat -Entity $vms -Stat $metric -Start (Get-Date).AddHours(-1) -MaxSamples 5 -ErrorAction SilentlyContinue
+            $vmStats = Get-Stat -Entity $vms -Stat $metric -Start (Get-Date).AddHours(-24) -MaxSamples 10 -ErrorAction SilentlyContinue
             
             foreach ($stat in $vmStats) {
                 # Check for duplicate before adding
