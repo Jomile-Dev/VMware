@@ -1,0 +1,739 @@
+# VCF ESXi Management Script - PowerShell with PowerCLI
+# Automated script - runs all operations without menu
+
+# Import required modules
+Import-Module VMware.PowerCLI -ErrorAction SilentlyContinue
+Import-Module Posh-SSH -ErrorAction SilentlyContinue
+
+# Disable certificate warnings
+Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session | Out-Null
+
+#region Configuration Variables
+# Update these variables for your environment
+
+# SDDC Manager Configuration
+$VCF_FQDN = "vcf.domain.com"
+$VCF_USERNAME = "administrator@vsphere.local"
+$VCF_PASSWORD = "YourPassword"
+
+# vCenter Servers (like your PowerShell example)
+$vCenterServers = @(
+    "vcenter1.domain.com",
+    "vcenter2.domain.com", 
+    "vcenter3.domain.com"
+)
+
+# vCenter Credentials
+$vCenterUsername = "administrator@vsphere.local"
+$vCenterPassword = "YourPassword"
+
+# ESXi default root password (for NUMA collection from vCenter discovered hosts)
+$ESXiRootPassword = "YourESXiRootPassword"
+
+# Workload filter for w02 operations
+$WorkloadFilter = "w02"
+
+# Output directory
+$OutputDirectory = "D:\"
+
+#endregion
+
+#region Helper Functions
+
+function Write-Log {
+    param([string]$Message, [string]$Level = "INFO")
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $color = switch ($Level) {
+        "SUCCESS" { "Green" }
+        "ERROR" { "Red" }
+        "WARNING" { "Yellow" }
+        default { "White" }
+    }
+    Write-Host "[$timestamp] [$Level] $Message" -ForegroundColor $color
+}
+
+function Test-RequiredModules {
+    $requiredModules = @("VMware.PowerCLI", "Posh-SSH")
+    $missingModules = @()
+    
+    foreach ($module in $requiredModules) {
+        if (-not (Get-Module -Name $module -ListAvailable)) {
+            $missingModules += $module
+        }
+    }
+    
+    if ($missingModules.Count -gt 0) {
+        Write-Log "Missing required PowerShell modules: $($missingModules -join ', ')" "ERROR"
+        Write-Log "Install with: Install-Module $($missingModules -join ', ') -Force" "ERROR"
+        return $false
+    }
+    return $true
+}
+
+#endregion
+
+#region SDDC Manager Functions
+
+function Get-SDDCToken {
+    param([string]$FQDN, [string]$Username, [string]$Password)
+    
+    Write-Log "Getting SDDC token from $FQDN..."
+    
+    $headers = @{
+        'Content-Type' = 'application/json'
+        'Accept' = 'application/json'
+    }
+    
+    $body = @{
+        username = $Username
+        password = $Password
+    } | ConvertTo-Json
+    
+    try {
+        $response = Invoke-RestMethod -Uri "https://$FQDN/v1/tokens" -Method POST -Headers $headers -Body $body -SkipCertificateCheck
+        Write-Log "SDDC token acquired successfully" "SUCCESS"
+        return $response.accessToken
+    }
+    catch {
+        Write-Log "Failed to get SDDC token: $($_.Exception.Message)" "ERROR"
+        return $null
+    }
+}
+
+function Get-ESXiCredentialsFromSDDC {
+    param([string]$FQDN, [string]$Token)
+    
+    Write-Log "Fetching ESXi credentials from SDDC Manager..."
+    
+    $headers = @{
+        'Authorization' = "Bearer $Token"
+        'Accept' = 'application/json'
+    }
+    
+    $params = @{
+        resourceType = 'ESXI'
+    }
+    
+    try {
+        $response = Invoke-RestMethod -Uri "https://$FQDN/v1/credentials" -Method GET -Headers $headers -Body $params -SkipCertificateCheck
+        
+        $esxiCredentials = @()
+        if ($response.elements) {
+            foreach ($credential in $response.elements) {
+                if ($credential.resourceType -eq 'ESXI') {
+                    $esxiCredentials += [PSCustomObject]@{
+                        Hostname = $credential.resource.resourceName
+                        Username = $credential.username
+                        Password = $credential.password
+                        ResourceIP = $credential.resource.resourceIp
+                        Source = 'SDDC'
+                    }
+                }
+            }
+        }
+        
+        Write-Log "Retrieved credentials for $($esxiCredentials.Count) ESXi hosts" "SUCCESS"
+        return $esxiCredentials
+    }
+    catch {
+        Write-Log "Failed to get ESXi credentials: $($_.Exception.Message)" "ERROR"
+        return @()
+    }
+}
+
+function Revoke-SDDCToken {
+    param([string]$FQDN, [string]$Token)
+    
+    Write-Log "Revoking SDDC token..."
+    
+    $headers = @{
+        'Authorization' = "Bearer $Token"
+    }
+    
+    try {
+        Invoke-RestMethod -Uri "https://$FQDN/v1/tokens/$Token" -Method DELETE -Headers $headers -SkipCertificateCheck
+        Write-Log "SDDC token revoked successfully" "SUCCESS"
+    }
+    catch {
+        Write-Log "Token revocation failed: $($_.Exception.Message)" "WARNING"
+    }
+}
+
+#endregion
+
+#region vCenter Functions
+
+function Connect-ToVCenters {
+    param([string[]]$vCenterList, [string]$Username, [string]$Password)
+    
+    Write-Log "Connecting to $($vCenterList.Count) vCenter servers..."
+    
+    $securePassword = ConvertTo-SecureString $Password -AsPlainText -Force
+    $credential = New-Object System.Management.Automation.PSCredential($Username, $securePassword)
+    
+    $connections = @{}
+    $successCount = 0
+    
+    foreach ($vcenter in $vCenterList) {
+        try {
+            Write-Log "Connecting to $vcenter..."
+            $connection = Connect-VIServer -Server $vcenter -Credential $credential -Force -ErrorAction Stop
+            
+            if ($connection) {
+                $connections[$vcenter] = $connection
+                $successCount++
+                Write-Log "Connected to $vcenter" "SUCCESS"
+            }
+        }
+        catch {
+            Write-Log "Failed to connect to $vcenter: $($_.Exception.Message)" "ERROR"
+        }
+    }
+    
+    Write-Log "Connected to $successCount/$($vCenterList.Count) vCenter servers" "SUCCESS"
+    return $connections
+}
+
+function Get-AllESXiHostsFromVCenter {
+    param([hashtable]$Connections, [string]$Filter = $null)
+    
+    $allHosts = @()
+    
+    foreach ($vcenterName in $Connections.Keys) {
+        try {
+            Write-Log "Getting ESXi hosts from $vcenterName..."
+            
+            $connection = $Connections[$vcenterName]
+            $hosts = Get-VMHost -Server $connection
+            
+            foreach ($host in $hosts) {
+                if ($Filter -and $host.Name -notlike "*$Filter*") {
+                    continue
+                }
+                
+                $hostInfo = [PSCustomObject]@{
+                    VCenter = $vcenterName
+                    Hostname = $host.Name
+                    HostIP = $host.Name
+                    ConnectionState = $host.ConnectionState
+                    PowerState = $host.PowerState
+                    InMaintenance = $host.State -eq 'Maintenance'
+                    Version = $host.Version
+                    Build = $host.Build
+                    Source = 'vCenter'
+                    HostObject = $host
+                }
+                
+                # Try to get management IP
+                try {
+                    $vmkernelAdapters = $host | Get-VMHostNetworkAdapter | Where-Object {$_.ManagementTrafficEnabled -eq $true}
+                    if ($vmkernelAdapters) {
+                        $hostInfo.HostIP = $vmkernelAdapters[0].IP
+                    }
+                }
+                catch { }
+                
+                $allHosts += $hostInfo
+            }
+        }
+        catch {
+            Write-Log "Failed to get hosts from $vcenterName: $($_.Exception.Message)" "ERROR"
+        }
+    }
+    
+    Write-Log "Found $($allHosts.Count) ESXi hosts across all vCenters" "SUCCESS"
+    return $allHosts
+}
+
+function Enable-SSHViaVCenter {
+    param([PSCustomObject]$HostInfo)
+    
+    try {
+        $vmhost = $HostInfo.HostObject
+        $sshService = $vmhost | Get-VMHostService | Where-Object {$_.Key -eq 'TSM-SSH'}
+        
+        if (-not $sshService) {
+            Write-Log "SSH service not found on $($HostInfo.Hostname)" "ERROR"
+            return $false
+        }
+        
+        # Start SSH service if not running
+        if ($sshService.Running -eq $false) {
+            $sshService | Start-VMHostService -Confirm:$false | Out-Null
+            Write-Log "SSH service started on $($HostInfo.Hostname)" "SUCCESS"
+        }
+        
+        # Set SSH policy to start automatically
+        $sshService | Set-VMHostService -Policy 'On' -Confirm:$false | Out-Null
+        Write-Log "SSH policy set to 'On' for $($HostInfo.Hostname)" "SUCCESS"
+        
+        return $true
+    }
+    catch {
+        Write-Log "Failed to enable SSH on $($HostInfo.Hostname): $($_.Exception.Message)" "ERROR"
+        return $false
+    }
+}
+
+function Disconnect-FromVCenters {
+    param([hashtable]$Connections)
+    
+    foreach ($vcenter in $Connections.Keys) {
+        try {
+            Disconnect-VIServer -Server $Connections[$vcenter] -Confirm:$false -ErrorAction SilentlyContinue
+            Write-Log "Disconnected from $vcenter"
+        }
+        catch {
+            Write-Log "Error disconnecting from $vcenter: $($_.Exception.Message)" "WARNING"
+        }
+    }
+}
+
+#endregion
+
+#region SSH Functions
+
+function Invoke-SSHCommand {
+    param([string]$HostIP, [string]$Username, [string]$Password, [string]$Command, [int]$TimeoutSeconds = 30)
+    
+    try {
+        $securePassword = ConvertTo-SecureString $Password -AsPlainText -Force
+        $credential = New-Object System.Management.Automation.PSCredential($Username, $securePassword)
+        
+        $sshSession = New-SSHSession -ComputerName $HostIP -Credential $credential -AcceptKey -ConnectionTimeout $TimeoutSeconds -ErrorAction Stop
+        
+        if ($sshSession) {
+            $result = Invoke-SSHCommand -SSHSession $sshSession -Command $Command -TimeOut $TimeoutSeconds
+            Remove-SSHSession -SSHSession $sshSession | Out-Null
+            
+            return $result.Output, $result.Error, $result.ExitStatus
+        }
+    }
+    catch {
+        return $null, $_.Exception.Message, 1
+    }
+}
+
+function Enable-SSHViaSSH {
+    param([PSCustomObject]$ESXiHost)
+    
+    try {
+        $command = "esxcli system ssh set -e true && /etc/init.d/SSH start"
+        $stdout, $stderr, $exitCode = Invoke-SSHCommand -HostIP $ESXiHost.ResourceIP -Username $ESXiHost.Username -Password $ESXiHost.Password -Command $command
+        
+        if ($exitCode -eq 0) {
+            Write-Log "SSH enabled on $($ESXiHost.Hostname)" "SUCCESS"
+            return $true
+        } else {
+            Write-Log "Failed to enable SSH on $($ESXiHost.Hostname): $stderr" "ERROR"
+            return $false
+        }
+    }
+    catch {
+        Write-Log "Exception enabling SSH on $($ESXiHost.Hostname): $($_.Exception.Message)" "ERROR"
+        return $false
+    }
+}
+
+#endregion
+
+#region NUMA Data Collection
+
+function Get-NUMADataFromHost {
+    param([PSCustomObject]$ESXiHost)
+    
+    $hostname = $ESXiHost.Hostname
+    $hostIP = if ($ESXiHost.ResourceIP) { $ESXiHost.ResourceIP } else { $ESXiHost.HostIP }
+    
+    Write-Log "Collecting NUMA data from $hostname..."
+    
+    try {
+        # Get NUMA client stats
+        $numaOutput, $numaError, $numaExitCode = Invoke-SSHCommand -HostIP $hostIP -Username $ESXiHost.Username -Password $ESXiHost.Password -Command "sched-stats -t numa-clients"
+        
+        # Get VM process list
+        $vmOutput, $vmError, $vmExitCode = Invoke-SSHCommand -HostIP $hostIP -Username $ESXiHost.Username -Password $ESXiHost.Password -Command "esxcli vm process list"
+        
+        # Parse NUMA output for CartelIDs
+        $cartelIDs = @()
+        if ($numaExitCode -eq 0 -and $numaOutput) {
+            $numaOutput | ForEach-Object {
+                if ($_ -match '\b\d{4,}\b') {
+                    $matches[0] | ForEach-Object {
+                        if ($_ -match '^\d+$' -and $_.Length -ge 4) {
+                            $cartelIDs += $_
+                        }
+                    }
+                }
+            }
+        }
+        
+        # Get detailed VM stats using CartelIDs
+        $detailedStats = @()
+        foreach ($cartelID in ($cartelIDs | Select-Object -First 10)) {
+            $detailOutput, $detailError, $detailExitCode = Invoke-SSHCommand -HostIP $hostIP -Username $ESXiHost.Username -Password $ESXiHost.Password -Command "esxcli vm process list | grep -A 5 -C 3 $cartelID"
+            
+            if ($detailExitCode -eq 0) {
+                $detailedStats += [PSCustomObject]@{
+                    CartelID = $cartelID
+                    ProcessInfo = $detailOutput -join "`n"
+                }
+            }
+        }
+        
+        return [PSCustomObject]@{
+            Hostname = $hostname
+            HostIP = $hostIP
+            Timestamp = Get-Date -Format "yyyy-MM-ddTHH:mm:ss"
+            NUMAOutput = if ($numaExitCode -eq 0) { $numaOutput } else { "Error: $numaError" }
+            VMOutput = if ($vmExitCode -eq 0) { $vmOutput } else { "Error: $vmError" }
+            CartelIDs = $cartelIDs
+            DetailedStats = $detailedStats
+            Source = $ESXiHost.Source
+            Success = ($numaExitCode -eq 0 -and $vmExitCode -eq 0)
+        }
+    }
+    catch {
+        Write-Log "Failed to collect data from $hostname`: $($_.Exception.Message)" "ERROR"
+        return [PSCustomObject]@{
+            Hostname = $hostname
+            HostIP = $hostIP
+            Timestamp = Get-Date -Format "yyyy-MM-ddTHH:mm:ss"
+            Error = $_.Exception.Message
+            Source = $ESXiHost.Source
+            Success = $false
+        }
+    }
+}
+
+function Export-NUMADataToCSV {
+    param([array]$NUMAData, [string]$WorkloadFilter = "all")
+    
+    if ($NUMAData.Count -eq 0) {
+        Write-Log "No NUMA data to export" "WARNING"
+        return
+    }
+    
+    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    
+    if (-not (Test-Path $OutputDirectory)) {
+        Write-Log "Directory $OutputDirectory does not exist" "ERROR"
+        return
+    }
+    
+    # CSV file paths
+    $numaCSVFile = Join-Path $OutputDirectory "esxi_numa_data_$($WorkloadFilter)_$timestamp.csv"
+    $vmCSVFile = Join-Path $OutputDirectory "esxi_vm_data_$($WorkloadFilter)_$timestamp.csv"
+    $detailedCSVFile = Join-Path $OutputDirectory "esxi_detailed_stats_$($WorkloadFilter)_$timestamp.csv"
+    
+    # Prepare NUMA data for CSV
+    $numaCSVData = @()
+    foreach ($hostData in $NUMAData) {
+        if ($hostData.Success -and $hostData.NUMAOutput) {
+            $numaLines = $hostData.NUMAOutput | Where-Object { $_ -and $_.Trim() }
+            foreach ($line in $numaLines) {
+                $numaCSVData += [PSCustomObject]@{
+                    Hostname = $hostData.Hostname
+                    HostIP = $hostData.HostIP
+                    Timestamp = $hostData.Timestamp
+                    Source = $hostData.Source
+                    NUMALine = $line.Trim()
+                    Status = "Success"
+                }
+            }
+        } else {
+            $numaCSVData += [PSCustomObject]@{
+                Hostname = $hostData.Hostname
+                HostIP = $hostData.HostIP
+                Timestamp = $hostData.Timestamp
+                Source = $hostData.Source
+                NUMALine = if ($hostData.Error) { "Error: $($hostData.Error)" } else { $hostData.NUMAOutput }
+                Status = if ($hostData.Error) { "Error" } else { "No Data" }
+            }
+        }
+    }
+    
+    # Prepare VM data for CSV
+    $vmCSVData = @()
+    foreach ($hostData in $NUMAData) {
+        if ($hostData.Success -and $hostData.VMOutput) {
+            $vmLines = $hostData.VMOutput | Where-Object { $_ -and $_.Trim() }
+            foreach ($line in $vmLines) {
+                $vmCSVData += [PSCustomObject]@{
+                    Hostname = $hostData.Hostname
+                    HostIP = $hostData.HostIP
+                    Timestamp = $hostData.Timestamp
+                    Source = $hostData.Source
+                    VMLine = $line.Trim()
+                    Status = "Success"
+                }
+            }
+        } else {
+            $vmCSVData += [PSCustomObject]@{
+                Hostname = $hostData.Hostname
+                HostIP = $hostData.HostIP
+                Timestamp = $hostData.Timestamp
+                Source = $hostData.Source
+                VMLine = if ($hostData.Error) { "Error: $($hostData.Error)" } else { $hostData.VMOutput }
+                Status = if ($hostData.Error) { "Error" } else { "No Data" }
+            }
+        }
+    }
+    
+    # Prepare detailed stats for CSV
+    $detailedCSVData = @()
+    foreach ($hostData in $NUMAData) {
+        if ($hostData.DetailedStats -and $hostData.DetailedStats.Count -gt 0) {
+            foreach ($stat in $hostData.DetailedStats) {
+                # Extract VM name from process info
+                $vmName = "Unknown"
+                if ($stat.ProcessInfo -match "Display Name:\s*(.+)") {
+                    $vmName = $matches[1].Trim()
+                }
+                
+                $detailedCSVData += [PSCustomObject]@{
+                    Hostname = $hostData.Hostname
+                    HostIP = $hostData.HostIP
+                    Timestamp = $hostData.Timestamp
+                    Source = $hostData.Source
+                    CartelID = $stat.CartelID
+                    VMName = $vmName
+                    ProcessInfo = ($stat.ProcessInfo -replace "`n", " | ")
+                    Status = "Success"
+                }
+            }
+        } else {
+            $detailedCSVData += [PSCustomObject]@{
+                Hostname = $hostData.Hostname
+                HostIP = $hostData.HostIP
+                Timestamp = $hostData.Timestamp
+                Source = $hostData.Source
+                CartelID = ""
+                VMName = ""
+                ProcessInfo = if ($hostData.Error) { "Error: $($hostData.Error)" } else { "No detailed stats" }
+                Status = if ($hostData.Error) { "Error" } else { "No Data" }
+            }
+        }
+    }
+    
+    # Export to CSV files
+    try {
+        $numaCSVData | Export-Csv -Path $numaCSVFile -NoTypeInformation -Encoding UTF8
+        $vmCSVData | Export-Csv -Path $vmCSVFile -NoTypeInformation -Encoding UTF8
+        $detailedCSVData | Export-Csv -Path $detailedCSVFile -NoTypeInformation -Encoding UTF8
+        
+        Write-Log "Data exported to:" "SUCCESS"
+        Write-Log "  - NUMA data: $numaCSVFile" "SUCCESS"
+        Write-Log "  - VM data: $vmCSVFile" "SUCCESS"
+        Write-Log "  - Detailed stats: $detailedCSVFile" "SUCCESS"
+    }
+    catch {
+        Write-Log "Failed to export CSV files: $($_.Exception.Message)" "ERROR"
+    }
+}
+
+#endregion
+
+#region Main Execution
+
+function Start-AutomatedESXiManagement {
+    Write-Log "=== VCF ESXi Management Script - Automated Execution ===" "SUCCESS"
+    Write-Log "PowerShell with PowerCLI - Running all operations automatically"
+    
+    # Check required modules
+    if (-not (Test-RequiredModules)) {
+        return
+    }
+    
+    $allESXiCredentials = @()
+    $vCenterConnections = @{}
+    $sddcToken = $null
+    
+    try {
+        # Step 1: Get SDDC Manager credentials
+        Write-Log "=== Step 1: SDDC Manager Operations ==="
+        
+        $sddcToken = Get-SDDCToken -FQDN $VCF_FQDN -Username $VCF_USERNAME -Password $VCF_PASSWORD
+        
+        if ($sddcToken) {
+            $sddcESXiCredentials = Get-ESXiCredentialsFromSDDC -FQDN $VCF_FQDN -Token $sddcToken
+            $allESXiCredentials += $sddcESXiCredentials
+            
+            Revoke-SDDCToken -FQDN $VCF_FQDN -Token $sddcToken
+            $sddcToken = $null
+        }
+        
+        # Step 2: Connect to vCenter servers
+        Write-Log "=== Step 2: vCenter Operations ==="
+        
+        $vCenterConnections = Connect-ToVCenters -vCenterList $vCenterServers -Username $vCenterUsername -Password $vCenterPassword
+        
+        # Step 3: Enable SSH on all ESXi hosts from SDDC
+        if ($allESXiCredentials.Count -gt 0) {
+            Write-Log "=== Step 3: Enable SSH on ALL SDDC ESXi hosts via SSH ==="
+            
+            $successCount = 0
+            $failedCount = 0
+            
+            foreach ($host in $allESXiCredentials) {
+                if (Enable-SSHViaSSH -ESXiHost $host) {
+                    $successCount++
+                } else {
+                    $failedCount++
+                }
+            }
+            
+            Write-Log "SSH enabled on $successCount/$($allESXiCredentials.Count) SDDC hosts (Failed: $failedCount)" "SUCCESS"
+        }
+        
+        # Step 4: Enable SSH on all ESXi hosts via vCenter
+        if ($vCenterConnections.Count -gt 0) {
+            Write-Log "=== Step 4: Enable SSH on ALL vCenter ESXi hosts via vCenter API ==="
+            
+            $vcenterHosts = Get-AllESXiHostsFromVCenter -Connections $vCenterConnections
+            
+            $successCount = 0
+            $failedCount = 0
+            
+            foreach ($host in $vcenterHosts) {
+                if (Enable-SSHViaVCenter -HostInfo $host) {
+                    $successCount++
+                } else {
+                    $failedCount++
+                }
+            }
+            
+            Write-Log "SSH enabled on $successCount/$($vcenterHosts.Count) vCenter hosts (Failed: $failedCount)" "SUCCESS"
+        }
+        
+        # Step 5: Enable SSH specifically on workload w02 hosts from SDDC
+        if ($allESXiCredentials.Count -gt 0) {
+            Write-Log "=== Step 5: Enable SSH on workload $WorkloadFilter SDDC hosts ==="
+            
+            $w02Hosts = $allESXiCredentials | Where-Object { $_.Hostname -like "*$WorkloadFilter*" }
+            
+            if ($w02Hosts.Count -gt 0) {
+                $successCount = 0
+                $failedCount = 0
+                
+                foreach ($host in $w02Hosts) {
+                    if (Enable-SSHViaSSH -ESXiHost $host) {
+                        $successCount++
+                    } else {
+                        $failedCount++
+                    }
+                }
+                
+                Write-Log "SSH enabled on $successCount/$($w02Hosts.Count) $WorkloadFilter SDDC hosts (Failed: $failedCount)" "SUCCESS"
+            } else {
+                Write-Log "No $WorkloadFilter hosts found in SDDC credentials" "WARNING"
+            }
+        }
+        
+        # Step 6: Enable SSH specifically on workload w02 hosts from vCenter
+        if ($vCenterConnections.Count -gt 0) {
+            Write-Log "=== Step 6: Enable SSH on workload $WorkloadFilter vCenter hosts ==="
+            
+            $w02VCenterHosts = Get-AllESXiHostsFromVCenter -Connections $vCenterConnections -Filter $WorkloadFilter
+            
+            if ($w02VCenterHosts.Count -gt 0) {
+                $successCount = 0
+                $failedCount = 0
+                
+                foreach ($host in $w02VCenterHosts) {
+                    if (Enable-SSHViaVCenter -HostInfo $host) {
+                        $successCount++
+                    } else {
+                        $failedCount++
+                    }
+                }
+                
+                Write-Log "SSH enabled on $successCount/$($w02VCenterHosts.Count) $WorkloadFilter vCenter hosts (Failed: $failedCount)" "SUCCESS"
+            } else {
+                Write-Log "No $WorkloadFilter hosts found in vCenter" "WARNING"
+            }
+        }
+        
+        # Step 7: Collect NUMA data from all SDDC hosts
+        if ($allESXiCredentials.Count -gt 0) {
+            Write-Log "=== Step 7: Collect NUMA data from ALL SDDC hosts ==="
+            
+            $allNUMAData = @()
+            foreach ($host in $allESXiCredentials) {
+                $allNUMAData += Get-NUMADataFromHost -ESXiHost $host
+            }
+            
+            Export-NUMADataToCSV -NUMAData $allNUMAData -WorkloadFilter "all_sddc"
+        }
+        
+        # Step 8: Collect NUMA data from workload w02 SDDC hosts
+        if ($allESXiCredentials.Count -gt 0) {
+            Write-Log "=== Step 8: Collect NUMA data from $WorkloadFilter SDDC hosts ==="
+            
+            $w02Hosts = $allESXiCredentials | Where-Object { $_.Hostname -like "*$WorkloadFilter*" }
+            
+            if ($w02Hosts.Count -gt 0) {
+                $w02NUMAData = @()
+                foreach ($host in $w02Hosts) {
+                    $w02NUMAData += Get-NUMADataFromHost -ESXiHost $host
+                }
+                
+                Export-NUMADataToCSV -NUMAData $w02NUMAData -WorkloadFilter $WorkloadFilter
+            } else {
+                Write-Log "No $WorkloadFilter hosts found for NUMA collection" "WARNING"
+            }
+        }
+        
+        # Step 9: Collect NUMA data from vCenter hosts (requires root password)
+        if ($vCenterConnections.Count -gt 0) {
+            Write-Log "=== Step 9: Collect NUMA data from vCenter hosts ==="
+            
+            $vcenterHosts = Get-AllESXiHostsFromVCenter -Connections $vCenterConnections
+            
+            if ($vcenterHosts.Count -gt 0) {
+                # Convert vCenter hosts to ESXi credential format
+                $vcenterESXiCredentials = @()
+                foreach ($host in $vcenterHosts) {
+                    $vcenterESXiCredentials += [PSCustomObject]@{
+                        Hostname = $host.Hostname
+                        Username = "root"
+                        Password = $ESXiRootPassword
+                        ResourceIP = $host.HostIP
+                        Source = "vCenter"
+                    }
+                }
+                
+                $vcenterNUMAData = @()
+                foreach ($host in $vcenterESXiCredentials) {
+                    $vcenterNUMAData += Get-NUMADataFromHost -ESXiHost $host
+                }
+                
+                Export-NUMADataToCSV -NUMAData $vcenterNUMAData -WorkloadFilter "vcenter"
+            }
+        }
+        
+        Write-Log "=== All operations completed successfully ===" "SUCCESS"
+        
+    }
+    catch {
+        Write-Log "Unexpected error: $($_.Exception.Message)" "ERROR"
+    }
+    finally {
+        # Cleanup
+        if ($sddcToken) {
+            Revoke-SDDCToken -FQDN $VCF_FQDN -Token $sddcToken
+        }
+        
+        if ($vCenterConnections.Count -gt 0) {
+            Write-Log "Cleaning up vCenter connections..."
+            Disconnect-FromVCenters -Connections $vCenterConnections
+        }
+        
+        Write-Log "Script execution completed."
+    }
+}
+
+# Script entry point
+Start-AutomatedESXiManagement
+
+#endregion
