@@ -7,12 +7,9 @@ Import-Module VMware.PowerCLI -ErrorAction SilentlyContinue
 # Disable certificate warnings
 Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session | Out-Null
 
-# Configuration Variables
-$UNIFIED_USERNAME = "administrator@vsphere.local"
-$UNIFIED_PASSWORD = "YourPassword"
+# Configuration Variables - Credentials will be prompted
 $VCF_FQDN = "vcf.domain.com"
 $vCenterServers = @("vcenter1.domain.com", "vcenter2.domain.com", "vcenter3.domain.com")
-$ESXiRootPassword = "YourESXiRootPassword"
 $WorkloadFilter = "w02"
 $OutputDirectory = "D:\"
 
@@ -51,10 +48,54 @@ function Test-RequiredModules {
     return $true
 }
 
-function Get-UnifiedCredential {
-    param([string]$Username, [string]$Password)
-    $securePassword = ConvertTo-SecureString $Password -AsPlainText -Force
-    return New-Object System.Management.Automation.PSCredential($Username, $securePassword)
+function Get-VCFCredentials {
+    Write-Log "=== VCF/SDDC Manager Credential Input ===" "SUCCESS"
+    Write-Host ""
+    
+    # Get VCF/SDDC username
+    do {
+        $vcfUsername = Read-Host "Enter VCF/SDDC Manager username (e.g., administrator@vsphere.local)"
+    } while ([string]::IsNullOrWhiteSpace($vcfUsername))
+    
+    # Get VCF/SDDC password
+    do {
+        $vcfSecurePassword = Read-Host "Enter VCF/SDDC Manager password" -AsSecureString
+        if ($vcfSecurePassword.Length -eq 0) {
+            Write-Host "Password cannot be empty. Please try again." -ForegroundColor Yellow
+        }
+    } while ($vcfSecurePassword.Length -eq 0)
+    
+    # Convert SecureString to plain text for API calls
+    $vcfPassword = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto([System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($vcfSecurePassword))
+    
+    Write-Log "VCF/SDDC Manager credentials captured successfully" "SUCCESS"
+    
+    return @{
+        Username = $vcfUsername
+        Password = $vcfPassword
+        Credential = New-Object System.Management.Automation.PSCredential($vcfUsername, $vcfSecurePassword)
+    }
+}
+
+function Get-ESXiRootCredentials {
+    Write-Log "=== ESXi Root Credential Input ===" "SUCCESS"
+    Write-Host ""
+    Write-Host "Note: This will be used as fallback if SDDC Manager doesn't provide ESXi credentials" -ForegroundColor Cyan
+    
+    # Get ESXi root password
+    do {
+        $esxiSecurePassword = Read-Host "Enter ESXi root password (or press Enter to skip)" -AsSecureString
+    } while ($false) # Allow empty for optional input
+    
+    if ($esxiSecurePassword.Length -gt 0) {
+        $esxiPassword = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto([System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($esxiSecurePassword))
+        Write-Log "ESXi root password captured successfully" "SUCCESS"
+    } else {
+        $esxiPassword = $null
+        Write-Log "ESXi root password skipped - will rely on SDDC Manager credentials" "WARNING"
+    }
+    
+    return $esxiPassword
 }
 
 function Get-SDDCToken {
@@ -542,12 +583,23 @@ function Export-NUMADataToCSV {
 }
 
 function Start-AutomatedESXiManagement {
-    Write-Log "=== VCF ESXi Management Script - Native SSH ===" "SUCCESS"
-    Write-Log "Using Windows native OpenSSH client with interactive authentication"
+    Write-Log "=== VCF ESXi Management Script - Interactive Authentication ===" "SUCCESS"
+    Write-Log "This script will prompt for credentials and use native SSH with interactive authentication"
+    Write-Host ""
     
     if (-not (Test-RequiredModules)) {
         return
     }
+    
+    # Get credentials from user input
+    $vcfCredentials = Get-VCFCredentials
+    $esxiRootPassword = Get-ESXiRootCredentials
+    
+    Write-Host ""
+    Write-Log "=== Credential Summary ===" "SUCCESS"
+    Write-Log "VCF/SDDC Username: $($vcfCredentials.Username)" 
+    Write-Log "ESXi Root Password: $(if($esxiRootPassword){'Provided'}else{'Not provided - using SDDC credentials only'})"
+    Write-Host ""
     
     # SSH Key setup if configured
     if ($SSHPublicKeyContent -and -not $SSHKeyPath) {
@@ -555,7 +607,6 @@ function Start-AutomatedESXiManagement {
         Write-Log "Will use interactive password authentication" "WARNING"
     }
     
-    $unifiedCredential = Get-UnifiedCredential -Username $UNIFIED_USERNAME -Password $UNIFIED_PASSWORD
     $allESXiCredentials = @()
     $vCenterConnections = @{}
     $sddcToken = $null
@@ -563,7 +614,7 @@ function Start-AutomatedESXiManagement {
     try {
         Write-Log "=== Step 1: SDDC Manager Operations ==="
         
-        $sddcToken = Get-SDDCToken -FQDN $VCF_FQDN -Username $UNIFIED_USERNAME -Password $UNIFIED_PASSWORD
+        $sddcToken = Get-SDDCToken -FQDN $VCF_FQDN -Username $vcfCredentials.Username -Password $vcfCredentials.Password
         
         if ($sddcToken) {
             $sddcESXiCredentials = Get-ESXiCredentialsFromSDDC -FQDN $VCF_FQDN -Token $sddcToken
@@ -583,7 +634,7 @@ function Start-AutomatedESXiManagement {
         
         Write-Log "=== Step 2: vCenter Operations ==="
         
-        $vCenterConnections = Connect-ToVCenters -vCenterList $vCenterServers -Credential $unifiedCredential
+        $vCenterConnections = Connect-ToVCenters -vCenterList $vCenterServers -Credential $vcfCredentials.Credential
         
         Write-Log "=== Step 3: Enable SSH on ALL SDDC ESXi hosts ==="
         
@@ -655,19 +706,4 @@ function Start-AutomatedESXiManagement {
     catch {
         Write-Log "Unexpected error: $($_.Exception.Message)" "ERROR"
     }
-    finally {
-        if ($sddcToken) {
-            Revoke-SDDCToken -FQDN $VCF_FQDN -Token $sddcToken
-        }
-        
-        if ($vCenterConnections.Count -gt 0) {
-            Write-Log "Cleaning up vCenter connections..."
-            Disconnect-FromVCenters -Connections $vCenterConnections
-        }
-        
-        Write-Log "Script execution completed."
-    }
-}
-
-# Script entry point
-Start-AutomatedESXiManagement
+    
