@@ -1,0 +1,257 @@
+So does a vmware powercli connection and gets the SAN only datastore
+
+from there it will total up all the vms total provision and used and get me the output
+
+I'll help you create a PowerCLI script that connects to VMware, identifies SAN-only datastores, and calculates the total provisioned and used storage for all VMs on those datastores.
+VMware SAN Datastore VM Storage Calculator
+Code 
+
+This PowerCLI script will help you connect to VMware vCenter and analyze storage usage on SAN-only datastores. Here's what it does:
+Key Features:
+
+    Connects to vCenter - Prompts for credentials and establishes connection
+    Identifies SAN datastores - Filters for VMFS datastores with SAN LUN identifiers (naa., eui., t10.*)
+    Calculates VM storage metrics:
+        Total provisioned space across all VMs
+        Total used space across all VMs
+        Per-VM breakdown
+        Per-datastore breakdown
+
+Output Includes:
+
+    Summary totals for all VMs on SAN storage
+    Storage efficiency percentage (used vs provisioned)
+    Datastore breakdown showing capacity and usage per datastore
+    Top 10 largest VMs by provisioned space
+    CSV export with detailed per-VM information
+
+Before Running:
+
+    Install VMware PowerCLI:
+
+powershell
+
+   Install-Module -Name VMware.PowerCLI -Scope CurrentUser
+
+    Update connection parameters:
+        Change $vCenterServer to your vCenter server address
+        Modify the SAN datastore filter if needed (currently filters for FC/iSCSI LUNs)
+    Run with appropriate permissions - ensure your account has read access to vCenter inventory
+
+The script will export a detailed CSV file with all VM information and provide both summary and detailed console output. Would you like me to modify any specific part of the script or add additional filtering criteria?
+
+Not top 10, I want to do it for the whole cluster using SAN
+
+I'll modify the script to process the entire cluster and show all VMs on SAN datastores, not just the top 10.
+VMware SAN Datastore VM Storage Calculator
+Code 
+VMware SAN Datastore VM Storage Calculator
+Code 
+VMware SAN Datastore VM Storage Calculator
+Code 
+VMware SAN Datastore VM Storage Calculator
+Code 
+VMware SAN Datastore VM Storage Calculator
+Code 
+VMware SAN Datastore VM Storage Calculator
+Code 
+
+Perfect! I've updated the script to process the entire cluster and show all VMs on SAN storage. Here are the key improvements:
+Enhanced Features:
+
+    Cluster-focused processing:
+        Specify a specific cluster name or process all clusters
+        Gets datastores from all hosts in the cluster(s)
+
+
+# VMware PowerCLI Script - Cluster-wide SAN Datastore VM Storage Calculator
+# This script connects to vCenter, identifies all SAN-only datastores in the cluster, and calculates total VM storage
+
+# Import VMware PowerCLI module
+Import-Module VMware.VimAutomation.Core -ErrorAction SilentlyContinue
+
+# Connection parameters - modify these for your environment
+$vCenterServer = "your-vcenter-server.domain.com"
+$ClusterName = "your-cluster-name"  # Specify your cluster name or leave empty to process all clusters
+$Credential = Get-Credential -Message "Enter vCenter credentials"
+
+try {
+    # Connect to vCenter Server
+    Write-Host "Connecting to vCenter Server: $vCenterServer" -ForegroundColor Green
+    Connect-VIServer -Server $vCenterServer -Credential $Credential -ErrorAction Stop
+    
+    # Get cluster(s) to process
+    if ($ClusterName) {
+        $Clusters = Get-Cluster -Name $ClusterName -ErrorAction Stop
+        Write-Host "Processing cluster: $ClusterName" -ForegroundColor Green
+    } else {
+        $Clusters = Get-Cluster
+        Write-Host "Processing all clusters: $($Clusters.Name -join ', ')" -ForegroundColor Green
+    }
+    
+    # Get all datastores from the cluster(s) and filter for SAN-only (typically FC or iSCSI)
+    Write-Host "Retrieving SAN datastores from cluster(s)..." -ForegroundColor Yellow
+    
+    $AllDatastores = @()
+    foreach ($Cluster in $Clusters) {
+        $ClusterDatastores = $Cluster | Get-VMHost | Get-Datastore | Sort-Object Name -Unique
+        $AllDatastores += $ClusterDatastores
+    }
+    
+    # Remove duplicates and filter for SAN datastores
+    $SANDatastores = $AllDatastores | Sort-Object Name -Unique | Where-Object {
+        $_.Type -eq "VMFS" -and 
+        ($_.ExtensionData.Info.Vmfs.Extent[0].DiskName -like "naa.*" -or 
+         $_.ExtensionData.Info.Vmfs.Extent[0].DiskName -like "eui.*" -or
+         $_.ExtensionData.Info.Vmfs.Extent[0].DiskName -like "t10.*")
+    }
+    
+    if ($SANDatastores.Count -eq 0) {
+        Write-Warning "No SAN datastores found. Please check your storage configuration."
+        return
+    }
+    
+    Write-Host "Found $($SANDatastores.Count) SAN datastores" -ForegroundColor Green
+    
+    # Initialize totals
+    $TotalProvisionedGB = 0
+    $TotalUsedGB = 0
+    $VMCount = 0
+    $Results = @()
+    
+    # Process each SAN datastore
+    foreach ($Datastore in $SANDatastores) {
+        Write-Host "Processing datastore: $($Datastore.Name)" -ForegroundColor Cyan
+        
+        # Get all VMs on this datastore
+        $VMs = Get-VM -Datastore $Datastore
+        
+        foreach ($VM in $VMs) {
+            $VMCount++
+            
+            # Get VM disk information
+            $VMView = Get-View -Id $VM.Id
+            $VMProvisionedGB = [math]::Round(($VM.ProvisionedSpaceGB), 2)
+            $VMUsedGB = [math]::Round(($VM.UsedSpaceGB), 2)
+            
+            # Add to totals
+            $TotalProvisionedGB += $VMProvisionedGB
+            $TotalUsedGB += $VMUsedGB
+            
+            # Create result object for this VM
+            $VMResult = [PSCustomObject]@{
+                VMName = $VM.Name
+                Cluster = ($VM | Get-VMHost | Get-Cluster).Name
+                ESXiHost = $VM.VMHost.Name
+                Datastore = $Datastore.Name
+                PowerState = $VM.PowerState
+                ProvisionedGB = $VMProvisionedGB
+                UsedGB = $VMUsedGB
+                NumCPU = $VM.NumCpu
+                MemoryGB = [math]::Round($VM.MemoryGB, 2)
+                DatastoreCapacityGB = [math]::Round($Datastore.CapacityGB, 2)
+                DatastoreFreeSpaceGB = [math]::Round($Datastore.FreeSpaceGB, 2)
+            }
+            
+            $Results += $VMResult
+        }
+    }
+    
+    # Display summary results
+    Write-Host "`n" + "="*70 -ForegroundColor Green
+    Write-Host "CLUSTER-WIDE SUMMARY REPORT - SAN Datastores VM Storage" -ForegroundColor Green
+    Write-Host "="*70 -ForegroundColor Green
+    
+    if ($ClusterName) {
+        Write-Host "Cluster: $ClusterName" -ForegroundColor White
+    } else {
+        Write-Host "Clusters: $($Clusters.Name -join ', ')" -ForegroundColor White
+    }
+    Write-Host "Number of SAN Datastores: $($SANDatastores.Count)" -ForegroundColor White
+    Write-Host "Total VMs on SAN Storage: $VMCount" -ForegroundColor White
+    Write-Host "Total Provisioned Space: $([math]::Round($TotalProvisionedGB, 2)) GB ($([math]::Round($TotalProvisionedGB/1024, 2)) TB)" -ForegroundColor Yellow
+    Write-Host "Total Used Space: $([math]::Round($TotalUsedGB, 2)) GB ($([math]::Round($TotalUsedGB/1024, 2)) TB)" -ForegroundColor Yellow
+    Write-Host "Storage Efficiency: $([math]::Round((($TotalUsedGB / $TotalProvisionedGB) * 100), 2))%" -ForegroundColor Cyan
+    Write-Host "Total Cluster SAN Capacity: $([math]::Round(($SANDatastores | Measure-Object CapacityGB -Sum).Sum, 2)) GB" -ForegroundColor Magenta
+    Write-Host "Total Cluster SAN Free Space: $([math]::Round(($SANDatastores | Measure-Object FreeSpaceGB -Sum).Sum, 2)) GB" -ForegroundColor Magenta
+    
+    # Display datastore breakdown
+    Write-Host "`nDatastore Breakdown:" -ForegroundColor Green
+    Write-Host "-"*50 -ForegroundColor Green
+    
+    foreach ($Datastore in $SANDatastores) {
+        $DatastoreVMs = ($Results | Where-Object {$_.Datastore -eq $Datastore.Name}).Count
+        $DatastoreProvisioned = ($Results | Where-Object {$_.Datastore -eq $Datastore.Name} | Measure-Object ProvisionedGB -Sum).Sum
+        $DatastoreUsed = ($Results | Where-Object {$_.Datastore -eq $Datastore.Name} | Measure-Object UsedGB -Sum).Sum
+        
+        Write-Host "Datastore: $($Datastore.Name)" -ForegroundColor White
+        Write-Host "  VMs: $DatastoreVMs" -ForegroundColor Gray
+        Write-Host "  Provisioned: $([math]::Round($DatastoreProvisioned, 2)) GB" -ForegroundColor Gray
+        Write-Host "  Used: $([math]::Round($DatastoreUsed, 2)) GB" -ForegroundColor Gray
+        Write-Host "  Capacity: $([math]::Round($Datastore.CapacityGB, 2)) GB" -ForegroundColor Gray
+        Write-Host "  Free: $([math]::Round($Datastore.FreeSpaceGB, 2)) GB" -ForegroundColor Gray
+        Write-Host ""
+    }
+    
+    # Export detailed results to CSV
+    $ExportPath = "Cluster_SAN_VM_Storage_Report_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+    $Results | Export-Csv -Path $ExportPath -NoTypeInformation
+    Write-Host "Detailed report exported to: $ExportPath" -ForegroundColor Green
+    
+    # Display all VMs sorted by provisioned space
+    Write-Host "`nAll VMs on SAN Storage (sorted by Provisioned Space):" -ForegroundColor Green
+    Write-Host "-"*60 -ForegroundColor Green
+    $Results | Sort-Object ProvisionedGB -Descending | 
+        Format-Table VMName, Cluster, Datastore, ProvisionedGB, UsedGB, PowerState -AutoSize
+    
+    # Additional cluster statistics
+    Write-Host "`nCluster Statistics:" -ForegroundColor Green
+    Write-Host "-"*40 -ForegroundColor Green
+    foreach ($Cluster in $Clusters) {
+        $ClusterVMs = $Results | Where-Object {$_.Cluster -eq $Cluster.Name}
+        $ClusterProvisioned = ($ClusterVMs | Measure-Object ProvisionedGB -Sum).Sum
+        $ClusterUsed = ($ClusterVMs | Measure-Object UsedGB -Sum).Sum
+        
+        Write-Host "Cluster: $($Cluster.Name)" -ForegroundColor White
+        Write-Host "  VMs on SAN: $($ClusterVMs.Count)" -ForegroundColor Gray
+        Write-Host "  Provisioned: $([math]::Round($ClusterProvisioned, 2)) GB" -ForegroundColor Gray
+        Write-Host "  Used: $([math]::Round($ClusterUsed, 2)) GB" -ForegroundColor Gray
+        Write-Host ""
+    }
+    
+}
+catch {
+    Write-Error "An error occurred: $($_.Exception.Message)"
+}
+finally {
+    # Disconnect from vCenter
+    if ($global:DefaultVIServers.Count -gt 0) {
+        Write-Host "Disconnecting from vCenter..." -ForegroundColor Yellow
+        Disconnect-VIServer -Confirm:$false
+    }
+}
+
+# Additional function to get more detailed SAN information
+function Get-SANDatastoreDetails {
+    param(
+        [VMware.VimAutomation.ViCore.Types.V1.DatastoreManagement.Datastore[]]$Datastores
+    )
+    
+    Write-Host "`nDetailed SAN Information:" -ForegroundColor Green
+    Write-Host "-"*50 -ForegroundColor Green
+    
+    foreach ($ds in $Datastores) {
+        $dsView = Get-View -Id $ds.Id
+        Write-Host "Datastore: $($ds.Name)" -ForegroundColor White
+        Write-Host "  Type: $($ds.Type)" -ForegroundColor Gray
+        Write-Host "  File System: $($dsView.Info.Vmfs.Version)" -ForegroundColor Gray
+        Write-Host "  Block Size: $($dsView.Info.Vmfs.BlockSizeMb) MB" -ForegroundColor Gray
+        
+        foreach ($extent in $dsView.Info.Vmfs.Extent) {
+            Write-Host "  LUN: $($extent.DiskName)" -ForegroundColor Gray
+        }
+        Write-Host ""
+    }
+}
+
+Write-Host "`nScript completed. Check the exported CSV file for detailed VM information." -ForegroundColor Green
