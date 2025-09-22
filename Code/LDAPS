@@ -1,0 +1,31 @@
+Connect-VIServer -Server vcenter.domain.local -User administrator@vsphere.local -Password 'YourPassword'
+
+$certPath = "C:\Temp\ldaps.cer"
+$certContent = Get-Content -Path $certPath -Raw
+Add-TrustAuthorityRootCertificate -Certificate $certContent -Server $global:DefaultVIServer
+
+# Import the module (installed with PowerCLI 12+)
+Import-Module VMware.VimAutomation.SsoAdmin
+
+# Connect to SSO (administrator account)
+Connect-SsoAdminServer -Server vcenter.domain.local -User "administrator@vsphere.local" -Password "YourPassword"
+
+# Define identity source settings
+$domainName    = "domain.local"
+$adServer      = "dc01.domain.local"
+$baseDNUsers   = "CN=Users,DC=domain,DC=local"
+$baseDNGroups  = "CN=Users,DC=domain,DC=local"
+$bindDN        = "CN=svc_vcenter,OU=ServiceAccounts,DC=domain,DC=local"
+$bindPassword  = "YourServiceAccountPassword"
+
+# Create new LDAPS Identity Source
+New-SsoIdentitySource -Name $domainName `
+    -Domain $domainName `
+    -Type LdapWithTls `
+    -PrimaryUrl "ldaps://$adServer:636" `
+    -BaseDNUsers $baseDNUsers `
+    -BaseDNGroups $baseDNGroups `
+    -Username $bindDN `
+    -Password $bindPassword
+
+Get-SsoIdentitySource
