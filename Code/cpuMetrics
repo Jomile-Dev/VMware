@@ -1,140 +1,218 @@
-# VM CPU Contention, Wait Time, and NUMA Metrics Report
-# This script collects performance metrics for all VMs since their last boot
+# VM CPU Contention and NUMA Metrics Report - Optimized for Large Environments
+# This script uses batch processing for fast collection across 1000+ VMs
+
+param(
+    [int]$BatchSize = 100,
+    [int]$ThrottleLimit = 10
+)
 
 # Connect to vCenter (modify as needed)
 # Connect-VIServer -Server your-vcenter.domain.com
 
-# Get all powered-on VMs
+$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+Write-Host "Collecting VM inventory..." -ForegroundColor Cyan
+# Get all powered-on VMs in one call
 $vms = Get-VM | Where-Object {$_.PowerState -eq "PoweredOn"}
+$totalVMs = $vms.Count
+Write-Host "Found $totalVMs powered-on VMs" -ForegroundColor Green
 
-# Initialize results array
-$results = @()
+# Get all VM views in batch for boot times
+Write-Host "Retrieving VM boot times..." -ForegroundColor Cyan
+$vmViews = Get-View -ViewType VirtualMachine -Property Name,Runtime.BootTime,Config.Hardware.NumCPU,Config.Hardware.MemoryMB -Filter @{"Runtime.PowerState"="poweredOn"}
 
-foreach ($vm in $vms) {
-    Write-Host "Processing: $($vm.Name)" -ForegroundColor Cyan
+# Create hashtable for quick lookup
+$bootTimeHash = @{}
+$vmConfigHash = @{}
+foreach ($view in $vmViews) {
+    $bootTimeHash[$view.Name] = $view.Runtime.BootTime
+    $vmConfigHash[$view.Name] = @{
+        NumCPU = $view.Config.Hardware.NumCPU
+        MemoryMB = $view.Config.Hardware.MemoryMB
+    }
+}
+
+# Define all metrics to collect
+$allMetrics = @(
+    'cpu.ready.summation',
+    'cpu.wait.summation',
+    'cpu.costop.summation',
+    'cpu.maxlimited.summation',
+    'cpu.usagemhz.average',
+    'cpu.usage.average',
+    'numa.memoryLocal.average',
+    'numa.memoryRemote.average'
+)
+
+# Process VMs in batches for statistics collection
+$results = [System.Collections.ArrayList]::new()
+$batches = [math]::Ceiling($vms.Count / $BatchSize)
+
+Write-Host "Processing $totalVMs VMs in $batches batches of $BatchSize..." -ForegroundColor Cyan
+
+for ($i = 0; $i -lt $batches; $i++) {
+    $batchStart = $i * $BatchSize
+    $batchEnd = [math]::Min(($i + 1) * $BatchSize - 1, $vms.Count - 1)
+    $currentBatch = $vms[$batchStart..$batchEnd]
     
-    # Get VM boot time
-    $bootTime = (Get-VM $vm).ExtensionData.Runtime.BootTime
+    $batchNum = $i + 1
+    Write-Host "Processing batch $batchNum of $batches (VMs $($batchStart+1)-$($batchEnd+1))..." -ForegroundColor Yellow
     
-    if ($null -eq $bootTime) {
-        Write-Host "  Skipping - Unable to determine boot time" -ForegroundColor Yellow
+    # Get oldest boot time in this batch to minimize data retrieval
+    $oldestBoot = ($currentBatch | ForEach-Object { $bootTimeHash[$_.Name] } | 
+                   Where-Object {$_ -ne $null} | 
+                   Measure-Object -Minimum).Minimum
+    
+    if ($null -eq $oldestBoot) {
+        Write-Host "  No valid boot times in this batch, skipping..." -ForegroundColor Yellow
         continue
     }
     
-    # Calculate time since boot
-    $timeSinceBoot = (Get-Date) - $bootTime
-    
-    # Get performance statistics since boot
-    $stats = Get-Stat -Entity $vm -Start $bootTime -Realtime:$false -MaxSamples 10000 -Stat @(
-        'cpu.ready.summation',
-        'cpu.wait.summation',
-        'cpu.costop.summation',
-        'cpu.maxlimited.summation',
-        'cpu.usagemhz.average',
-        'cpu.usage.average',
-        'mem.active.average',
-        'sys.resourceMemConsumed.average'
-    ) -ErrorAction SilentlyContinue
-    
-    # Get NUMA-related stats
-    $numaStats = Get-Stat -Entity $vm -Start $bootTime -Realtime:$false -MaxSamples 10000 -Stat @(
-        'numa.memoryLocal.average',
-        'numa.memoryRemote.average'
-    ) -ErrorAction SilentlyContinue
-    
-    # Calculate averages and convert ready/wait times from milliseconds
-    # CPU Ready: Time VM was ready to run but couldn't get CPU time
-    $cpuReady = ($stats | Where-Object {$_.MetricId -eq 'cpu.ready.summation'} | 
-                 Measure-Object -Property Value -Average).Average
-    $cpuReadyPercent = if ($cpuReady) { ($cpuReady / 20000) * 100 } else { 0 }
-    
-    # CPU Wait: Time spent waiting for CPU resources
-    $cpuWait = ($stats | Where-Object {$_.MetricId -eq 'cpu.wait.summation'} | 
-                Measure-Object -Property Value -Average).Average
-    $cpuWaitPercent = if ($cpuWait) { ($cpuWait / 20000) * 100 } else { 0 }
-    
-    # CPU CoStop: Time VMs with multiple vCPUs wait for all vCPUs to be scheduled
-    $cpuCostop = ($stats | Where-Object {$_.MetricId -eq 'cpu.costop.summation'} | 
-                  Measure-Object -Property Value -Average).Average
-    $cpuCostopPercent = if ($cpuCostop) { ($cpuCostop / 20000) * 100 } else { 0 }
-    
-    # CPU Max Limited: Time VM was ready but hit a CPU limit
-    $cpuMaxLimited = ($stats | Where-Object {$_.MetricId -eq 'cpu.maxlimited.summation'} | 
-                      Measure-Object -Property Value -Average).Average
-    $cpuMaxLimitedPercent = if ($cpuMaxLimited) { ($cpuMaxLimited / 20000) * 100 } else { 0 }
-    
-    # CPU Usage
-    $cpuUsageMhz = ($stats | Where-Object {$_.MetricId -eq 'cpu.usagemhz.average'} | 
-                    Measure-Object -Property Value -Average).Average
-    $cpuUsagePercent = ($stats | Where-Object {$_.MetricId -eq 'cpu.usage.average'} | 
-                        Measure-Object -Property Value -Average).Average
-    
-    # NUMA Memory Stats
-    $numaLocal = ($numaStats | Where-Object {$_.MetricId -eq 'numa.memoryLocal.average'} | 
-                  Measure-Object -Property Value -Average).Average
-    $numaRemote = ($numaStats | Where-Object {$_.MetricId -eq 'numa.memoryRemote.average'} | 
-                   Measure-Object -Property Value -Average).Average
-    
-    # Calculate NUMA locality percentage
-    $numaLocalityPercent = if ($numaLocal -and $numaRemote) {
-        ($numaLocal / ($numaLocal + $numaRemote)) * 100
-    } else { 0 }
-    
-    # Get VM configuration details
-    $vmView = Get-View $vm.Id
-    $numCPUs = $vm.NumCpu
-    $memorySizeGB = $vm.MemoryGB
-    $hostName = $vm.VMHost.Name
-    
-    # Create result object
-    $result = [PSCustomObject]@{
-        VMName = $vm.Name
-        Host = $hostName
-        NumCPUs = $numCPUs
-        MemoryGB = $memorySizeGB
-        PowerState = $vm.PowerState
-        BootTime = $bootTime
-        UptimeDays = [math]::Round($timeSinceBoot.TotalDays, 2)
-        CPUReadyPercent = [math]::Round($cpuReadyPercent, 2)
-        CPUWaitPercent = [math]::Round($cpuWaitPercent, 2)
-        CPUCostopPercent = [math]::Round($cpuCostopPercent, 2)
-        CPUMaxLimitedPercent = [math]::Round($cpuMaxLimitedPercent, 2)
-        CPUUsageMHz = [math]::Round($cpuUsageMhz, 2)
-        CPUUsagePercent = [math]::Round($cpuUsagePercent, 2)
-        NUMALocalMB = [math]::Round($numaLocal, 2)
-        NUMARemoteMB = [math]::Round($numaRemote, 2)
-        NUMALocalityPercent = [math]::Round($numaLocalityPercent, 2)
-        ContentionStatus = if ($cpuReadyPercent -gt 10) { "Critical" } 
-                          elseif ($cpuReadyPercent -gt 5) { "Warning" }
-                          else { "Normal" }
+    # Get stats for entire batch in one call (much faster)
+    try {
+        $batchStats = Get-Stat -Entity $currentBatch -Start $oldestBoot -Realtime:$false -MaxSamples 10000 -Stat $allMetrics -ErrorAction SilentlyContinue
+    } catch {
+        Write-Host "  Error retrieving stats for batch: $_" -ForegroundColor Red
+        continue
     }
     
-    $results += $result
+    # Group stats by VM for faster processing
+    $statsByVM = $batchStats | Group-Object -Property Entity
+    
+    # Process each VM in parallel using runspaces
+    $currentBatch | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
+        $vm = $_
+        $bootTimeHash = $using:bootTimeHash
+        $vmConfigHash = $using:vmConfigHash
+        $statsByVM = $using:statsByVM
+        
+        $bootTime = $bootTimeHash[$vm.Name]
+        
+        if ($null -eq $bootTime) {
+            return $null
+        }
+        
+        # Get stats for this VM
+        $vmStats = ($statsByVM | Where-Object {$_.Name -eq $vm.Name}).Group
+        
+        if (-not $vmStats) {
+            return $null
+        }
+        
+        # Calculate time since boot
+        $timeSinceBoot = (Get-Date) - $bootTime
+        
+        # Group stats by metric for faster filtering
+        $statsByMetric = $vmStats | Group-Object -Property MetricId -AsHashTable
+        
+        # Calculate averages (division by 20000 converts to percentage for summation metrics)
+        $cpuReady = ($statsByMetric['cpu.ready.summation'] | Measure-Object -Property Value -Average).Average
+        $cpuReadyPercent = if ($cpuReady) { ($cpuReady / 20000) * 100 } else { 0 }
+        
+        $cpuWait = ($statsByMetric['cpu.wait.summation'] | Measure-Object -Property Value -Average).Average
+        $cpuWaitPercent = if ($cpuWait) { ($cpuWait / 20000) * 100 } else { 0 }
+        
+        $cpuCostop = ($statsByMetric['cpu.costop.summation'] | Measure-Object -Property Value -Average).Average
+        $cpuCostopPercent = if ($cpuCostop) { ($cpuCostop / 20000) * 100 } else { 0 }
+        
+        $cpuMaxLimited = ($statsByMetric['cpu.maxlimited.summation'] | Measure-Object -Property Value -Average).Average
+        $cpuMaxLimitedPercent = if ($cpuMaxLimited) { ($cpuMaxLimited / 20000) * 100 } else { 0 }
+        
+        $cpuUsageMhz = ($statsByMetric['cpu.usagemhz.average'] | Measure-Object -Property Value -Average).Average
+        $cpuUsagePercent = ($statsByMetric['cpu.usage.average'] | Measure-Object -Property Value -Average).Average
+        
+        $numaLocal = ($statsByMetric['numa.memoryLocal.average'] | Measure-Object -Property Value -Average).Average
+        $numaRemote = ($statsByMetric['numa.memoryRemote.average'] | Measure-Object -Property Value -Average).Average
+        
+        $numaLocalityPercent = if ($numaLocal -and $numaRemote -and ($numaLocal + $numaRemote) -gt 0) {
+            ($numaLocal / ($numaLocal + $numaRemote)) * 100
+        } else { 0 }
+        
+        # Get config from hash
+        $config = $vmConfigHash[$vm.Name]
+        
+        # Return result object
+        [PSCustomObject]@{
+            VMName = $vm.Name
+            Host = $vm.VMHost.Name
+            NumCPUs = $config.NumCPU
+            MemoryGB = [math]::Round($config.MemoryMB / 1024, 2)
+            PowerState = $vm.PowerState
+            BootTime = $bootTime
+            UptimeDays = [math]::Round($timeSinceBoot.TotalDays, 2)
+            CPUReadyPercent = [math]::Round($cpuReadyPercent, 2)
+            CPUWaitPercent = [math]::Round($cpuWaitPercent, 2)
+            CPUCostopPercent = [math]::Round($cpuCostopPercent, 2)
+            CPUMaxLimitedPercent = [math]::Round($cpuMaxLimitedPercent, 2)
+            CPUUsageMHz = [math]::Round($cpuUsageMhz, 2)
+            CPUUsagePercent = [math]::Round($cpuUsagePercent, 2)
+            NUMALocalMB = [math]::Round($numaLocal, 2)
+            NUMARemoteMB = [math]::Round($numaRemote, 2)
+            NUMALocalityPercent = [math]::Round($numaLocalityPercent, 2)
+            ContentionStatus = if ($cpuReadyPercent -gt 10) { "Critical" } 
+                              elseif ($cpuReadyPercent -gt 5) { "Warning" }
+                              else { "Normal" }
+        }
+    } | ForEach-Object {
+        if ($_ -ne $null) {
+            [void]$results.Add($_)
+        }
+    }
 }
 
+$stopwatch.Stop()
+$elapsedTime = $stopwatch.Elapsed.TotalSeconds
+
+Write-Host "`nCompleted in $([math]::Round($elapsedTime, 2)) seconds" -ForegroundColor Green
+Write-Host "Processed $($results.Count) VMs successfully" -ForegroundColor Green
+
 # Display results sorted by CPU Ready time (highest contention first)
-Write-Host "`n=== VM CPU Contention and NUMA Report ===" -ForegroundColor Green
-$results | Sort-Object CPUReadyPercent -Descending | Format-Table -AutoSize
+Write-Host "`n=== Top 20 VMs by CPU Contention ===" -ForegroundColor Green
+$results | Sort-Object CPUReadyPercent -Descending | Select-Object -First 20 | Format-Table -AutoSize
 
 # Export to CSV
 $exportPath = "VM_Contention_NUMA_Report_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
 $results | Export-Csv -Path $exportPath -NoTypeInformation
-Write-Host "`nReport exported to: $exportPath" -ForegroundColor Green
+Write-Host "`nFull report exported to: $exportPath" -ForegroundColor Green
 
-# Summary of VMs with high contention
-$highContention = $results | Where-Object {$_.CPUReadyPercent -gt 5}
-if ($highContention) {
-    Write-Host "`n=== VMs with High CPU Contention (>5%) ===" -ForegroundColor Yellow
-    $highContention | Select-Object VMName, CPUReadyPercent, CPUWaitPercent, NUMALocalityPercent | 
-                      Format-Table -AutoSize
+# Summary statistics
+Write-Host "`n=== Summary Statistics ===" -ForegroundColor Cyan
+Write-Host "Total VMs Processed: $($results.Count)"
+Write-Host "Average CPU Ready: $([math]::Round(($results | Measure-Object -Property CPUReadyPercent -Average).Average, 2))%"
+Write-Host "Average CPU Wait: $([math]::Round(($results | Measure-Object -Property CPUWaitPercent -Average).Average, 2))%"
+Write-Host "Average NUMA Locality: $([math]::Round(($results | Measure-Object -Property NUMALocalityPercent -Average).Average, 2))%"
+
+# VMs with high contention
+$criticalVMs = ($results | Where-Object {$_.CPUReadyPercent -gt 10}).Count
+$warningVMs = ($results | Where-Object {$_.CPUReadyPercent -gt 5 -and $_.CPUReadyPercent -le 10}).Count
+$normalVMs = ($results | Where-Object {$_.CPUReadyPercent -le 5}).Count
+
+Write-Host "`nContention Status:"
+Write-Host "  Critical (>10%): $criticalVMs VMs" -ForegroundColor Red
+Write-Host "  Warning (5-10%): $warningVMs VMs" -ForegroundColor Yellow
+Write-Host "  Normal (<5%):    $normalVMs VMs" -ForegroundColor Green
+
+# VMs with poor NUMA locality
+$poorNUMA = ($results | Where-Object {$_.NUMALocalityPercent -lt 80 -and $_.NUMALocalityPercent -gt 0}).Count
+Write-Host "`nNUMA Status:"
+Write-Host "  Poor Locality (<80%): $poorNUMA VMs" -ForegroundColor Yellow
+
+# Show worst offenders
+if ($criticalVMs -gt 0) {
+    Write-Host "`n=== Critical Contention VMs (>10% CPU Ready) ===" -ForegroundColor Red
+    $results | Where-Object {$_.CPUReadyPercent -gt 10} | 
+               Sort-Object CPUReadyPercent -Descending | 
+               Select-Object VMName, Host, NumCPUs, CPUReadyPercent, CPUWaitPercent, NUMALocalityPercent | 
+               Format-Table -AutoSize
 }
 
-# Summary of VMs with poor NUMA locality
-$poorNUMA = $results | Where-Object {$_.NUMALocalityPercent -lt 80 -and $_.NUMALocalityPercent -gt 0}
-if ($poorNUMA) {
-    Write-Host "`n=== VMs with Poor NUMA Locality (<80% local) ===" -ForegroundColor Yellow
-    $poorNUMA | Select-Object VMName, NUMALocalityPercent, NumCPUs, MemoryGB | 
-                Format-Table -AutoSize
+if ($poorNUMA -gt 0) {
+    Write-Host "`n=== Top 10 VMs with Poor NUMA Locality ===" -ForegroundColor Yellow
+    $results | Where-Object {$_.NUMALocalityPercent -lt 80 -and $_.NUMALocalityPercent -gt 0} |
+               Sort-Object NUMALocalityPercent | 
+               Select-Object -First 10 |
+               Select-Object VMName, Host, NumCPUs, MemoryGB, NUMALocalityPercent | 
+               Format-Table -AutoSize
 }
 
 # Performance interpretation guide
