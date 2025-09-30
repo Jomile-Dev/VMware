@@ -1,0 +1,32 @@
+# Connect to vCenter
+Connect-VIServer -Server "your-vcenter.domain.local"
+
+# Time range (last 1 hour as example)
+$start = (Get-Date).AddHours(-1)
+$end   = Get-Date
+
+# Get all VMs and performance stats
+$vms = Get-VM
+$report = @()
+
+foreach ($vm in $vms) {
+    $metrics = Get-Stat -Entity $vm -Stat cpu.wait.summation,cpu.ready.summation,cpu.costop.summation `
+        -Start $start -Finish $end -IntervalMins 5
+
+    # Group and calculate averages
+    $wait  = ($metrics | Where-Object {$_.MetricId -eq "cpu.wait.summation"} | Measure-Object -Property Value -Average).Average
+    $ready = ($metrics | Where-Object {$_.MetricId -eq "cpu.ready.summation"} | Measure-Object -Property Value -Average).Average
+    $costop= ($metrics | Where-Object {$_.MetricId -eq "cpu.costop.summation"} | Measure-Object -Property Value -Average).Average
+
+    $report += [PSCustomObject]@{
+        VMName          = $vm.Name
+        CPUWait_ms      = [math]::Round($wait, 2)
+        CPUReady_ms     = [math]::Round($ready, 2)
+        CPUCoStop_ms    = [math]::Round($costop, 2)
+        CPUReady_Percent = [math]::Round(($ready / (5*60*1000)) * 100, 2)  # ready time as %
+    }
+}
+
+# Export to CSV
+$report | Export-Csv -Path "C:\VM_CPU_Metrics.csv" -NoTypeInformation
+Write-Host "✅ Metrics exported to C:\VM_CPU_Metrics.csv"
