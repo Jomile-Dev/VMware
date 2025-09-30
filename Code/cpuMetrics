@@ -1,35 +1,38 @@
 # Connect to vCenter
 Connect-VIServer -Server "your-vcenter.domain.local"
 
+# Define how far back to collect (default: 30 days if boot time is older)
+$defaultStart = (Get-Date).AddDays(-30)
+$end = Get-Date
+
 # Get all VMs
 $vms = Get-VM
 
-# Time range: from VM boot time (or earliest available data)
-$report = @()
+# Use parallel foreach for speed (PowerShell 7+ required)
+$report = $vms | ForEach-Object -Parallel {
+    $vm = $_
 
-foreach ($vm in $vms) {
-    $uptime = (Get-Stat -Entity $vm -Stat cpu.usage.average -MaxSamples 1).Timestamp
-    $start = (Get-VMGuest $vm).BootTime
-    if (-not $start) { $start = (Get-Date).AddYears(-1) }  # fallback if boot time unavailable
-    $end = Get-Date
+    # Try to get boot time
+    try { $bootTime = (Get-VMGuest -VM $vm -ErrorAction SilentlyContinue).BootTime }
+    catch { $bootTime = $null }
+    if (-not $bootTime -or $bootTime -lt $defaultStart) { $bootTime = $defaultStart }
 
-    Write-Host "Collecting stats for $($vm.Name) from $start to $end..."
+    # Collect summarized CPU metrics
+    $metrics = Get-Stat -Entity $vm -Stat cpu.ready.summation,cpu.wait.summation,cpu.costop.summation `
+        -Start $bootTime -Finish $using:end -IntervalMins 30 -MaxSamples 100 -ErrorAction SilentlyContinue
 
-    $stats = Get-Stat -Entity $vm -Stat cpu.ready.summation,cpu.wait.summation,cpu.costop.summation `
-        -Start $start -Finish $end -IntervalMins 5 -ErrorAction SilentlyContinue
+    if ($metrics) {
+        $ready  = ($metrics | Where-Object {$_.MetricId -eq "cpu.ready.summation"} | Measure-Object -Property Value -Sum).Sum
+        $wait   = ($metrics | Where-Object {$_.MetricId -eq "cpu.wait.summation"}  | Measure-Object -Property Value -Sum).Sum
+        $costop = ($metrics | Where-Object {$_.MetricId -eq "cpu.costop.summation"} | Measure-Object -Property Value -Sum).Sum
 
-    if ($stats) {
-        $ready  = ($stats | Where-Object {$_.MetricId -eq "cpu.ready.summation"} | Measure-Object -Property Value -Sum).Sum
-        $wait   = ($stats | Where-Object {$_.MetricId -eq "cpu.wait.summation"}  | Measure-Object -Property Value -Sum).Sum
-        $costop = ($stats | Where-Object {$_.MetricId -eq "cpu.costop.summation"} | Measure-Object -Property Value -Sum).Sum
+        # Calculate % (approx. over collected period)
+        $totalSamples = ($metrics | Group-Object -Property MetricId | Select-Object -First 1).Group.Count
+        $totalTimeMs  = $totalSamples * 30 * 60 * 1000
 
-        # Convert to percentage of total time (assuming 5min intervals in ms)
-        $totalSamples = ($stats | Group-Object -Property MetricId | Select-Object -First 1).Group.Count
-        $totalTimeMs = $totalSamples * 5 * 60 * 1000
-
-        $report += [PSCustomObject]@{
+        [PSCustomObject]@{
             VMName         = $vm.Name
-            TotalSamples   = $totalSamples
+            BootTime       = $bootTime
             CPUReady_ms    = [math]::Round($ready,2)
             CPUWait_ms     = [math]::Round($wait,2)
             CPUCoStop_ms   = [math]::Round($costop,2)
@@ -38,11 +41,8 @@ foreach ($vm in $vms) {
             CPUCoStop_pct  = if ($totalTimeMs -ne 0) {[math]::Round(($costop / $totalTimeMs) * 100, 2)} else {0}
         }
     }
-    else {
-        Write-Warning "⚠️ No CPU performance data found for $($vm.Name)."
-    }
-}
+} -ThrottleLimit 20  # Adjust this (15-30) based on vCenter load
 
-# Export to CSV
-$report | Export-Csv -Path "C:\VM_CPU_Lifetime_Metrics.csv" -NoTypeInformation
-Write-Host "✅ Done! Results saved to C:\VM_CPU_Lifetime_Metrics.csv"
+# Export report
+$report | Export-Csv "C:\VM_CPU_Contention_Summary.csv" -NoTypeInformation
+Write-Host "✅ Done! Results exported to C:\VM_CPU_Contention_Summary.csv"
