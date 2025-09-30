@@ -1,13 +1,25 @@
-# VM CPU Contention and NUMA Metrics - Diagnostic & Fixed Version
-# Configuration
-$BatchSize = 50
-$HoursBack = 24  # Look back 24 hours (adjust if needed)
+# VM CPU Contention and NUMA Metrics - Enhanced Diagnostic Version
+# This script handles common data collection issues
 
-Write-Host "=== Starting VM Metrics Collection ===" -ForegroundColor Green
-Write-Host "Looking back $HoursBack hours from now" -ForegroundColor Cyan
+param(
+    [int]$HoursBack = 2,  # Start with 2 hours for faster testing
+    [int]$BatchSize = 25,
+    [switch]$UseRealtime = $false
+)
+
+Write-Host "=== VM CPU & NUMA Metrics Collection ===" -ForegroundColor Green
+Write-Host "Time range: Last $HoursBack hours" -ForegroundColor Cyan
+
+# Check vCenter connection
+if (-not $global:DefaultVIServer) {
+    Write-Host "ERROR: Not connected to vCenter. Run Connect-VIServer first!" -ForegroundColor Red
+    exit
+}
+
+Write-Host "Connected to: $($global:DefaultVIServer.Name)" -ForegroundColor Green
 
 # Get powered-on VMs
-Write-Host "`nStep 1: Getting VM inventory..." -ForegroundColor Cyan
+Write-Host "`n[1/5] Getting VM inventory..." -ForegroundColor Cyan
 $vms = Get-VM | Where-Object {$_.PowerState -eq "PoweredOn"}
 Write-Host "Found $($vms.Count) powered-on VMs" -ForegroundColor Green
 
@@ -16,181 +28,242 @@ if ($vms.Count -eq 0) {
     exit
 }
 
-# Test with first 3 VMs to diagnose
-Write-Host "`nStep 2: Testing stat collection with first 3 VMs..." -ForegroundColor Cyan
-$testVMs = $vms | Select-Object -First 3
+# Test stat collection with sample VMs
+Write-Host "`n[2/5] Testing stat collection (first 5 VMs)..." -ForegroundColor Cyan
+$testVMs = $vms | Select-Object -First 5
 $startTime = (Get-Date).AddHours(-$HoursBack)
 
-Write-Host "Start time: $startTime" -ForegroundColor Yellow
-Write-Host "Test VMs: $($testVMs.Name -join ', ')" -ForegroundColor Yellow
+# Define metrics we want to collect
+$metricsToTest = @(
+    'cpu.ready.summation',
+    'cpu.wait.summation', 
+    'cpu.costop.summation',
+    'cpu.maxlimited.summation',
+    'cpu.usage.average',
+    'cpu.usagemhz.average',
+    'numa.memoryLocal.average',
+    'numa.memoryRemote.average'
+)
 
-# Try realtime stats first (most reliable)
-Write-Host "`nTrying REALTIME stats..." -ForegroundColor Cyan
-$realtimeStats = Get-Stat -Entity $testVMs -Realtime -MaxSamples 10 -ErrorAction SilentlyContinue
+Write-Host "Testing metrics availability..." -ForegroundColor Yellow
 
-if ($realtimeStats) {
-    Write-Host "SUCCESS: Realtime stats available!" -ForegroundColor Green
-    Write-Host "Sample count: $($realtimeStats.Count)" -ForegroundColor Green
-    Write-Host "Available metrics:" -ForegroundColor Yellow
-    $realtimeStats | Select-Object -First 10 MetricId -Unique | ForEach-Object { Write-Host "  - $($_.MetricId)" }
-} else {
-    Write-Host "WARNING: No realtime stats returned" -ForegroundColor Yellow
+# Function to test and collect stats
+function Test-StatCollection {
+    param($VMs, $Metrics, $UseRealtime, $StartTime)
+    
+    $availableMetrics = @{}
+    
+    foreach ($metric in $Metrics) {
+        try {
+            if ($UseRealtime) {
+                $stats = Get-Stat -Entity $VMs -Stat $metric -Realtime -MaxSamples 5 -ErrorAction Stop
+            } else {
+                $stats = Get-Stat -Entity $VMs -Stat $metric -Start $StartTime -ErrorAction Stop
+            }
+            
+            if ($stats -and $stats.Count -gt 0) {
+                $availableMetrics[$metric] = $stats.Count
+                Write-Host "  ✓ $metric - $($stats.Count) samples" -ForegroundColor Green
+            } else {
+                Write-Host "  ✗ $metric - No data" -ForegroundColor Yellow
+            }
+        } catch {
+            Write-Host "  ✗ $metric - Error: $($_.Exception.Message)" -ForegroundColor Red
+        }
+    }
+    
+    return $availableMetrics
 }
 
-# Try historical stats
-Write-Host "`nTrying HISTORICAL stats (last $HoursBack hours)..." -ForegroundColor Cyan
-$historicalStats = Get-Stat -Entity $testVMs -Start $startTime -ErrorAction SilentlyContinue
-
-if ($historicalStats) {
-    Write-Host "SUCCESS: Historical stats available!" -ForegroundColor Green
-    Write-Host "Sample count: $($historicalStats.Count)" -ForegroundColor Green
-    Write-Host "Available metrics:" -ForegroundColor Yellow
-    $historicalStats | Select-Object MetricId -Unique | Select-Object -First 20 | ForEach-Object { Write-Host "  - $($_.MetricId)" }
+# Try realtime first if requested
+if ($UseRealtime) {
+    Write-Host "`nTesting REALTIME stats..." -ForegroundColor Cyan
+    $availableMetrics = Test-StatCollection -VMs $testVMs -Metrics $metricsToTest -UseRealtime $true -StartTime $null
+    $useRealtimeCollection = $true
 } else {
-    Write-Host "WARNING: No historical stats returned" -ForegroundColor Yellow
+    Write-Host "`nTesting HISTORICAL stats..." -ForegroundColor Cyan
+    $availableMetrics = Test-StatCollection -VMs $testVMs -Metrics $metricsToTest -UseRealtime $false -StartTime $startTime
+    $useRealtimeCollection = $false
 }
 
-# Determine which method to use
-$useRealtime = $false
-if ($realtimeStats) {
-    Write-Host "`nUsing REALTIME stats for collection" -ForegroundColor Green
-    $useRealtime = $true
-} elseif ($historicalStats) {
-    Write-Host "`nUsing HISTORICAL stats for collection" -ForegroundColor Green
-} else {
-    Write-Host "`nERROR: No stats available! Check if:" -ForegroundColor Red
-    Write-Host "  1. Statistics collection is enabled in vCenter" -ForegroundColor Red
-    Write-Host "  2. You have proper permissions" -ForegroundColor Red
-    Write-Host "  3. VMs have been running long enough" -ForegroundColor Red
+if ($availableMetrics.Count -eq 0) {
+    Write-Host "`nERROR: No metrics available! Troubleshooting:" -ForegroundColor Red
+    Write-Host "1. Check vCenter statistics level (should be 2 or higher):" -ForegroundColor Yellow
+    Write-Host "   Get-VIEvent -MaxSamples 1 -Start (Get-Date).AddHours(-1)" -ForegroundColor Gray
+    Write-Host "2. Verify VMs have been running for at least 20 minutes" -ForegroundColor Yellow
+    Write-Host "3. Try running with -UseRealtime switch" -ForegroundColor Yellow
+    Write-Host "4. Check user permissions for performance data access" -ForegroundColor Yellow
     exit
 }
 
+Write-Host "`nSuccessfully identified $($availableMetrics.Count) available metrics" -ForegroundColor Green
+
 # Now collect for all VMs
-Write-Host "`nStep 3: Collecting stats for all $($vms.Count) VMs..." -ForegroundColor Cyan
+Write-Host "`n[3/5] Collecting stats for all VMs..." -ForegroundColor Cyan
 $results = [System.Collections.ArrayList]::new()
 $batches = [math]::Ceiling($vms.Count / $BatchSize)
 $processedCount = 0
+$skippedCount = 0
 
 for ($i = 0; $i -lt $batches; $i++) {
     $batchStart = $i * $BatchSize
     $batchEnd = [math]::Min(($i + 1) * $BatchSize - 1, $vms.Count - 1)
     $currentBatch = $vms[$batchStart..$batchEnd]
     
-    Write-Host "Processing batch $($i+1)/$batches (VMs $($batchStart+1)-$($batchEnd+1))..." -ForegroundColor Yellow
+    $percentComplete = [math]::Round((($i + 1) / $batches) * 100)
+    Write-Host "Processing batch $($i+1)/$batches ($percentComplete%) - VMs $($batchStart+1)-$($batchEnd+1)..." -ForegroundColor Yellow
     
-    # Get stats based on what works
-    if ($useRealtime) {
-        $allStats = Get-Stat -Entity $currentBatch -Realtime -MaxSamples 30 -ErrorAction SilentlyContinue
-    } else {
-        $allStats = Get-Stat -Entity $currentBatch -Start $startTime -ErrorAction SilentlyContinue
-    }
+    # Collect only available metrics
+    $statsList = @($availableMetrics.Keys)
     
-    if (-not $allStats) {
-        Write-Host "  No stats for this batch, skipping..." -ForegroundColor Gray
+    try {
+        if ($useRealtimeCollection) {
+            $allStats = Get-Stat -Entity $currentBatch -Stat $statsList -Realtime -MaxSamples 30 -ErrorAction Stop
+        } else {
+            $allStats = Get-Stat -Entity $currentBatch -Stat $statsList -Start $startTime -ErrorAction Stop
+        }
+    } catch {
+        Write-Host "  Error collecting stats: $($_.Exception.Message)" -ForegroundColor Red
         continue
     }
     
-    Write-Host "  Retrieved $($allStats.Count) stat samples" -ForegroundColor Gray
+    if (-not $allStats -or $allStats.Count -eq 0) {
+        Write-Host "  No stats for this batch" -ForegroundColor Gray
+        continue
+    }
     
-    # Group by VM for faster processing
-    $statsByVM = $allStats | Group-Object -Property Entity
+    # Group by VM
+    $statsByVM = $allStats | Group-Object -Property {$_.Entity.Name}
     
     foreach ($vm in $currentBatch) {
         $vmStats = ($statsByVM | Where-Object {$_.Name -eq $vm.Name}).Group
         
         if (-not $vmStats -or $vmStats.Count -eq 0) {
+            $skippedCount++
             continue
         }
         
         # Group by metric
         $byMetric = $vmStats | Group-Object -Property MetricId -AsHashTable
         
-        # Helper function for stats calculation
-        function Get-StatValues {
-            param($metricData, $isDivision = $false)
-            if (-not $metricData) { 
-                return @{Avg=0; Median=0; Max=0; Count=0} 
+        # Calculate statistics helper
+        function Get-StatSummary {
+            param($data, $convertFromSummation = $false)
+            
+            if (-not $data -or $data.Count -eq 0) {
+                return @{Avg=0; Median=0; Max=0; P95=0; Count=0}
             }
-            $values = $metricData.Value
-            if ($isDivision) {
+            
+            $values = $data.Value
+            
+            # Convert summation metrics to percentages
+            if ($convertFromSummation) {
                 $values = $values | ForEach-Object { ($_ / 20000) * 100 }
             }
+            
             $sorted = $values | Sort-Object
-            $median = if ($sorted.Count -gt 0) {
-                if ($sorted.Count % 2 -eq 0) {
-                    ($sorted[$sorted.Count/2-1] + $sorted[$sorted.Count/2]) / 2
+            $count = $sorted.Count
+            
+            $median = if ($count -gt 0) {
+                if ($count % 2 -eq 0) {
+                    ($sorted[$count/2-1] + $sorted[$count/2]) / 2
                 } else {
-                    $sorted[[math]::Floor($sorted.Count/2)]
+                    $sorted[[math]::Floor($count/2)]
                 }
             } else { 0 }
+            
+            $p95Index = [math]::Ceiling($count * 0.95) - 1
+            $p95 = if ($count -gt 0) { $sorted[$p95Index] } else { 0 }
             
             return @{
                 Avg = if ($values) { ($values | Measure-Object -Average).Average } else { 0 }
                 Median = $median
                 Max = if ($values) { ($values | Measure-Object -Maximum).Maximum } else { 0 }
-                Count = $values.Count
+                P95 = $p95
+                Count = $count
             }
         }
         
-        # Get CPU metrics (these use summation, need division)
-        $cpuReady = Get-StatValues $byMetric['cpu.ready.summation'] -isDivision $true
-        $cpuWait = Get-StatValues $byMetric['cpu.wait.summation'] -isDivision $true
-        $cpuCostop = Get-StatValues $byMetric['cpu.costop.summation'] -isDivision $true
-        $cpuMaxLimited = Get-StatValues $byMetric['cpu.maxlimited.summation'] -isDivision $true
+        # Process CPU contention metrics (summation -> percentage)
+        $cpuReady = Get-StatSummary $byMetric['cpu.ready.summation'] -convertFromSummation $true
+        $cpuWait = Get-StatSummary $byMetric['cpu.wait.summation'] -convertFromSummation $true
+        $cpuCostop = Get-StatSummary $byMetric['cpu.costop.summation'] -convertFromSummation $true
+        $cpuMaxLimited = Get-StatSummary $byMetric['cpu.maxlimited.summation'] -convertFromSummation $true
         
-        # Get CPU usage (these are already percentages)
-        $cpuUsage = Get-StatValues $byMetric['cpu.usage.average']
-        $cpuUsageMhz = Get-StatValues $byMetric['cpu.usagemhz.average']
+        # Process CPU usage
+        $cpuUsage = Get-StatSummary $byMetric['cpu.usage.average']
+        $cpuUsageMhz = Get-StatSummary $byMetric['cpu.usagemhz.average']
         
-        # Get NUMA metrics and calculate locality
-        $numaLocal = $byMetric['numa.memoryLocal.average']
-        $numaRemote = $byMetric['numa.memoryRemote.average']
+        # Calculate NUMA locality percentage
+        $numaLocalStats = $byMetric['numa.memoryLocal.average']
+        $numaRemoteStats = $byMetric['numa.memoryRemote.average']
         
-        $numaLocalityPercents = @()
-        if ($numaLocal -and $numaRemote) {
-            for ($j = 0; $j -lt [math]::Min($numaLocal.Count, $numaRemote.Count); $j++) {
-                $local = $numaLocal[$j].Value
-                $remote = $numaRemote[$j].Value
+        $numaLocalityValues = @()
+        if ($numaLocalStats -and $numaRemoteStats) {
+            $minCount = [math]::Min($numaLocalStats.Count, $numaRemoteStats.Count)
+            for ($j = 0; $j -lt $minCount; $j++) {
+                $local = $numaLocalStats[$j].Value
+                $remote = $numaRemoteStats[$j].Value
                 $total = $local + $remote
                 if ($total -gt 0) {
-                    $numaLocalityPercents += ($local / $total) * 100
+                    $numaLocalityValues += ($local / $total) * 100
                 }
             }
         }
         
-        $numaLocality = Get-StatValues ($numaLocalityPercents | ForEach-Object { [PSCustomObject]@{Value=$_} })
+        $numaLocality = if ($numaLocalityValues.Count -gt 0) {
+            $sorted = $numaLocalityValues | Sort-Object
+            @{
+                Avg = ($numaLocalityValues | Measure-Object -Average).Average
+                Median = $sorted[[math]::Floor($sorted.Count/2)]
+                Min = ($numaLocalityValues | Measure-Object -Minimum).Minimum
+                Max = ($numaLocalityValues | Measure-Object -Maximum).Maximum
+            }
+        } else {
+            @{Avg=0; Median=0; Min=0; Max=0}
+        }
+        
+        # Determine status
+        $status = if ($cpuReady.Avg -gt 10 -or $cpuReady.P95 -gt 20) { "Critical" }
+                 elseif ($cpuReady.Avg -gt 5 -or $cpuReady.P95 -gt 10) { "Warning" }
+                 else { "Normal" }
         
         $result = [PSCustomObject]@{
             VMName = $vm.Name
             Host = $vm.VMHost.Name
             NumCPUs = $vm.NumCpu
-            MemoryGB = $vm.MemoryGB
+            MemoryGB = [math]::Round($vm.MemoryGB, 1)
+            PowerState = $vm.PowerState
             Samples = $vmStats.Count
             
+            # CPU Ready (primary contention indicator)
             CPUReady_Avg = [math]::Round($cpuReady.Avg, 2)
             CPUReady_Median = [math]::Round($cpuReady.Median, 2)
             CPUReady_Max = [math]::Round($cpuReady.Max, 2)
+            CPUReady_P95 = [math]::Round($cpuReady.P95, 2)
             
+            # CPU Wait (I/O wait)
             CPUWait_Avg = [math]::Round($cpuWait.Avg, 2)
-            CPUWait_Median = [math]::Round($cpuWait.Median, 2)
             CPUWait_Max = [math]::Round($cpuWait.Max, 2)
             
+            # CPU CoStop (multi-vCPU scheduling delays)
             CPUCoStop_Avg = [math]::Round($cpuCostop.Avg, 2)
-            CPUCoStop_Median = [math]::Round($cpuCostop.Median, 2)
             CPUCoStop_Max = [math]::Round($cpuCostop.Max, 2)
             
+            # CPU MaxLimited (resource limits hit)
             CPUMaxLimited_Avg = [math]::Round($cpuMaxLimited.Avg, 2)
             
+            # CPU Usage
             CPUUsage_Avg = [math]::Round($cpuUsage.Avg, 2)
-            CPUUsage_Median = [math]::Round($cpuUsage.Median, 2)
+            CPUUsage_P95 = [math]::Round($cpuUsage.P95, 2)
+            CPUUsageMhz_Avg = [math]::Round($cpuUsageMhz.Avg, 0)
             
+            # NUMA Locality (higher is better)
             NUMALocality_Avg = [math]::Round($numaLocality.Avg, 2)
             NUMALocality_Median = [math]::Round($numaLocality.Median, 2)
-            NUMALocality_Min = [math]::Round($numaLocality.Max, 2)
+            NUMALocality_Min = [math]::Round($numaLocality.Min, 2)
             
-            Status = if ($cpuReady.Avg -gt 10) { "Critical" }
-                    elseif ($cpuReady.Avg -gt 5) { "Warning" }
-                    else { "Normal" }
+            Status = $status
         }
         
         [void]$results.Add($result)
@@ -198,44 +271,83 @@ for ($i = 0; $i -lt $batches; $i++) {
     }
 }
 
-Write-Host "`nStep 4: Analysis complete!" -ForegroundColor Green
-Write-Host "Successfully processed $processedCount VMs with data" -ForegroundColor Green
+Write-Host "`n[4/5] Processing complete!" -ForegroundColor Green
+Write-Host "VMs with data: $processedCount" -ForegroundColor Green
+Write-Host "VMs skipped (no data): $skippedCount" -ForegroundColor Yellow
 
 if ($results.Count -eq 0) {
-    Write-Host "`nERROR: No VMs returned data. Possible issues:" -ForegroundColor Red
-    Write-Host "  - Stats collection interval too short" -ForegroundColor Red
-    Write-Host "  - VMs just started (no historical data)" -ForegroundColor Red
-    Write-Host "  - vCenter statistics level too low" -ForegroundColor Red
+    Write-Host "`nERROR: No VMs returned usable data!" -ForegroundColor Red
+    Write-Host "Recommendations:" -ForegroundColor Yellow
+    Write-Host "  1. Increase -HoursBack parameter (try 24 hours)" -ForegroundColor Gray
+    Write-Host "  2. Use -UseRealtime switch for current data" -ForegroundColor Gray
+    Write-Host "  3. Wait 20-30 minutes for stats to accumulate" -ForegroundColor Gray
+    Write-Host "  4. Check vCenter statistics level configuration" -ForegroundColor Gray
     exit
 }
 
 # Display results
-Write-Host "`n=== Top 20 VMs by CPU Ready (Contention) ===" -ForegroundColor Cyan
-$results | Sort-Object CPUReady_Avg -Descending | Select-Object -First 20 |
-    Format-Table VMName, CPUReady_Avg, CPUReady_Median, CPUWait_Avg, NUMALocality_Avg, Status -AutoSize
+Write-Host "`n[5/5] Analysis Results" -ForegroundColor Cyan
+Write-Host "`n=== TOP 20 VMs by CPU Ready (Contention) ===" -ForegroundColor Yellow
+$results | Sort-Object CPUReady_Avg -Descending | Select-Object -First 20 VMName, NumCPUs, 
+    @{N='Ready%';E={$_.CPUReady_Avg}}, 
+    @{N='Ready_P95';E={$_.CPUReady_P95}},
+    @{N='Wait%';E={$_.CPUWait_Avg}}, 
+    @{N='CoStop%';E={$_.CPUCoStop_Avg}},
+    @{N='Usage%';E={$_.CPUUsage_Avg}},
+    @{N='NUMA%';E={$_.NUMALocality_Avg}},
+    Status | Format-Table -AutoSize
+
+Write-Host "`n=== VMs with Poor NUMA Locality (<80%) ===" -ForegroundColor Yellow
+$poorNUMA = $results | Where-Object {$_.NUMALocality_Avg -gt 0 -and $_.NUMALocality_Avg -lt 80} | 
+    Sort-Object NUMALocality_Avg | Select-Object -First 10
+if ($poorNUMA) {
+    $poorNUMA | Select-Object VMName, NumCPUs, MemoryGB, 
+        @{N='NUMA%';E={$_.NUMALocality_Avg}},
+        @{N='Ready%';E={$_.CPUReady_Avg}},
+        Host | Format-Table -AutoSize
+} else {
+    Write-Host "  All VMs have good NUMA locality!" -ForegroundColor Green
+}
 
 # Environment summary
-Write-Host "`n=== Environment Summary (Average of VM Averages) ===" -ForegroundColor Green
-[PSCustomObject]@{
-    "CPU Ready %" = [math]::Round(($results.CPUReady_Avg | Measure-Object -Average).Average, 2)
-    "CPU Ready Median %" = [math]::Round(($results.CPUReady_Median | Measure-Object -Average).Average, 2)
-    "CPU Wait %" = [math]::Round(($results.CPUWait_Avg | Measure-Object -Average).Average, 2)
-    "CPU CoStop %" = [math]::Round(($results.CPUCoStop_Avg | Measure-Object -Average).Average, 2)
-    "CPU Usage %" = [math]::Round(($results.CPUUsage_Avg | Measure-Object -Average).Average, 2)
-    "NUMA Locality %" = [math]::Round(($results | Where-Object {$_.NUMALocality_Avg -gt 0}).NUMALocality_Avg | Measure-Object -Average).Average, 2)
-} | Format-List
+Write-Host "`n=== ENVIRONMENT SUMMARY ===" -ForegroundColor Cyan
+$avgMetrics = [PSCustomObject]@{
+    'Total VMs Analyzed' = $processedCount
+    'Avg CPU Ready %' = [math]::Round(($results.CPUReady_Avg | Measure-Object -Average).Average, 2)
+    'Avg CPU Ready P95 %' = [math]::Round(($results.CPUReady_P95 | Measure-Object -Average).Average, 2)
+    'Avg CPU Wait %' = [math]::Round(($results.CPUWait_Avg | Measure-Object -Average).Average, 2)
+    'Avg CPU CoStop %' = [math]::Round(($results.CPUCoStop_Avg | Measure-Object -Average).Average, 2)
+    'Avg CPU Usage %' = [math]::Round(($results.CPUUsage_Avg | Measure-Object -Average).Average, 2)
+    'Avg NUMA Locality %' = [math]::Round(($results | Where-Object {$_.NUMALocality_Avg -gt 0}).NUMALocality_Avg | Measure-Object -Average).Average, 2)
+}
+$avgMetrics | Format-List
 
-# Status summary
-$critical = ($results | Where-Object {$_.Status -eq "Critical"}).Count
-$warning = ($results | Where-Object {$_.Status -eq "Warning"}).Count
-$normal = ($results | Where-Object {$_.Status -eq "Normal"}).Count
+# Status breakdown
+$statusCounts = $results | Group-Object Status | Select-Object Name, Count
+Write-Host "=== VM STATUS BREAKDOWN ===" -ForegroundColor Cyan
+foreach ($status in $statusCounts) {
+    $color = switch ($status.Name) {
+        "Critical" { "Red" }
+        "Warning" { "Yellow" }
+        "Normal" { "Green" }
+    }
+    Write-Host "$($status.Name): $($status.Count) VMs" -ForegroundColor $color
+}
 
-Write-Host "=== VM Status Summary ===" -ForegroundColor Cyan
-Write-Host "Critical (>10% CPU Ready): $critical" -ForegroundColor Red
-Write-Host "Warning (5-10% CPU Ready): $warning" -ForegroundColor Yellow
-Write-Host "Normal (<5% CPU Ready):    $normal" -ForegroundColor Green
-
-# Export
-$exportPath = "VM_Metrics_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+# Export to CSV
+$timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$exportPath = "VM_CPU_NUMA_Metrics_$timestamp.csv"
 $results | Export-Csv -Path $exportPath -NoTypeInformation
-Write-Host "`nFull report: $exportPath" -ForegroundColor Green
+Write-Host "`n✓ Full report exported to: $exportPath" -ForegroundColor Green
+
+# Recommendations
+Write-Host "`n=== INTERPRETATION GUIDE ===" -ForegroundColor Cyan
+Write-Host "CPU Ready % - Time VM waited for CPU" -ForegroundColor White
+Write-Host "  < 5%   = Normal" -ForegroundColor Green
+Write-Host "  5-10%  = Minor contention" -ForegroundColor Yellow
+Write-Host "  > 10%  = Significant contention" -ForegroundColor Red
+Write-Host ""
+Write-Host "NUMA Locality % - Memory access efficiency" -ForegroundColor White
+Write-Host "  > 90%  = Excellent" -ForegroundColor Green
+Write-Host "  80-90% = Good" -ForegroundColor Yellow
+Write-Host "  < 80%  = Poor (consider resizing)" -ForegroundColor Red
