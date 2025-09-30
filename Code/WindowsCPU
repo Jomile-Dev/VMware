@@ -1,0 +1,10 @@
+# 1. Connect to vCenter
+Connect-VIServer -Server "vcenter.domain.local" -User "administrator@vsphere.local" -Password "YourPassword"
+
+# 2. Collect per-VM metrics
+Get-VM | Select-Object Name,
+    @{N="CPU Ready (%)";E={(Get-Stat -Entity $_ -Stat cpu.ready.summation -Realtime -MaxSamples 1).Value / 20000}},
+    @{N="Co-Stop (%)";E={(Get-Stat -Entity $_ -Stat cpu.costop.summation -Realtime -MaxSamples 1).Value / 20000}},
+    @{N="CPU Wait (%)";E={(Get-Stat -Entity $_ -Stat cpu.wait.summation -Realtime -MaxSamples 1).Value / 20000}},
+    @{N="Uptime (Days)";E={((Get-View $_.Id).Summary.Runtime.BootTime - (Get-Date)).Days}},
+    @{N="NUMA Node";E={(Get-VMResourceConfiguration $_).NumaNodeAffinity}}
