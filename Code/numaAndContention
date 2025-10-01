@@ -396,37 +396,24 @@ try {
     $ESXiHosts | Format-Table -AutoSize
     
     # Step 4: Connect to vCenter and enable SSH on filtered ESXi hosts
-    Write-Log "`n=== Enabling SSH on ESXi hosts ===" -Level "INFO"
+    Write-Log "`n=== Enabling SSH on ESXi hosts via vSphere ===" -Level "INFO"
     
     foreach ($ESXiHost in $ESXiHosts) {
         $esxiHostName = $ESXiHost.ResourceName
-        $username = $ESXiHost.Username
-        $password = $ESXiHost.Password
-        
-        # Validate password exists
-        if ([string]::IsNullOrEmpty($password)) {
-            Write-Log "Skipping $esxiHostName - No password available" -Level "WARN"
-            continue
-        }
         
         try {
-            Write-Log "Enabling SSH on $esxiHostName..."
+            Write-Log "Enabling SSH on $esxiHostName via vSphere..."
             Enable-SSH -esxiHost $esxiHostName
             Write-Log "SSH enabled on $esxiHostName" -Level "SUCCESS"
-            
-            # Step 5: Run remote commands using plink
-            Write-Log "Running remote commands on $esxiHostName..."
-            $results = Run-RemoteCommands -esxiHost $esxiHostName -username $username -password $password
-            
-            Write-Log "Commands executed successfully on $esxiHostName" -Level "SUCCESS"
         }
         catch {
-            Write-Log "Failed to process $esxiHostName : $_" -Level "ERROR"
+            Write-Log "Failed to enable SSH on $esxiHostName : $_" -Level "ERROR"
         }
     }
     
-    # Original SSH key deployment section starts here
-    # Step 6: Generate SSH key pair
+    # Give SSH service time to start
+    Write-Log "Waiting for SSH services to start..."
+    Start-Sleep -Seconds 5
     $KeyPath = Join-Path $KeyDirectory "esxi_key"
     $KeyPair = New-RSAKeyPair -KeyPath $KeyPath -KeySize 4096
     
