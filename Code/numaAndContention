@@ -79,69 +79,77 @@ function Get-SDDCApiToken {
         [PSCredential]$Credential
     )
     
-    Write-Log "Authenticating with SDDC API using credentials..."
+    Write-Log "Authenticating with SDDC API to obtain token..."
     
     try {
-        # Example for VMware Cloud (VMC) - adjust for your SDDC platform
-        $AuthEndpoint = "https://$Server/vmc/api/auth/login"
+        $AuthEndpoint = "https://$Server/v1/tokens"
+        
+        # Create basic auth header
+        $Base64Auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$($Credential.UserName):$($Credential.GetNetworkCredential().Password)"))
         
         $Headers = @{
+            "Authorization" = "Basic $Base64Auth"
             "Content-Type" = "application/json"
         }
         
-        # Use Get-Credential username and password
-        $Body = @{
-            username = $Credential.UserName
-            password = $Credential.GetNetworkCredential().Password
-        } | ConvertTo-Json
+        $Response = Invoke-RestMethod -Uri $AuthEndpoint -Method Post -Headers $Headers
         
-        $Response = Invoke-RestMethod -Uri $AuthEndpoint -Method Post -Headers $Headers -Body $Body
-        
-        Write-Log "SDDC API authentication successful" -Level "SUCCESS"
-        return $Response.access_token
+        Write-Log "SDDC API token obtained successfully" -Level "SUCCESS"
+        return $Response.accessToken
     }
     catch {
-        Write-Log "Failed to authenticate with SDDC API: $_" -Level "ERROR"
+        Write-Log "Failed to obtain SDDC API token: $_" -Level "ERROR"
         throw
     }
 }
 #endregion
 
-#region ESXi Host Discovery
-function Get-ESXiHostsFromSDDC {
+#region ESXi Credentials Discovery
+function Get-ESXiCredentialsFromSDDC {
     param(
         [string]$Server,
         [string]$Token
     )
     
-    Write-Log "Retrieving ESXi hosts from SDDC API..."
+    Write-Log "Retrieving ESXi credentials from SDDC API..."
     
     try {
-        # Adjust endpoint based on your SDDC platform
-        $HostsEndpoint = "https://$Server/vmc/api/inventory/hosts"
+        # Query credentials endpoint with ESXi resource type filter
+        $CredentialsEndpoint = "https://$Server/v1/credentials?resourceType=ESXI"
         
         $Headers = @{
             "Authorization" = "Bearer $Token"
             "Content-Type" = "application/json"
         }
         
-        $Response = Invoke-RestMethod -Uri $HostsEndpoint -Method Get -Headers $Headers
+        $Response = Invoke-RestMethod -Uri $CredentialsEndpoint -Method Get -Headers $Headers
         
-        # Parse response (adjust based on your API response structure)
-        $Hosts = $Response.hosts | ForEach-Object {
+        # Filter for root accounts only
+        $RootCredentials = $Response.elements | Where-Object {
+            $_.accountType -eq "USER" -and $_.username -eq "root"
+        }
+        
+        if ($RootCredentials.Count -eq 0) {
+            Write-Log "No root credentials found for ESXi hosts" -Level "WARN"
+            return @()
+        }
+        
+        # Parse and format credentials
+        $ESXiHosts = $RootCredentials | ForEach-Object {
             [PSCustomObject]@{
-                Hostname = $_.name
-                IPAddress = $_.ip_address
-                Username = $_.credentials.username
-                Password = $_.credentials.password
+                ResourceName = $_.resourceName
+                AccountType = $_.accountType
+                Username = $_.username
+                Password = $_.password
+                CredentialType = $_.credentialType
             }
         }
         
-        Write-Log "Retrieved $($Hosts.Count) ESXi hosts" -Level "SUCCESS"
-        return $Hosts
+        Write-Log "Retrieved $($ESXiHosts.Count) ESXi root credentials" -Level "SUCCESS"
+        return $ESXiHosts
     }
     catch {
-        Write-Log "Failed to retrieve ESXi hosts: $_" -Level "ERROR"
+        Write-Log "Failed to retrieve ESXi credentials: $_" -Level "ERROR"
         throw
     }
 }
@@ -224,18 +232,8 @@ function Deploy-SSHKeyToESXi {
 try {
     Write-Log "=== ESXi SSH Key Deployment Automation Started ===" -Level "INFO"
     
-    # Get vCenter credentials
-    $vCenterCredential = Get-Credential -Message "Enter vCenter credentials"
-    
-    # Get SDDC credentials (can be same or different)
-    $UseSeperateSDDCCreds = Read-Host "Use separate credentials for SDDC? (Y/N)"
-    if ($UseSeperateSDDCCreds -eq 'Y' -or $UseSeperateSDDCCreds -eq 'y') {
-        $SDDCCredential = Get-Credential -Message "Enter SDDC API credentials"
-    }
-    else {
-        $SDDCCredential = $vCenterCredential
-        Write-Log "Using same credentials for SDDC as vCenter"
-    }
+    # Get credentials (same for both vCenter and SDDC)
+    $Credential = Get-Credential -Message "Enter vCenter/SDDC credentials"
     
     # Step 1: Connect to all vCenter servers
     Write-Log "Connecting to vCenter servers..."
@@ -243,7 +241,7 @@ try {
     $ConnectedvCenters = @()
     foreach ($vCenter in $vCenterServers) {
         try {
-            $Connection = Connect-VIServer -Server $vCenter -Credential $vCenterCredential -ErrorAction Stop
+            $Connection = Connect-VIServer -Server $vCenter -Credential $Credential -ErrorAction Stop
             Write-Log "Connected to vCenter: $vCenter" -Level "SUCCESS"
             $ConnectedvCenters += $vCenter
         }
@@ -258,8 +256,8 @@ try {
     
     Write-Log "Successfully connected to $($ConnectedvCenters.Count) of $($vCenterServers.Count) vCenter(s)" -Level "SUCCESS"
     
-    # Step 2: Authenticate with SDDC API using Get-Credential
-    $ApiToken = Get-SDDCApiToken -Server $SDDCServer -Credential $SDDCCredential
+    # Step 2: Authenticate with SDDC API and get token
+    $ApiToken = Get-SDDCApiToken -Server $SDDCServer -Credential $Credential
     
     # Step 3: Generate SSH key pair
     $KeyPath = Join-Path $KeyDirectory "esxi_key"
@@ -268,8 +266,8 @@ try {
     Write-Log "Private Key: $($KeyPair.PrivateKey)"
     Write-Log "Public Key: $($KeyPair.PublicKey)"
     
-    # Step 4: Retrieve ESXi hosts from SDDC API
-    $ESXiHosts = Get-ESXiHostsFromSDDC -Server $SDDCServer -Token $ApiToken
+    # Step 4: Retrieve ESXi credentials from SDDC API
+    $ESXiHosts = Get-ESXiCredentialsFromSDDC -Server $SDDCServer -Token $ApiToken
     
     if ($ESXiHosts.Count -eq 0) {
         Write-Log "No ESXi hosts found" -Level "WARN"
@@ -278,17 +276,18 @@ try {
     
     # Step 5: Deploy SSH key to each host
     $Results = @()
-    foreach ($Host in $ESXiHosts) {
+    foreach ($ESXiHost in $ESXiHosts) {
         $HostCred = New-Object System.Management.Automation.PSCredential(
-            $Host.Username,
-            (ConvertTo-SecureString $Host.Password -AsPlainText -Force)
+            $ESXiHost.Username,
+            (ConvertTo-SecureString $ESXiHost.Password -AsPlainText -Force)
         )
         
-        $Success = Deploy-SSHKeyToESXi -ESXiHost $Host.IPAddress -Credential $HostCred -PublicKey $KeyPair.PublicKeyContent.Trim()
+        $Success = Deploy-SSHKeyToESXi -ESXiHost $ESXiHost.ResourceName -Credential $HostCred -PublicKey $KeyPair.PublicKeyContent.Trim()
         
         $Results += [PSCustomObject]@{
-            Hostname = $Host.Hostname
-            IPAddress = $Host.IPAddress
+            ResourceName = $ESXiHost.ResourceName
+            AccountType = $ESXiHost.AccountType
+            Username = $ESXiHost.Username
             Status = if ($Success) { "SUCCESS" } else { "FAILED" }
             Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
         }
@@ -305,8 +304,8 @@ try {
     # Optional: Test key-based authentication
     if ($TestConnection) {
         Write-Log "`n=== Testing SSH Key Authentication ===" -Level "INFO"
-        foreach ($Host in $ESXiHosts | Select-Object -First 1) {
-            Write-Log "Testing connection to $($Host.IPAddress)..."
+        foreach ($ESXiHost in $ESXiHosts | Select-Object -First 1) {
+            Write-Log "Testing connection to $($ESXiHost.ResourceName)..."
             # Implementation for testing key auth would go here
         }
     }
