@@ -6,7 +6,7 @@ param(
 
 # Configuration - Modify these values
 $vCenterServers = @("vcenter01.domain.com", "vcenter02.domain.com")
-$SDDCServer = "sddc01.domain.com"
+$SddcManagerUrl = "https://sddc01.domain.com"
 $KeyDirectory = "./keys"
 
 # Configuration
@@ -73,71 +73,73 @@ function New-RSAKeyPair {
 #endregion
 
 #region SDDC API Authentication
-function Get-SDDCApiToken {
+function Get-ApiToken {
     param(
-        [string]$Server,
+        [string]$SddcManagerUrl,
         [PSCredential]$Credential
     )
     
-    Write-Log "Authenticating with SDDC API to obtain token..."
+    Write-Log "Generating API Token using JSON body..."
     
     try {
-        $AuthEndpoint = "https://$Server/v1/tokens"
+        $username = $Credential.UserName
+        $password = $Credential.GetNetworkCredential().Password
         
-        # Create basic auth header
-        $Base64Auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$($Credential.UserName):$($Credential.GetNetworkCredential().Password)"))
+        $body = @{ username = $username; password = $password } | ConvertTo-Json
+        $headers = @{ "Content-Type" = "application/json" }
         
-        $Headers = @{
-            "Authorization" = "Basic $Base64Auth"
-            "Content-Type" = "application/json"
-        }
+        $response = Invoke-RestMethod -Uri "$SddcManagerUrl/v1/tokens" -Method Post -Headers $headers -Body $body
         
-        $Response = Invoke-RestMethod -Uri $AuthEndpoint -Method Post -Headers $Headers
-        
-        Write-Log "SDDC API token obtained successfully" -Level "SUCCESS"
-        return $Response.accessToken
+        Write-Log "API Token generated successfully" -Level "SUCCESS"
+        return $response.accessToken
     }
     catch {
-        Write-Log "Failed to obtain SDDC API token: $_" -Level "ERROR"
+        Write-Log "Failed to generate API token: $_" -Level "ERROR"
         throw
     }
 }
 #endregion
 
 #region ESXi Credentials Discovery
-function Get-ESXiCredentialsFromSDDC {
+function Get-ESXiCredentials {
     param(
-        [string]$Server,
-        [string]$Token
+        [string]$SddcManagerUrl,
+        [string]$apiToken
     )
     
-    Write-Log "Retrieving ESXi credentials from SDDC API..."
+    Write-Log "Getting ESXi credentials from SDDC Manager API..."
     
     try {
-        # Query credentials endpoint with ESXi resource type filter
-        $CredentialsEndpoint = "https://$Server/v1/credentials?resourceType=ESXI"
-        
-        $Headers = @{
-            "Authorization" = "Bearer $Token"
+        $headers = @{
+            "Authorization" = "Bearer $apiToken"
             "Content-Type" = "application/json"
         }
         
-        $Response = Invoke-RestMethod -Uri $CredentialsEndpoint -Method Get -Headers $Headers
+        $uri = "$SddcManagerUrl/v1/credentials?resourceType=ESXI"
+        $response = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get
+        $credentials = $response.elements
         
-        # Filter for root accounts only
-        $RootCredentials = $Response.elements | Where-Object {
-            $_.accountType -eq "USER" -and $_.username -eq "root"
-        }
-        
-        if ($RootCredentials.Count -eq 0) {
-            Write-Log "No root credentials found for ESXi hosts" -Level "WARN"
+        if (-not $credentials) {
+            Write-Host "No credentials found under 'elements'."
             return @()
         }
         
-        # Parse and format credentials
-        $ESXiHosts = $RootCredentials | ForEach-Object {
+        # Print available account types and usernames
+        Write-Host "Available ESXi Credentials:"
+        $credentials | ForEach-Object {
             [PSCustomObject]@{
-                ResourceName = $_.resourceName
+                ResourceName = $_.resource.resourceName
+                AccountType = $_.accountType
+                Username = $_.username
+            }
+        } | Format-Table -AutoSize
+        
+        # Filter for SSH credentials with username 'root'
+        $filtered = $credentials | Where-Object {
+            $_.credentialType -eq "SSH" -and $_.username -eq "root"
+        } | ForEach-Object {
+            [PSCustomObject]@{
+                ResourceName = $_.resource.resourceName
                 AccountType = $_.accountType
                 Username = $_.username
                 Password = $_.password
@@ -145,8 +147,13 @@ function Get-ESXiCredentialsFromSDDC {
             }
         }
         
-        Write-Log "Retrieved $($ESXiHosts.Count) ESXi root credentials" -Level "SUCCESS"
-        return $ESXiHosts
+        if ($filtered.Count -eq 0) {
+            Write-Log "No SSH root credentials found for ESXi hosts" -Level "WARN"
+            return @()
+        }
+        
+        Write-Log "Found $($filtered.Count) ESXi root SSH credentials" -Level "SUCCESS"
+        return $filtered
     }
     catch {
         Write-Log "Failed to retrieve ESXi credentials: $_" -Level "ERROR"
@@ -256,8 +263,8 @@ try {
     
     Write-Log "Successfully connected to $($ConnectedvCenters.Count) of $($vCenterServers.Count) vCenter(s)" -Level "SUCCESS"
     
-    # Step 2: Authenticate with SDDC API and get token
-    $ApiToken = Get-SDDCApiToken -Server $SDDCServer -Credential $Credential
+    # Step 2: Authenticate with SDDC Manager and get API token
+    $ApiToken = Get-ApiToken -SddcManagerUrl $SddcManagerUrl -Credential $Credential
     
     # Step 3: Generate SSH key pair
     $KeyPath = Join-Path $KeyDirectory "esxi_key"
@@ -266,8 +273,8 @@ try {
     Write-Log "Private Key: $($KeyPair.PrivateKey)"
     Write-Log "Public Key: $($KeyPair.PublicKey)"
     
-    # Step 4: Retrieve ESXi credentials from SDDC API
-    $ESXiHosts = Get-ESXiCredentialsFromSDDC -Server $SDDCServer -Token $ApiToken
+    # Step 4: Retrieve ESXi root credentials from SDDC Manager
+    $ESXiHosts = Get-ESXiCredentials -SddcManagerUrl $SddcManagerUrl -apiToken $ApiToken
     
     if ($ESXiHosts.Count -eq 0) {
         Write-Log "No ESXi hosts found" -Level "WARN"
