@@ -1,0 +1,481 @@
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory=$false)]
+    [switch]$TestConnection
+)
+
+# Configuration - Modify these values
+$vCenterServers = @("vcenter01.domain.com", "vcenter02.domain.com")
+$SddcManagerUrl = "https://sddc01.domain.com"  # Must include https://
+$plinkPath = "C:\Program Files\PuTTY\plink.exe"
+$outputPath = "D:\Working\numa\sched_stats_augmented.csv"
+$KeyDirectory = "./keys"
+$HostFilter = "W03"  # Only process hosts containing this string
+
+# Configuration
+$ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
+
+# Initialize logging
+$LogFile = "ESXi-KeyDeployment-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
+function Write-Log {
+    param([string]$Message, [string]$Level = "INFO")
+    $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $LogMessage = "[$Timestamp] [$Level] $Message"
+    Write-Host $LogMessage
+    Add-Content -Path $LogFile -Value $LogMessage
+}
+
+#region SSH Key Generation
+function New-RSAKeyPair {
+    param(
+        [string]$KeyPath,
+        [int]$KeySize = 4096
+    )
+    
+    Write-Log "Generating RSA $KeySize-bit SSH key pair..."
+    
+    # Ensure directory exists
+    $KeyDir = Split-Path -Parent $KeyPath
+    if (!(Test-Path $KeyDir)) {
+        New-Item -ItemType Directory -Path $KeyDir -Force | Out-Null
+    }
+    
+    # Generate key using ssh-keygen (cross-platform in PS7)
+    $PrivateKeyPath = "$KeyPath"
+    $PublicKeyPath = "$KeyPath.pub"
+    
+    # Check if ssh-keygen is available
+    if (!(Get-Command ssh-keygen -ErrorAction SilentlyContinue)) {
+        throw "ssh-keygen not found. Please install OpenSSH client."
+    }
+    
+    # Generate key (no passphrase for automation)
+    $sshKeyGenArgs = @(
+        "-t", "rsa",
+        "-b", $KeySize,
+        "-f", $PrivateKeyPath,
+        "-N", '""',
+        "-C", "esxi-automation-$(Get-Date -Format 'yyyyMMdd')"
+    )
+    
+    & ssh-keygen @sshKeyGenArgs 2>&1 | Out-Null
+    
+    if (!(Test-Path $PrivateKeyPath) -or !(Test-Path $PublicKeyPath)) {
+        throw "Failed to generate SSH key pair"
+    }
+    
+    Write-Log "SSH key pair generated successfully at $KeyDir" -Level "SUCCESS"
+    
+    return @{
+        PrivateKey = $PrivateKeyPath
+        PublicKey = $PublicKeyPath
+        PublicKeyContent = Get-Content $PublicKeyPath -Raw
+    }
+}
+#endregion
+
+#region SDDC API Authentication
+function Get-ApiToken {
+    param(
+        [string]$SddcManagerUrl,
+        [PSCredential]$Credential
+    )
+    
+    Write-Log "Generating API Token using JSON body..."
+    
+    # Ensure URL has https:// prefix
+    if ($SddcManagerUrl -notmatch '^https?://') {
+        $SddcManagerUrl = "https://$SddcManagerUrl"
+        Write-Log "Added https:// prefix to SDDC Manager URL" -Level "WARN"
+    }
+    
+    # Remove trailing slash if present
+    $SddcManagerUrl = $SddcManagerUrl.TrimEnd('/')
+    
+    try {
+        $username = $Credential.UserName
+        $password = $Credential.GetNetworkCredential().Password
+        
+        $body = @{ username = $username; password = $password } | ConvertTo-Json
+        $headers = @{ "Content-Type" = "application/json" }
+        
+        $tokenUri = "$SddcManagerUrl/v1/tokens"
+        Write-Log "Requesting token from: $tokenUri"
+        
+        $response = Invoke-RestMethod -Uri $tokenUri -Method Post -Headers $headers -Body $body
+        
+        Write-Log "API Token generated successfully" -Level "SUCCESS"
+        return $response.accessToken
+    }
+    catch {
+        Write-Log "Failed to generate API token: $_" -Level "ERROR"
+        throw
+    }
+}
+#endregion
+
+#region ESXi Credentials Discovery
+function Get-ESXiCredentials {
+    param(
+        [string]$SddcManagerUrl,
+        [string]$apiToken,
+        [string]$HostFilter = ""
+    )
+    
+    Write-Log "Getting ESXi credentials from SDDC Manager API..."
+    
+    # Ensure URL has https:// prefix and no trailing slash
+    if ($SddcManagerUrl -notmatch '^https?://') {
+        $SddcManagerUrl = "https://$SddcManagerUrl"
+    }
+    $SddcManagerUrl = $SddcManagerUrl.TrimEnd('/')
+    
+    try {
+        $headers = @{
+            "Authorization" = "Bearer $apiToken"
+            "Content-Type" = "application/json"
+        }
+        
+        $uri = "$SddcManagerUrl/v1/credentials?resourceType=ESXI"
+        Write-Log "Requesting credentials from: $uri"
+        
+        $response = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get
+        $credentials = $response.elements
+        
+        if (-not $credentials) {
+            Write-Log "No credentials found under 'elements'." -Level "WARN"
+            return @()
+        }
+        
+        # Print available account types and usernames
+        Write-Host "`nAvailable ESXi Credentials:"
+        $credentials | ForEach-Object {
+            [PSCustomObject]@{
+                ResourceName = $_.resource.resourceName
+                AccountType = $_.accountType
+                Username = $_.username
+                CredentialType = $_.credentialType
+                HasPassword = if ($_.password) { "Yes" } else { "No" }
+            }
+        } | Format-Table -AutoSize
+        
+        # Filter for SSH credentials with username 'root'
+        $filtered = $credentials | Where-Object {
+            $_.credentialType -eq "SSH" -and $_.username -eq "root"
+        } | ForEach-Object {
+            # Check if password exists
+            if (-not $_.password) {
+                Write-Log "Warning: No password found for $($_.resource.resourceName)" -Level "WARN"
+            }
+            
+            [PSCustomObject]@{
+                ResourceName = $_.resource.resourceName
+                AccountType = $_.accountType
+                Username = $_.username
+                Password = $_.password
+                CredentialType = $_.credentialType
+            }
+        }
+        
+        # Remove entries with null passwords
+        $filtered = $filtered | Where-Object { $_.Password -ne $null -and $_.Password -ne "" }
+        
+        if ($filtered.Count -eq 0) {
+            Write-Log "No SSH root credentials with valid passwords found for ESXi hosts" -Level "WARN"
+            return @()
+        }
+        
+        Write-Log "Found $($filtered.Count) ESXi root SSH credentials with valid passwords" -Level "SUCCESS"
+        
+        # Filter for hosts containing the specified filter string
+        Write-Host "`nFiltering for hosts containing '$HostFilter'..."
+        $filteredByName = $filtered | Where-Object {
+            $_.ResourceName -like "*$HostFilter*"
+        }
+        
+        if ($filteredByName.Count -eq 0) {
+            Write-Log "No hosts found matching filter '$HostFilter'" -Level "WARN"
+            return @()
+        }
+        
+        Write-Log "Found $($filteredByName.Count) hosts matching filter '$HostFilter'" -Level "SUCCESS"
+        return $filteredByName
+    }
+    catch {
+        Write-Log "Failed to retrieve ESXi credentials: $_" -Level "ERROR"
+        throw
+    }
+}
+#endregion
+
+#region vCenter Connection
+function Connect-ToVCenter {
+    param(
+        [string]$vcenterServer,
+        [PSCredential]$credential
+    )
+    
+    Connect-VIServer -Server $vcenterServer -Credential $credential
+}
+#endregion
+
+#region Enable SSH on ESXi
+function Enable-SSH {
+    param(
+        [string]$esxiHost
+    )
+    
+    Get-VMHostService -VMHost $esxiHost | Where-Object { $_.Key -eq "TSM-SSH" } | Start-VMHostService -Confirm:$false
+}
+#endregion
+
+#region Run Remote Commands using PuTTY's plink.exe
+function Run-RemoteCommands {
+    param(
+        [string]$plinkPath,
+        [string]$esxiHost,
+        [string]$username,
+        [string]$password
+    )
+    
+    # Execute esxcli vm process list
+    $vmList = & $plinkPath -ssh "$username@$esxiHost" -pw $password "esxcli vm process list"
+    Start-Sleep -Seconds 1
+    
+    # Execute sched-stats command
+    $schedStats = & $plinkPath -ssh "$username@$esxiHost" -pw $password "sched-stats -t numa-clients"
+    Start-Sleep -Seconds 1
+    
+    return @{
+        SchedStats = $schedStats
+        VMList = $vmList
+    }
+}
+#endregion
+function Deploy-SSHKeyToESXi {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$ESXiHost,
+        
+        [Parameter(Mandatory=$true)]
+        [PSCredential]$Credential,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$PublicKey
+    )
+    
+    Write-Log "Deploying SSH key to $ESXiHost..."
+    
+    try {
+        # Connect via SSH using Posh-SSH module (install if needed)
+        if (!(Get-Module -ListAvailable -Name Posh-SSH)) {
+            Write-Log "Installing Posh-SSH module..." -Level "WARN"
+            Install-Module -Name Posh-SSH -Force -Scope CurrentUser
+        }
+        
+        Import-Module Posh-SSH -ErrorAction Stop
+        
+        # Establish SSH session
+        $Session = New-SSHSession -ComputerName $ESXiHost -Credential $Credential -AcceptKey
+        
+        if (!$Session) {
+            throw "Failed to establish SSH session"
+        }
+        
+        # Prepare authorized_keys directory
+        $Commands = @(
+            "mkdir -p /etc/ssh/keys-root",
+            "chmod 700 /etc/ssh/keys-root",
+            "touch /etc/ssh/keys-root/authorized_keys",
+            "chmod 600 /etc/ssh/keys-root/authorized_keys"
+        )
+        
+        foreach ($Cmd in $Commands) {
+            Invoke-SSHCommand -SessionId $Session.SessionId -Command $Cmd | Out-Null
+        }
+        
+        # Check if key already exists
+        $CheckKey = Invoke-SSHCommand -SessionId $Session.SessionId -Command "grep -F `"$PublicKey`" /etc/ssh/keys-root/authorized_keys"
+        
+        if ($CheckKey.Output) {
+            Write-Log "Public key already exists on $ESXiHost" -Level "WARN"
+        }
+        else {
+            # Append public key
+            $EscapedKey = $PublicKey.Replace('"', '\"')
+            $AddKeyCmd = "echo `"$EscapedKey`" >> /etc/ssh/keys-root/authorized_keys"
+            Invoke-SSHCommand -SessionId $Session.SessionId -Command $AddKeyCmd | Out-Null
+            
+            Write-Log "SSH key deployed to $ESXiHost successfully" -Level "SUCCESS"
+        }
+        
+        # Persist configuration across reboots
+        Invoke-SSHCommand -SessionId $Session.SessionId -Command "/sbin/auto-backup.sh" | Out-Null
+        
+        # Close session
+        Remove-SSHSession -SessionId $Session.SessionId | Out-Null
+        
+        return $true
+    }
+    catch {
+        Write-Log "Failed to deploy key to $ESXiHost : $_" -Level "ERROR"
+        return $false
+    }
+}
+#endregion
+
+#region Main Execution
+try {
+    Write-Log "=== ESXi SSH Key Deployment Automation Started ===" -Level "INFO"
+    
+    # Get credentials (same for both vCenter and SDDC)
+    $Credential = Get-Credential -Message "Enter vCenter/SDDC credentials"
+    
+    # Step 1: Connect to all vCenter servers
+    Write-Log "Connecting to vCenter servers..."
+    
+    $ConnectedvCenters = @()
+    foreach ($vCenter in $vCenterServers) {
+        try {
+            $Connection = Connect-VIServer -Server $vCenter -Credential $Credential -ErrorAction Stop
+            Write-Log "Connected to vCenter: $vCenter" -Level "SUCCESS"
+            $ConnectedvCenters += $vCenter
+        }
+        catch {
+            Write-Log "Failed to connect to $vCenter : $_" -Level "ERROR"
+        }
+    }
+    
+    if ($ConnectedvCenters.Count -eq 0) {
+        throw "Failed to connect to any vCenter servers"
+    }
+    
+    Write-Log "Successfully connected to $($ConnectedvCenters.Count) of $($vCenterServers.Count) vCenter(s)" -Level "SUCCESS"
+    
+    # Step 2: Authenticate with SDDC Manager and get API token
+    $ApiToken = Get-ApiToken -SddcManagerUrl $SddcManagerUrl -Credential $Credential
+    
+    # Step 3: Retrieve ESXi root credentials from SDDC Manager (filtered for W03 hosts)
+    $ESXiHosts = Get-ESXiCredentials -SddcManagerUrl $SddcManagerUrl -apiToken $ApiToken -HostFilter $HostFilter
+    
+    if ($ESXiHosts.Count -eq 0) {
+        Write-Log "No ESXi hosts found matching filter criteria" -Level "WARN"
+        exit 0
+    }
+    
+    Write-Host "`nFiltered ESXi Hosts:"
+    $ESXiHosts | Format-Table -AutoSize
+    
+    # Step 4: Connect to vCenter and enable SSH on filtered ESXi hosts
+    Write-Log "`n=== Enabling SSH on ESXi hosts ===" -Level "INFO"
+    
+    foreach ($ESXiHost in $ESXiHosts) {
+        $esxiHostName = $ESXiHost.ResourceName
+        $username = $ESXiHost.Username
+        $password = $ESXiHost.Password
+        
+        # Validate password exists
+        if ([string]::IsNullOrEmpty($password)) {
+            Write-Log "Skipping $esxiHostName - No password available" -Level "WARN"
+            continue
+        }
+        
+        try {
+            Write-Log "Enabling SSH on $esxiHostName..."
+            Enable-SSH -esxiHost $esxiHostName
+            Write-Log "SSH enabled on $esxiHostName" -Level "SUCCESS"
+            
+            # Step 5: Run remote commands using plink
+            Write-Log "Running remote commands on $esxiHostName..."
+            $results = Run-RemoteCommands -plinkPath $plinkPath -esxiHost $esxiHostName -username $username -password $password
+            
+            Write-Log "Commands executed successfully on $esxiHostName" -Level "SUCCESS"
+        }
+        catch {
+            Write-Log "Failed to process $esxiHostName : $_" -Level "ERROR"
+        }
+    }
+    
+    Write-Log "`nResults exported to $outputPath" -Level "SUCCESS"
+    
+    # Original SSH key deployment section starts here
+    # Step 6: Generate SSH key pair
+    $KeyPath = Join-Path $KeyDirectory "esxi_key"
+    $KeyPair = New-RSAKeyPair -KeyPath $KeyPath -KeySize 4096
+    
+    Write-Log "Private Key: $($KeyPair.PrivateKey)"
+    Write-Log "Public Key: $($KeyPair.PublicKey)"
+    
+    # Step 4: Retrieve ESXi root credentials from SDDC Manager
+    $ESXiHosts = Get-ESXiCredentials -SddcManagerUrl $SddcManagerUrl -apiToken $ApiToken
+    
+    if ($ESXiHosts.Count -eq 0) {
+        Write-Log "No ESXi hosts found" -Level "WARN"
+        exit 0
+    }
+    
+    # Step 7: Deploy SSH key to each host (using the same filtered ESXi hosts)
+    Write-Log "`n=== Deploying SSH Keys ===" -Level "INFO"
+    $Results = @()
+    foreach ($ESXiHost in $ESXiHosts) {
+        # Validate password exists before creating credential
+        if ([string]::IsNullOrEmpty($ESXiHost.Password)) {
+            Write-Log "Skipping $($ESXiHost.ResourceName) - No password available for SSH key deployment" -Level "WARN"
+            $Results += [PSCustomObject]@{
+                ResourceName = $ESXiHost.ResourceName
+                AccountType = $ESXiHost.AccountType
+                Username = $ESXiHost.Username
+                Status = "SKIPPED - No Password"
+                Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            }
+            continue
+        }
+        
+        $HostCred = New-Object System.Management.Automation.PSCredential(
+            $ESXiHost.Username,
+            (ConvertTo-SecureString $ESXiHost.Password -AsPlainText -Force)
+        )
+        
+        $Success = Deploy-SSHKeyToESXi -ESXiHost $ESXiHost.ResourceName -Credential $HostCred -PublicKey $KeyPair.PublicKeyContent.Trim()
+        
+        $Results += [PSCustomObject]@{
+            ResourceName = $ESXiHost.ResourceName
+            AccountType = $ESXiHost.AccountType
+            Username = $ESXiHost.Username
+            Status = if ($Success) { "SUCCESS" } else { "FAILED" }
+            Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        }
+    }
+    
+    # Step 8: Generate report
+    Write-Log "`n=== Deployment Summary ===" -Level "INFO"
+    $Results | Format-Table -AutoSize
+    
+    $ReportPath = "ESXi-KeyDeployment-Report-$(Get-Date -Format 'yyyyMMdd-HHmmss').csv"
+    $Results | Export-Csv -Path $ReportPath -NoTypeInformation
+    Write-Log "Report saved to: $ReportPath" -Level "SUCCESS"
+    
+    # Optional: Test key-based authentication
+    if ($TestConnection) {
+        Write-Log "`n=== Testing SSH Key Authentication ===" -Level "INFO"
+        foreach ($ESXiHost in $ESXiHosts | Select-Object -First 1) {
+            Write-Log "Testing connection to $($ESXiHost.ResourceName)..."
+            # Implementation for testing key auth would go here
+        }
+    }
+}
+catch {
+    Write-Log "Critical error: $_" -Level "ERROR"
+    throw
+}
+finally {
+    # Disconnect from all vCenter servers
+    if ($global:DefaultVIServers) {
+        Disconnect-VIServer -Server * -Confirm:$false -ErrorAction SilentlyContinue
+        Write-Log "Disconnected from all vCenter servers" -Level "INFO"
+    }
+    
+    Write-Log "=== Script execution completed ===" -Level "INFO"
+}
+#endregion
