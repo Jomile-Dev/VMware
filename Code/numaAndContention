@@ -1,36 +1,13 @@
-#Requires -Version 7.0
-#Requires -Modules VMware.PowerCLI
-
-<#
-.SYNOPSIS
-    Automates SSH key deployment to ESXi hosts via VMware SDDC API and PowerCLI
-.DESCRIPTION
-    1. Authenticates with vCenter and SDDC API
-    2. Generates RSA 4096-bit SSH key pair
-    3. Retrieves ESXi hosts from SDDC API
-    4. Deploys public key to all ESXi hosts
-.PARAMETER vCenterServers
-    Array of vCenter server FQDNs/IPs
-.PARAMETER SDDCApiUrl
-    SDDC API base URL (e.g., https://vmc.vmware.com/vmc/api)
-.PARAMETER KeyDirectory
-    Directory to store generated SSH keys (default: ./keys)
-#>
-
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory=$true)]
-    [string[]]$vCenterServers,
-    
-    [Parameter(Mandatory=$true)]
-    [string]$SDDCApiUrl,
-    
-    [Parameter(Mandatory=$false)]
-    [string]$KeyDirectory = "./keys",
-    
     [Parameter(Mandatory=$false)]
     [switch]$TestConnection
 )
+
+# Configuration - Modify these values
+$vCenterServers = @("vcenter01.domain.com", "vcenter02.domain.com")
+$SDDCApiUrl = "https://vmc.vmware.com/vmc/api"
+$KeyDirectory = "./keys"
 
 # Configuration
 $ErrorActionPreference = "Stop"
