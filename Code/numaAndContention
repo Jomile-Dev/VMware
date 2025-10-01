@@ -5,11 +5,9 @@ param(
 )
 
 # Configuration - Modify these values
-$vCenterServers = @("vcenter01.domain.com", 
-                    "vcenter02.domain.com")
-
+$vCenterServers = @("vcenter01.domain.com", "vcenter02.domain.com")
 $SDDCServer = "sddc01.domain.com"
-$KeyDirectory = "C:\Working\keys"
+$KeyDirectory = "./keys"
 
 # Configuration
 $ErrorActionPreference = "Stop"
@@ -224,14 +222,16 @@ function Deploy-SSHKeyToESXi {
 try {
     Write-Log "=== ESXi SSH Key Deployment Automation Started ===" -Level "INFO"
     
+    # Get credentials once for both vCenter and SDDC
+    $Credential = Get-Credential -Message "Enter vCenter/SDDC credentials"
+    
     # Step 1: Connect to all vCenter servers
     Write-Log "Connecting to vCenter servers..."
-    $vCenterCred = Get-Credential -Message "Enter vCenter credentials"
     
     $ConnectedvCenters = @()
     foreach ($vCenter in $vCenterServers) {
         try {
-            $Connection = Connect-VIServer -Server $vCenter -Credential $vCenterCred -ErrorAction Stop
+            $Connection = Connect-VIServer -Server $vCenter -Credential $Credential -ErrorAction Stop
             Write-Log "Connected to vCenter: $vCenter" -Level "SUCCESS"
             $ConnectedvCenters += $vCenter
         }
@@ -247,8 +247,7 @@ try {
     Write-Log "Successfully connected to $($ConnectedvCenters.Count) of $($vCenterServers.Count) vCenter(s)" -Level "SUCCESS"
     
     # Step 2: Authenticate with SDDC API
-    $SDDCCred = Get-Credential -Message "Enter SDDC API token (use token as password)"
-    $ApiToken = Get-SDDCApiToken -Server $SDDCServer -Credential $SDDCCred
+    $ApiToken = Get-SDDCApiToken -Server $SDDCServer -Credential $Credential
     
     # Step 3: Generate SSH key pair
     $KeyPath = Join-Path $KeyDirectory "esxi_key"
