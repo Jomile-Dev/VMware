@@ -7,8 +7,6 @@ param(
 # Configuration - Modify these values
 $vCenterServers = @("vcenter01.domain.com", "vcenter02.domain.com")
 $SddcManagerUrl = "https://sddc01.domain.com"  # Must include https://
-$plinkPath = "C:\Program Files\PuTTY\plink.exe"
-$outputPath = "D:\Working\numa\sched_stats_augmented.csv"
 $KeyDirectory = "./keys"
 $HostFilter = "W03"  # Only process hosts containing this string
 
@@ -233,11 +231,41 @@ function Enable-SSH {
 #region Run Remote Commands using PuTTY's plink.exe
 function Run-RemoteCommands {
     param(
-        [string]$plinkPath,
         [string]$esxiHost,
         [string]$username,
         [string]$password
     )
+    
+    # Find plink.exe in common locations
+    $plinkLocations = @(
+        "plink.exe",  # If in PATH
+        "C:\Program Files\PuTTY\plink.exe",
+        "C:\Program Files (x86)\PuTTY\plink.exe",
+        "$env:ProgramFiles\PuTTY\plink.exe",
+        "${env:ProgramFiles(x86)}\PuTTY\plink.exe"
+    )
+    
+    $plinkPath = $null
+    foreach ($location in $plinkLocations) {
+        if (Test-Path $location -ErrorAction SilentlyContinue) {
+            $plinkPath = $location
+            break
+        }
+    }
+    
+    if (-not $plinkPath) {
+        # Try using Get-Command to find plink in PATH
+        $plinkCmd = Get-Command plink.exe -ErrorAction SilentlyContinue
+        if ($plinkCmd) {
+            $plinkPath = $plinkCmd.Source
+        }
+    }
+    
+    if (-not $plinkPath) {
+        throw "plink.exe not found. Please install PuTTY or ensure plink.exe is in your PATH"
+    }
+    
+    Write-Log "Using plink.exe from: $plinkPath"
     
     # Execute esxcli vm process list
     $vmList = & $plinkPath -ssh "$username@$esxiHost" -pw $password "esxcli vm process list"
@@ -388,7 +416,7 @@ try {
             
             # Step 5: Run remote commands using plink
             Write-Log "Running remote commands on $esxiHostName..."
-            $results = Run-RemoteCommands -plinkPath $plinkPath -esxiHost $esxiHostName -username $username -password $password
+            $results = Run-RemoteCommands -esxiHost $esxiHostName -username $username -password $password
             
             Write-Log "Commands executed successfully on $esxiHostName" -Level "SUCCESS"
         }
@@ -396,8 +424,6 @@ try {
             Write-Log "Failed to process $esxiHostName : $_" -Level "ERROR"
         }
     }
-    
-    Write-Log "`nResults exported to $outputPath" -Level "SUCCESS"
     
     # Original SSH key deployment section starts here
     # Step 6: Generate SSH key pair
