@@ -79,23 +79,25 @@ function Get-SDDCApiToken {
         [PSCredential]$Credential
     )
     
-    Write-Log "Authenticating with SDDC API..."
+    Write-Log "Authenticating with SDDC API using credentials..."
     
     try {
         # Example for VMware Cloud (VMC) - adjust for your SDDC platform
-        $AuthEndpoint = "https://$Server/vmc/api/auth/api-tokens/authorize"
+        $AuthEndpoint = "https://$Server/vmc/api/auth/login"
         
         $Headers = @{
             "Content-Type" = "application/json"
         }
         
+        # Use Get-Credential username and password
         $Body = @{
-            refresh_token = $Credential.GetNetworkCredential().Password
+            username = $Credential.UserName
+            password = $Credential.GetNetworkCredential().Password
         } | ConvertTo-Json
         
         $Response = Invoke-RestMethod -Uri $AuthEndpoint -Method Post -Headers $Headers -Body $Body
         
-        Write-Log "SDDC API token retrieved successfully" -Level "SUCCESS"
+        Write-Log "SDDC API authentication successful" -Level "SUCCESS"
         return $Response.access_token
     }
     catch {
@@ -222,8 +224,18 @@ function Deploy-SSHKeyToESXi {
 try {
     Write-Log "=== ESXi SSH Key Deployment Automation Started ===" -Level "INFO"
     
-    # Get credentials once for both vCenter and SDDC
-    $Credential = Get-Credential -Message "Enter vCenter/SDDC credentials"
+    # Get vCenter credentials
+    $vCenterCredential = Get-Credential -Message "Enter vCenter credentials"
+    
+    # Get SDDC credentials (can be same or different)
+    $UseSeperateSDDCCreds = Read-Host "Use separate credentials for SDDC? (Y/N)"
+    if ($UseSeperateSDDCCreds -eq 'Y' -or $UseSeperateSDDCCreds -eq 'y') {
+        $SDDCCredential = Get-Credential -Message "Enter SDDC API credentials"
+    }
+    else {
+        $SDDCCredential = $vCenterCredential
+        Write-Log "Using same credentials for SDDC as vCenter"
+    }
     
     # Step 1: Connect to all vCenter servers
     Write-Log "Connecting to vCenter servers..."
@@ -231,7 +243,7 @@ try {
     $ConnectedvCenters = @()
     foreach ($vCenter in $vCenterServers) {
         try {
-            $Connection = Connect-VIServer -Server $vCenter -Credential $Credential -ErrorAction Stop
+            $Connection = Connect-VIServer -Server $vCenter -Credential $vCenterCredential -ErrorAction Stop
             Write-Log "Connected to vCenter: $vCenter" -Level "SUCCESS"
             $ConnectedvCenters += $vCenter
         }
@@ -246,8 +258,8 @@ try {
     
     Write-Log "Successfully connected to $($ConnectedvCenters.Count) of $($vCenterServers.Count) vCenter(s)" -Level "SUCCESS"
     
-    # Step 2: Authenticate with SDDC API
-    $ApiToken = Get-SDDCApiToken -Server $SDDCServer -Credential $Credential
+    # Step 2: Authenticate with SDDC API using Get-Credential
+    $ApiToken = Get-SDDCApiToken -Server $SDDCServer -Credential $SDDCCredential
     
     # Step 3: Generate SSH key pair
     $KeyPath = Join-Path $KeyDirectory "esxi_key"
