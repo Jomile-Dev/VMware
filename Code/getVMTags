@@ -1,0 +1,46 @@
+# Requires: VMware.PowerCLI
+
+# 1. Prompt once for credentials
+$cred = Get-Credential -Message "Enter vCenter credentials"
+
+# 2. List all vCenters you want to connect to
+$vcenters = @(
+    "vcsa1.example.local",
+    "vcsa2.example.local",
+    "vcsa3.example.local"
+)
+
+# 3. Connect to each vCenter
+foreach ($vc in $vcenters) {
+    Write-Host "Connecting to $vc..." -ForegroundColor Cyan
+    Connect-VIServer -Server $vc -Credential $cred -WarningAction SilentlyContinue
+}
+
+# 4. Get all VMs and their tags (including untagged VMs)
+$results = @()
+
+foreach ($vm in Get-VM) {
+    # Get tag assignments (could be 0)
+    $tagAssignments = Get-TagAssignment -Entity $vm -ErrorAction SilentlyContinue
+    $tagNames = if ($tagAssignments) {
+        ($tagAssignments | Select-Object -ExpandProperty Tag).Name -join ", "
+    } else {
+        ""  # blank if no tags
+    }
+
+    # Build result object
+    $results += [PSCustomObject]@{
+        VMName     = $vm.Name
+        PowerState = $vm.PowerState
+        Cluster    = $vm.VMHost.Parent.Name
+        vCenter    = ($vm.VMHost | Get-View).Client.ServiceUrl.Split('/')[2]
+        Tags       = $tagNames
+    }
+}
+
+# 5. Output results
+$results | Format-Table -AutoSize
+
+# 6. (Optional) Export to CSV
+$results | Export-Csv -Path ".\AllVMs_Tags.csv" -NoTypeInformation
+Write-Host "✅ Exported to AllVMs_Tags.csv" -ForegroundColor Green
