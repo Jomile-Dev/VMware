@@ -1,5 +1,14 @@
 # Requires: VMware.PowerCLI
 
+# 0. SMTP Configuration
+$smtpServer = "smtp.example.com"
+$smtpPort = 25  # Use 587 for TLS, 465 for SSL
+$smtpFrom = "vcenter-reports@example.com"
+$smtpTo = "admin@example.com"
+$smtpSubject = "vCenter VEEAM Tags Report - $(Get-Date -Format 'yyyy-MM-dd')"
+# $smtpUsername = "your-username"  # Uncomment if authentication required
+# $smtpPassword = "your-password"  # Uncomment if authentication required
+
 # 1. Prompt once for credentials
 $cred = Get-Credential -Message "Enter vCenter credentials"
 
@@ -76,6 +85,28 @@ $taggedCount = ($results | Where-Object { $_.VEEAM_Tags -ne "" }).Count
 $totalCount = $results.Count
 Write-Host "`nSummary: $taggedCount out of $totalCount VMs have VEEAM tags" -ForegroundColor Cyan
 
+# 6a. Count VMs per tag
+Write-Host "`nVMs per VEEAM Tag:" -ForegroundColor Yellow
+$tagCounts = @{}
+foreach ($result in $results) {
+    if ($result.VEEAM_Tags -ne "") {
+        $tags = $result.VEEAM_Tags -split ", "
+        foreach ($tag in $tags) {
+            if ($tagCounts.ContainsKey($tag)) {
+                $tagCounts[$tag]++
+            } else {
+                $tagCounts[$tag] = 1
+            }
+        }
+    }
+}
+
+# Display tag counts
+$tagCountsSorted = $tagCounts.GetEnumerator() | Sort-Object Value -Descending
+$tagCountsSorted | ForEach-Object {
+    Write-Host "  $($_.Key): $($_.Value) VMs" -ForegroundColor Gray
+}
+
 # 7. Export to CSV with timestamp
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $csvPath = ".\VMs_VEEAM_Tags_$timestamp.csv"
@@ -85,3 +116,95 @@ Write-Host "✅ Exported to $csvPath" -ForegroundColor Green
 # 8. Disconnect from all vCenters
 Write-Host "`nDisconnecting from vCenters..." -ForegroundColor Cyan
 Disconnect-VIServer -Server * -Confirm:$false
+
+# 9. Send email report
+Write-Host "`nSending email report..." -ForegroundColor Cyan
+
+# Build email body
+$emailBody = @"
+<html>
+<head>
+<style>
+    body { font-family: Arial, sans-serif; }
+    h2 { color: #0078D4; }
+    table { border-collapse: collapse; width: 100%; margin-top: 10px; }
+    th { background-color: #0078D4; color: white; padding: 10px; text-align: left; }
+    td { border: 1px solid #ddd; padding: 8px; }
+    tr:nth-child(even) { background-color: #f2f2f2; }
+    .summary { background-color: #e7f3ff; padding: 15px; margin: 10px 0; border-radius: 5px; }
+    .no-tags { background-color: #fff3cd; padding: 15px; margin: 10px 0; border-radius: 5px; }
+</style>
+</head>
+<body>
+<h2>vCenter VEEAM Tags Report</h2>
+<p><strong>Generated:</strong> $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</p>
+
+<div class="summary">
+<h3>Summary</h3>
+<ul>
+    <li><strong>Total VMs:</strong> $totalCount</li>
+    <li><strong>VMs with VEEAM tags:</strong> $taggedCount</li>
+    <li><strong>VMs without VEEAM tags:</strong> $($totalCount - $taggedCount)</li>
+</ul>
+</div>
+
+<h3>Breakdown by VEEAM Tag</h3>
+<table>
+<tr>
+    <th>Tag Name</th>
+    <th>VM Count</th>
+    <th>Percentage</th>
+</tr>
+"@
+
+# Add tag counts to email with percentages
+foreach ($tagCount in $tagCountsSorted) {
+    $percentage = [math]::Round(($tagCount.Value / $totalCount) * 100, 1)
+    $emailBody += @"
+<tr>
+    <td>$($tagCount.Key)</td>
+    <td>$($tagCount.Value)</td>
+    <td>$percentage%</td>
+</tr>
+"@
+}
+
+$emailBody += @"
+</table>
+
+<div class="no-tags">
+<h3>VMs Without VEEAM Tags</h3>
+<p><strong>Count:</strong> $($totalCount - $taggedCount) VMs ($([math]::Round((($totalCount - $taggedCount) / $totalCount) * 100, 1))% of total)</p>
+</div>
+
+<p style="margin-top: 20px;"><em>Full details are available in the attached CSV file.</em></p>
+</body>
+</html>
+"@
+
+# Send email
+try {
+    $mailParams = @{
+        SmtpServer = $smtpServer
+        Port = $smtpPort
+        From = $smtpFrom
+        To = $smtpTo
+        Subject = $smtpSubject
+        Body = $emailBody
+        BodyAsHtml = $true
+        Attachments = $csvPath
+    }
+    
+    # Add authentication if configured
+    # if ($smtpUsername -and $smtpPassword) {
+    #     $securePassword = ConvertTo-SecureString $smtpPassword -AsPlainText -Force
+    #     $mailParams.Credential = New-Object System.Management.Automation.PSCredential($smtpUsername, $securePassword)
+    #     $mailParams.UseSsl = $true
+    # }
+    
+    Send-MailMessage @mailParams
+    Write-Host "✅ Email sent successfully to $smtpTo" -ForegroundColor Green
+}
+catch {
+    Write-Host "❌ Failed to send email: $_" -ForegroundColor Red
+}
