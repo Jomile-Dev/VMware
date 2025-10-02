@@ -1,155 +1,157 @@
 # Requires: VMware.PowerCLI
 
-# 1. Ask for credentials
+# 1. Prompt once for credentials
 $cred = Get-Credential -Message "Enter vCenter credentials"
 
-# 2. Connect to multiple vCenters - UPDATE THIS LIST WITH YOUR ACTUAL VCENTERS!
+# 2. List all vCenters you want to connect to
 $vcenters = @(
     "vcsa1.example.local",
     "vcsa2.example.local",
     "vcsa3.example.local"
     # Add ALL your vCenter FQDNs or IPs here
 )
-Write-Host "=== Connecting to vCenters ===" -ForegroundColor Cyan
 
+# 3. Connect to each vCenter and store connections
+$connectedServers = @()
+Write-Host "=== Connecting to vCenters ===" -ForegroundColor Cyan
 foreach ($vc in $vcenters) {
+    Write-Host "Connecting to $vc..." -ForegroundColor Yellow
     try {
-        Write-Host "Connecting to $vc..." -ForegroundColor Yellow
         $connection = Connect-VIServer -Server $vc -Credential $cred -WarningAction SilentlyContinue -ErrorAction Stop
-        Write-Host "✅ Successfully connected to $vc" -ForegroundColor Green
+        $connectedServers += $connection
+        Write-Host "✅ Connected to $vc" -ForegroundColor Green
     }
     catch {
-        Write-Error "❌ Failed to connect to $vc"
-        Write-Host "   Error: $($_.Exception.Message)" -ForegroundColor Red
-        Write-Host "   Possible reasons: Wrong credentials, network issue, vCenter unreachable" -ForegroundColor Gray
+        Write-Host "❌ Failed to connect to $vc : $($_.Exception.Message)" -ForegroundColor Red
     }
 }
 
-# Verify connections
-Write-Host "`n=== Active Connections ===" -ForegroundColor Cyan
-if ($global:DefaultVIServers.Count -eq 0) {
+if ($connectedServers.Count -eq 0) {
     Write-Error "No vCenter connections established! Exiting..."
     exit
 }
-$global:DefaultVIServers | ForEach-Object {
-    Write-Host "✅ $($_.Name) - User: $($_.User) - Version: $($_.Version)" -ForegroundColor Green
-}
-Write-Host ""
 
-# 3. Import CSV
+Write-Host "`n✅ Connected to $($connectedServers.Count) vCenter(s)" -ForegroundColor Green
+
+# 4. Set category name - Common choices: "Backup", "Veeam", "Application", "VEEAM"
+$categoryName = "VEEAM"
+
+# 5. Import CSV
 $csvPath = ".\vm_tags.csv"
 if (-not (Test-Path $csvPath)) {
     Write-Error "CSV file not found: $csvPath"
+    Disconnect-VIServer -Server * -Confirm:$false
     exit
 }
 $vmList = Import-Csv -Path $csvPath
-Write-Host "📋 Loaded $($vmList.Count) entries from CSV" -ForegroundColor Cyan
+Write-Host "`n📋 Loaded $($vmList.Count) entries from CSV`n" -ForegroundColor Cyan
 
-# 4. Process each vCenter individually
-foreach ($vcServer in $global:DefaultVIServers) {
-    Write-Host "`n╔═══════════════════════════════════════════════════════════╗" -ForegroundColor Magenta
-    Write-Host "║  Processing vCenter: $($vcServer.Name.PadRight(35))║" -ForegroundColor Magenta
-    Write-Host "╚═══════════════════════════════════════════════════════════╝" -ForegroundColor Magenta
+# 6. Process each vCenter individually
+foreach ($vcServer in $connectedServers) {
+    Write-Host "`n========================================" -ForegroundColor Cyan
+    Write-Host "Processing vCenter: $($vcServer.Name)" -ForegroundColor Cyan
+    Write-Host "========================================" -ForegroundColor Cyan
     
     # Ensure category exists on THIS vCenter
-    $categoryName = "Backup"  # Change this to your preferred category name
     $category = Get-TagCategory -Name $categoryName -Server $vcServer -ErrorAction SilentlyContinue
     if (-not $category) {
         Write-Host "Creating category '$categoryName' on $($vcServer.Name)..." -ForegroundColor Yellow
-        $category = New-TagCategory -Name $categoryName -Cardinality Multiple -EntityType VirtualMachine -Description "Veeam backup tags" -Server $vcServer
-        Write-Host "✅ Category created" -ForegroundColor Green
+        try {
+            $category = New-TagCategory -Name $categoryName -Cardinality Multiple -EntityType VirtualMachine -Description "Veeam backup tags" -Server $vcServer -ErrorAction Stop
+            Write-Host "✅ Category created" -ForegroundColor Green
+        }
+        catch {
+            Write-Error "Failed to create category on $($vcServer.Name): $($_.Exception.Message)"
+            continue
+        }
     }
     else {
         Write-Host "✅ Category '$categoryName' exists on $($vcServer.Name)" -ForegroundColor Green
     }
-    
-    # Get total VMs visible on this vCenter
-    $totalVMs = (Get-VM -Server $vcServer -ErrorAction SilentlyContinue).Count
-    Write-Host "Total VMs visible on $($vcServer.Name): $totalVMs" -ForegroundColor Yellow
     
     # Process each VM from CSV
     foreach ($row in $vmList) {
         $vmName = $row.VMName.Trim()
         $tagList = $row.Tags -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" }
 
-        Write-Host "`n--- Processing VM: $vmName ---" -ForegroundColor Cyan
+        Write-Host "`n--- Processing VM: $vmName ---" -ForegroundColor White
         
-        # Search for VM on THIS specific vCenter
+        # Search for VM on THIS vCenter only
         $vm = Get-VM -Name $vmName -Server $vcServer -ErrorAction SilentlyContinue
         
-        # Try wildcard if exact match fails
         if (-not $vm) {
-            Write-Host "⚠️  Exact match failed, trying wildcard search..." -ForegroundColor Yellow
-            $vms = Get-VM -Name "*$vmName*" -Server $vcServer -ErrorAction SilentlyContinue
-            if ($vms.Count -eq 1) {
-                $vm = $vms
-                Write-Host "✅ Found via wildcard: '$($vm.Name)'" -ForegroundColor Green
-            }
-            elseif ($vms.Count -gt 1) {
-                Write-Warning "❌ Multiple VMs found matching '$vmName' on $($vcServer.Name):"
-                $vms | ForEach-Object { Write-Host "   - $($_.Name)" -ForegroundColor Gray }
-                continue
-            }
-        }
-        
-        if (-not $vm) {
-            Write-Host "⚠️  VM '$vmName' not found on $($vcServer.Name). Skipping..." -ForegroundColor Yellow
+            Write-Host "⚠️  VM '$vmName' not found on $($vcServer.Name) - Skipping" -ForegroundColor Gray
             continue
         }
         
         Write-Host "✅ Found VM: $vmName (PowerState: $($vm.PowerState), Host: $($vm.VMHost.Name))" -ForegroundColor Green
 
+        # Process each tag for this VM
         foreach ($tagName in $tagList) {
             if (-not $tagName) { continue }
 
             # Get or create tag on THIS vCenter
             $tag = Get-Tag -Name $tagName -Category $categoryName -Server $vcServer -ErrorAction SilentlyContinue
             if (-not $tag) {
-                Write-Host "🆕 Creating tag '$tagName' in category '$categoryName' on $($vcServer.Name)..." -ForegroundColor Yellow
+                Write-Host "   🆕 Creating tag '$tagName' in category '$categoryName' on $($vcServer.Name)..." -ForegroundColor Yellow
                 try {
                     $tag = New-Tag -Name $tagName -Category $categoryName -Server $vcServer -ErrorAction Stop
-                    Write-Host "✅ Tag '$tagName' created" -ForegroundColor Green
+                    Write-Host "   ✅ Tag '$tagName' created" -ForegroundColor Green
                 }
                 catch {
-                    Write-Error "Failed to create tag '$tagName': $($_.Exception.Message)"
+                    Write-Error "   Failed to create tag '$tagName' on $($vcServer.Name): $($_.Exception.Message)"
                     continue
                 }
             }
             else {
-                Write-Host "✅ Tag '$tagName' exists" -ForegroundColor Green
+                Write-Host "   ✅ Tag '$tagName' exists" -ForegroundColor Green
             }
 
             # Check if tag is already assigned
             $existingAssignment = Get-TagAssignment -Entity $vm -Tag $tag -Server $vcServer -ErrorAction SilentlyContinue
             if ($existingAssignment) {
-                Write-Host "ℹ️  Tag '$tagName' already assigned to '$vmName'" -ForegroundColor Gray
+                Write-Host "   ℹ️  Tag '$tagName' already assigned to '$vmName'" -ForegroundColor Gray
                 continue
             }
 
-            # Assign tag
-            Write-Host "🏷️  Assigning '$tagName' to '$vmName'..." -ForegroundColor Yellow
+            # Assign tag on THIS vCenter
+            Write-Host "   🏷️  Assigning '$tagName' to '$vmName' on $($vcServer.Name)..." -ForegroundColor Yellow
             try {
                 $assignment = New-TagAssignment -Entity $vm -Tag $tag -Server $vcServer -ErrorAction Stop
-                Write-Host "✅ Successfully assigned '$tagName' to '$vmName'" -ForegroundColor Green
+                Write-Host "   ✅ Successfully assigned '$tagName' to '$vmName'" -ForegroundColor Green
             }
             catch {
-                Write-Error "Failed to assign tag '$tagName' to '$vmName': $($_.Exception.Message)"
-            }
-        }
-    }
-    
-    # Verification for this vCenter
-    Write-Host "`n=== Verification for $($vcServer.Name) ===" -ForegroundColor Cyan
-    foreach ($row in $vmList) {
-        $vmName = $row.VMName.Trim()
-        $vm = Get-VM -Name $vmName -Server $vcServer -ErrorAction SilentlyContinue
-        if ($vm) {
-            $assignedTags = Get-TagAssignment -Entity $vm -Server $vcServer | Select-Object -ExpandProperty Tag | Select-Object -ExpandProperty Name
-            if ($assignedTags) {
-                Write-Host "$vmName : $($assignedTags -join ', ')" -ForegroundColor Green
+                Write-Error "   Failed to assign tag '$tagName' to '$vmName' on $($vcServer.Name): $($_.Exception.Message)"
             }
         }
     }
 }
 
-Write-Host "`n✅ All done! Processed all vCenters." -ForegroundColor Green
+# 7. Verification across all vCenters
+Write-Host "`n========================================" -ForegroundColor Cyan
+Write-Host "=== Verification ===" -ForegroundColor Cyan
+Write-Host "========================================" -ForegroundColor Cyan
+
+foreach ($vcServer in $connectedServers) {
+    Write-Host "`nvCenter: $($vcServer.Name)" -ForegroundColor Yellow
+    foreach ($row in $vmList) {
+        $vmName = $row.VMName.Trim()
+        $vm = Get-VM -Name $vmName -Server $vcServer -ErrorAction SilentlyContinue
+        if ($vm) {
+            $assignedTags = Get-TagAssignment -Entity $vm -Server $vcServer | 
+                           Where-Object { $_.Tag.Category.Name -eq $categoryName } |
+                           Select-Object -ExpandProperty Tag | 
+                           Select-Object -ExpandProperty Name
+            if ($assignedTags) {
+                Write-Host "  ✅ $vmName : $($assignedTags -join ', ')" -ForegroundColor Green
+            } else {
+                Write-Host "  ⚠️  $vmName : No $categoryName tags assigned" -ForegroundColor Yellow
+            }
+        }
+    }
+}
+
+# 8. Disconnect from all vCenters
+Write-Host "`n=== Disconnecting from vCenters ===" -ForegroundColor Cyan
+Disconnect-VIServer -Server * -Confirm:$false
+Write-Host "✅ All done!" -ForegroundColor Green
