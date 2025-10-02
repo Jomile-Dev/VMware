@@ -6,43 +6,99 @@ $cred = Get-Credential -Message "Enter vCenter credentials"
 # 2. Connect to multiple vCenters
 $vcenters = @("vcsa1.example.local", "vcsa2.example.local")
 foreach ($vc in $vcenters) {
-    Connect-VIServer -Server $vc -Credential $cred -WarningAction SilentlyContinue
+    try {
+        Write-Host "Connecting to $vc..." -ForegroundColor Cyan
+        Connect-VIServer -Server $vc -Credential $cred -WarningAction SilentlyContinue -ErrorAction Stop
+        Write-Host "✅ Connected to $vc" -ForegroundColor Green
+    }
+    catch {
+        Write-Warning "Failed to connect to $vc - $($_.Exception.Message)"
+    }
 }
 
 # 3. Ensure category exists
 $categoryName = "General"
-if (-not (Get-TagCategory -Name $categoryName -ErrorAction SilentlyContinue)) {
-    Write-Host "Creating category '$categoryName'..."
-    New-TagCategory -Name $categoryName -Cardinality Multiple -EntityType VirtualMachine
+$category = Get-TagCategory -Name $categoryName -ErrorAction SilentlyContinue
+if (-not $category) {
+    Write-Host "Creating category '$categoryName'..." -ForegroundColor Yellow
+    $category = New-TagCategory -Name $categoryName -Cardinality Multiple -EntityType VirtualMachine
+    Write-Host "✅ Category created" -ForegroundColor Green
+}
+else {
+    Write-Host "✅ Category '$categoryName' exists" -ForegroundColor Green
 }
 
 # 4. Import CSV
-$vmList = Import-Csv -Path ".\vm_tags.csv"
+$csvPath = ".\vm_tags.csv"
+if (-not (Test-Path $csvPath)) {
+    Write-Error "CSV file not found: $csvPath"
+    exit
+}
+$vmList = Import-Csv -Path $csvPath
+Write-Host "📋 Loaded $($vmList.Count) entries from CSV" -ForegroundColor Cyan
 
 # 5. Process each VM
 foreach ($row in $vmList) {
     $vmName = $row.VMName.Trim()
-    $tagList = $row.Tags -split "," | ForEach-Object { $_.Trim() }
+    $tagList = $row.Tags -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" }
 
+    Write-Host "`n--- Processing VM: $vmName ---" -ForegroundColor Cyan
+    
     $vm = Get-VM -Name $vmName -ErrorAction SilentlyContinue
     if (-not $vm) {
         Write-Warning "❌ VM '$vmName' not found. Skipping..."
         continue
     }
-    Write-Host "✅ Found VM: $vmName"
+    Write-Host "✅ Found VM: $vmName (on $($vm.VMHost.Parent.Name))" -ForegroundColor Green
 
     foreach ($tagName in $tagList) {
         if (-not $tagName) { continue }
 
-        $tag = Get-Tag -Name $tagName -ErrorAction SilentlyContinue
+        # Get or create tag
+        $tag = Get-Tag -Name $tagName -Category $categoryName -ErrorAction SilentlyContinue
         if (-not $tag) {
-            Write-Host "🆕 Creating tag '$tagName'..."
-            $tag = New-Tag -Name $tagName -Category $categoryName
+            Write-Host "🆕 Creating tag '$tagName' in category '$categoryName'..." -ForegroundColor Yellow
+            try {
+                $tag = New-Tag -Name $tagName -Category $categoryName -ErrorAction Stop
+                Write-Host "✅ Tag '$tagName' created" -ForegroundColor Green
+            }
+            catch {
+                Write-Error "Failed to create tag '$tagName': $($_.Exception.Message)"
+                continue
+            }
+        }
+        else {
+            Write-Host "✅ Tag '$tagName' exists" -ForegroundColor Green
         }
 
-        Write-Host "🏷️ Assigning '$tagName' to '$vmName'..."
-        New-TagAssignment -Entity $vm -Tag $tag -ErrorAction SilentlyContinue | Out-Null
+        # Check if tag is already assigned
+        $existingAssignment = Get-TagAssignment -Entity $vm -Tag $tag -ErrorAction SilentlyContinue
+        if ($existingAssignment) {
+            Write-Host "ℹ️  Tag '$tagName' already assigned to '$vmName'" -ForegroundColor Gray
+            continue
+        }
+
+        # Assign tag
+        Write-Host "🏷️  Assigning '$tagName' to '$vmName'..." -ForegroundColor Yellow
+        try {
+            $assignment = New-TagAssignment -Entity $vm -Tag $tag -ErrorAction Stop
+            Write-Host "✅ Successfully assigned '$tagName' to '$vmName'" -ForegroundColor Green
+        }
+        catch {
+            Write-Error "Failed to assign tag '$tagName' to '$vmName': $($_.Exception.Message)"
+        }
     }
 }
 
-Write-Host "✅ All done!"
+# 6. Verify assignments
+Write-Host "`n=== Verification ===" -ForegroundColor Cyan
+foreach ($row in $vmList) {
+    $vmName = $row.VMName.Trim()
+    $vm = Get-VM -Name $vmName -ErrorAction SilentlyContinue
+    if ($vm) {
+        $assignedTags = Get-TagAssignment -Entity $vm | Select-Object -ExpandProperty Tag | Select-Object -ExpandProperty Name
+        Write-Host "$vmName : $($assignedTags -join ', ')" -ForegroundColor Green
+    }
+}
+
+Write-Host "`n✅ All done!" -ForegroundColor Green
