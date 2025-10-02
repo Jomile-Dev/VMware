@@ -3,18 +3,38 @@
 # 1. Ask for credentials
 $cred = Get-Credential -Message "Enter vCenter credentials"
 
-# 2. Connect to multiple vCenters
-$vcenters = @("vcsa1.example.local", "vcsa2.example.local")
+# 2. Connect to multiple vCenters - UPDATE THIS LIST WITH YOUR ACTUAL VCENTERS!
+$vcenters = @(
+    "vcsa1.example.local",
+    "vcsa2.example.local",
+    "vcsa3.example.local"
+    # Add ALL your vCenter FQDNs or IPs here
+)
+Write-Host "=== Connecting to vCenters ===" -ForegroundColor Cyan
+
 foreach ($vc in $vcenters) {
     try {
-        Write-Host "Connecting to $vc..." -ForegroundColor Cyan
-        Connect-VIServer -Server $vc -Credential $cred -WarningAction SilentlyContinue -ErrorAction Stop
-        Write-Host "✅ Connected to $vc" -ForegroundColor Green
+        Write-Host "Connecting to $vc..." -ForegroundColor Yellow
+        $connection = Connect-VIServer -Server $vc -Credential $cred -WarningAction SilentlyContinue -ErrorAction Stop
+        Write-Host "✅ Successfully connected to $vc" -ForegroundColor Green
     }
     catch {
-        Write-Warning "Failed to connect to $vc - $($_.Exception.Message)"
+        Write-Error "❌ Failed to connect to $vc"
+        Write-Host "   Error: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "   Possible reasons: Wrong credentials, network issue, vCenter unreachable" -ForegroundColor Gray
     }
 }
+
+# Verify connections
+Write-Host "`n=== Active Connections ===" -ForegroundColor Cyan
+if ($global:DefaultVIServers.Count -eq 0) {
+    Write-Error "No vCenter connections established! Exiting..."
+    exit
+}
+$global:DefaultVIServers | ForEach-Object {
+    Write-Host "✅ $($_.Name) - User: $($_.User) - Version: $($_.Version)" -ForegroundColor Green
+}
+Write-Host ""
 
 # 3. Ensure category exists - Common choices: "Backup", "Veeam", "Application", "General"
 $categoryName = "Backup"  # Change this to your preferred category name
@@ -37,6 +57,37 @@ if (-not (Test-Path $csvPath)) {
 $vmList = Import-Csv -Path $csvPath
 Write-Host "📋 Loaded $($vmList.Count) entries from CSV" -ForegroundColor Cyan
 
+# 4a. Diagnostic - Check what VMs are visible
+Write-Host "`n=== Diagnostic Information ===" -ForegroundColor Cyan
+Write-Host "Connected vCenters:" -ForegroundColor Yellow
+$global:DefaultVIServers | ForEach-Object {
+    Write-Host "  - $($_.Name) (User: $($_.User), Connected: $($_.IsConnected))" -ForegroundColor Gray
+}
+$totalVMs = (Get-VM -ErrorAction SilentlyContinue).Count
+Write-Host "Total VMs visible: $totalVMs" -ForegroundColor Yellow
+Write-Host "Searching for VMs in CSV..." -ForegroundColor Yellow
+foreach ($row in $vmList) {
+    $testVM = Get-VM -Name $row.VMName.Trim() -ErrorAction SilentlyContinue
+    if ($testVM) {
+        Write-Host "  ✅ $($row.VMName) - Found" -ForegroundColor Green
+    } else {
+        Write-Host "  ❌ $($row.VMName) - NOT FOUND" -ForegroundColor Red
+        # Try searching in all datacenters
+        $found = $false
+        Get-Datacenter | ForEach-Object {
+            $dcVMs = Get-VM -Location $_ -Name "*$($row.VMName)*" -ErrorAction SilentlyContinue
+            if ($dcVMs) {
+                Write-Host "     Found similar: $($dcVMs.Name -join ', ') in datacenter $($_.Name)" -ForegroundColor Yellow
+                $found = $true
+            }
+        }
+        if (-not $found) {
+            Write-Host "     Not found in any datacenter - check permissions or vCenter connection" -ForegroundColor Gray
+        }
+    }
+}
+Write-Host "=== End Diagnostics ===`n" -ForegroundColor Cyan
+
 # 5. Process each VM
 foreach ($row in $vmList) {
     $vmName = $row.VMName.Trim()
@@ -44,12 +95,46 @@ foreach ($row in $vmList) {
 
     Write-Host "`n--- Processing VM: $vmName ---" -ForegroundColor Cyan
     
+    # Try multiple methods to find the VM
+    $vm = $null
+    
+    # Method 1: Exact match
     $vm = Get-VM -Name $vmName -ErrorAction SilentlyContinue
+    
+    # Method 2: Wildcard search if exact match fails
     if (-not $vm) {
-        Write-Warning "❌ VM '$vmName' not found. Skipping..."
+        Write-Host "⚠️  Exact match failed, trying wildcard search..." -ForegroundColor Yellow
+        $vms = Get-VM -Name "*$vmName*" -ErrorAction SilentlyContinue
+        if ($vms.Count -eq 1) {
+            $vm = $vms
+            Write-Host "✅ Found via wildcard: '$($vm.Name)'" -ForegroundColor Green
+        }
+        elseif ($vms.Count -gt 1) {
+            Write-Warning "❌ Multiple VMs found matching '$vmName':"
+            $vms | ForEach-Object { Write-Host "   - $($_.Name)" -ForegroundColor Gray }
+            continue
+        }
+    }
+    
+    # Method 3: Search across each vCenter individually
+    if (-not $vm) {
+        Write-Host "⚠️  Searching across all connected vCenters..." -ForegroundColor Yellow
+        foreach ($vc in $global:DefaultVIServers) {
+            $vm = Get-VM -Name $vmName -Server $vc -ErrorAction SilentlyContinue
+            if ($vm) {
+                Write-Host "✅ Found in vCenter: $($vc.Name)" -ForegroundColor Green
+                break
+            }
+        }
+    }
+    
+    if (-not $vm) {
+        Write-Warning "❌ VM '$vmName' not found in any connected vCenter. Skipping..."
+        Write-Host "   Check: 1) VM name spelling, 2) Connected to correct vCenter, 3) VM exists and is visible" -ForegroundColor Gray
         continue
     }
-    Write-Host "✅ Found VM: $vmName (on $($vm.VMHost.Parent.Name))" -ForegroundColor Green
+    
+    Write-Host "✅ Found VM: $vmName (PowerState: $($vm.PowerState), Host: $($vm.VMHost.Name))" -ForegroundColor Green
 
     foreach ($tagName in $tagList) {
         if (-not $tagName) { continue }
