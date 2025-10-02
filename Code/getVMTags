@@ -27,7 +27,16 @@ $results = @()
 
 Write-Host "`nRetrieving VMs and VEEAM tags..." -ForegroundColor Cyan
 
-foreach ($vm in Get-VM) {
+# Get all connected vCenter servers
+$connectedVCs = $global:DefaultVIServers
+
+foreach ($vcServer in $connectedVCs) {
+    Write-Host "Processing VMs from $($vcServer.Name)..." -ForegroundColor Yellow
+    
+    # Get VMs from this specific vCenter
+    $vms = Get-VM -Server $vcServer
+    
+    foreach ($vm in $vms) {
     # Get tag assignments for this VM
     $tagAssignments = Get-TagAssignment -Entity $vm -ErrorAction SilentlyContinue
     
@@ -51,8 +60,9 @@ foreach ($vm in Get-VM) {
         VMName       = $vm.Name
         PowerState   = $vm.PowerState
         Cluster      = $vm.VMHost.Parent.Name
-        vCenter      = ($vm.VMHost | Get-View).Client.ServiceUrl.Split('/')[2]
+        vCenter      = $vcServer.Name
         VEEAM_Tags   = $veeamTagNames
+    }
     }
 }
 
