@@ -13,34 +13,62 @@ $vcenters = @(
 # 3. Connect to each vCenter
 foreach ($vc in $vcenters) {
     Write-Host "Connecting to $vc..." -ForegroundColor Cyan
-    Connect-VIServer -Server $vc -Credential $cred -WarningAction SilentlyContinue
+    try {
+        Connect-VIServer -Server $vc -Credential $cred -WarningAction SilentlyContinue -ErrorAction Stop
+        Write-Host "✅ Connected to $vc" -ForegroundColor Green
+    }
+    catch {
+        Write-Host "❌ Failed to connect to $vc : $_" -ForegroundColor Red
+    }
 }
 
-# 4. Get all VMs and their tags (including untagged VMs)
+# 4. Get all VMs and their VEEAM category tags
 $results = @()
 
+Write-Host "`nRetrieving VMs and VEEAM tags..." -ForegroundColor Cyan
+
 foreach ($vm in Get-VM) {
-    # Get tag assignments (could be 0)
+    # Get tag assignments for this VM
     $tagAssignments = Get-TagAssignment -Entity $vm -ErrorAction SilentlyContinue
-    $tagNames = if ($tagAssignments) {
-        ($tagAssignments | Select-Object -ExpandProperty Tag).Name -join ", "
+    
+    # Filter only tags from VEEAM category
+    $veeamTags = if ($tagAssignments) {
+        $tagAssignments | Where-Object { 
+            $_.Tag.Category.Name -eq "VEEAM" 
+        } | Select-Object -ExpandProperty Tag | Select-Object -ExpandProperty Name
     } else {
-        ""  # blank if no tags
+        $null
+    }
+    
+    $veeamTagNames = if ($veeamTags) {
+        $veeamTags -join ", "
+    } else {
+        ""  # blank if no VEEAM tags
     }
 
     # Build result object
     $results += [PSCustomObject]@{
-        VMName     = $vm.Name
-        PowerState = $vm.PowerState
-        Cluster    = $vm.VMHost.Parent.Name
-        vCenter    = ($vm.VMHost | Get-View).Client.ServiceUrl.Split('/')[2]
-        Tags       = $tagNames
+        VMName       = $vm.Name
+        PowerState   = $vm.PowerState
+        Cluster      = $vm.VMHost.Parent.Name
+        vCenter      = ($vm.VMHost | Get-View).Client.ServiceUrl.Split('/')[2]
+        VEEAM_Tags   = $veeamTagNames
     }
 }
 
 # 5. Output results
+Write-Host "`nAll VMs with VEEAM Category Tags:" -ForegroundColor Yellow
 $results | Format-Table -AutoSize
 
-# 6. (Optional) Export to CSV
-$results | Export-Csv -Path ".\AllVMs_Tags.csv" -NoTypeInformation
-Write-Host "✅ Exported to AllVMs_Tags.csv" -ForegroundColor Green
+# 6. Show summary
+$taggedCount = ($results | Where-Object { $_.VEEAM_Tags -ne "" }).Count
+$totalCount = $results.Count
+Write-Host "`nSummary: $taggedCount out of $totalCount VMs have VEEAM tags" -ForegroundColor Cyan
+
+# 7. Export to CSV
+$results | Export-Csv -Path ".\VMs_VEEAM_Tags.csv" -NoTypeInformation
+Write-Host "✅ Exported to VMs_VEEAM_Tags.csv" -ForegroundColor Green
+
+# 8. Disconnect from all vCenters
+Write-Host "`nDisconnecting from vCenters..." -ForegroundColor Cyan
+Disconnect-VIServer -Server * -Confirm:$false
