@@ -1,49 +1,48 @@
-
 # Requires: VMware.PowerCLI
 
-# 1. Prompt for credentials
+# 1. Ask for credentials
 $cred = Get-Credential -Message "Enter vCenter credentials"
 
-# 2. List all vCenters to connect to
-$vcenters = @(
-    "vcsa1.example.local",
-    "vcsa2.example.local"
-)
-
-# 3. Connect to all vCenters
+# 2. Connect to multiple vCenters
+$vcenters = @("vcsa1.example.local", "vcsa2.example.local")
 foreach ($vc in $vcenters) {
-    Write-Host "Connecting to $vc..."
     Connect-VIServer -Server $vc -Credential $cred -WarningAction SilentlyContinue
 }
 
-# 4. Import the CSV file
-# Format: VMName,Tags
-$csvPath = ".\vm_tags.csv"
-$vmList = Import-Csv -Path $csvPath
+# 3. Ensure category exists
+$categoryName = "General"
+if (-not (Get-TagCategory -Name $categoryName -ErrorAction SilentlyContinue)) {
+    Write-Host "Creating category '$categoryName'..."
+    New-TagCategory -Name $categoryName -Cardinality Multiple -EntityType VirtualMachine
+}
 
-# 5. Process each row
+# 4. Import CSV
+$vmList = Import-Csv -Path ".\vm_tags.csv"
+
+# 5. Process each VM
 foreach ($row in $vmList) {
-    $vmName = $row.VMName
+    $vmName = $row.VMName.Trim()
     $tagList = $row.Tags -split "," | ForEach-Object { $_.Trim() }
 
     $vm = Get-VM -Name $vmName -ErrorAction SilentlyContinue
     if (-not $vm) {
-        Write-Warning "VM '$vmName' not found. Skipping..."
+        Write-Warning "❌ VM '$vmName' not found. Skipping..."
         continue
     }
+    Write-Host "✅ Found VM: $vmName"
 
     foreach ($tagName in $tagList) {
-        # Check if tag exists, create if not
+        if (-not $tagName) { continue }
+
         $tag = Get-Tag -Name $tagName -ErrorAction SilentlyContinue
         if (-not $tag) {
-            Write-Host "Creating tag '$tagName' since it doesn't exist..."
-            $tag = New-Tag -Name $tagName -Category "General" -Description "Auto-created by script"
+            Write-Host "🆕 Creating tag '$tagName'..."
+            $tag = New-Tag -Name $tagName -Category $categoryName
         }
 
-        # Assign tag to VM
-        Write-Host "Assigning tag '$tagName' to VM '$vmName'..."
+        Write-Host "🏷️ Assigning '$tagName' to '$vmName'..."
         New-TagAssignment -Entity $vm -Tag $tag -ErrorAction SilentlyContinue | Out-Null
     }
 }
 
-Write-Host "✅ Tag assignment completed."
+Write-Host "✅ All done!"
