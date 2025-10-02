@@ -1,1 +1,49 @@
 
+# Requires: VMware.PowerCLI
+
+# 1. Prompt for credentials
+$cred = Get-Credential -Message "Enter vCenter credentials"
+
+# 2. List all vCenters to connect to
+$vcenters = @(
+    "vcsa1.example.local",
+    "vcsa2.example.local"
+)
+
+# 3. Connect to all vCenters
+foreach ($vc in $vcenters) {
+    Write-Host "Connecting to $vc..."
+    Connect-VIServer -Server $vc -Credential $cred -WarningAction SilentlyContinue
+}
+
+# 4. Import the CSV file
+# Format: VMName,Tags
+$csvPath = ".\vm_tags.csv"
+$vmList = Import-Csv -Path $csvPath
+
+# 5. Process each row
+foreach ($row in $vmList) {
+    $vmName = $row.VMName
+    $tagList = $row.Tags -split "," | ForEach-Object { $_.Trim() }
+
+    $vm = Get-VM -Name $vmName -ErrorAction SilentlyContinue
+    if (-not $vm) {
+        Write-Warning "VM '$vmName' not found. Skipping..."
+        continue
+    }
+
+    foreach ($tagName in $tagList) {
+        # Check if tag exists, create if not
+        $tag = Get-Tag -Name $tagName -ErrorAction SilentlyContinue
+        if (-not $tag) {
+            Write-Host "Creating tag '$tagName' since it doesn't exist..."
+            $tag = New-Tag -Name $tagName -Category "General" -Description "Auto-created by script"
+        }
+
+        # Assign tag to VM
+        Write-Host "Assigning tag '$tagName' to VM '$vmName'..."
+        New-TagAssignment -Entity $vm -Tag $tag -ErrorAction SilentlyContinue | Out-Null
+    }
+}
+
+Write-Host "✅ Tag assignment completed."
