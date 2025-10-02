@@ -76,9 +76,11 @@ $taggedCount = ($results | Where-Object { $_.VEEAM_Tags -ne "" }).Count
 $totalCount = $results.Count
 Write-Host "`nSummary: $taggedCount out of $totalCount VMs have VEEAM tags" -ForegroundColor Cyan
 
-# 7. Export to CSV
-$results | Export-Csv -Path ".\VMs_VEEAM_Tags.csv" -NoTypeInformation
-Write-Host "✅ Exported to VMs_VEEAM_Tags.csv" -ForegroundColor Green
+# 7. Export to CSV with timestamp
+$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$csvPath = ".\VMs_VEEAM_Tags_$timestamp.csv"
+$results | Export-Csv -Path $csvPath -NoTypeInformation
+Write-Host "✅ Exported to $csvPath" -ForegroundColor Green
 
 # 8. Disconnect from all vCenters
 Write-Host "`nDisconnecting from vCenters..." -ForegroundColor Cyan
