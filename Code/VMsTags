@@ -1,48 +1,39 @@
 # Requires: VMware.PowerCLI
+# Run in PowerShell 7+ or Windows PowerShell with PowerCLI installed
 
-# 1. Prompt for credentials
+# 1. Ask for user credentials once
 $cred = Get-Credential -Message "Enter vCenter credentials"
 
-# 2. List all vCenters to connect to
+# 2. List all vCenters you want to connect to
 $vcenters = @(
     "vcsa1.example.local",
-    "vcsa2.example.local"
+    "vcsa2.example.local",
+    "vcsa3.example.local"
 )
 
-# 3. Connect to all vCenters
+# 3. Connect to each vCenter
 foreach ($vc in $vcenters) {
     Write-Host "Connecting to $vc..."
     Connect-VIServer -Server $vc -Credential $cred -WarningAction SilentlyContinue
 }
 
-# 4. Import the CSV file
-# Format: VMName,Tags
-$csvPath = ".\vm_tags.csv"
-$vmList = Import-Csv -Path $csvPath
+# 4. Collect all VMs and their tags
+$results = @()
 
-# 5. Process each row
-foreach ($row in $vmList) {
-    $vmName = $row.VMName
-    $tagList = $row.Tags -split "," | ForEach-Object { $_.Trim() }
+foreach ($vm in Get-VM) {
+    $tags = (Get-TagAssignment -Entity $vm | Select-Object -ExpandProperty Tag).Name -join ", "
 
-    $vm = Get-VM -Name $vmName -ErrorAction SilentlyContinue
-    if (-not $vm) {
-        Write-Warning "VM '$vmName' not found. Skipping..."
-        continue
-    }
-
-    foreach ($tagName in $tagList) {
-        # Check if tag exists, create if not
-        $tag = Get-Tag -Name $tagName -ErrorAction SilentlyContinue
-        if (-not $tag) {
-            Write-Host "Creating tag '$tagName' since it doesn't exist..."
-            $tag = New-Tag -Name $tagName -Category "General" -Description "Auto-created by script"
-        }
-
-        # Assign tag to VM
-        Write-Host "Assigning tag '$tagName' to VM '$vmName'..."
-        New-TagAssignment -Entity $vm -Tag $tag -ErrorAction SilentlyContinue | Out-Null
+    $results += [PSCustomObject]@{
+        VMName     = $vm.Name
+        PowerState = $vm.PowerState
+        vCenter    = $vm.VMHost.Parent.Name
+        Tags       = $tags
     }
 }
 
-Write-Host "✅ Tag assignment completed."
+# 5. Display results
+$results | Format-Table -AutoSize
+
+# 6. (Optional) Export to CSV
+$results | Export-Csv -Path ".\VMs_With_Tags.csv" -NoTypeInformation
+Write-Host "Exported VM list to VMs_With_Tags.csv"
