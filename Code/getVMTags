@@ -10,11 +10,14 @@ $vcenters = @(
     "vcsa3.example.local"
 )
 
-# 3. Connect to each vCenter
+# 3. Connect to each vCenter and store connections
+$connectedServers = @()
+
 foreach ($vc in $vcenters) {
     Write-Host "Connecting to $vc..." -ForegroundColor Cyan
     try {
-        Connect-VIServer -Server $vc -Credential $cred -WarningAction SilentlyContinue -ErrorAction Stop
+        $connection = Connect-VIServer -Server $vc -Credential $cred -WarningAction SilentlyContinue -ErrorAction Stop
+        $connectedServers += $connection
         Write-Host "✅ Connected to $vc" -ForegroundColor Green
     }
     catch {
@@ -25,16 +28,14 @@ foreach ($vc in $vcenters) {
 # 4. Get all VMs and their VEEAM category tags
 $results = @()
 
-Write-Host "`nRetrieving VMs and VEEAM tags..." -ForegroundColor Cyan
+Write-Host "`nRetrieving VMs and VEEAM tags from $($connectedServers.Count) vCenters..." -ForegroundColor Cyan
 
-# Get all connected vCenter servers
-$connectedVCs = $global:DefaultVIServers
-
-foreach ($vcServer in $connectedVCs) {
-    Write-Host "Processing VMs from $($vcServer.Name)..." -ForegroundColor Yellow
+foreach ($vcServer in $connectedServers) {
+    Write-Host "`nProcessing VMs from $($vcServer.Name)..." -ForegroundColor Yellow
     
     # Get VMs from this specific vCenter
     $vms = Get-VM -Server $vcServer
+    Write-Host "  Found $($vms.Count) VMs" -ForegroundColor Gray
     
     foreach ($vm in $vms) {
     # Get tag assignments for this VM
