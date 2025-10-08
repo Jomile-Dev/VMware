@@ -224,7 +224,26 @@ function Enable-SSH {
         [string]$esxiHost
     )
     
-    Get-VMHostService -VMHost $esxiHost | Where-Object { $_.Key -eq "TSM-SSH" } | Start-VMHostService -Confirm:$false
+    try {
+        # Get the VMHost object first
+        $vmHost = Get-VMHost -Name $esxiHost -ErrorAction Stop
+        
+        # Get SSH service and check if it's already running
+        $sshService = Get-VMHostService -VMHost $vmHost | Where-Object { $_.Key -eq "TSM-SSH" }
+        
+        if ($sshService.Running) {
+            Write-Log "SSH service is already running on $esxiHost" -Level "INFO"
+        }
+        else {
+            Write-Log "Starting SSH service on $esxiHost..."
+            Start-VMHostService -HostService $sshService -Confirm:$false | Out-Null
+            Write-Log "SSH service started on $esxiHost" -Level "SUCCESS"
+        }
+    }
+    catch {
+        Write-Log "Error enabling SSH on ${esxiHost}: $_" -Level "ERROR"
+        throw
+    }
 }
 #endregion
 
