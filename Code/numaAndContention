@@ -221,15 +221,29 @@ function Connect-ToVCenter {
 #region Enable SSH on ESXi
 function Enable-SSH {
     param(
+        [Parameter(Mandatory=$true)]
+        [ValidateNotNullOrEmpty()]
         [string]$esxiHost
     )
+    
+    Write-Log "Attempting to enable SSH on: $esxiHost"
     
     try {
         # Get the VMHost object first
         $vmHost = Get-VMHost -Name $esxiHost -ErrorAction Stop
         
+        if (-not $vmHost) {
+            throw "Host $esxiHost not found in connected vCenter(s)"
+        }
+        
+        Write-Log "Found host: $($vmHost.Name) (State: $($vmHost.ConnectionState))"
+        
         # Get SSH service and check if it's already running
         $sshService = Get-VMHostService -VMHost $vmHost | Where-Object { $_.Key -eq "TSM-SSH" }
+        
+        if (-not $sshService) {
+            throw "SSH service (TSM-SSH) not found on host"
+        }
         
         if ($sshService.Running) {
             Write-Log "SSH service is already running on $esxiHost" -Level "INFO"
