@@ -101,7 +101,7 @@ function Get-ApiToken {
         $tokenUri = "$SddcManagerUrl/v1/tokens"
         Write-Log "Requesting token from: $tokenUri"
         
-        $response = Invoke-RestMethod -Uri $tokenUri -Method Post -Headers $headers -Body $body
+        $response = Invoke-RestMethod -Uri $tokenUri -Method Post -Headers $headers -Body $body -SkipCertificateCheck
         
         Write-Log "API Token generated successfully" -Level "SUCCESS"
         return $response.accessToken
@@ -138,7 +138,7 @@ function Get-ESXiCredentials {
         $uri = "$SddcManagerUrl/v1/credentials?resourceType=ESXI"
         Write-Log "Requesting credentials from: $uri"
         
-        $response = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get
+        $response = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -SkipCertificateCheck
         $credentials = $response.elements
         
         if (-not $credentials) {
@@ -187,34 +187,27 @@ function Get-ESXiCredentials {
         Write-Log "Found $($filtered.Count) ESXi root SSH credentials with valid passwords" -Level "SUCCESS"
         
         # Filter for hosts containing the specified filter string
-        Write-Host "`nFiltering for hosts containing '$HostFilter'..."
-        $filteredByName = $filtered | Where-Object {
-            $_.ResourceName -like "*$HostFilter*"
+        if ($HostFilter) {
+            Write-Host "`nFiltering for hosts containing '$HostFilter'..."
+            $filteredByName = $filtered | Where-Object {
+                $_.ResourceName -like "*$HostFilter*"
+            }
+            
+            if ($filteredByName.Count -eq 0) {
+                Write-Log "No hosts found matching filter '$HostFilter'" -Level "WARN"
+                return @()
+            }
+            
+            Write-Log "Found $($filteredByName.Count) hosts matching filter '$HostFilter'" -Level "SUCCESS"
+            return $filteredByName
         }
         
-        if ($filteredByName.Count -eq 0) {
-            Write-Log "No hosts found matching filter '$HostFilter'" -Level "WARN"
-            return @()
-        }
-        
-        Write-Log "Found $($filteredByName.Count) hosts matching filter '$HostFilter'" -Level "SUCCESS"
-        return $filteredByName
+        return $filtered
     }
     catch {
         Write-Log "Failed to retrieve ESXi credentials: $_" -Level "ERROR"
         throw
     }
-}
-#endregion
-
-#region vCenter Connection
-function Connect-ToVCenter {
-    param(
-        [string]$vcenterServer,
-        [PSCredential]$credential
-    )
-    
-    Connect-VIServer -Server $vcenterServer -Credential $credential
 }
 #endregion
 
@@ -253,67 +246,17 @@ function Enable-SSH {
             Start-VMHostService -HostService $sshService -Confirm:$false | Out-Null
             Write-Log "SSH service started on $esxiHost" -Level "SUCCESS"
         }
+        
+        return $true
     }
     catch {
         Write-Log "Error enabling SSH on ${esxiHost}: $_" -Level "ERROR"
-        throw
+        return $false
     }
 }
 #endregion
 
-#region Run Remote Commands using PuTTY's plink.exe
-function Run-RemoteCommands {
-    param(
-        [string]$esxiHost,
-        [string]$username,
-        [string]$password
-    )
-    
-    # Find plink.exe in common locations
-    $plinkLocations = @(
-        "plink.exe",  # If in PATH
-        "C:\Program Files\PuTTY\plink.exe",
-        "C:\Program Files (x86)\PuTTY\plink.exe",
-        "$env:ProgramFiles\PuTTY\plink.exe",
-        "${env:ProgramFiles(x86)}\PuTTY\plink.exe"
-    )
-    
-    $plinkPath = $null
-    foreach ($location in $plinkLocations) {
-        if (Test-Path $location -ErrorAction SilentlyContinue) {
-            $plinkPath = $location
-            break
-        }
-    }
-    
-    if (-not $plinkPath) {
-        # Try using Get-Command to find plink in PATH
-        $plinkCmd = Get-Command plink.exe -ErrorAction SilentlyContinue
-        if ($plinkCmd) {
-            $plinkPath = $plinkCmd.Source
-        }
-    }
-    
-    if (-not $plinkPath) {
-        throw "plink.exe not found. Please install PuTTY or ensure plink.exe is in your PATH"
-    }
-    
-    Write-Log "Using plink.exe from: $plinkPath"
-    
-    # Execute esxcli vm process list
-    $vmList = & $plinkPath -ssh "$username@$esxiHost" -pw $password "esxcli vm process list"
-    Start-Sleep -Seconds 1
-    
-    # Execute sched-stats command
-    $schedStats = & $plinkPath -ssh "$username@$esxiHost" -pw $password "sched-stats -t numa-clients"
-    Start-Sleep -Seconds 1
-    
-    return @{
-        SchedStats = $schedStats
-        VMList = $vmList
-    }
-}
-#endregion
+#region Deploy SSH Key and Clean Old Keys
 function Deploy-SSHKeyToESXi {
     param(
         [Parameter(Mandatory=$true)]
@@ -338,7 +281,7 @@ function Deploy-SSHKeyToESXi {
         Import-Module Posh-SSH -ErrorAction Stop
         
         # Establish SSH session
-        $Session = New-SSHSession -ComputerName $ESXiHost -Credential $Credential -AcceptKey
+        $Session = New-SSHSession -ComputerName $ESXiHost -Credential $Credential -AcceptKey -ErrorAction Stop
         
         if (!$Session) {
             throw "Failed to establish SSH session"
@@ -353,10 +296,22 @@ function Deploy-SSHKeyToESXi {
         )
         
         foreach ($Cmd in $Commands) {
-            Invoke-SSHCommand -SessionId $Session.SessionId -Command $Cmd | Out-Null
+            Invoke-SSHCommand -SessionId $Session.SessionId -Command $Cmd -ErrorAction SilentlyContinue | Out-Null
         }
         
-        # Check if key already exists
+        # Remove old SSH keys ending with '110'
+        Write-Log "Removing old SSH keys ending with '110' from $ESXiHost..."
+        $RemoveOldKeysCmd = "sed -i '/110$/d' /etc/ssh/keys-root/authorized_keys"
+        $RemoveResult = Invoke-SSHCommand -SessionId $Session.SessionId -Command $RemoveOldKeysCmd
+        
+        if ($RemoveResult.ExitStatus -eq 0) {
+            Write-Log "Old SSH keys removed successfully" -Level "SUCCESS"
+        }
+        else {
+            Write-Log "No old keys found or removal had issues" -Level "WARN"
+        }
+        
+        # Check if new key already exists
         $CheckKey = Invoke-SSHCommand -SessionId $Session.SessionId -Command "grep -F `"$PublicKey`" /etc/ssh/keys-root/authorized_keys"
         
         if ($CheckKey.Output) {
@@ -364,15 +319,20 @@ function Deploy-SSHKeyToESXi {
         }
         else {
             # Append public key
-            $EscapedKey = $PublicKey.Replace('"', '\"')
+            $EscapedKey = $PublicKey.Replace('"', '\"').Replace('$', '\$')
             $AddKeyCmd = "echo `"$EscapedKey`" >> /etc/ssh/keys-root/authorized_keys"
-            Invoke-SSHCommand -SessionId $Session.SessionId -Command $AddKeyCmd | Out-Null
+            $AddResult = Invoke-SSHCommand -SessionId $Session.SessionId -Command $AddKeyCmd
             
-            Write-Log "SSH key deployed to $ESXiHost successfully" -Level "SUCCESS"
+            if ($AddResult.ExitStatus -eq 0) {
+                Write-Log "SSH key deployed to $ESXiHost successfully" -Level "SUCCESS"
+            }
+            else {
+                throw "Failed to add SSH key: $($AddResult.Error)"
+            }
         }
         
         # Persist configuration across reboots
-        Invoke-SSHCommand -SessionId $Session.SessionId -Command "/sbin/auto-backup.sh" | Out-Null
+        Invoke-SSHCommand -SessionId $Session.SessionId -Command "/sbin/auto-backup.sh" -ErrorAction SilentlyContinue | Out-Null
         
         # Close session
         Remove-SSHSession -SessionId $Session.SessionId | Out-Null
@@ -381,7 +341,112 @@ function Deploy-SSHKeyToESXi {
     }
     catch {
         Write-Log "Failed to deploy key to $ESXiHost : $_" -Level "ERROR"
+        if ($Session) {
+            Remove-SSHSession -SessionId $Session.SessionId -ErrorAction SilentlyContinue | Out-Null
+        }
         return $false
+    }
+}
+#endregion
+
+#region Capture ESXtop Performance Data
+function Get-ESXtopPerformanceData {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$ESXiHost,
+        
+        [Parameter(Mandatory=$true)]
+        [PSCredential]$Credential
+    )
+    
+    Write-Log "Capturing ESXtop performance data from $ESXiHost..."
+    
+    try {
+        Import-Module Posh-SSH -ErrorAction Stop
+        
+        # Establish SSH session
+        $Session = New-SSHSession -ComputerName $ESXiHost -Credential $Credential -AcceptKey -ErrorAction Stop
+        
+        if (!$Session) {
+            throw "Failed to establish SSH session for performance data capture"
+        }
+        
+        # Run esxtop in batch mode to capture VM CPU statistics
+        # -b = batch mode, -n 1 = one iteration, -c = CPU view
+        Write-Log "Running esxtop to capture CPU metrics..."
+        $EsxtopCmd = "esxtop -b -n 1 -c | head -n 50"
+        $EsxtopResult = Invoke-SSHCommand -SessionId $Session.SessionId -Command $EsxtopCmd -TimeOut 30
+        
+        # Parse the output for VM-specific metrics
+        $OutputLines = $EsxtopResult.Output -split "`n"
+        
+        # Create a structured output
+        $PerformanceData = @{
+            Host = $ESXiHost
+            Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            RawData = $EsxtopResult.Output
+        }
+        
+        # Alternative: Get specific VM performance metrics using vim-cmd
+        Write-Log "Getting VM list and performance metrics..."
+        $VMListCmd = "vim-cmd vmsvc/getallvms | grep -v '^Vmid' | awk '{print `$1, `$2}'"
+        $VMListResult = Invoke-SSHCommand -SessionId $Session.SessionId -Command $VMListCmd
+        
+        # Get CPU ready and co-stop values for each VM
+        Write-Log "Collecting detailed VM CPU metrics..."
+        $VMMetrics = @()
+        
+        # Use esxcli to get VM world IDs and then query performance
+        $WorldCmd = "esxcli vm process list"
+        $WorldResult = Invoke-SSHCommand -SessionId $Session.SessionId -Command $WorldCmd
+        
+        # Parse world data
+        $CurrentVM = $null
+        $WorldLines = $WorldResult.Output -split "`n"
+        foreach ($Line in $WorldLines) {
+            if ($Line -match "^(\S+):$") {
+                $CurrentVM = $Matches[1]
+            }
+            elseif ($Line -match "World ID:\s+(\d+)" -and $CurrentVM) {
+                $WorldID = $Matches[1]
+                
+                # Get CPU stats for this world
+                $StatsCmd = "vsish -e get /sched/groups/$WorldID/stats"
+                $StatsResult = Invoke-SSHCommand -SessionId $Session.SessionId -Command $StatsCmd -ErrorAction SilentlyContinue
+                
+                if ($StatsResult.ExitStatus -eq 0) {
+                    $VMMetrics += [PSCustomObject]@{
+                        VMName = $CurrentVM
+                        WorldID = $WorldID
+                        Stats = $StatsResult.Output
+                    }
+                }
+            }
+        }
+        
+        $PerformanceData.VMMetrics = $VMMetrics
+        
+        # Alternative method using esxtop interactive mode simulation
+        Write-Log "Getting CPU contention metrics..."
+        
+        # Run a more targeted esxtop command for CPU stats
+        $CPUStatsCmd = @"
+echo -e "c\nV\nq" | esxtop -b -n 1 | grep -E "^\s*(Group|VM|vmx-)" | head -n 30
+"@
+        $CPUStatsResult = Invoke-SSHCommand -SessionId $Session.SessionId -Command $CPUStatsCmd -TimeOut 30
+        $PerformanceData.CPUContention = $CPUStatsResult.Output
+        
+        # Close session
+        Remove-SSHSession -SessionId $Session.SessionId | Out-Null
+        
+        return $PerformanceData
+    }
+    catch {
+        Write-Log "Failed to capture performance data from $ESXiHost : $_" -Level "ERROR"
+        if ($Session) {
+            Remove-SSHSession -SessionId $Session.SessionId -ErrorAction SilentlyContinue | Out-Null
+        }
+        return $null
     }
 }
 #endregion
@@ -414,10 +479,17 @@ try {
     
     Write-Log "Successfully connected to $($ConnectedvCenters.Count) of $($vCenterServers.Count) vCenter(s)" -Level "SUCCESS"
     
-    # Step 2: Authenticate with SDDC Manager and get API token
+    # Step 2: Generate SSH Keys
+    $KeyPath = Join-Path $KeyDirectory "esxi_key"
+    $KeyPair = New-RSAKeyPair -KeyPath $KeyPath -KeySize 4096
+    
+    Write-Log "Private Key: $($KeyPair.PrivateKey)"
+    Write-Log "Public Key: $($KeyPair.PublicKey)"
+    
+    # Step 3: Authenticate with SDDC Manager and get API token
     $ApiToken = Get-ApiToken -SddcManagerUrl $SddcManagerUrl -Credential $Credential
     
-    # Step 3: Retrieve ESXi root credentials from SDDC Manager (filtered for W03 hosts)
+    # Step 4: Retrieve ESXi root credentials from SDDC Manager (filtered for W03 hosts)
     $ESXiHosts = Get-ESXiCredentials -SddcManagerUrl $SddcManagerUrl -apiToken $ApiToken -HostFilter $HostFilter
     
     if ($ESXiHosts.Count -eq 0) {
@@ -425,46 +497,48 @@ try {
         exit 0
     }
     
-    Write-Host "`nFiltered ESXi Hosts:"
+    Write-Host "`nFiltered ESXi Hosts to Process:"
     $ESXiHosts | Format-Table -AutoSize
     
-    # Step 4: Connect to vCenter and enable SSH on filtered ESXi hosts
+    # Step 5: Enable SSH on filtered ESXi hosts
     Write-Log "`n=== Enabling SSH on ESXi hosts via vSphere ===" -Level "INFO"
     
+    $SSHEnabledHosts = @()
     foreach ($ESXiHost in $ESXiHosts) {
         $esxiHostName = $ESXiHost.ResourceName
         
-        try {
-            Write-Log "Enabling SSH on $esxiHostName via vSphere..."
-            Enable-SSH -esxiHost $esxiHostName
+        # Check if host name is valid
+        if ([string]::IsNullOrWhiteSpace($esxiHostName)) {
+            Write-Log "Skipping host with empty name" -Level "WARN"
+            continue
+        }
+        
+        $sshEnabled = Enable-SSH -esxiHost $esxiHostName
+        if ($sshEnabled) {
+            $SSHEnabledHosts += $ESXiHost
             Write-Log "SSH enabled on $esxiHostName" -Level "SUCCESS"
         }
-        catch {
-            Write-Log "Failed to enable SSH on $esxiHostName : $_" -Level "ERROR"
+        else {
+            Write-Log "Failed to enable SSH on $esxiHostName" -Level "ERROR"
         }
     }
     
     # Give SSH service time to start
-    Write-Log "Waiting for SSH services to start..."
-    Start-Sleep -Seconds 5
-    $KeyPath = Join-Path $KeyDirectory "esxi_key"
-    $KeyPair = New-RSAKeyPair -KeyPath $KeyPath -KeySize 4096
-    
-    Write-Log "Private Key: $($KeyPair.PrivateKey)"
-    Write-Log "Public Key: $($KeyPair.PublicKey)"
-    
-    # Step 4: Retrieve ESXi root credentials from SDDC Manager
-    $ESXiHosts = Get-ESXiCredentials -SddcManagerUrl $SddcManagerUrl -apiToken $ApiToken
-    
-    if ($ESXiHosts.Count -eq 0) {
-        Write-Log "No ESXi hosts found" -Level "WARN"
-        exit 0
+    if ($SSHEnabledHosts.Count -gt 0) {
+        Write-Log "Waiting for SSH services to start..."
+        Start-Sleep -Seconds 5
+    }
+    else {
+        Write-Log "No hosts with SSH enabled. Exiting." -Level "ERROR"
+        exit 1
     }
     
-    # Step 7: Deploy SSH key to each host (using the same filtered ESXi hosts)
+    # Step 6: Deploy SSH key to each host
     Write-Log "`n=== Deploying SSH Keys ===" -Level "INFO"
     $Results = @()
-    foreach ($ESXiHost in $ESXiHosts) {
+    $PerformanceResults = @()
+    
+    foreach ($ESXiHost in $SSHEnabledHosts) {
         # Validate password exists before creating credential
         if ([string]::IsNullOrEmpty($ESXiHost.Password)) {
             Write-Log "Skipping $($ESXiHost.ResourceName) - No password available for SSH key deployment" -Level "WARN"
@@ -483,6 +557,7 @@ try {
             (ConvertTo-SecureString $ESXiHost.Password -AsPlainText -Force)
         )
         
+        # Deploy SSH key and remove old keys
         $Success = Deploy-SSHKeyToESXi -ESXiHost $ESXiHost.ResourceName -Credential $HostCred -PublicKey $KeyPair.PublicKeyContent.Trim()
         
         $Results += [PSCustomObject]@{
@@ -492,22 +567,59 @@ try {
             Status = if ($Success) { "SUCCESS" } else { "FAILED" }
             Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
         }
+        
+        # If key deployment was successful, capture performance data
+        if ($Success) {
+            Write-Log "`n=== Capturing Performance Data from $($ESXiHost.ResourceName) ===" -Level "INFO"
+            $PerfData = Get-ESXtopPerformanceData -ESXiHost $ESXiHost.ResourceName -Credential $HostCred
+            
+            if ($PerfData) {
+                $PerformanceResults += $PerfData
+                
+                # Save performance data to individual file
+                $PerfFile = "ESXi-Performance-$($ESXiHost.ResourceName)-$(Get-Date -Format 'yyyyMMdd-HHmmss').txt"
+                $PerfData | ConvertTo-Json -Depth 5 | Out-File -FilePath $PerfFile
+                Write-Log "Performance data saved to: $PerfFile" -Level "SUCCESS"
+                
+                # Display summary of CPU contention data
+                Write-Host "`nCPU Contention Data for $($ESXiHost.ResourceName):"
+                Write-Host $PerfData.CPUContention
+            }
+        }
     }
     
-    # Step 8: Generate report
+    # Step 7: Generate reports
     Write-Log "`n=== Deployment Summary ===" -Level "INFO"
     $Results | Format-Table -AutoSize
     
     $ReportPath = "ESXi-KeyDeployment-Report-$(Get-Date -Format 'yyyyMMdd-HHmmss').csv"
     $Results | Export-Csv -Path $ReportPath -NoTypeInformation
-    Write-Log "Report saved to: $ReportPath" -Level "SUCCESS"
+    Write-Log "Deployment report saved to: $ReportPath" -Level "SUCCESS"
+    
+    # Save consolidated performance report
+    if ($PerformanceResults.Count -gt 0) {
+        $PerfReportPath = "ESXi-Performance-Report-$(Get-Date -Format 'yyyyMMdd-HHmmss').json"
+        $PerformanceResults | ConvertTo-Json -Depth 5 | Out-File -FilePath $PerfReportPath
+        Write-Log "Performance report saved to: $PerfReportPath" -Level "SUCCESS"
+    }
     
     # Optional: Test key-based authentication
     if ($TestConnection) {
         Write-Log "`n=== Testing SSH Key Authentication ===" -Level "INFO"
-        foreach ($ESXiHost in $ESXiHosts | Select-Object -First 1) {
+        foreach ($ESXiHost in $SSHEnabledHosts | Select-Object -First 1) {
             Write-Log "Testing connection to $($ESXiHost.ResourceName)..."
-            # Implementation for testing key auth would go here
+            
+            try {
+                # Test with key authentication
+                $TestSession = New-SSHSession -ComputerName $ESXiHost.ResourceName -KeyFile $KeyPair.PrivateKey -ErrorAction Stop
+                if ($TestSession) {
+                    Write-Log "Key-based authentication successful for $($ESXiHost.ResourceName)" -Level "SUCCESS"
+                    Remove-SSHSession -SessionId $TestSession.SessionId | Out-Null
+                }
+            }
+            catch {
+                Write-Log "Key-based authentication test failed: $_" -Level "WARN"
+            }
         }
     }
 }
