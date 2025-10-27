@@ -1,4 +1,4 @@
-# VM CPU Hot Add Configuration Script - Fixed Version (Get-View Removed)
+# VM CPU and Memory Hot Add Configuration Script - Enhanced Version
 # Specify the CSV file path here
 $CSVPath = "C:\path\to\your\vmlist.csv"
 
@@ -60,7 +60,7 @@ try {
 
 # Validate CSV headers
 Write-Host "Validating CSV headers..." -ForegroundColor Yellow
-$requiredHeaders = @("VMName", "PowerState", "CPUHotAddEnabled", "MemoryHotAddEnabled", "CPUCountBefore", "CPUCountAfter")
+$requiredHeaders = @("VMName", "PowerState", "CPUHotAddEnabled", "MemoryHotAddEnabled", "CPUCountBefore", "CPUCountAfter", "MemoryGBBefore", "MemoryGBAfter")
 $csvHeaders = $VMList[0].PSObject.Properties.Name
 $missingHeaders = $requiredHeaders | Where-Object { $_ -notin $csvHeaders }
 
@@ -138,7 +138,7 @@ Write-Host "VM CONFIGURATION CHANGE CONFIRMATION" -ForegroundColor Yellow
 Write-Host "=" * 80 -ForegroundColor Yellow
 
 foreach ($vmEntry in $VMList) {
-    Write-Host "VM: $($vmEntry.VMName) | CPU: $($vmEntry.CPUCountBefore) -> $($vmEntry.CPUCountAfter) | Hot Add: Enabled" -ForegroundColor Cyan
+    Write-Host "VM: $($vmEntry.VMName) | CPU: $($vmEntry.CPUCountBefore) -> $($vmEntry.CPUCountAfter) | Memory: $($vmEntry.MemoryGBBefore)GB -> $($vmEntry.MemoryGBAfter)GB | Hot Add: Enabled" -ForegroundColor Cyan
 }
 
 Write-Host "`nTotal VMs: $($VMList.Count) | Processing: PARALLEL" -ForegroundColor Yellow
@@ -146,7 +146,7 @@ Write-Host "WARNING: VMs will be shut down and reconfigured!" -ForegroundColor R
 Write-Host "`nPress ENTER to continue or CTRL+C to cancel..." -ForegroundColor White
 Read-Host
 
-# Create robust script block for parallel processing - FIXED: Removed problematic Get-View validation
+# Create robust script block for parallel processing
 $vmProcessingScript = {
     param($vmData, $vCenterList, $username, $password, $jobId)
     
@@ -251,8 +251,11 @@ $vmProcessingScript = {
             OriginalPowerState = $vmData.PowerState
             OriginalCPUCount = $vmData.CPUCountBefore
             TargetCPUCount = $vmData.CPUCountAfter
+            OriginalMemoryGB = $vmData.MemoryGBBefore
+            TargetMemoryGB = $vmData.MemoryGBAfter
             NewCPUCount = ""
             NewCoresPerSocket = ""
+            NewMemoryGB = ""
             NewCPUHotAddEnabled = ""
             NewMemoryHotAddEnabled = ""
             FinalPowerState = ""
@@ -263,12 +266,12 @@ $vmProcessingScript = {
             ProgressLog = $progressLog
         }
         
-        # FIXED: Connect to vCenter servers with enhanced validation and debugging
+        # Connect to vCenter servers with enhanced validation and debugging
         Add-ProgressLog "CONNECTING - Attempting vCenter connections" "INFO"
         $jobConnections = @()
         $vmServer = $null
         
-        # CRITICAL FIX: Validate the vCenter list parameter
+        # Validate the vCenter list parameter
         if (-not $vCenterList -or $vCenterList.Count -eq 0) {
             throw "vCenter server list is empty or null in job parameter"
         }
@@ -277,7 +280,7 @@ $vmProcessingScript = {
         Add-ProgressLog "DEBUG - Received vCenter list count: $($vCenterList.Count)" "INFO"
         Add-ProgressLog "DEBUG - vCenter list type: $($vCenterList.GetType().Name)" "INFO"
         
-        # FIXED: Handle both array and single string inputs
+        # Handle both array and single string inputs
         $serverListToProcess = @()
         if ($vCenterList -is [array]) {
             $serverListToProcess = $vCenterList
@@ -315,7 +318,7 @@ $vmProcessingScript = {
         
         Add-ProgressLog "VCENTER_LIST - Will attempt to connect to $($validServers.Count) servers: $($validServers -join ', ')" "INFO"
         
-        # FIXED: Connect with explicit server parameter to prevent prompting
+        # Connect with explicit server parameter to prevent prompting
         foreach ($vcServer in $validServers) {
             try {
                 Add-ProgressLog "CONNECT_ATTEMPT - Connecting to '$vcServer'" "INFO"
@@ -326,7 +329,7 @@ $vmProcessingScript = {
                     continue
                 }
                 
-                # CRITICAL FIX: Explicitly pass server parameter and suppress all prompts
+                # Explicitly pass server parameter and suppress all prompts
                 $connection = Connect-VIServer -Server $vcServer -Credential $jobCredential -Force -ErrorAction Stop -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false
                 
                 if ($connection -and $connection.IsConnected) {
@@ -363,7 +366,7 @@ $vmProcessingScript = {
                     $targetVM = Get-VM -Name $vmData.VMName -Server $server -ErrorAction Stop
                     if ($targetVM -and $targetVM.Name -eq $vmData.VMName) {
                         $vmServer = $server
-                        Add-ProgressLog "VM_FOUND - Located '$($targetVM.Name)' on $server (Current Power: $($targetVM.PowerState), CPUs: $($targetVM.NumCpu))" "SUCCESS"
+                        Add-ProgressLog "VM_FOUND - Located '$($targetVM.Name)' on $server (Current Power: $($targetVM.PowerState), CPUs: $($targetVM.NumCpu), Memory: $($targetVM.MemoryGB)GB)" "SUCCESS"
                         break
                     } else {
                         $targetVM = $null
@@ -438,13 +441,14 @@ $vmProcessingScript = {
             Add-ProgressLog "SHUTDOWN_SKIP - VM already powered off or invalid, proceeding to reconfiguration" "INFO"
         }
         
-        # PHASE 2: GRACEFUL - Reconfigure VM with automatic fallback (no failures)
+        # PHASE 2: Reconfigure VM with automatic fallback
         Add-ProgressLog "CONFIG_START - Beginning VM reconfiguration" "INFO"
         
         # Wait after shutdown for VM state to fully stabilize
         Start-Sleep -Seconds 8
         
         $targetCPUs = [int]$vmData.CPUCountAfter
+        $targetMemoryGB = [int]$vmData.MemoryGBAfter
         $configurationSuccessful = $false
         $vmView = $null
         
@@ -461,12 +465,12 @@ $vmProcessingScript = {
             # Configure via API
             $configSpec = New-Object VMware.Vim.VirtualMachineConfigSpec
             $configSpec.NumCPUs = $targetCPUs
-            $configSpec.NumCoresPerSocket = 1
+            $configSpec.MemoryMB = $targetMemoryGB * 1024
             $configSpec.CpuHotAddEnabled = $true
             $configSpec.MemoryHotAddEnabled = $true
             
             $task = $vmView.ReconfigVM($configSpec)
-            Add-ProgressLog "CONFIG_API_TASK - API reconfiguration task submitted" "INFO"
+            Add-ProgressLog "CONFIG_API_TASK - API reconfiguration task submitted (CPU: $targetCPUs, Memory: ${targetMemoryGB}GB)" "INFO"
             
             # Monitor the task
             $taskInfo = Get-View $task -ErrorAction Stop
@@ -497,11 +501,11 @@ $vmProcessingScript = {
                 # Get fresh VM for cmdlet approach
                 $cmdletVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
                 
-                # Apply CPU configuration using reliable cmdlets
-                Add-ProgressLog "CONFIG_CMDLET_CPU - Setting CPUs to $targetCPUs with 1 core per socket..." "INFO"
-                Set-VM -VM $cmdletVM -NumCpu $targetCPUs -CoresPerSocket 1 -Confirm:$false -ErrorAction Stop
+                # Apply CPU and Memory configuration using reliable cmdlets
+                Add-ProgressLog "CONFIG_CMDLET_RESOURCES - Setting CPUs to $targetCPUs and Memory to ${targetMemoryGB}GB..." "INFO"
+                Set-VM -VM $cmdletVM -NumCpu $targetCPUs -MemoryGB $targetMemoryGB -Confirm:$false -ErrorAction Stop
                 
-                Add-ProgressLog "CONFIG_CMDLET_SUCCESS - CPU configuration applied successfully via PowerCLI" "SUCCESS"
+                Add-ProgressLog "CONFIG_CMDLET_SUCCESS - CPU and Memory configuration applied successfully via PowerCLI" "SUCCESS"
                 $configurationSuccessful = $true
                 
                 # TRY to enable hot add (if this fails, it's not critical)
@@ -538,111 +542,119 @@ $vmProcessingScript = {
         }
         
         # PHASE 3: Power on the VM after configuration
-        Add-ProgressLog "POWERON_START - Will power on VM after configuration changes" "INFO"
-        # Always power on the VM after configuration
         Add-ProgressLog "POWERON_START - Initiating startup sequence" "INFO"
         
         # Wait a moment after reconfiguration before powering on
         Start-Sleep -Seconds 3
         
         try {
-                # Get fresh VM object
-                $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
-                
-                if (-not $targetVM) {
-                    throw "Cannot retrieve VM object for power operations"
-                }
-                
-                Add-ProgressLog "POWERON_VM_STATE - Current VM state: $($targetVM.PowerState)" "INFO"
-                
-                if ($targetVM.PowerState -eq "PoweredOff") {
-                    Add-ProgressLog "POWERON_EXECUTE - VM is PoweredOff, starting power on sequence" "INFO"
-                    
-                    # Start the VM
-                    Start-VM -VM $targetVM -Confirm:$false -ErrorAction Stop
-                    Add-ProgressLog "POWERON_INITIATED - Power on command sent successfully" "SUCCESS"
-                    
-                    # Wait longer to ensure VM actually powers on (2 minutes max)
-                    $powerOnTimeout = (Get-Date).AddMinutes(2)
-                    $powerOnStart = Get-Date
-                    
-                    while ($targetVM.PowerState -ne "PoweredOn" -and (Get-Date) -lt $powerOnTimeout) {
-                        Start-Sleep -Seconds 10
-                        try {
-                            $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
-                            if ($targetVM) {
-                                $elapsed = [math]::Round(((Get-Date) - $powerOnStart).TotalSeconds)
-                                
-                                # Log progress every 30 seconds
-                                if ($elapsed % 30 -eq 0) {
-                                    Add-ProgressLog "POWERON_PROGRESS - Power on in progress (${elapsed}s elapsed, State: $($targetVM.PowerState))" "INFO"
-                                }
-                                
-                                # Check if VM is now powered on
-                                if ($targetVM.PowerState -eq "PoweredOn") {
-                                    Add-ProgressLog "POWERON_SUCCESS - VM powered on (${elapsed}s)" "SUCCESS"
-                                    break
-                                }
-                            }
-                        } catch {
-                            Add-ProgressLog "POWERON_STATUS_ERROR - Error checking power status: $($_.Exception.Message)" "WARN"
-                            break
-                        }
-                    }
-                    
-                    # Final verification
-                    try {
-                        $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
-                        $powerOnDuration = [math]::Round(((Get-Date) - $powerOnStart).TotalSeconds)
-                        
-                        if ($targetVM -and $targetVM.PowerState -eq "PoweredOn") {
-                            Add-ProgressLog "POWERON_VERIFIED - VM successfully powered on (${powerOnDuration}s total)" "SUCCESS"
-                        } else {
-                            Add-ProgressLog "POWERON_TIMEOUT - VM did not power on within timeout (${powerOnDuration}s, State: $($targetVM.PowerState))" "WARN"
-                            Add-ProgressLog "POWERON_TIMEOUT - VM may still be starting up in background" "INFO"
-                        }
-                    } catch {
-                        Add-ProgressLog "POWERON_FINAL_CHECK_ERROR - Error during final power state verification: $($_.Exception.Message)" "WARN"
-                    }
-                    
-                } elseif ($targetVM.PowerState -eq "PoweredOn") {
-                    Add-ProgressLog "POWERON_ALREADY - VM is already powered on" "SUCCESS"
-                } else {
-                    Add-ProgressLog "POWERON_UNEXPECTED_STATE - VM is in unexpected state: $($targetVM.PowerState)" "WARN"
-                    # Try to power on anyway
-                    try {
-                        Start-VM -VM $targetVM -Confirm:$false -ErrorAction Stop
-                        Add-ProgressLog "POWERON_FORCED - Power on command sent from unexpected state" "INFO"
-                        
-                        # Brief wait to check if it worked
-                        Start-Sleep -Seconds 15
-                        $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
-                        Add-ProgressLog "POWERON_FORCED_RESULT - Power state after forced start: $($targetVM.PowerState)" "INFO"
-                        
-                    } catch {
-                        Add-ProgressLog "POWERON_FORCE_FAILED - Failed to power on from unexpected state: $($_.Exception.Message)" "WARN"
-                    }
-                }
-                
-            } catch {
-                Add-ProgressLog "POWERON_ERROR - Power on failed: $($_.Exception.Message)" "ERROR"
+            # Get fresh VM object
+            $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
+            
+            if (-not $targetVM) {
+                throw "Cannot retrieve VM object for power operations"
             }
+            
+            Add-ProgressLog "POWERON_VM_STATE - Current VM state: $($targetVM.PowerState)" "INFO"
+            
+            if ($targetVM.PowerState -eq "PoweredOff") {
+                Add-ProgressLog "POWERON_EXECUTE - VM is PoweredOff, starting power on sequence" "INFO"
+                
+                # Start the VM
+                Start-VM -VM $targetVM -Confirm:$false -ErrorAction Stop
+                Add-ProgressLog "POWERON_INITIATED - Power on command sent successfully" "SUCCESS"
+                
+                # Wait longer to ensure VM actually powers on (2 minutes max)
+                $powerOnTimeout = (Get-Date).AddMinutes(2)
+                $powerOnStart = Get-Date
+                
+                while ($targetVM.PowerState -ne "PoweredOn" -and (Get-Date) -lt $powerOnTimeout) {
+                    Start-Sleep -Seconds 10
+                    try {
+                        $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
+                        if ($targetVM) {
+                            $elapsed = [math]::Round(((Get-Date) - $powerOnStart).TotalSeconds)
+                            
+                            # Log progress every 30 seconds
+                            if ($elapsed % 30 -eq 0) {
+                                Add-ProgressLog "POWERON_PROGRESS - Power on in progress (${elapsed}s elapsed, State: $($targetVM.PowerState))" "INFO"
+                            }
+                            
+                            # Check if VM is now powered on
+                            if ($targetVM.PowerState -eq "PoweredOn") {
+                                Add-ProgressLog "POWERON_SUCCESS - VM powered on (${elapsed}s)" "SUCCESS"
+                                break
+                            }
+                        }
+                    } catch {
+                        Add-ProgressLog "POWERON_STATUS_ERROR - Error checking power status: $($_.Exception.Message)" "WARN"
+                        break
+                    }
+                }
+                
+                # Final verification
+                try {
+                    $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
+                    $powerOnDuration = [math]::Round(((Get-Date) - $powerOnStart).TotalSeconds)
+                    
+                    if ($targetVM -and $targetVM.PowerState -eq "PoweredOn") {
+                        Add-ProgressLog "POWERON_VERIFIED - VM successfully powered on (${powerOnDuration}s total)" "SUCCESS"
+                    } else {
+                        Add-ProgressLog "POWERON_TIMEOUT - VM did not power on within timeout (${powerOnDuration}s, State: $($targetVM.PowerState))" "WARN"
+                        Add-ProgressLog "POWERON_TIMEOUT - VM may still be starting up in background" "INFO"
+                    }
+                } catch {
+                    Add-ProgressLog "POWERON_FINAL_CHECK_ERROR - Error during final power state verification: $($_.Exception.Message)" "WARN"
+                }
+                
+            } elseif ($targetVM.PowerState -eq "PoweredOn") {
+                Add-ProgressLog "POWERON_ALREADY - VM is already powered on" "SUCCESS"
+            } else {
+                Add-ProgressLog "POWERON_UNEXPECTED_STATE - VM is in unexpected state: $($targetVM.PowerState)" "WARN"
+                # Try to power on anyway
+                try {
+                    Start-VM -VM $targetVM -Confirm:$false -ErrorAction Stop
+                    Add-ProgressLog "POWERON_FORCED - Power on command sent from unexpected state" "INFO"
+                    
+                    # Brief wait to check if it worked
+                    Start-Sleep -Seconds 15
+                    $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
+                    Add-ProgressLog "POWERON_FORCED_RESULT - Power state after forced start: $($targetVM.PowerState)" "INFO"
+                    
+                } catch {
+                    Add-ProgressLog "POWERON_FORCE_FAILED - Failed to power on from unexpected state: $($_.Exception.Message)" "WARN"
+                }
+            }
+            
+        } catch {
+            Add-ProgressLog "POWERON_ERROR - Power on failed: $($_.Exception.Message)" "ERROR"
+        }
         
-        # PHASE 4: FIXED - Set final configuration values using TARGET values (no Get-View validation)
+        # PHASE 4: Set final configuration values
         Add-ProgressLog "FINALIZE - Setting final configuration values from successful reconfiguration" "INFO"
         
-        # CRITICAL FIX: Since reconfiguration was successful, use the target values directly
-        # This eliminates the problematic Get-View validation that was causing the VIObject error
-        $result.NewCPUCount = $targetCPUs
-        $result.NewCoresPerSocket = 1
+        # Get fresh VM object to retrieve actual configuration
+        try {
+            $finalConfigVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
+            $result.NewCPUCount = $finalConfigVM.NumCpu
+            $result.NewCoresPerSocket = $finalConfigVM.CoresPerSocket
+            $result.NewMemoryGB = $finalConfigVM.MemoryGB
+            Add-ProgressLog "FINAL_CONFIG_RETRIEVED - Retrieved actual configuration from VM object" "SUCCESS"
+        } catch {
+            # Fallback to target values if retrieval fails
+            $result.NewCPUCount = $targetCPUs
+            $result.NewCoresPerSocket = "Unknown"
+            $result.NewMemoryGB = $targetMemoryGB
+            Add-ProgressLog "FINAL_CONFIG_FALLBACK - Using target values (could not retrieve actual config)" "WARN"
+        }
+        
         $result.NewCPUHotAddEnabled = $true
         $result.NewMemoryHotAddEnabled = $true
         
-        Add-ProgressLog "FINAL_CONFIG - CPUs: $($result.NewCPUCount), Cores/Socket: $($result.NewCoresPerSocket)" "SUCCESS"
+        Add-ProgressLog "FINAL_CONFIG - CPUs: $($result.NewCPUCount), Cores/Socket: $($result.NewCoresPerSocket), Memory: $($result.NewMemoryGB)GB" "SUCCESS"
         Add-ProgressLog "FINAL_CONFIG - Hot Add CPU: $($result.NewCPUHotAddEnabled), Hot Add Memory: $($result.NewMemoryHotAddEnabled)" "SUCCESS"
-        Add-ProgressLog "FINAL_CONFIG - Configuration values set from successful API call (no validation needed)" "SUCCESS"
         
-        # Get final power state using basic VM object (this is safe)
+        # Get final power state
         try {
             $finalVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
             $result.FinalPowerState = $finalVM.PowerState
@@ -710,7 +722,7 @@ if ($finalServerArray.Count -eq 0) {
 
 Write-Host "Passing $($finalServerArray.Count) servers to jobs: $($finalServerArray -join ', ')" -ForegroundColor Green
 
-# FIXED: Start jobs in batches with validated server list
+# Start jobs in batches with validated server list
 foreach ($vmEntry in $VMList) {
     # Wait for available slot
     while ((Get-Job -State Running).Count -ge $maxJobs) {
@@ -760,7 +772,7 @@ foreach ($vmEntry in $VMList) {
                         
                         if ($vmResult.Status -eq "Success") {
                             Write-Host "✓ SUCCESS: $($vmResult.VMName)" -ForegroundColor Green
-                            Write-Host "  └─ Configuration: $($vmResult.NewCPUCount) CPUs, $($vmResult.NewCoresPerSocket) cores/socket" -ForegroundColor Green
+                            Write-Host "  └─ Configuration: $($vmResult.NewCPUCount) CPUs ($($vmResult.NewCoresPerSocket) cores/socket), $($vmResult.NewMemoryGB)GB RAM" -ForegroundColor Green
                             Write-Host "  └─ Power State: $($vmResult.FinalPowerState)" -ForegroundColor Green
                             Write-Host "  └─ Processing Time: $duration minutes" -ForegroundColor Green
                         } else {
@@ -783,7 +795,7 @@ foreach ($vmEntry in $VMList) {
         }
     }
     
-    # FIXED: Start new job with properly formatted server array and additional validation
+    # Start new job with properly formatted server array
     Write-Host "DEBUG: Starting job $jobCounter with server array count: $($finalServerArray.Count)" -ForegroundColor Gray
     Write-Host "DEBUG: Server array contents: $($finalServerArray -join ', ')" -ForegroundColor Gray
     
@@ -798,7 +810,7 @@ foreach ($vmEntry in $VMList) {
         }
         
         Write-Host "`nLAUNCHED JOB $jobCounter FOR VM: $($vmEntry.VMName)" -ForegroundColor Cyan -BackgroundColor DarkBlue
-        Write-Host "   PowerShell Job ID: $($job.Id) | Target CPUs: $($vmEntry.CPUCountBefore) → $($vmEntry.CPUCountAfter)" -ForegroundColor White
+        Write-Host "   PowerShell Job ID: $($job.Id) | Target CPUs: $($vmEntry.CPUCountBefore) → $($vmEntry.CPUCountAfter) | Memory: $($vmEntry.MemoryGBBefore)GB → $($vmEntry.MemoryGBAfter)GB" -ForegroundColor White
         $jobCounter++
         
         # Small delay to prevent overwhelming the system
@@ -873,7 +885,8 @@ while ($jobs.Count -gt $processedJobs.Count) {
                     
                     if ($vmResult.Status -eq "Success") {
                         Write-Host "*** SUCCESS: $($vmResult.VMName)" -ForegroundColor Green -BackgroundColor DarkGreen
-                        Write-Host "    Configuration: $($vmResult.OriginalCPUCount) -> $($vmResult.NewCPUCount) CPUs, $($vmResult.NewCoresPerSocket) cores/socket" -ForegroundColor Green
+                        Write-Host "    Configuration: $($vmResult.OriginalCPUCount) -> $($vmResult.NewCPUCount) CPUs ($($vmResult.NewCoresPerSocket) cores/socket)" -ForegroundColor Green
+                        Write-Host "    Memory: $($vmResult.OriginalMemoryGB)GB -> $($vmResult.NewMemoryGB)GB" -ForegroundColor Green
                         Write-Host "    Power State: $($vmResult.FinalPowerState)" -ForegroundColor Green
                         Write-Host "    Hot Add CPU: $($vmResult.NewCPUHotAddEnabled) | Hot Add Memory: $($vmResult.NewMemoryHotAddEnabled)" -ForegroundColor Green
                         Write-Host "    Processing Time: $duration minutes" -ForegroundColor Green
@@ -963,7 +976,7 @@ if ($results.Count -gt 0) {
     
     # Detailed results table
     Write-Host "`nDETAILED RESULTS TABLE:" -ForegroundColor Cyan
-    $results | Select-Object VMName, Status, OriginalCPUCount, NewCPUCount, NewCoresPerSocket, FinalPowerState, ProcessingTimeMinutes | 
+    $results | Select-Object VMName, Status, OriginalCPUCount, NewCPUCount, NewCoresPerSocket, OriginalMemoryGB, NewMemoryGB, FinalPowerState, ProcessingTimeMinutes | 
         Format-Table -AutoSize
     
     # Show failures if any
