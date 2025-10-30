@@ -142,7 +142,8 @@ foreach ($vmEntry in $VMList) {
 }
 
 Write-Host "`nTotal VMs: $($VMList.Count) | Processing: PARALLEL" -ForegroundColor Yellow
-Write-Host "WARNING: VMs will be shut down and reconfigured!" -ForegroundColor Red
+Write-Host "NOTE: Script will detect each VM's current power state and restore it after reconfiguration" -ForegroundColor Cyan
+Write-Host "WARNING: Powered-on VMs will be shut down temporarily for reconfiguration!" -ForegroundColor Red
 Write-Host "`nPress ENTER to continue or CTRL+C to cancel..." -ForegroundColor White
 Read-Host
 
@@ -248,7 +249,7 @@ $vmProcessingScript = {
             VMName = $vmData.VMName
             JobId = $jobId
             Status = "Success"
-            OriginalPowerState = $vmData.PowerState
+            OriginalPowerState = ""
             OriginalCPUCount = $vmData.CPUCountBefore
             TargetCPUCount = $vmData.CPUCountAfter
             OriginalMemoryGB = $vmData.MemoryGBBefore
@@ -390,9 +391,14 @@ $vmProcessingScript = {
             throw "VM object is invalid - Name property is missing"
         }
         
+        # Capture the ACTUAL current power state from the VM
+        $originalPowerState = $targetVM.PowerState
+        $result.OriginalPowerState = $originalPowerState
+        Add-ProgressLog "VM_STATE_CAPTURED - Original power state: $originalPowerState (will restore this state after reconfiguration)" "INFO"
+        
         # PHASE 1: Shutdown if needed with null checks
         if ($targetVM -and $targetVM.PowerState -eq "PoweredOn") {
-            Add-ProgressLog "SHUTDOWN_START - Initiating graceful shutdown (VMware Tools required)" "INFO"
+            Add-ProgressLog "SHUTDOWN_START - VM is currently powered on, initiating graceful shutdown (VMware Tools required)" "INFO"
             
             try {
                 Shutdown-VMGuest -VM $targetVM -Confirm:$false -ErrorAction Stop
@@ -547,7 +553,7 @@ $vmProcessingScript = {
         }
         
         # PHASE 3: Power on the VM after configuration (only if it was originally powered on)
-        if ($vmData.PowerState -eq "PoweredOn") {
+        if ($originalPowerState -eq "PoweredOn") {
             Add-ProgressLog "POWERON_START - VM was originally powered on, initiating startup sequence" "INFO"
             
             # Wait a moment after reconfiguration before powering on
@@ -990,11 +996,30 @@ if ($results.Count -gt 0) {
     
     # Detailed results table
     Write-Host "`nDETAILED RESULTS TABLE:" -ForegroundColor Cyan
-    $results | Select-Object VMName, Status, OriginalCPUCount, NewCPUCount, NewCoresPerSocket, OriginalMemoryGB, NewMemoryGB, `
+    $results | Select-Object VMName, Status, OriginalPowerState, OriginalCPUCount, NewCPUCount, NewCoresPerSocket, OriginalMemoryGB, NewMemoryGB, `
         @{Name="CPUHotAdd";Expression={$_.NewCPUHotAddEnabled}}, `
         @{Name="MemoryHotAdd";Expression={$_.NewMemoryHotAddEnabled}}, `
         FinalPowerState, ProcessingTimeMinutes | 
         Format-Table -AutoSize
+    
+    # Power state analysis
+    Write-Host "`nPOWER STATE SUMMARY:" -ForegroundColor Cyan
+    Write-Host "=" * 40 -ForegroundColor Cyan
+    
+    $originallyOn = $results | Where-Object { $_.OriginalPowerState -eq "PoweredOn" }
+    $originallyOff = $results | Where-Object { $_.OriginalPowerState -eq "PoweredOff" }
+    
+    if ($originallyOn.Count -gt 0) {
+        Write-Host "`nVMs Originally Powered ON ($($originallyOn.Count)):" -ForegroundColor Green
+        $originallyOn | Select-Object VMName, FinalPowerState, Status | Format-Table -AutoSize
+    }
+    
+    if ($originallyOff.Count -gt 0) {
+        Write-Host "VMs Originally Powered OFF ($($originallyOff.Count)):" -ForegroundColor Yellow
+        $originallyOff | Select-Object VMName, FinalPowerState, Status | Format-Table -AutoSize
+    }
+    
+    Write-Host "=" * 40 -ForegroundColor Cyan
     
     # Show failures if any
     $failures = $results | Where-Object { $_.Status -eq "Failed" }
