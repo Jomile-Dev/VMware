@@ -406,7 +406,7 @@ $vmProcessingScript = {
             $shutdownStart = Get-Date
             
             while ($targetVM -and $targetVM.PowerState -ne "PoweredOff" -and (Get-Date) -lt $shutdownTimeout) {
-                Start-Sleep -Seconds 10
+                Start-Sleep -Seconds 5
                 
                 try {
                     $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
@@ -569,7 +569,7 @@ $vmProcessingScript = {
                 $powerOnStart = Get-Date
                 
                 while ($targetVM.PowerState -ne "PoweredOn" -and (Get-Date) -lt $powerOnTimeout) {
-                    Start-Sleep -Seconds 10
+                    Start-Sleep -Seconds 5
                     try {
                         $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
                         if ($targetVM) {
@@ -814,7 +814,7 @@ foreach ($vmEntry in $VMList) {
         $jobCounter++
         
         # Small delay to prevent overwhelming the system
-        Start-Sleep -Seconds 1
+        Start-Sleep -Milliseconds 500
         
     } catch {
         Write-Error "CRITICAL ERROR: Failed to start job for VM $($vmEntry.VMName): $($_.Exception.Message)"
@@ -944,7 +944,7 @@ while ($jobs.Count -gt $processedJobs.Count) {
         $lastSummaryUpdate = $currentTime
     }
     
-    Start-Sleep -Seconds 2
+    Start-Sleep -Seconds 1
 }
 
 # Final processing and comprehensive reporting
