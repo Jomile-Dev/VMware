@@ -103,13 +103,16 @@ try {
             $n2vSanUsableTB = [math]::Round($totalvSanTB - (2 * $avgStoragePerHostTB), 2)
         }
         
-        # Get all powered-on VMs in the cluster
-        $vms = $cluster | Get-VM | Where-Object { $_.PowerState -eq "PoweredOn" }
-        $totalVMs = [int]$vms.Count
+        # Get ALL VMs in the cluster (regardless of power state)
+        $allVMs = $cluster | Get-VM
+        $totalVMs = [int]$allVMs.Count
+        $poweredOnVMs = $allVMs | Where-Object { $_.PowerState -eq "PoweredOn" }
+        $poweredOnCount = [int]$poweredOnVMs.Count
+        $poweredOffCount = $totalVMs - $poweredOnCount
         
-        # Calculate VM resource demands (allocated resources) - convert to proper numeric types
-        $allocatedCpuCores = [int](($vms | Measure-Object -Property NumCpu -Sum).Sum)
-        $allocatedMemoryMB = [double](($vms | Measure-Object -Property MemoryMB -Sum).Sum)
+        # Calculate VM resource demands using ONLY powered-on VMs (allocated resources)
+        $allocatedCpuCores = [int](($poweredOnVMs | Measure-Object -Property NumCpu -Sum).Sum)
+        $allocatedMemoryMB = [double](($poweredOnVMs | Measure-Object -Property MemoryMB -Sum).Sum)
         
         # Calculate vCPU to pCPU ratio
         $vCpuToPcpuRatio = [math]::Round([double]$allocatedCpuCores / [double]$totalCpuCores, 2)
@@ -117,7 +120,7 @@ try {
         # Calculate total usable CPU cores with 3:1 overcommit
         $totalUsableCpuCores = [double]($totalCpuCores * $CpuOvercommitRatio)
         
-        # Calculate utilisation percentages against N-2 usable capacity (FIXED)
+        # Calculate utilisation percentages against N-2 usable capacity
         $n2CpuUtilPct = if ($n2UsableCpuCores -gt 0) { [math]::Round(([double]$allocatedCpuCores / [double]$n2UsableCpuCores) * 100, 2) } else { 0 }
         $n2MemUtilPct = if ($n2MemoryMB -gt 0) { [math]::Round(($allocatedMemoryMB / $n2MemoryMB) * 100, 2) } else { 0 }
         $n2vSanUtilPct = if ($n2vSanUsableTB -gt 0) { [math]::Round(($vSanUsedTB / $n2vSanUsableTB) * 100, 2) } else { 0 }
@@ -127,9 +130,11 @@ try {
             Cluster = [string]$cluster.Name
             TotalHosts = $totalHosts
             TotalVMs = $totalVMs
+            PoweredOnVMs = $poweredOnCount
+            PoweredOffVMs = $poweredOffCount
             vCpuToPcpuRatio = "$($vCpuToPcpuRatio):1"
             
-            # Currently assigned/used resources
+            # Currently assigned/used resources (from powered-on VMs only)
             vCPU_Assigned = $allocatedCpuCores
             Memory_Assigned_GB = [math]::Round($allocatedMemoryMB / 1024, 2)      # Convert to GB
             vSAN_Used_TB = if ($vSanUsedTB -gt 0) { $vSanUsedTB } else { 0 }
@@ -188,6 +193,8 @@ try {
         <h3>Analysis Parameters</h3>
         <ul>
             <li>CPU Overcommit Ratio: $($CpuOvercommitRatio):1</li>
+            <li>VM counts include all VMs (powered-on and powered-off)</li>
+            <li>Resource utilization based on powered-on VMs only</li>
         </ul>
     </div>
 
@@ -195,8 +202,8 @@ try {
     <table>
         <tr>
             <th rowspan="2">Cluster</th>
-            <th rowspan="2">Total Hosts</th>
-            <th rowspan="2">Total VMs</th>
+            <th rowspan="2">Total<br>Hosts</th>
+            <th colspan="3" style="background-color: #e8f4f8; text-align: center;">VM Counts</th>
             <th rowspan="2">vCPU:pCPU<br>Ratio</th>
             <th colspan="3" style="background-color: #fff3cd; text-align: center;">Currently Assigned/Used</th>
             <th colspan="3" style="background-color: #e6f3ff; text-align: center;">Total Cluster Capacity</th>
@@ -204,6 +211,9 @@ try {
             <th colspan="3" style="background-color: #f0f8e6; text-align: center;">Utilisation % N-2</th>
         </tr>
         <tr>
+            <th class="small-text" style="background-color: #e8f4f8;">Total<br>VMs</th>
+            <th class="small-text" style="background-color: #e8f4f8;">Powered<br>On</th>
+            <th class="small-text" style="background-color: #e8f4f8;">Powered<br>Off</th>
             <th class="small-text" style="background-color: #fff3cd;">vCPU<br>Assigned</th>
             <th class="small-text" style="background-color: #fff3cd;">Memory<br>Assigned (GB)</th>
             <th class="small-text" style="background-color: #fff3cd;">vSAN<br>Used (TB)</th>
@@ -227,7 +237,10 @@ try {
             $htmlBody += "<tr>"
             $htmlBody += "<td>$($result.Cluster)</td>"
             $htmlBody += "<td class='center-text'>$($result.TotalHosts)</td>"
-            $htmlBody += "<td class='center-text'>$($result.TotalVMs)</td>"
+            # VM counts
+            $htmlBody += "<td style='background-color: #f0f8fc; text-align: center;'>$($result.TotalVMs)</td>"
+            $htmlBody += "<td style='background-color: #f0f8fc; text-align: center;'>$($result.PoweredOnVMs)</td>"
+            $htmlBody += "<td style='background-color: #f0f8fc; text-align: center;'>$($result.PoweredOffVMs)</td>"
             $htmlBody += "<td class='center-text'>$($result.vCpuToPcpuRatio)</td>"
             # Currently assigned/used resources
             $htmlBody += "<td style='background-color: #fffbf0; text-align: center;'>$($result.vCPU_Assigned)</td>"
@@ -254,10 +267,11 @@ try {
     <div class="summary">
         <h3>Notes</h3>
         <ul>
-            <li><strong>Currently Assigned/Used:</strong> The total amount of CPU/RAM/vSAN storage used within a cluster</li>
+            <li><strong>VM Counts:</strong> Total VMs includes all VMs (powered-on and powered-off) in each cluster</li>
+            <li><strong>Currently Assigned/Used:</strong> Resource usage from powered-on VMs only</li>
             <li><strong>Total Cluster Capacity:</strong> The total/maximum amount of resources within a cluster (all hosts)</li>
             <li><strong>Usable Capacity:</strong> The amount of usable compute storage with 2 hosts down</li>
-            <li><strong>Utilisation % (N-2):</strong> This is currently assigned / Total usable Capacity to give a percentage</li>
+            <li><strong>Utilisation % (N-2):</strong> Currently assigned resources / Total usable capacity (N-2)</li>
             <li>CPU capacity includes $($CpuOvercommitRatio):1 overcommit ratio for both total and N-2 calculations</li>
             <li>vSAN N-2 capacity is calculated based on average storage per host</li>
             <li>Utilisation percentages indicate capacity stress in a 2-host failure scenario</li>
