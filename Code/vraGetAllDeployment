@@ -1,5 +1,5 @@
-# VMware Aria Automation - Export All Deployments with Server Names
-# Exports all deployments and their associated vSphere machine hostnames to CSV
+# VMware Aria Automation - Export Deployments with vSphere Machines
+# Exports only deployments that contain Cloud.vSphere.Machine resources
 
 $vraServer = "vra.yourdomain.com"
 $outputPath = "C:\Logs\vRA_Deployments_Export_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
@@ -52,116 +52,111 @@ $headers = @{
     "Content-Type" = "application/json"
 }
 
-# Get all deployments with pagination
+# Get all deployments with pagination and filter as we go
 Write-Log "=== FETCHING DEPLOYMENTS ===" -Color Cyan
 $uri = "https://$vraServer/deployment/api/deployments"
-$allDeployments = @()
+$exportData = @()
 $page = 0
-$size = 100
+$size = 500
+$totalProcessed = 0
+$foundCount = 0
+$skippedCount = 0
 
 do {
     $pagedUri = "$uri`?page=$page&size=$size&expand=resources"
     Write-Log "  Fetching page $($page + 1)..." -Color Gray
     
-    $response = Invoke-RestMethod -Uri $pagedUri -Method Get -Headers $headers
-    $deployments = if ($response.content) { $response.content } else { $response }
-    
-    $allDeployments += $deployments
-    $page++
-    
-    $hasMore = if ($response.totalPages) { 
-        $page -lt $response.totalPages 
-    } elseif ($response.totalElements) { 
-        $allDeployments.Count -lt $response.totalElements 
-    } else { 
-        $deployments.Count -eq $size 
+    try {
+        $response = Invoke-RestMethod -Uri $pagedUri -Method Get -Headers $headers
+        $deployments = if ($response.content) { $response.content } else { $response }
+        
+        # Process each deployment immediately
+        foreach ($dep in $deployments) {
+            $totalProcessed++
+            $vSphereMachines = @()
+            
+            # Check inline resources for Cloud.vSphere.Machine
+            if ($dep.resources) {
+                $vSphereMachines = @($dep.resources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" })
+            }
+            
+            # Try separate resource call if needed
+            if ($vSphereMachines.Count -eq 0) {
+                try {
+                    $resourceUri = "https://$vraServer/deployment/api/deployments/$($dep.id)/resources"
+                    $separateResources = Invoke-RestMethod -Uri $resourceUri -Method Get -Headers $headers -ErrorAction Stop
+                    $resList = if ($separateResources.content) { $separateResources.content } else { $separateResources }
+                    $vSphereMachines = @($resList | Where-Object { $_.type -eq "Cloud.vSphere.Machine" })
+                } catch {
+                    # No resources available
+                }
+            }
+            
+            # Only keep deployments with Cloud.vSphere.Machine
+            if ($vSphereMachines.Count -gt 0) {
+                $foundCount++
+                Write-Log "  ✓ [$foundCount] $($dep.name) - $($vSphereMachines.Count) vSphere machine(s)" -Color Green
+                
+                foreach ($machine in $vSphereMachines) {
+                    # Get hostname from properties
+                    $hostname = if ($machine.properties.hostname) { 
+                        $machine.properties.hostname 
+                    } elseif ($machine.properties.resourceName) {
+                        $machine.properties.resourceName
+                    } elseif ($machine.name) {
+                        $machine.name
+                    } else {
+                        "N/A"
+                    }
+                    
+                    $exportData += [PSCustomObject]@{
+                        DeploymentName = $dep.name
+                        DeploymentID = $dep.id
+                        ServerName = $hostname
+                        ResourceName = $machine.name
+                        Status = $dep.status
+                        CreatedBy = $dep.createdBy
+                        CreatedAt = $dep.createdAt
+                        ProjectID = $dep.projectId
+                    }
+                }
+            } else {
+                $skippedCount++
+            }
+        }
+        
+        Write-Log "  Page summary: Processed $($deployments.Count), Found $foundCount total, Skipped $skippedCount total" -Color Cyan
+        
+        $page++
+        
+        # Check if there are more pages
+        $hasMore = if ($response.totalPages) { 
+            $page -lt $response.totalPages 
+        } elseif ($response.totalElements) { 
+            $totalProcessed -lt $response.totalElements 
+        } else { 
+            $deployments.Count -eq $size 
+        }
+    }
+    catch {
+        Write-Log "Error fetching page $($page + 1): $($_.Exception.Message)" -Color Red
+        break
     }
     
 } while ($hasMore)
 
-Write-Log "Total deployments retrieved: $($allDeployments.Count)`n" -Color Cyan
-
-# Process deployments and extract server information
-Write-Log "=== PROCESSING DEPLOYMENTS ===" -Color Cyan
-$exportData = @()
-$counter = 0
-
-foreach ($dep in $allDeployments) {
-    $counter++
-    Write-Log "[$counter/$($allDeployments.Count)] Processing: $($dep.name)" -Color Yellow
-    
-    $vSphereMachines = @()
-    
-    # Check inline resources
-    if ($dep.resources) {
-        $vSphereMachines = @($dep.resources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" })
-    }
-    
-    # Try separate resource call if needed
-    if ($vSphereMachines.Count -eq 0) {
-        try {
-            $resourceUri = "https://$vraServer/deployment/api/deployments/$($dep.id)/resources"
-            $separateResources = Invoke-RestMethod -Uri $resourceUri -Method Get -Headers $headers -ErrorAction Stop
-            $resList = if ($separateResources.content) { $separateResources.content } else { $separateResources }
-            $vSphereMachines = @($resList | Where-Object { $_.type -eq "Cloud.vSphere.Machine" })
-        } catch {
-            # No resources available
-        }
-    }
-    
-    # If deployment has vSphere machines, export them
-    if ($vSphereMachines.Count -gt 0) {
-        foreach ($machine in $vSphereMachines) {
-            # Get hostname from properties
-            $hostname = if ($machine.properties.hostname) { 
-                $machine.properties.hostname 
-            } elseif ($machine.properties.resourceName) {
-                $machine.properties.resourceName
-            } elseif ($machine.name) {
-                $machine.name
-            } else {
-                "N/A"
-            }
-            
-            $exportData += [PSCustomObject]@{
-                DeploymentName = $dep.name
-                DeploymentID = $dep.id
-                ServerName = $hostname
-                ResourceName = $machine.name
-                Status = $dep.status
-                CreatedBy = $dep.createdBy
-                CreatedAt = $dep.createdAt
-                ProjectID = $dep.projectId
-            }
-            
-            Write-Log "  → Server: $hostname" -Color Gray
-        }
-    } else {
-        # Deployment has no vSphere machines
-        $exportData += [PSCustomObject]@{
-            DeploymentName = $dep.name
-            DeploymentID = $dep.id
-            ServerName = "No vSphere Machines"
-            ResourceName = "N/A"
-            Status = $dep.status
-            CreatedBy = $dep.createdBy
-            CreatedAt = $dep.createdAt
-            ProjectID = $dep.projectId
-        }
-    }
-}
+Write-Log "`nTotal deployments scanned: $totalProcessed" -Color Cyan
+Write-Log "Deployments with vSphere machines: $foundCount`n" -Color Green
 
 # Export to CSV
 Write-Log "`n=== EXPORTING ===" -Color Cyan
 $exportData | Export-Csv -Path $outputPath -NoTypeInformation
-Write-Log "Exported $($exportData.Count) records to:" -Color Green
+Write-Log "Exported $($exportData.Count) server records to:" -Color Green
 Write-Log "$outputPath" -Color White
 
 # Summary
 Write-Log "`n=== SUMMARY ===" -Color Cyan
-$withServers = ($exportData | Where-Object { $_.ServerName -ne "No vSphere Machines" }).Count
-$withoutServers = ($exportData | Where-Object { $_.ServerName -eq "No vSphere Machines" }).Count
-
-Write-Log "Deployments with servers: $withServers" -Color Green
-Write-Log "Deployments without servers: $withoutServers" -Color Yellow
-Write-Log "Total records: $($exportData.Count)" -Color Cyan
+Write-Log "Total deployments scanned: $totalProcessed" -Color White
+Write-Log "Deployments with Cloud.vSphere.Machine: $foundCount" -Color Green
+Write-Log "Deployments skipped (no vSphere machines): $skippedCount" -Color Yellow
+Write-Log "Total server records exported: $($exportData.Count)" -Color Cyan
