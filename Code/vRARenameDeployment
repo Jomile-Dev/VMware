@@ -58,68 +58,107 @@ $headers = @{
     "Content-Type" = "application/json"
 }
 
-# Function to find deployment containing the resource/server
-function Find-Deployment {
-    param($ServerName)
+# Function to get all deployments with pagination
+function Get-AllDeployments {
+    Write-Log "Fetching all deployments..." -Color Cyan
     
-    # Get all deployments and search for Cloud.vSphere.Machine resources
-    $searchUri = "https://$vraServer/deployment/api/deployments"
+    $uri = "https://$vraServer/deployment/api/deployments"
+    $allDeployments = @()
+    $page = 0
+    $size = 100
     
-    try {
-        $response = Invoke-RestMethod -Uri $searchUri -Method Get -Headers $headers -ErrorAction Stop
+    do {
+        $pagedUri = "$uri`?page=$page&size=$size&expand=resources"
+        Write-Log "  Fetching page $($page + 1)..." -Color Gray
+        
+        $response = Invoke-RestMethod -Uri $pagedUri -Method Get -Headers $headers
         $deployments = if ($response.content) { $response.content } else { $response }
         
-        Write-Log "  Searching $($deployments.Count) deployments for vSphere Machine" -Color Gray
+        $allDeployments += $deployments
+        $page++
         
-        if ($deployments.Count -gt 0) {
-            foreach ($dep in $deployments) {
-                if ($dep.resources) {
-                    # Filter by Cloud.vSphere.Machine resource type
-                    $vsphereMachines = $dep.resources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" }
-                    
-                    foreach ($machine in $vsphereMachines) {
-                        # Check hostname or resourceName properties
-                        if ($machine.properties) {
-                            $hostname = $machine.properties.hostname
-                            $resourceName = $machine.properties.resourceName
-                            
-                            if ($hostname -eq $ServerName -or $resourceName -eq $ServerName) {
-                                Write-Log "  ✓ Found in deployment: $($dep.name)" -Color Green
-                                return @{
-                                    DeploymentId = $dep.id
-                                    CurrentName = $dep.name
-                                    AlreadyNamed = ($dep.name -eq $ServerName)
-                                }
-                            }
-                        }
-                    }
+        # Check if there are more pages
+        $hasMore = $false
+        if ($response.totalPages) {
+            $hasMore = $page -lt $response.totalPages
+        }
+        elseif ($response.totalElements) {
+            $hasMore = $allDeployments.Count -lt $response.totalElements
+        }
+        else {
+            $hasMore = $deployments.Count -eq $size
+        }
+        
+    } while ($hasMore)
+    
+    Write-Log "Total deployments retrieved: $($allDeployments.Count)" -Color Cyan
+    return $allDeployments
+}
+
+# Function to find deployment containing the resource/server
+function Find-Deployment {
+    param($ServerName, $AllDeployments)
+    
+    Write-Log "  Searching for server: $ServerName" -Color Gray
+    
+    foreach ($dep in $AllDeployments) {
+        $vSphereMachines = @()
+        
+        # Check if resources exist in the deployment object
+        if ($dep.resources -and $dep.resources.Count -gt 0) {
+            $vSphereMachines = @($dep.resources | Where-Object { 
+                $_.type -eq "Cloud.vSphere.Machine" 
+            })
+        }
+        
+        # If not found, try fetching resources separately
+        if ($vSphereMachines.Count -eq 0) {
+            try {
+                $resourceUri = "https://$vraServer/deployment/api/deployments/$($dep.id)/resources"
+                $separateResources = Invoke-RestMethod -Uri $resourceUri -Method Get -Headers $headers -ErrorAction Stop
+                $resList = if ($separateResources.content) { $separateResources.content } else { $separateResources }
+                
+                $vSphereMachines = @($resList | Where-Object { 
+                    $_.type -eq "Cloud.vSphere.Machine" 
+                })
+            } catch {
+                # Continue if we can't fetch resources
+                continue
+            }
+        }
+        
+        # Check each vSphere machine for a name match
+        foreach ($machine in $vSphereMachines) {
+            # Check the resource name property
+            if ($machine.name -eq $ServerName) {
+                Write-Log "  ✓ Found in deployment: $($dep.name)" -Color Green
+                Write-Log "    Matched on resource name: $($machine.name)" -Color Gray
+                return @{
+                    DeploymentId = $dep.id
+                    CurrentName = $dep.name
+                    AlreadyNamed = ($dep.name -eq $ServerName)
                 }
             }
             
-            # Not found - show sample for debugging
-            Write-Log "  ✗ Not found. Sample vSphere Machines:" -Color Yellow
-            $count = 0
-            foreach ($dep in $deployments) {
-                if ($dep.resources) {
-                    $machines = $dep.resources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" }
-                    foreach ($machine in $machines) {
-                        if ($machine.properties) {
-                            Write-Log "    Deployment: $($dep.name)" -Color Gray
-                            Write-Log "      hostname: $($machine.properties.hostname)" -Color Gray
-                            Write-Log "      resourceName: $($machine.properties.resourceName)" -Color Gray
-                            $count++
-                            if ($count -ge 3) { break }
-                        }
+            # Also check properties for additional matching options
+            if ($machine.properties) {
+                $hostname = $machine.properties.hostname
+                $resourceName = $machine.properties.resourceName
+                
+                if ($hostname -eq $ServerName -or $resourceName -eq $ServerName) {
+                    Write-Log "  ✓ Found in deployment: $($dep.name)" -Color Green
+                    Write-Log "    Matched on property: hostname=$hostname, resourceName=$resourceName" -Color Gray
+                    return @{
+                        DeploymentId = $dep.id
+                        CurrentName = $dep.name
+                        AlreadyNamed = ($dep.name -eq $ServerName)
                     }
                 }
-                if ($count -ge 3) { break }
             }
         }
     }
-    catch {
-        Write-Log "    Error: $($_.Exception.Message)" -Color Red
-    }
     
+    Write-Log "  ✗ Server not found in any deployment" -Color Yellow
     return $null
 }
 
@@ -140,6 +179,10 @@ function Rename-Deployment {
     }
 }
 
+# Get all deployments once at the start
+$allDeployments = Get-AllDeployments
+Write-Log ""
+
 # Process servers
 Write-Log "=== PROCESSING SERVERS ===" -Color Cyan
 $results = @()
@@ -151,42 +194,47 @@ foreach ($server in $servers) {
     
     Write-Log "`n[$counter/$($servers.Count)] $serverName" -Color Yellow
     
-    $deployment = Find-Deployment -ServerName $serverName
+    $deployment = Find-Deployment -ServerName $serverName -AllDeployments $allDeployments
     
     if (-not $deployment) {
         Write-Log "  ✗ Not found" -Color Red
         $results += [PSCustomObject]@{
             ServerName = $serverName
             Status = "Not Found"
+            OldName = "N/A"
         }
         continue
     }
     
-    Write-Log "  Current: $($deployment.CurrentName)" -Color Gray
+    Write-Log "  Current deployment name: $($deployment.CurrentName)" -Color Gray
     
     if ($deployment.AlreadyNamed) {
-        Write-Log "  ℹ Already correct" -Color Cyan
+        Write-Log "  ℹ Already correctly named" -Color Cyan
         $results += [PSCustomObject]@{
             ServerName = $serverName
             Status = "Already Named"
+            OldName = $deployment.CurrentName
         }
         continue
     }
     
+    Write-Log "  Attempting rename: '$($deployment.CurrentName)' → '$serverName'" -Color White
     $success = Rename-Deployment -DeploymentId $deployment.DeploymentId -NewName $serverName
     
     if ($success) {
-        Write-Log "  ✓ Renamed" -Color Green
+        Write-Log "  ✓ Successfully renamed!" -Color Green
         $results += [PSCustomObject]@{
             ServerName = $serverName
             Status = "Renamed"
+            OldName = $deployment.CurrentName
         }
     }
     else {
-        Write-Log "  ✗ Failed" -Color Red
+        Write-Log "  ✗ Rename failed" -Color Red
         $results += [PSCustomObject]@{
             ServerName = $serverName
             Status = "Failed"
+            OldName = $deployment.CurrentName
         }
     }
     
@@ -204,7 +252,9 @@ Write-Log "Renamed: $renamed" -Color Green
 Write-Log "Already Named: $alreadyNamed" -Color Cyan
 Write-Log "Not Found: $notFound" -Color Red
 Write-Log "Failed: $failed" -Color Red
+Write-Log "Total Processed: $($servers.Count)" -Color White
 
 $resultsPath = Join-Path (Split-Path $logPath -Parent) "Results_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
 $results | Export-Csv -Path $resultsPath -NoTypeInformation
-Write-Log "`nResults: $resultsPath" -Color White
+Write-Log "`nResults exported to: $resultsPath" -Color White
+Write-Log "Log file: $logPath" -Color White
