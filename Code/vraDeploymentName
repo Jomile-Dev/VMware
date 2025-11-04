@@ -1,8 +1,12 @@
 # Import Active Directory module
 Import-Module ActiveDirectory
 
-# Get only Windows Server computer objects with Name and Description
-Get-ADComputer -Filter {OperatingSystem -like "*Windows Server*"} -Properties Description, OperatingSystem | 
+# Define the OU path (replace with your actual OU)
+$OUPath = "OU=Servers,DC=yourdomain,DC=com"
+
+# Get only Windows Server computer objects, excluding clusters
+Get-ADComputer -Filter {OperatingSystem -like "*Windows Server*"} -SearchBase $OUPath -Properties Description, OperatingSystem | 
+    Where-Object {$_.Name -notlike "*CLUSTER*" -and $_.Name -notlike "*CLU*"} |
     Select-Object Name, Description, OperatingSystem | 
     Export-Csv -Path "C:\Temp\AD_Servers.csv" -NoTypeInformation
 
