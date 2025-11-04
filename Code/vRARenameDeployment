@@ -1,5 +1,5 @@
 # VMware Aria Automation - Bulk Deployment Renamer
-# Renames deployments to match their resource/server names
+# Finds deployments by server name and renames them based on the Description column
 
 $vraServer = "vra.yourdomain.com"
 $csvPath = "C:\Path\To\Servers.csv"
@@ -191,8 +191,9 @@ $counter = 0
 foreach ($server in $servers) {
     $counter++
     $serverName = $server.Name.Trim()
+    $newDeploymentName = $server.Description.Trim()
     
-    Write-Log "`n[$counter/$($servers.Count)] $serverName" -Color Yellow
+    Write-Log "`n[$counter/$($servers.Count)] Server: $serverName → New Name: $newDeploymentName" -Color Yellow
     
     $deployment = Find-Deployment -ServerName $serverName -AllDeployments $allDeployments
     
@@ -200,6 +201,7 @@ foreach ($server in $servers) {
         Write-Log "  ✗ Not found" -Color Red
         $results += [PSCustomObject]@{
             ServerName = $serverName
+            NewName = $newDeploymentName
             Status = "Not Found"
             OldName = "N/A"
         }
@@ -208,23 +210,25 @@ foreach ($server in $servers) {
     
     Write-Log "  Current deployment name: $($deployment.CurrentName)" -Color Gray
     
-    if ($deployment.AlreadyNamed) {
+    if ($deployment.CurrentName -eq $newDeploymentName) {
         Write-Log "  ℹ Already correctly named" -Color Cyan
         $results += [PSCustomObject]@{
             ServerName = $serverName
+            NewName = $newDeploymentName
             Status = "Already Named"
             OldName = $deployment.CurrentName
         }
         continue
     }
     
-    Write-Log "  Attempting rename: '$($deployment.CurrentName)' → '$serverName'" -Color White
-    $success = Rename-Deployment -DeploymentId $deployment.DeploymentId -NewName $serverName
+    Write-Log "  Attempting rename: '$($deployment.CurrentName)' → '$newDeploymentName'" -Color White
+    $success = Rename-Deployment -DeploymentId $deployment.DeploymentId -NewName $newDeploymentName
     
     if ($success) {
         Write-Log "  ✓ Successfully renamed!" -Color Green
         $results += [PSCustomObject]@{
             ServerName = $serverName
+            NewName = $newDeploymentName
             Status = "Renamed"
             OldName = $deployment.CurrentName
         }
@@ -233,6 +237,7 @@ foreach ($server in $servers) {
         Write-Log "  ✗ Rename failed" -Color Red
         $results += [PSCustomObject]@{
             ServerName = $serverName
+            NewName = $newDeploymentName
             Status = "Failed"
             OldName = $deployment.CurrentName
         }
