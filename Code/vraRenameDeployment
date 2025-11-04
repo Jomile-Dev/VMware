@@ -76,49 +76,72 @@ function Get-vRADeployment {
         [string]$DeploymentName
     )
     
-    # Try to get all deployments and search for the server name
-    $uri = "https://$Server/deployment/api/deployments"
+    # Service Broker uses catalog API endpoints
+    $endpoints = @(
+        "https://$Server/catalog/api/deployments",
+        "https://$Server/iaas/api/deployments",
+        "https://$Server/deployment/api/deployments"
+    )
+    
     $headers = @{
         "Authorization" = "Bearer $Token"
         "Content-Type" = "application/json"
     }
     
-    try {
-        Write-Host "Searching for deployment containing: $DeploymentName" -ForegroundColor Cyan
-        $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers
-        
-        # Search through all deployments for matching server name
-        $matchingDeployment = $response.content | Where-Object {
-            $_.name -eq $DeploymentName -or 
-            $_.name -like "*$DeploymentName*" -or
-            ($_.resources | Where-Object { $_.name -eq $DeploymentName -or $_.name -like "*$DeploymentName*" })
-        } | Select-Object -First 1
-        
-        if ($matchingDeployment) {
-            Write-Host "Found deployment: $($matchingDeployment.name) (ID: $($matchingDeployment.id))" -ForegroundColor Green
-            return $matchingDeployment
-        }
-        else {
-            # Try searching in resources within deployments
-            foreach ($deployment in $response.content) {
-                $matchingResource = $deployment.resources | Where-Object { 
-                    $_.name -eq $DeploymentName -or $_.name -like "*$DeploymentName*" 
-                }
-                if ($matchingResource) {
-                    Write-Host "Found server in deployment: $($deployment.name)" -ForegroundColor Green
-                    return $deployment
+    foreach ($uri in $endpoints) {
+        try {
+            Write-Host "Trying endpoint: $uri" -ForegroundColor Cyan
+            $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers -ErrorAction Stop
+            
+            Write-Host "Successfully connected to: $uri" -ForegroundColor Green
+            
+            # Check if response has content or items
+            $deployments = if ($response.content) { $response.content } elseif ($response.items) { $response.items } else { $response }
+            
+            Write-Host "Found $($deployments.Count) deployments total" -ForegroundColor Cyan
+            
+            # Search through all deployments for matching server name
+            $matchingDeployment = $deployments | Where-Object {
+                $_.name -eq $DeploymentName -or 
+                $_.name -like "*$DeploymentName*"
+            } | Select-Object -First 1
+            
+            if ($matchingDeployment) {
+                Write-Host "Found deployment: $($matchingDeployment.name) (ID: $($matchingDeployment.id))" -ForegroundColor Green
+                return @{
+                    deployment = $matchingDeployment
+                    endpoint = $uri
                 }
             }
-            
-            Write-Host "No deployment found for server: $DeploymentName" -ForegroundColor Yellow
-            return $null
+            else {
+                # Search in resources within deployments
+                Write-Host "Searching within deployment resources..." -ForegroundColor Cyan
+                foreach ($deployment in $deployments) {
+                    if ($deployment.resources) {
+                        $matchingResource = $deployment.resources | Where-Object { 
+                            $_.name -eq $DeploymentName -or $_.name -like "*$DeploymentName*" 
+                        }
+                        if ($matchingResource) {
+                            Write-Host "Found server '$DeploymentName' in deployment: $($deployment.name)" -ForegroundColor Green
+                            return @{
+                                deployment = $deployment
+                                endpoint = $uri
+                            }
+                        }
+                    }
+                }
+                
+                Write-Host "Server '$DeploymentName' not found in this endpoint" -ForegroundColor Yellow
+            }
+        }
+        catch {
+            Write-Host "Endpoint failed: $uri - $($_.Exception.Message)" -ForegroundColor Yellow
+            continue
         }
     }
-    catch {
-        Write-Host "Failed to search deployments: $_" -ForegroundColor Red
-        Write-Host "Error Details: $($_.Exception.Message)" -ForegroundColor Red
-        return $null
-    }
+    
+    Write-Host "All endpoints failed. Unable to find deployment for: $DeploymentName" -ForegroundColor Red
+    return $null
 }
 
 # Function to update deployment name
@@ -128,10 +151,14 @@ function Update-vRADeploymentName {
         [string]$Token,
         [string]$DeploymentId,
         [string]$NewName,
-        [string]$Description
+        [string]$Description,
+        [string]$Endpoint
     )
     
-    $uri = "https://$Server/deployment/api/deployments/$DeploymentId"
+    # Determine the correct update endpoint based on where we found the deployment
+    $baseEndpoint = $Endpoint -replace "/deployments.*", "/deployments"
+    $uri = "$baseEndpoint/$DeploymentId"
+    
     $headers = @{
         "Authorization" = "Bearer $Token"
         "Content-Type" = "application/json"
@@ -143,12 +170,14 @@ function Update-vRADeploymentName {
     } | ConvertTo-Json
     
     try {
+        Write-Host "Updating deployment at: $uri" -ForegroundColor Cyan
         $response = Invoke-RestMethod -Uri $uri -Method Patch -Headers $headers -Body $body
         Write-Host "Successfully updated deployment to '$NewName'" -ForegroundColor Green
         return $true
     }
     catch {
         Write-Host "Failed to update deployment: $_" -ForegroundColor Red
+        Write-Host "Error Details: $($_.Exception.Message)" -ForegroundColor Red
         return $false
     }
 }
@@ -178,12 +207,12 @@ foreach ($server in $servers) {
     Write-Host "`n--- Processing: $($server.Name) ---" -ForegroundColor Yellow
     
     # Get the deployment
-    $deployment = Get-vRADeployment -Server $vraServer -Token $token -DeploymentName $server.Name
+    $result = Get-vRADeployment -Server $vraServer -Token $token -DeploymentName $server.Name
     
-    if ($null -ne $deployment) {
+    if ($null -ne $result -and $null -ne $result.deployment) {
         # Update deployment with description
         $newDescription = if ($server.Description) { $server.Description } else { "Updated from CSV" }
-        Update-vRADeploymentName -Server $vraServer -Token $token -DeploymentId $deployment.id -NewName $server.Name -Description $newDescription
+        Update-vRADeploymentName -Server $vraServer -Token $token -DeploymentId $result.deployment.id -NewName $server.Name -Description $newDescription -Endpoint $result.endpoint
     }
     else {
         Write-Host "Deployment not found for: $($server.Name)" -ForegroundColor Red
