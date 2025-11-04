@@ -1,15 +1,8 @@
-# VMware Aria Automation - Bulk Deployment Renamer
-# Renames deployments to match their resource/server names
+# VMware Aria Deep Inspection Tool
+# This script examines the exact structure of deployments to understand how to search
 
 $vraServer = "vra.yourdomain.com"
-$csvPath = "C:\Path\To\Servers.csv"
-$logPath = "C:\Logs\DeploymentRename_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
-
-function Write-Log {
-    param($Message, $Color = "White")
-    Write-Host $Message -ForegroundColor $Color
-    Add-Content -Path $logPath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - $Message"
-}
+$testServerName = "WSPO000110"  # Replace with a server you KNOW exists in the UI
 
 # Disable SSL validation
 if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
@@ -28,12 +21,8 @@ if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) 
 }
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-# Import CSV
-$servers = @(Import-Csv -Path $csvPath)
-Write-Host "Loaded $($servers.Count) servers from CSV`n" -ForegroundColor Green
-
 # Authenticate
-Write-Log "=== AUTHENTICATION ===" -Color Cyan
+Write-Host "=== AUTHENTICATION ===" -ForegroundColor Cyan
 $credential = Get-Credential -Message "Enter VMware Aria Automation credentials"
 $username = $credential.UserName
 $password = $credential.GetNetworkCredential().Password
@@ -51,134 +40,164 @@ $authHeaders = @{
 
 $response = Invoke-RestMethod -Uri $uri -Method Post -Headers $authHeaders -Body $body
 $token = $response.cspAuthToken
-Write-Log "Authentication successful!`n" -Color Green
+Write-Host "✓ Authenticated`n" -ForegroundColor Green
 
 $headers = @{
     "Authorization" = "Bearer $token"
     "Content-Type" = "application/json"
 }
 
-# Function to find deployment containing the resource/server
-function Find-Deployment {
-    param($ServerName)
+# Get deployments
+Write-Host "=== FETCHING DEPLOYMENTS ===" -ForegroundColor Cyan
+$uri = "https://$vraServer/deployment/api/deployments"
+Write-Host "Calling: $uri`n" -ForegroundColor Gray
+
+try {
+    $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers
+    $deployments = if ($response.content) { $response.content } else { $response }
     
-    # Get all deployments (like the UI does), then search through them
-    $searchUri = "https://$vraServer/deployment/api/deployments"
+    Write-Host "Retrieved $($deployments.Count) deployments`n" -ForegroundColor Green
     
-    try {
-        Write-Log "  Fetching all deployments..." -Color Gray
-        $response = Invoke-RestMethod -Uri $searchUri -Method Get -Headers $headers -ErrorAction Stop
-        $deployments = if ($response.content) { $response.content } else { $response }
+    # Show first 5 deployments with full detail
+    Write-Host "=== FIRST 5 DEPLOYMENTS (DETAILED) ===" -ForegroundColor Cyan
+    for ($i = 0; $i -lt [Math]::Min(5, $deployments.Count); $i++) {
+        $dep = $deployments[$i]
+        Write-Host "`n[$($i+1)] Deployment:" -ForegroundColor Yellow
+        Write-Host "  Name: $($dep.name)" -ForegroundColor White
+        Write-Host "  ID: $($dep.id)" -ForegroundColor Gray
         
-        Write-Log "  Searching through $($deployments.Count) deployments" -Color Gray
+        Write-Host "  All Properties:" -ForegroundColor Cyan
+        $dep.PSObject.Properties.Name | ForEach-Object {
+            $value = $dep.$_
+            if ($value -ne $null) {
+                if ($value -is [array]) {
+                    Write-Host "    - $_  [Array with $($value.Count) items]" -ForegroundColor Gray
+                }
+                elseif ($value -is [PSCustomObject]) {
+                    Write-Host "    - $_  [Object]" -ForegroundColor Gray
+                }
+                else {
+                    Write-Host "    - $_  = $value" -ForegroundColor Gray
+                }
+            }
+        }
         
-        if ($deployments.Count -gt 0) {
-            # Search through all deployments for one containing a resource with the server name
-            foreach ($dep in $deployments) {
-                if ($dep.resources) {
-                    $matchingResource = $dep.resources | Where-Object { $_.name -eq $ServerName }
-                    if ($matchingResource) {
-                        Write-Log "  ✓ Found in deployment: $($dep.name)" -Color Green
-                        return @{
-                            DeploymentId = $dep.id
-                            CurrentName = $dep.name
-                            AlreadyNamed = ($dep.name -eq $ServerName)
-                        }
+        # Deep dive into resources if they exist
+        if ($dep.resources) {
+            Write-Host "`n  Resources ($($dep.resources.Count)):" -ForegroundColor Cyan
+            foreach ($res in $dep.resources) {
+                Write-Host "    Resource:" -ForegroundColor Yellow
+                $res.PSObject.Properties.Name | ForEach-Object {
+                    $value = $res.$_
+                    if ($value -ne $null -and $value -ne "") {
+                        Write-Host "      - $_  = $value" -ForegroundColor Gray
                     }
                 }
             }
-            Write-Log "  ✗ No deployment contains resource named '$ServerName'" -Color Yellow
+        }
+        else {
+            Write-Host "  NO RESOURCES PROPERTY" -ForegroundColor Red
         }
     }
-    catch {
-        Write-Log "    Error: $($_.Exception.Message)" -Color Red
-    }
     
-    return $null
-}
-
-# Function to rename deployment
-function Rename-Deployment {
-    param($DeploymentId, $NewName)
+    # Try to find your specific server
+    Write-Host "`n`n=== SEARCHING FOR YOUR SERVER: $testServerName ===" -ForegroundColor Cyan
     
-    $uri = "https://$vraServer/deployment/api/deployments/$DeploymentId"
-    $body = @{ name = $NewName } | ConvertTo-Json
-    
-    try {
-        Invoke-RestMethod -Uri $uri -Method Patch -Headers $headers -Body $body -ErrorAction Stop | Out-Null
-        return $true
-    }
-    catch {
-        Write-Log "      Error: $($_.Exception.Message)" -Color Red
-        return $false
-    }
-}
-
-# Process servers
-Write-Log "=== PROCESSING SERVERS ===" -Color Cyan
-$results = @()
-$counter = 0
-
-foreach ($server in $servers) {
-    $counter++
-    $serverName = $server.Name.Trim()
-    
-    Write-Log "`n[$counter/$($servers.Count)] $serverName" -Color Yellow
-    
-    $deployment = Find-Deployment -ServerName $serverName
-    
-    if (-not $deployment) {
-        Write-Log "  ✗ Not found" -Color Red
-        $results += [PSCustomObject]@{
-            ServerName = $serverName
-            Status = "Not Found"
+    $found = $false
+    foreach ($dep in $deployments) {
+        # Check deployment name
+        if ($dep.name -eq $testServerName) {
+            Write-Host "`n✓ FOUND AS DEPLOYMENT NAME!" -ForegroundColor Green
+            Write-Host "  Deployment ID: $($dep.id)" -ForegroundColor White
+            $found = $true
+            break
         }
-        continue
-    }
-    
-    Write-Log "  Current: $($deployment.CurrentName)" -Color Gray
-    
-    if ($deployment.AlreadyNamed) {
-        Write-Log "  ℹ Already correct" -Color Cyan
-        $results += [PSCustomObject]@{
-            ServerName = $serverName
-            Status = "Already Named"
+        
+        # Check if name contains server name
+        if ($dep.name -like "*$testServerName*") {
+            Write-Host "`n✓ FOUND IN DEPLOYMENT NAME (partial match)!" -ForegroundColor Green
+            Write-Host "  Deployment Name: $($dep.name)" -ForegroundColor White
+            Write-Host "  Deployment ID: $($dep.id)" -ForegroundColor White
+            $found = $true
+            break
         }
-        continue
+        
+        # Check resources
+        if ($dep.resources) {
+            foreach ($res in $dep.resources) {
+                if ($res.name -eq $testServerName) {
+                    Write-Host "`n✓ FOUND AS RESOURCE NAME!" -ForegroundColor Green
+                    Write-Host "  In Deployment: $($dep.name)" -ForegroundColor White
+                    Write-Host "  Deployment ID: $($dep.id)" -ForegroundColor White
+                    Write-Host "  Resource Type: $($res.type)" -ForegroundColor White
+                    $found = $true
+                    break
+                }
+                
+                # Check all resource properties for the server name
+                $res.PSObject.Properties | ForEach-Object {
+                    if ($_.Value -eq $testServerName) {
+                        Write-Host "`n✓ FOUND IN RESOURCE PROPERTY!" -ForegroundColor Green
+                        Write-Host "  In Deployment: $($dep.name)" -ForegroundColor White
+                        Write-Host "  Property: $($_.Name)" -ForegroundColor White
+                        Write-Host "  Resource Type: $($res.type)" -ForegroundColor White
+                        $found = $true
+                    }
+                }
+            }
+        }
+        
+        if ($found) { break }
     }
     
-    $success = Rename-Deployment -DeploymentId $deployment.DeploymentId -NewName $serverName
+    if (-not $found) {
+        Write-Host "`n✗ NOT FOUND in any deployment or resource" -ForegroundColor Red
+        Write-Host "`nPossible reasons:" -ForegroundColor Yellow
+        Write-Host "  1. Server name is incorrect or has different casing" -ForegroundColor Gray
+        Write-Host "  2. Server exists in a different API endpoint" -ForegroundColor Gray
+        Write-Host "  3. Pagination - server is beyond the first page" -ForegroundColor Gray
+        
+        # Show sample names for comparison
+        Write-Host "`nSample deployment names (first 10):" -ForegroundColor Yellow
+        $deployments | Select-Object -First 10 | ForEach-Object {
+            Write-Host "  - $($_.name)" -ForegroundColor Gray
+        }
+        
+        Write-Host "`nSample resource names (first 10):" -ForegroundColor Yellow
+        $count = 0
+        foreach ($dep in $deployments) {
+            if ($dep.resources) {
+                foreach ($res in $dep.resources) {
+                    Write-Host "  - $($res.name) (in deployment: $($dep.name))" -ForegroundColor Gray
+                    $count++
+                    if ($count -ge 10) { break }
+                }
+            }
+            if ($count -ge 10) { break }
+        }
+    }
     
-    if ($success) {
-        Write-Log "  ✓ Renamed" -Color Green
-        $results += [PSCustomObject]@{
-            ServerName = $serverName
-            Status = "Renamed"
+    # Check pagination
+    Write-Host "`n`n=== PAGINATION INFO ===" -ForegroundColor Cyan
+    if ($response.PSObject.Properties.Name -contains "totalElements") {
+        Write-Host "Total Elements: $($response.totalElements)" -ForegroundColor White
+        Write-Host "Elements Retrieved: $($deployments.Count)" -ForegroundColor White
+        
+        if ($response.totalElements -gt $deployments.Count) {
+            Write-Host "⚠ WARNING: More deployments exist! You need pagination." -ForegroundColor Yellow
+            Write-Host "  Try: ?page=0&size=100" -ForegroundColor Gray
         }
     }
     else {
-        Write-Log "  ✗ Failed" -Color Red
-        $results += [PSCustomObject]@{
-            ServerName = $serverName
-            Status = "Failed"
+        Write-Host "Response properties:" -ForegroundColor Gray
+        $response.PSObject.Properties.Name | ForEach-Object {
+            Write-Host "  - $_" -ForegroundColor Gray
         }
     }
     
-    Start-Sleep -Milliseconds 200
+}
+catch {
+    Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
 }
 
-# Summary
-Write-Log "`n=== SUMMARY ===" -Color Cyan
-$renamed = ($results | Where-Object { $_.Status -eq "Renamed" }).Count
-$alreadyNamed = ($results | Where-Object { $_.Status -eq "Already Named" }).Count
-$notFound = ($results | Where-Object { $_.Status -eq "Not Found" }).Count
-$failed = ($results | Where-Object { $_.Status -eq "Failed" }).Count
-
-Write-Log "Renamed: $renamed" -Color Green
-Write-Log "Already Named: $alreadyNamed" -Color Cyan
-Write-Log "Not Found: $notFound" -Color Red
-Write-Log "Failed: $failed" -Color Red
-
-$resultsPath = Join-Path (Split-Path $logPath -Parent) "Results_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
-$results | Export-Csv -Path $resultsPath -NoTypeInformation
-Write-Log "`nResults: $resultsPath" -Color White
+Write-Host "`n=== COMPLETE ===" -ForegroundColor Cyan
