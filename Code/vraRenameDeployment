@@ -76,7 +76,7 @@ function Get-vRADeployment {
         [string]$MachineName
     )
     
-    # Try IaaS endpoint (most common for vRA 8.x)
+    # Use IaaS endpoint
     $baseUri = "https://$Server/iaas/api/deployments"
     
     $headers = @{
@@ -87,68 +87,27 @@ function Get-vRADeployment {
     try {
         Write-Host "Searching for machine: $MachineName" -ForegroundColor Cyan
         
-        # Search using API filter for Cloud.vSphere.Machine resources
-        # This is much faster than fetching all deployments
-        $searchUri = "$baseUri`?`$filter=resources.name eq '$MachineName'"
+        # Use API filter to search directly for the machine name
+        # This searches through resources without fetching all deployments
+        $searchUri = "$baseUri`?`$filter=(resources/any(r:r/name eq '$MachineName'))"
         
-        Write-Host "Trying filtered search..." -ForegroundColor Cyan
-        try {
-            $response = Invoke-RestMethod -Uri $searchUri -Method Get -Headers $headers -ErrorAction Stop
-            $deployments = if ($response.content) { $response.content } else { $response }
-            
-            if ($deployments -and $deployments.Count -gt 0) {
-                $deployment = $deployments[0]
-                $machine = $deployment.resources | Where-Object { $_.name -eq $MachineName -and $_.type -eq "Cloud.vSphere.Machine" }
-                
-                if ($machine) {
-                    Write-Host "Found machine in deployment: $($deployment.name)" -ForegroundColor Green
-                    return @{
-                        deployment = $deployment
-                        endpoint = $baseUri
-                        resource = $machine
-                    }
-                }
-            }
-        }
-        catch {
-            Write-Host "Filtered search failed, falling back to full search..." -ForegroundColor Yellow
-        }
+        Write-Host "Using API filter search..." -ForegroundColor Gray
+        $response = Invoke-RestMethod -Uri $searchUri -Method Get -Headers $headers -ErrorAction Stop
+        $deployments = if ($response.content) { $response.content } else { $response }
         
-        # Fallback: paginate through all deployments
-        Write-Host "Performing full search through all deployments..." -ForegroundColor Cyan
-        $page = 0
-        $pageSize = 200
-        $hasMore = $true
-        $checkedCount = 0
-        
-        while ($hasMore) {
-            $uri = "$baseUri`?`$skip=$($page * $pageSize)&`$top=$pageSize"
+        if ($deployments -and $deployments.Count -gt 0) {
+            Write-Host "Found $($deployments.Count) matching deployment(s)" -ForegroundColor Green
             
-            $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers -ErrorAction Stop
-            $deployments = if ($response.content) { $response.content } elseif ($response.items) { $response.items } else { $response }
-            
-            if ($deployments.Count -eq 0) {
-                $hasMore = $false
-                break
-            }
-            
-            $checkedCount += $deployments.Count
-            
-            # Only show progress every 10 pages (2000 deployments)
-            if ($page % 10 -eq 0) {
-                Write-Host "Checked $checkedCount deployments..." -ForegroundColor Gray
-            }
-            
+            # Find the specific Cloud.vSphere.Machine resource
             foreach ($deployment in $deployments) {
                 if ($deployment.resources) {
-                    # Look specifically for Cloud.vSphere.Machine resources
                     $machine = $deployment.resources | Where-Object { 
-                        $_.type -eq "Cloud.vSphere.Machine" -and $_.name -eq $MachineName
+                        $_.name -eq $MachineName -and $_.type -eq "Cloud.vSphere.Machine"
                     }
                     
                     if ($machine) {
-                        Write-Host "Found machine '$MachineName' in deployment: $($deployment.name)" -ForegroundColor Green
-                        Write-Host "  Total deployments checked: $checkedCount" -ForegroundColor Cyan
+                        Write-Host "  Deployment: $($deployment.name)" -ForegroundColor Cyan
+                        Write-Host "  Machine Type: $($machine.type)" -ForegroundColor Gray
                         return @{
                             deployment = $deployment
                             endpoint = $baseUri
@@ -157,18 +116,35 @@ function Get-vRADeployment {
                     }
                 }
             }
-            
-            if ($deployments.Count -lt $pageSize) {
-                $hasMore = $false
-            }
-            $page++
         }
         
-        Write-Host "Machine '$MachineName' not found after checking $checkedCount deployments" -ForegroundColor Red
+        Write-Host "Machine '$MachineName' not found" -ForegroundColor Yellow
         return $null
     }
     catch {
         Write-Host "Search failed: $($_.Exception.Message)" -ForegroundColor Red
+        
+        # If OData filter fails, try simpler search
+        Write-Host "Trying alternative search method..." -ForegroundColor Yellow
+        try {
+            # Try searching with expand parameter
+            $searchUri = "$baseUri`?`$filter=name eq '$MachineName'"
+            $response = Invoke-RestMethod -Uri $searchUri -Method Get -Headers $headers
+            $deployments = if ($response.content) { $response.content } else { $response }
+            
+            if ($deployments -and $deployments.Count -gt 0) {
+                Write-Host "Found deployment: $($deployments[0].name)" -ForegroundColor Green
+                return @{
+                    deployment = $deployments[0]
+                    endpoint = $baseUri
+                    resource = $null
+                }
+            }
+        }
+        catch {
+            Write-Host "Alternative search also failed" -ForegroundColor Red
+        }
+        
         return $null
     }
 }
