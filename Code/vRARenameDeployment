@@ -62,45 +62,33 @@ $headers = @{
 function Find-Deployment {
     param($ServerName)
     
-    # Get all deployments and search for Machine resources with the server name
+    # Get all deployments and search for Cloud.vSphere.Machine resources
     $searchUri = "https://$vraServer/deployment/api/deployments"
     
     try {
         $response = Invoke-RestMethod -Uri $searchUri -Method Get -Headers $headers -ErrorAction Stop
         $deployments = if ($response.content) { $response.content } else { $response }
         
-        Write-Log "  Searching through $($deployments.Count) deployments for Machine resource" -Color Gray
+        Write-Log "  Searching $($deployments.Count) deployments for vSphere Machine" -Color Gray
         
         if ($deployments.Count -gt 0) {
-            # Search for Machine resources containing the server name
             foreach ($dep in $deployments) {
                 if ($dep.resources) {
-                    # Filter by Machine resource type
-                    $machineResources = $dep.resources | Where-Object { $_.type -eq "Machine" }
+                    # Filter by Cloud.vSphere.Machine resource type
+                    $vsphereMachines = $dep.resources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" }
                     
-                    foreach ($machine in $machineResources) {
-                        # Check name property
-                        if ($machine.name -eq $ServerName) {
-                            Write-Log "  ✓ Found Machine resource in deployment: $($dep.name)" -Color Green
-                            return @{
-                                DeploymentId = $dep.id
-                                CurrentName = $dep.name
-                                AlreadyNamed = ($dep.name -eq $ServerName)
-                            }
-                        }
-                        
-                        # Check properties object for the name
+                    foreach ($machine in $vsphereMachines) {
+                        # Check hostname or resourceName properties
                         if ($machine.properties) {
-                            # Check various property names where server name might be
-                            $propNames = @("name", "resourceName", "vmName", "hostName", "computerName")
-                            foreach ($propName in $propNames) {
-                                if ($machine.properties.$propName -eq $ServerName) {
-                                    Write-Log "  ✓ Found in Machine resource properties ($propName) in: $($dep.name)" -Color Green
-                                    return @{
-                                        DeploymentId = $dep.id
-                                        CurrentName = $dep.name
-                                        AlreadyNamed = ($dep.name -eq $ServerName)
-                                    }
+                            $hostname = $machine.properties.hostname
+                            $resourceName = $machine.properties.resourceName
+                            
+                            if ($hostname -eq $ServerName -or $resourceName -eq $ServerName) {
+                                Write-Log "  ✓ Found in deployment: $($dep.name)" -Color Green
+                                return @{
+                                    DeploymentId = $dep.id
+                                    CurrentName = $dep.name
+                                    AlreadyNamed = ($dep.name -eq $ServerName)
                                 }
                             }
                         }
@@ -108,20 +96,20 @@ function Find-Deployment {
                 }
             }
             
-            # Not found - show sample Machine resources for debugging
-            Write-Log "  ✗ Machine resource not found. Sample Machine resources:" -Color Yellow
+            # Not found - show sample for debugging
+            Write-Log "  ✗ Not found. Sample vSphere Machines:" -Color Yellow
             $count = 0
             foreach ($dep in $deployments) {
                 if ($dep.resources) {
-                    $machines = $dep.resources | Where-Object { $_.type -eq "Machine" }
+                    $machines = $dep.resources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" }
                     foreach ($machine in $machines) {
-                        Write-Log "    Deployment: $($dep.name)" -Color Gray
-                        Write-Log "      Machine name: $($machine.name)" -Color Gray
                         if ($machine.properties) {
-                            Write-Log "      Properties: name=$($machine.properties.name), resourceName=$($machine.properties.resourceName)" -Color Gray
+                            Write-Log "    Deployment: $($dep.name)" -Color Gray
+                            Write-Log "      hostname: $($machine.properties.hostname)" -Color Gray
+                            Write-Log "      resourceName: $($machine.properties.resourceName)" -Color Gray
+                            $count++
+                            if ($count -ge 3) { break }
                         }
-                        $count++
-                        if ($count -ge 3) { break }
                     }
                 }
                 if ($count -ge 3) { break }
