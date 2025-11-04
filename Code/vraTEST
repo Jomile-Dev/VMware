@@ -44,14 +44,15 @@ $headers = @{
     "Content-Type" = "application/json"
 }
 
-# Get all deployments with pagination
+# Get all deployments with pagination - NOW WITH EXPAND PARAMETER
 $uri = "https://$vraServer/deployment/api/deployments"
 $allDeployments = @()
 $page = 0
 $size = 100
 
 do {
-    $pagedUri = "$uri`?page=$page&size=$size"
+    # MODIFIED: Added expand=resources to include resource details
+    $pagedUri = "$uri`?page=$page&size=$size&expand=resources"
     Write-Host "Fetching page $($page + 1)..." -ForegroundColor Gray
     
     $response = Invoke-RestMethod -Uri $pagedUri -Method Get -Headers $headers
@@ -76,6 +77,38 @@ do {
 
 Write-Host "`nTotal deployments retrieved: $($allDeployments.Count)`n" -ForegroundColor Cyan
 
+# DIAGNOSTIC: Show structure of first deployment
+Write-Host "=== DIAGNOSTIC: FIRST DEPLOYMENT STRUCTURE ===" -ForegroundColor Magenta
+if ($allDeployments.Count -gt 0) {
+    Write-Host "Properties in first deployment:" -ForegroundColor Yellow
+    $allDeployments[0].PSObject.Properties.Name | ForEach-Object {
+        Write-Host "  - $_" -ForegroundColor Gray
+    }
+    
+    if ($allDeployments[0].resources) {
+        Write-Host "`nFirst deployment has $($allDeployments[0].resources.Count) resources" -ForegroundColor Green
+    } else {
+        Write-Host "`nWARNING: First deployment has NO resources property!" -ForegroundColor Red
+        Write-Host "Attempting to fetch resources separately for first deployment..." -ForegroundColor Yellow
+        
+        try {
+            $depId = $allDeployments[0].id
+            $resourceUri = "https://$vraServer/deployment/api/deployments/$depId/resources"
+            $separateResources = Invoke-RestMethod -Uri $resourceUri -Method Get -Headers $headers
+            Write-Host "Successfully retrieved resources separately!" -ForegroundColor Green
+            Write-Host "Sample resource structure:" -ForegroundColor Cyan
+            if ($separateResources.content) {
+                $separateResources.content[0] | ConvertTo-Json -Depth 2
+            } else {
+                $separateResources[0] | ConvertTo-Json -Depth 2
+            }
+        } catch {
+            Write-Host "Could not fetch resources separately: $_" -ForegroundColor Red
+        }
+    }
+}
+Write-Host "`n" 
+
 # Show sample of each unique resource type
 Write-Host "=== SAMPLE DEPLOYMENTS BY RESOURCE TYPE ===" -ForegroundColor Cyan
 
@@ -98,34 +131,75 @@ foreach ($dep in $allDeployments) {
 
 Write-Host "`nFound $($resourceTypes.Count) unique resource types:`n" -ForegroundColor Green
 
-foreach ($type in $resourceTypes.Keys | Sort-Object) {
-    $sample = $resourceTypes[$type]
+if ($resourceTypes.Count -eq 0) {
+    Write-Host "WARNING: No resources found in any deployment!" -ForegroundColor Red
+    Write-Host "This could mean:" -ForegroundColor Yellow
+    Write-Host "  1. Deployments don't have resources" -ForegroundColor Gray
+    Write-Host "  2. API version doesn't support expand parameter" -ForegroundColor Gray
+    Write-Host "  3. Different API endpoint needed" -ForegroundColor Gray
+    Write-Host "`nTrying alternative method to fetch resources..." -ForegroundColor Yellow
     
-    Write-Host "Resource Type: $type" -ForegroundColor Yellow
-    Write-Host "  Example Deployment: $($sample.Deployment.name)" -ForegroundColor White
-    Write-Host "  Resource Name: $($sample.Resource.name)" -ForegroundColor White
-    
-    if ($sample.Resource.properties) {
-        Write-Host "  Properties:" -ForegroundColor Cyan
-        $sample.Resource.properties.PSObject.Properties | Select-Object -First 10 | ForEach-Object {
-            $value = if ($_.Value -is [string] -and $_.Value.Length -gt 50) { 
-                $_.Value.Substring(0, 50) + "..." 
-            } else { 
-                $_.Value 
+    # Try fetching resources for first 5 deployments individually
+    $foundResources = $false
+    foreach ($dep in $allDeployments | Select-Object -First 5) {
+        try {
+            $resourceUri = "https://$vraServer/deployment/api/deployments/$($dep.id)/resources"
+            $resources = Invoke-RestMethod -Uri $resourceUri -Method Get -Headers $headers
+            $resList = if ($resources.content) { $resources.content } else { $resources }
+            
+            if ($resList.Count -gt 0) {
+                $foundResources = $true
+                Write-Host "`nFound resources in deployment: $($dep.name)" -ForegroundColor Green
+                foreach ($res in $resList) {
+                    Write-Host "  Resource Type: $($res.type)" -ForegroundColor Cyan
+                    Write-Host "  Resource Name: $($res.name)" -ForegroundColor White
+                    if ($res.properties) {
+                        Write-Host "  Sample Properties:" -ForegroundColor Yellow
+                        $res.properties.PSObject.Properties | Select-Object -First 5 | ForEach-Object {
+                            Write-Host "    - $($_.Name) = $($_.Value)" -ForegroundColor Gray
+                        }
+                    }
+                }
+                break
             }
-            Write-Host "    - $($_.Name) = $value" -ForegroundColor Gray
+        } catch {
+            Write-Host "  Could not fetch resources for $($dep.name): $_" -ForegroundColor Red
+        }
+    }
+    
+    if (-not $foundResources) {
+        Write-Host "`nNo resources found using alternative method either." -ForegroundColor Red
+    }
+} else {
+    foreach ($type in $resourceTypes.Keys | Sort-Object) {
+        $sample = $resourceTypes[$type]
+        
+        Write-Host "Resource Type: $type" -ForegroundColor Yellow
+        Write-Host "  Example Deployment: $($sample.Deployment.name)" -ForegroundColor White
+        Write-Host "  Resource Name: $($sample.Resource.name)" -ForegroundColor White
+        
+        if ($sample.Resource.properties) {
+            Write-Host "  Properties:" -ForegroundColor Cyan
+            $sample.Resource.properties.PSObject.Properties | Select-Object -First 10 | ForEach-Object {
+                $value = if ($_.Value -is [string] -and $_.Value.Length -gt 50) { 
+                    $_.Value.Substring(0, 50) + "..." 
+                } else { 
+                    $_.Value 
+                }
+                Write-Host "    - $($_.Name) = $value" -ForegroundColor Gray
+            }
+            
+            $propCount = ($sample.Resource.properties.PSObject.Properties | Measure-Object).Count
+            if ($propCount -gt 10) {
+                Write-Host "    ... and $($propCount - 10) more properties" -ForegroundColor Gray
+            }
+        }
+        else {
+            Write-Host "  No properties" -ForegroundColor Red
         }
         
-        $propCount = ($sample.Resource.properties.PSObject.Properties | Measure-Object).Count
-        if ($propCount -gt 10) {
-            Write-Host "    ... and $($propCount - 10) more properties" -ForegroundColor Gray
-        }
+        Write-Host ""
     }
-    else {
-        Write-Host "  No properties" -ForegroundColor Red
-    }
-    
-    Write-Host ""
 }
 
 Write-Host "`n=== DEPLOYMENTS WITH Cloud.vSphere.Machine ===" -ForegroundColor Cyan
