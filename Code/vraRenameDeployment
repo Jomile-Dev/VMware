@@ -1,8 +1,11 @@
 # VMware Aria Automation Configuration
 $vraServer = "vra.yourdomain.com"  # Replace with your Aria Automation FQDN
-$username = "admin@local"           # Replace with your username
-$password = "YourPassword"          # Replace with your password
 $csvFile = "C:\Temp\serverList.csv"
+
+# Prompt for credentials
+$credential = Get-Credential -Message "Enter VMware Aria Automation credentials"
+$username = $credential.UserName
+$password = $credential.GetNetworkCredential().Password
 
 # Disable SSL certificate validation (only for self-signed certs)
 if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
