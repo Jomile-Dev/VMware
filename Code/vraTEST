@@ -44,12 +44,37 @@ $headers = @{
     "Content-Type" = "application/json"
 }
 
-# Get all deployments
+# Get all deployments with pagination
 $uri = "https://$vraServer/deployment/api/deployments"
-$response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers
-$deployments = if ($response.content) { $response.content } else { $response }
+$allDeployments = @()
+$page = 0
+$size = 100
 
-Write-Host "Total deployments: $($deployments.Count)`n" -ForegroundColor Cyan
+do {
+    $pagedUri = "$uri`?page=$page&size=$size"
+    Write-Host "Fetching page $($page + 1)..." -ForegroundColor Gray
+    
+    $response = Invoke-RestMethod -Uri $pagedUri -Method Get -Headers $headers
+    $deployments = if ($response.content) { $response.content } else { $response }
+    
+    $allDeployments += $deployments
+    $page++
+    
+    # Check if there are more pages
+    $hasMore = $false
+    if ($response.totalPages) {
+        $hasMore = $page -lt $response.totalPages
+    }
+    elseif ($response.totalElements) {
+        $hasMore = $allDeployments.Count -lt $response.totalElements
+    }
+    else {
+        $hasMore = $deployments.Count -eq $size
+    }
+    
+} while ($hasMore)
+
+Write-Host "`nTotal deployments retrieved: $($allDeployments.Count)`n" -ForegroundColor Cyan
 
 # Filter for deployments with Cloud.vSphere.Machine resources
 $count = 0
