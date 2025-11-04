@@ -1,0 +1,433 @@
+<#
+.SYNOPSIS
+    Updates vRealize Automation deployment names with comprehensive logging and error checking.
+
+.DESCRIPTION
+    This script connects to vRA and updates deployment names for specified VMs.
+    Includes validation for unique names, captures original deployment names,
+    and creates detailed logs of all changes and errors.
+
+.PARAMETER vraServer
+    The vRA server hostname or IP address
+
+.PARAMETER credential
+    PSCredential object for vRA authentication
+
+.PARAMETER inputFile
+    Path to CSV file containing VMName and NewDeploymentName columns
+
+.PARAMETER logPath
+    Path for log files (default: script directory)
+
+.EXAMPLE
+    .\Update-vRADeploymentNames.ps1 -vraServer "vra.domain.com" -inputFile "C:\deployments.csv"
+#>
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory=$true)]
+    [string]$vraServer,
+    
+    [Parameter(Mandatory=$false)]
+    [PSCredential]$credential,
+    
+    [Parameter(Mandatory=$true)]
+    [string]$inputFile,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$logPath = $PSScriptRoot
+)
+
+# Initialize logging
+$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$logFile = Join-Path $logPath "vRA_Update_Log_$timestamp.log"
+$resultsFile = Join-Path $logPath "vRA_Update_Results_$timestamp.csv"
+$errorFile = Join-Path $logPath "vRA_Update_Errors_$timestamp.log"
+
+# Results collection
+$results = [System.Collections.ArrayList]::new()
+$allExistingDeployments = @{}
+
+# Function to write log entries
+function Write-Log {
+    param(
+        [string]$message,
+        [ValidateSet('INFO','WARNING','ERROR','SUCCESS')]
+        [string]$level = 'INFO'
+    )
+    
+    $logEntry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [$level] $message"
+    Add-Content -Path $logFile -Value $logEntry
+    
+    $color = switch($level) {
+        'INFO'    { 'Cyan' }
+        'WARNING' { 'Yellow' }
+        'ERROR'   { 'Red' }
+        'SUCCESS' { 'Green' }
+        default   { 'White' }
+    }
+    
+    Write-Host $logEntry -ForegroundColor $color
+}
+
+# Function to write error details
+function Write-ErrorLog {
+    param(
+        [string]$vmName,
+        [string]$errorMessage,
+        [string]$errorDetails
+    )
+    
+    $errorEntry = @"
+
+========================================
+Time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+VM Name: $vmName
+Error: $errorMessage
+Details: $errorDetails
+========================================
+"@
+    Add-Content -Path $errorFile -Value $errorEntry
+}
+
+# Function to connect to vRA
+function Connect-vRAServer {
+    param(
+        [string]$server,
+        [PSCredential]$cred
+    )
+    
+    try {
+        Write-Log "Connecting to vRA server: $server" -level INFO
+        
+        if (-not $cred) {
+            $cred = Get-Credential -Message "Enter vRA credentials"
+        }
+        
+        # Connect to vRA
+        Connect-vRAServer -Server $server -Credential $cred -IgnoreCertificateErrors
+        
+        Write-Log "Successfully connected to vRA" -level SUCCESS
+        return $true
+    }
+    catch {
+        Write-Log "Failed to connect to vRA: $($_.Exception.Message)" -level ERROR
+        Write-ErrorLog -vmName "N/A" -errorMessage "Connection Failed" -errorDetails $_.Exception.Message
+        return $false
+    }
+}
+
+# Function to get all existing deployments (for uniqueness check)
+function Get-AllDeployments {
+    try {
+        Write-Log "Retrieving all existing deployments for uniqueness validation..." -level INFO
+        $deployments = Get-vRADeployment
+        
+        $deploymentHash = @{}
+        foreach ($dep in $deployments) {
+            $deploymentHash[$dep.Name.ToLower()] = $dep.Id
+        }
+        
+        Write-Log "Retrieved $($deploymentHash.Count) existing deployments" -level SUCCESS
+        return $deploymentHash
+    }
+    catch {
+        Write-Log "Error retrieving deployments: $($_.Exception.Message)" -level ERROR
+        return @{}
+    }
+}
+
+# Function to validate deployment name uniqueness
+function Test-DeploymentNameUnique {
+    param(
+        [string]$newName,
+        [string]$currentDeploymentId
+    )
+    
+    $newNameLower = $newName.ToLower()
+    
+    # Check if name exists in our cache
+    if ($allExistingDeployments.ContainsKey($newNameLower)) {
+        $existingId = $allExistingDeployments[$newNameLower]
+        # If it's the same deployment, that's okay
+        if ($existingId -eq $currentDeploymentId) {
+            return $true
+        }
+        return $false
+    }
+    
+    return $true
+}
+
+# Function to get deployment by VM name
+function Get-DeploymentByVM {
+    param([string]$vm)
+    
+    try {
+        # Search for deployment containing the VM
+        $deployment = Get-vRADeployment | Where-Object {
+            $_.Resources.Name -contains $vm
+        }
+        
+        if ($deployment) {
+            return $deployment
+        }
+        else {
+            Write-Log "No deployment found for VM: $vm" -level WARNING
+            return $null
+        }
+    }
+    catch {
+        Write-Log "Error finding deployment for VM '$vm': $($_.Exception.Message)" -level ERROR
+        Write-ErrorLog -vmName $vm -errorMessage "Deployment Lookup Failed" -errorDetails $_.Exception.Message
+        return $null
+    }
+}
+
+# Function to update deployment name
+function Update-DeploymentName {
+    param(
+        [string]$currentVMName,
+        [string]$newName,
+        [int]$currentIndex,
+        [int]$totalCount
+    )
+    
+    $resultObj = [PSCustomObject]@{
+        VMName = $currentVMName
+        OriginalDeploymentName = ""
+        NewDeploymentName = $newName
+        DeploymentId = ""
+        Status = "Failed"
+        ErrorMessage = ""
+        Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    }
+    
+    try {
+        Write-Log "[$currentIndex/$totalCount] Processing VM: $currentVMName" -level INFO
+        
+        # Find the deployment
+        $deployment = Get-DeploymentByVM -vm $currentVMName
+        
+        if (-not $deployment) {
+            $resultObj.ErrorMessage = "Deployment not found for VM"
+            Write-Log "  ERROR: Deployment not found for VM: $currentVMName" -level ERROR
+            return $resultObj
+        }
+        
+        $currentDeploymentName = $deployment.Name
+        $deploymentId = $deployment.Id
+        
+        $resultObj.OriginalDeploymentName = $currentDeploymentName
+        $resultObj.DeploymentId = $deploymentId
+        
+        Write-Log "  Original deployment name: $currentDeploymentName" -level INFO
+        Write-Log "  Deployment ID: $deploymentId" -level INFO
+        Write-Log "  New deployment name: $newName" -level INFO
+        
+        # Check if new name is the same as current
+        if ($currentDeploymentName -eq $newName) {
+            $resultObj.Status = "Skipped"
+            $resultObj.ErrorMessage = "New name same as current name"
+            Write-Log "  SKIPPED: New name is the same as current name" -level WARNING
+            return $resultObj
+        }
+        
+        # Validate uniqueness
+        if (-not (Test-DeploymentNameUnique -newName $newName -currentDeploymentId $deploymentId)) {
+            $resultObj.ErrorMessage = "Deployment name already exists"
+            Write-Log "  ERROR: Deployment name '$newName' already exists" -level ERROR
+            Write-ErrorLog -vmName $currentVMName -errorMessage "Duplicate Name" -errorDetails "The deployment name '$newName' is already in use by another deployment"
+            return $resultObj
+        }
+        
+        # Update the deployment name
+        Write-Log "  Updating deployment name..." -level INFO
+        $deployment | Set-vRADeployment -Name $newName -Confirm:$false
+        
+        # Update our cache with the new name
+        $allExistingDeployments.Remove($currentDeploymentName.ToLower())
+        $allExistingDeployments[$newName.ToLower()] = $deploymentId
+        
+        $resultObj.Status = "Success"
+        Write-Log "  SUCCESS: Deployment name updated successfully" -level SUCCESS
+        
+        return $resultObj
+    }
+    catch {
+        $resultObj.ErrorMessage = $_.Exception.Message
+        Write-Log "  ERROR: Failed to update deployment: $($_.Exception.Message)" -level ERROR
+        Write-ErrorLog -vmName $currentVMName -errorMessage "Update Failed" -errorDetails $_.Exception.Message
+        return $resultObj
+    }
+}
+
+# Function to validate input file
+function Test-InputFile {
+    param([string]$filePath)
+    
+    if (-not (Test-Path $filePath)) {
+        Write-Log "Input file not found: $filePath" -level ERROR
+        return $false
+    }
+    
+    try {
+        $data = Import-Csv -Path $filePath
+        
+        if ($data.Count -eq 0) {
+            Write-Log "Input file is empty" -level ERROR
+            return $false
+        }
+        
+        if (-not ($data[0].PSObject.Properties.Name -contains 'VMName')) {
+            Write-Log "CSV file missing required column: VMName" -level ERROR
+            return $false
+        }
+        
+        if (-not ($data[0].PSObject.Properties.Name -contains 'NewDeploymentName')) {
+            Write-Log "CSV file missing required column: NewDeploymentName" -level ERROR
+            return $false
+        }
+        
+        # Check for duplicate new names in the input file
+        $newNames = $data | Select-Object -ExpandProperty NewDeploymentName
+        $duplicates = $newNames | Group-Object | Where-Object { $_.Count -gt 1 }
+        
+        if ($duplicates) {
+            Write-Log "CRITICAL: Duplicate new deployment names found in input file:" -level ERROR
+            foreach ($dup in $duplicates) {
+                Write-Log "  - '$($dup.Name)' appears $($dup.Count) times" -level ERROR
+            }
+            return $false
+        }
+        
+        Write-Log "Input file validation passed: $($data.Count) records found" -level SUCCESS
+        return $true
+    }
+    catch {
+        Write-Log "Error validating input file: $($_.Exception.Message)" -level ERROR
+        return $false
+    }
+}
+
+# Function to save results
+function Save-Results {
+    param([array]$resultsArray)
+    
+    try {
+        $resultsArray | Export-Csv -Path $resultsFile -NoTypeInformation -Encoding UTF8
+        Write-Log "Results saved to: $resultsFile" -level SUCCESS
+    }
+    catch {
+        Write-Log "Failed to save results: $($_.Exception.Message)" -level ERROR
+    }
+}
+
+# Main script execution
+Write-Host "`n========================================" -ForegroundColor Cyan
+Write-Host "vRA Deployment Name Update Script" -ForegroundColor Cyan
+Write-Host "Large Scale Update with Logging" -ForegroundColor Cyan
+Write-Host "========================================`n" -ForegroundColor Cyan
+
+Write-Log "Script started" -level INFO
+Write-Log "Log file: $logFile" -level INFO
+Write-Log "Results file: $resultsFile" -level INFO
+Write-Log "Error file: $errorFile" -level INFO
+
+# Validate input file
+if (-not (Test-InputFile -filePath $inputFile)) {
+    Write-Log "Input file validation failed. Exiting." -level ERROR
+    exit 1
+}
+
+# Connect to vRA
+if (-not (Connect-vRAServer -server $vraServer -cred $credential)) {
+    Write-Log "Failed to connect to vRA. Exiting." -level ERROR
+    exit 1
+}
+
+# Load all existing deployments for uniqueness checking
+Write-Log "Loading existing deployments for validation..." -level INFO
+$allExistingDeployments = Get-AllDeployments
+
+if ($allExistingDeployments.Count -eq 0) {
+    Write-Log "WARNING: Could not load existing deployments. Uniqueness validation may be limited." -level WARNING
+}
+
+# Load updates from CSV
+Write-Log "Loading updates from CSV file..." -level INFO
+$updates = Import-Csv -Path $inputFile
+$totalUpdates = $updates.Count
+
+Write-Log "Loaded $totalUpdates deployment updates to process" -level INFO
+Write-Host "`n"
+
+# Process each update
+$currentIndex = 0
+foreach ($update in $updates) {
+    $currentIndex++
+    
+    # Skip empty rows
+    if ([string]::IsNullOrWhiteSpace($update.VMName) -or 
+        [string]::IsNullOrWhiteSpace($update.NewDeploymentName)) {
+        Write-Log "[$currentIndex/$totalUpdates] Skipping empty row" -level WARNING
+        continue
+    }
+    
+    $result = Update-DeploymentName -currentVMName $update.VMName `
+                                   -newName $update.NewDeploymentName `
+                                   -currentIndex $currentIndex `
+                                   -totalCount $totalUpdates
+    
+    [void]$results.Add($result)
+    
+    # Progress indicator every 50 records
+    if ($currentIndex % 50 -eq 0) {
+        Write-Host "`n--- Progress: $currentIndex / $totalUpdates ($('{0:P0}' -f ($currentIndex/$totalUpdates))) ---`n" -ForegroundColor Magenta
+    }
+    
+    Write-Host "" # Blank line between updates
+}
+
+# Save results
+Write-Log "Saving results to CSV..." -level INFO
+Save-Results -resultsArray $results
+
+# Generate summary
+$successCount = ($results | Where-Object { $_.Status -eq 'Success' }).Count
+$failCount = ($results | Where-Object { $_.Status -eq 'Failed' }).Count
+$skipCount = ($results | Where-Object { $_.Status -eq 'Skipped' }).Count
+
+Write-Host "`n========================================" -ForegroundColor Cyan
+Write-Host "Update Summary" -ForegroundColor Cyan
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Log "Total Records Processed: $totalUpdates" -level INFO
+Write-Log "Successful Updates: $successCount" -level SUCCESS
+Write-Log "Failed Updates: $failCount" -level $(if ($failCount -gt 0) { "ERROR" } else { "INFO" })
+Write-Log "Skipped Updates: $skipCount" -level WARNING
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host "Log File: $logFile" -ForegroundColor White
+Write-Host "Results File: $resultsFile" -ForegroundColor White
+if ($failCount -gt 0) {
+    Write-Host "Error File: $errorFile" -ForegroundColor Yellow
+}
+Write-Host "========================================`n" -ForegroundColor Cyan
+
+# Disconnect from vRA
+try {
+    Disconnect-vRAServer -Confirm:$false
+    Write-Log "Disconnected from vRA server" -level INFO
+}
+catch {
+    Write-Log "Error disconnecting from vRA: $($_.Exception.Message)" -level WARNING
+}
+
+Write-Log "Script completed" -level INFO
+
+# Exit with appropriate code
+if ($failCount -gt 0) {
+    exit 1
+}
+else {
+    exit 0
+}
