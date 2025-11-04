@@ -1,0 +1,84 @@
+# List all deployments with Cloud.vSphere.Machine resources and their properties
+
+$vraServer = "vra.yourdomain.com"
+
+# Disable SSL validation
+if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
+    Add-Type @"
+    using System.Net;
+    using System.Security.Cryptography.X509Certificates;
+    public class TrustAllCertsPolicy : ICertificatePolicy {
+        public bool CheckValidationResult(
+            ServicePoint svcPoint, X509Certificate certificate,
+            WebRequest request, int certificateProblem) {
+            return true;
+        }
+    }
+"@
+    [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+}
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# Authenticate
+$credential = Get-Credential -Message "Enter VMware Aria Automation credentials"
+$username = $credential.UserName
+$password = $credential.GetNetworkCredential().Password
+
+$uri = "https://$vraServer/csp/gateway/am/api/login"
+$body = @{
+    username = $username
+    password = $password
+} | ConvertTo-Json
+
+$authHeaders = @{
+    "Content-Type" = "application/json"
+    "Accept" = "application/json"
+}
+
+$response = Invoke-RestMethod -Uri $uri -Method Post -Headers $authHeaders -Body $body
+$token = $response.cspAuthToken
+Write-Host "Authenticated`n" -ForegroundColor Green
+
+$headers = @{
+    "Authorization" = "Bearer $token"
+    "Content-Type" = "application/json"
+}
+
+# Get all deployments
+$uri = "https://$vraServer/deployment/api/deployments"
+$response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers
+$deployments = if ($response.content) { $response.content } else { $response }
+
+Write-Host "Total deployments: $($deployments.Count)`n" -ForegroundColor Cyan
+
+# Filter for deployments with Cloud.vSphere.Machine resources
+$count = 0
+foreach ($dep in $deployments) {
+    if ($dep.resources) {
+        $vsphereMachines = $dep.resources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" }
+        
+        if ($vsphereMachines.Count -gt 0) {
+            $count++
+            Write-Host "[$count] Deployment: $($dep.name)" -ForegroundColor Yellow
+            Write-Host "    ID: $($dep.id)" -ForegroundColor Gray
+            
+            foreach ($machine in $vsphereMachines) {
+                Write-Host "`n    vSphere Machine Resource:" -ForegroundColor Cyan
+                
+                if ($machine.properties) {
+                    Write-Host "    Properties:" -ForegroundColor White
+                    $machine.properties.PSObject.Properties | ForEach-Object {
+                        Write-Host "      - $($_.Name) = $($_.Value)" -ForegroundColor Gray
+                    }
+                }
+                else {
+                    Write-Host "      No properties found" -ForegroundColor Red
+                }
+            }
+            
+            Write-Host ""
+        }
+    }
+}
+
+Write-Host "`nTotal deployments with Cloud.vSphere.Machine: $count" -ForegroundColor Green
