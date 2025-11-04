@@ -79,8 +79,7 @@ function Get-vRADeployment {
     # Service Broker uses catalog API endpoints
     $endpoints = @(
         "https://$Server/catalog/api/deployments",
-        "https://$Server/iaas/api/deployments",
-        "https://$Server/deployment/api/deployments"
+        "https://$Server/iaas/api/deployments"
     )
     
     $headers = @{
@@ -88,59 +87,74 @@ function Get-vRADeployment {
         "Content-Type" = "application/json"
     }
     
-    foreach ($uri in $endpoints) {
+    foreach ($baseUri in $endpoints) {
         try {
-            Write-Host "Trying endpoint: $uri" -ForegroundColor Cyan
-            $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers -ErrorAction Stop
+            Write-Host "Trying endpoint: $baseUri" -ForegroundColor Cyan
             
-            Write-Host "Successfully connected to: $uri" -ForegroundColor Green
+            # Paginate through all deployments
+            $allDeployments = @()
+            $page = 0
+            $pageSize = 100
+            $hasMore = $true
             
-            # Check if response has content or items
-            $deployments = if ($response.content) { $response.content } elseif ($response.items) { $response.items } else { $response }
-            
-            Write-Host "Found $($deployments.Count) deployments total" -ForegroundColor Cyan
-            
-            # Search through all deployments for matching server name
-            $matchingDeployment = $deployments | Where-Object {
-                $_.name -eq $DeploymentName -or 
-                $_.name -like "*$DeploymentName*"
-            } | Select-Object -First 1
-            
-            if ($matchingDeployment) {
-                Write-Host "Found deployment: $($matchingDeployment.name) (ID: $($matchingDeployment.id))" -ForegroundColor Green
-                return @{
-                    deployment = $matchingDeployment
-                    endpoint = $uri
+            while ($hasMore) {
+                $uri = "$baseUri`?`$skip=$($page * $pageSize)&`$top=$pageSize"
+                Write-Host "Fetching page $($page + 1)..." -ForegroundColor Cyan
+                
+                $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers -ErrorAction Stop
+                
+                # Check if response has content or items
+                $deployments = if ($response.content) { $response.content } elseif ($response.items) { $response.items } else { $response }
+                
+                if ($deployments.Count -eq 0) {
+                    $hasMore = $false
+                } else {
+                    $allDeployments += $deployments
+                    $page++
+                    
+                    # Check if there are more pages
+                    if ($deployments.Count -lt $pageSize) {
+                        $hasMore = $false
+                    }
                 }
             }
-            else {
-                # Search in resources within deployments
-                Write-Host "Searching within deployment resources..." -ForegroundColor Cyan
-                foreach ($deployment in $deployments) {
-                    if ($deployment.resources) {
-                        $matchingResource = $deployment.resources | Where-Object { 
-                            $_.name -eq $DeploymentName -or $_.name -like "*$DeploymentName*" 
-                        }
-                        if ($matchingResource) {
-                            Write-Host "Found server '$DeploymentName' in deployment: $($deployment.name)" -ForegroundColor Green
-                            return @{
-                                deployment = $deployment
-                                endpoint = $uri
-                            }
+            
+            Write-Host "Found $($allDeployments.Count) total deployments" -ForegroundColor Green
+            
+            # Search for machine resources with the server name
+            Write-Host "Searching for machine: $DeploymentName" -ForegroundColor Cyan
+            
+            foreach ($deployment in $allDeployments) {
+                # Check if deployment has resources
+                if ($deployment.resources) {
+                    # Look for Cloud.vSphere.Machine or similar machine types
+                    $machineResource = $deployment.resources | Where-Object { 
+                        ($_.type -like "*Machine*" -or $_.type -eq "Cloud.vSphere.Machine" -or $_.type -eq "Cloud.Machine") -and
+                        ($_.name -eq $DeploymentName -or $_.name -like "*$DeploymentName*")
+                    }
+                    
+                    if ($machineResource) {
+                        Write-Host "Found machine '$DeploymentName' in deployment: $($deployment.name)" -ForegroundColor Green
+                        Write-Host "  Machine Type: $($machineResource.type)" -ForegroundColor Cyan
+                        Write-Host "  Machine ID: $($machineResource.id)" -ForegroundColor Cyan
+                        return @{
+                            deployment = $deployment
+                            endpoint = $baseUri
+                            machine = $machineResource
                         }
                     }
                 }
-                
-                Write-Host "Server '$DeploymentName' not found in this endpoint" -ForegroundColor Yellow
             }
+            
+            Write-Host "Machine '$DeploymentName' not found in this endpoint" -ForegroundColor Yellow
         }
         catch {
-            Write-Host "Endpoint failed: $uri - $($_.Exception.Message)" -ForegroundColor Yellow
+            Write-Host "Endpoint failed: $baseUri - $($_.Exception.Message)" -ForegroundColor Yellow
             continue
         }
     }
     
-    Write-Host "All endpoints failed. Unable to find deployment for: $DeploymentName" -ForegroundColor Red
+    Write-Host "All endpoints failed. Unable to find machine: $DeploymentName" -ForegroundColor Red
     return $null
 }
 
