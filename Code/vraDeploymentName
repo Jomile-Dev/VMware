@@ -5,9 +5,23 @@ Import-Module ActiveDirectory
 $OUPath = "OU=Servers,DC=yourdomain,DC=com"
 
 # Get only Windows Server computer objects, excluding clusters
-Get-ADComputer -Filter {OperatingSystem -like "*Windows Server*"} -SearchBase $OUPath -Properties Description, OperatingSystem | 
-    Where-Object {$_.Name -notlike "*CLUSTER*" -and $_.Name -notlike "*CLU*"} |
-    Select-Object Name, Description, OperatingSystem | 
-    Export-Csv -Path "C:\Temp\AD_Servers.csv" -NoTypeInformation
+$Servers = Get-ADComputer -Filter {OperatingSystem -like "*Windows Server*"} -SearchBase $OUPath -Properties Description, OperatingSystem | 
+    Where-Object {$_.Name -notlike "*CLUSTER*" -and $_.Name -notlike "*CLU*"}
+
+# Test connectivity and export only online servers
+$OnlineServers = $Servers | ForEach-Object {
+    if (Test-Connection -ComputerName $_.Name -Count 1 -Quiet) {
+        [PSCustomObject]@{
+            Name = $_.Name
+            Description = $_.Description
+            OperatingSystem = $_.OperatingSystem
+        }
+        Write-Host "Online: $($_.Name)" -ForegroundColor Green
+    } else {
+        Write-Host "Offline: $($_.Name)" -ForegroundColor Red
+    }
+}
+
+$OnlineServers | Export-Csv -Path "C:\Temp\AD_Servers.csv" -NoTypeInformation
 
 Write-Host "Export completed successfully to C:\Temp\AD_Servers.csv" -ForegroundColor Green
