@@ -1,13 +1,13 @@
-# VMware Aria Automation Configuration
+# VMware Aria Automation Troubleshooting Script
 $vraServer = "vra.yourdomain.com"  # Replace with your Aria Automation FQDN
-$csvFile = "C:\Temp\serverList.csv"
+$testServerName = "WSPO000110"     # Replace with a server name you know exists
 
 # Prompt for credentials
 $credential = Get-Credential -Message "Enter VMware Aria Automation credentials"
 $username = $credential.UserName
 $password = $credential.GetNetworkCredential().Password
 
-# Disable SSL certificate validation (only for self-signed certs)
+# Disable SSL certificate validation
 if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
     Add-Type @"
     using System.Net;
@@ -24,205 +24,199 @@ if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) 
 }
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-# Function to get authentication token
-function Get-vRAToken {
-    param(
-        [string]$Server,
-        [string]$Username,
-        [string]$Password
-    )
-    
-    # Try the standard vRA API endpoint first
-    $uri = "https://$Server/csp/gateway/am/api/login"
-    $body = @{
-        username = $Username
-        password = $Password
-    } | ConvertTo-Json
-    
-    $headers = @{
-        "Content-Type" = "application/json"
-        "Accept" = "application/json"
-    }
-    
-    try {
-        Write-Host "Attempting authentication to: $uri" -ForegroundColor Cyan
-        $response = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body
-        Write-Host "Successfully authenticated to VMware Aria Automation" -ForegroundColor Green
-        return $response.cspAuthToken
-    }
-    catch {
-        Write-Host "CSP endpoint failed, trying legacy vRA endpoint..." -ForegroundColor Yellow
-        
-        # Try legacy vRA authentication endpoint
-        $uri = "https://$Server/iaas/api/login"
-        try {
-            $response = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body
-            Write-Host "Successfully authenticated using legacy endpoint" -ForegroundColor Green
-            return $response.token
-        }
-        catch {
-            Write-Host "Failed to authenticate: $_" -ForegroundColor Red
-            Write-Host "Error Details: $($_.Exception.Message)" -ForegroundColor Red
-            return $null
-        }
-    }
+# Get token
+Write-Host "=== AUTHENTICATION ===" -ForegroundColor Cyan
+$uri = "https://$vraServer/csp/gateway/am/api/login"
+$body = @{
+    username = $username
+    password = $password
+} | ConvertTo-Json
+
+$headers = @{
+    "Content-Type" = "application/json"
+    "Accept" = "application/json"
 }
 
-# Function to get deployment by machine name
-function Get-vRADeployment {
-    param(
-        [string]$Server,
-        [string]$Token,
-        [string]$MachineName
-    )
-    
-    $headers = @{
-        "Authorization" = "Bearer $Token"
-        "Content-Type" = "application/json"
-    }
-    
-    try {
-        Write-Host "Searching for machine: $MachineName" -ForegroundColor Cyan
-        
-        # First, try to find the machine using the machines API endpoint
-        $machineUri = "https://$Server/iaas/api/machines?`$filter=name eq '$MachineName'"
-        
-        Write-Host "  Searching machines API..." -ForegroundColor Gray
-        try {
-            $machineResponse = Invoke-RestMethod -Uri $machineUri -Method Get -Headers $headers -ErrorAction Stop
-            $machines = if ($machineResponse.content) { $machineResponse.content } else { $machineResponse }
-            
-            if ($machines -and $machines.Count -gt 0) {
-                $machine = $machines[0]
-                Write-Host "  Found machine!" -ForegroundColor Green
-                
-                # Get the deployment ID from the machine
-                if ($machine.deploymentId) {
-                    $deploymentId = $machine.deploymentId
-                    Write-Host "  Getting deployment details..." -ForegroundColor Gray
-                    
-                    # Get the full deployment
-                    $deploymentUri = "https://$Server/iaas/api/deployments/$deploymentId"
-                    $deployment = Invoke-RestMethod -Uri $deploymentUri -Method Get -Headers $headers
-                    
-                    Write-Host "  Deployment: $($deployment.name)" -ForegroundColor Cyan
-                    Write-Host "  Machine ID: $($machine.id)" -ForegroundColor Gray
-                    
-                    return @{
-                        deployment = $deployment
-                        endpoint = "https://$Server/iaas/api/deployments"
-                        resource = $machine
-                    }
-                }
-            }
-        }
-        catch {
-            Write-Host "  Machines API search failed: $($_.Exception.Message)" -ForegroundColor Yellow
-        }
-        
-        # Fallback: Search deployments with simple name filter
-        Write-Host "  Trying deployments API..." -ForegroundColor Gray
-        $deploymentUri = "https://$Server/iaas/api/deployments?`$filter=name eq '$MachineName'"
-        
-        try {
-            $response = Invoke-RestMethod -Uri $deploymentUri -Method Get -Headers $headers -ErrorAction Stop
-            $deployments = if ($response.content) { $response.content } else { $response }
-            
-            if ($deployments -and $deployments.Count -gt 0) {
-                Write-Host "  Found deployment: $($deployments[0].name)" -ForegroundColor Green
-                return @{
-                    deployment = $deployments[0]
-                    endpoint = "https://$Server/iaas/api/deployments"
-                    resource = $null
-                }
-            }
-        }
-        catch {
-            Write-Host "  Deployment filter failed: $($_.Exception.Message)" -ForegroundColor Yellow
-        }
-        
-        Write-Host "  Machine '$MachineName' not found" -ForegroundColor Red
-        return $null
-    }
-    catch {
-        Write-Host "  Error: $($_.Exception.Message)" -ForegroundColor Red
-        return $null
-    }
+try {
+    $response = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body
+    $token = $response.cspAuthToken
+    Write-Host "Authentication successful!`n" -ForegroundColor Green
 }
-
-# Function to update deployment name
-function Update-vRADeploymentName {
-    param(
-        [string]$Server,
-        [string]$Token,
-        [string]$DeploymentId,
-        [string]$NewName,
-        [string]$Description,
-        [string]$Endpoint
-    )
-    
-    # Determine the correct update endpoint based on where we found the deployment
-    $baseEndpoint = $Endpoint -replace "/deployments.*", "/deployments"
-    $uri = "$baseEndpoint/$DeploymentId"
-    
-    $headers = @{
-        "Authorization" = "Bearer $Token"
-        "Content-Type" = "application/json"
-    }
-    
-    $body = @{
-        name = $NewName
-        description = $Description
-    } | ConvertTo-Json
-    
-    try {
-        Write-Host "Updating deployment at: $uri" -ForegroundColor Cyan
-        $response = Invoke-RestMethod -Uri $uri -Method Patch -Headers $headers -Body $body
-        Write-Host "Successfully updated deployment to '$NewName'" -ForegroundColor Green
-        return $true
-    }
-    catch {
-        Write-Host "Failed to update deployment: $_" -ForegroundColor Red
-        Write-Host "Error Details: $($_.Exception.Message)" -ForegroundColor Red
-        return $false
-    }
-}
-
-# Main Script
-Write-Host "=== VMware Aria Automation Deployment Update ===" -ForegroundColor Cyan
-
-# Get authentication token
-$token = Get-vRAToken -Server $vraServer -Username $username -Password $password
-
-if ($null -eq $token) {
-    Write-Host "Exiting due to authentication failure" -ForegroundColor Red
+catch {
+    Write-Host "Authentication failed: $_" -ForegroundColor Red
     exit
 }
 
-# Import CSV file
-if (-not (Test-Path $csvFile)) {
-    Write-Host "CSV file not found: $csvFile" -ForegroundColor Red
-    exit
+$headers = @{
+    "Authorization" = "Bearer $token"
+    "Content-Type" = "application/json"
 }
 
-$servers = Import-Csv -Path $csvFile
-Write-Host "`nProcessing $($servers.Count) servers from CSV..." -ForegroundColor Cyan
+# Test 1: Check available API endpoints
+Write-Host "=== TEST 1: Available Endpoints ===" -ForegroundColor Cyan
+$endpoints = @(
+    "https://$vraServer/iaas/api/machines",
+    "https://$vraServer/iaas/api/deployments",
+    "https://$vraServer/deployment/api/deployments",
+    "https://$vraServer/catalog/api/deployments"
+)
 
-# Process each server
-foreach ($server in $servers) {
-    Write-Host "`n--- Processing: $($server.Name) ---" -ForegroundColor Yellow
-    
-    # Get the deployment
-    $result = Get-vRADeployment -Server $vraServer -Token $token -DeploymentName $server.Name
-    
-    if ($null -ne $result -and $null -ne $result.deployment) {
-        # Update deployment with description
-        $newDescription = if ($server.Description) { $server.Description } else { "Updated from CSV" }
-        Update-vRADeploymentName -Server $vraServer -Token $token -DeploymentId $result.deployment.id -NewName $server.Name -Description $newDescription -Endpoint $result.endpoint
+foreach ($endpoint in $endpoints) {
+    Write-Host "Testing: $endpoint" -ForegroundColor Yellow
+    try {
+        $response = Invoke-RestMethod -Uri "$endpoint`?`$top=1" -Method Get -Headers $headers -ErrorAction Stop
+        Write-Host "  ✓ SUCCESS - Endpoint is accessible" -ForegroundColor Green
     }
-    else {
-        Write-Host "Deployment not found for: $($server.Name)" -ForegroundColor Red
+    catch {
+        Write-Host "  ✗ FAILED - $($_.Exception.Message)" -ForegroundColor Red
     }
 }
 
-Write-Host "`n=== Update Process Complete ===" -ForegroundColor Cyan
+# Test 2: Sample a deployment to see its structure
+Write-Host "`n=== TEST 2: Deployment Structure ===" -ForegroundColor Cyan
+try {
+    $response = Invoke-RestMethod -Uri "https://$vraServer/iaas/api/deployments?`$top=5" -Method Get -Headers $headers
+    $deployments = if ($response.content) { $response.content } else { $response }
+    
+    Write-Host "Found $($deployments.Count) sample deployments" -ForegroundColor Green
+    
+    $sampleDep = $deployments[0]
+    Write-Host "`nSample Deployment:" -ForegroundColor Yellow
+    Write-Host "  Name: $($sampleDep.name)"
+    Write-Host "  ID: $($sampleDep.id)"
+    Write-Host "  Has Resources: $(if ($sampleDep.resources) { 'YES' } else { 'NO' })"
+    
+    if ($sampleDep.resources) {
+        Write-Host "`n  Resources in this deployment:"
+        foreach ($res in $sampleDep.resources) {
+            Write-Host "    - Name: $($res.name)"
+            Write-Host "      Type: $($res.type)"
+            Write-Host "      ID: $($res.id)"
+        }
+    }
+    
+    Write-Host "`nAll available properties on deployment:"
+    $sampleDep.PSObject.Properties.Name | ForEach-Object { Write-Host "  - $_" -ForegroundColor Gray }
+}
+catch {
+    Write-Host "Failed to get deployment structure: $_" -ForegroundColor Red
+}
+
+# Test 3: Try machines API
+Write-Host "`n=== TEST 3: Machines API ===" -ForegroundColor Cyan
+try {
+    $response = Invoke-RestMethod -Uri "https://$vraServer/iaas/api/machines?`$top=5" -Method Get -Headers $headers
+    $machines = if ($response.content) { $response.content } else { $response }
+    
+    Write-Host "Found $($machines.Count) sample machines" -ForegroundColor Green
+    
+    if ($machines.Count -gt 0) {
+        $sampleMachine = $machines[0]
+        Write-Host "`nSample Machine:" -ForegroundColor Yellow
+        Write-Host "  Name: $($sampleMachine.name)"
+        Write-Host "  Type: $($sampleMachine.type)"
+        Write-Host "  ID: $($sampleMachine.id)"
+        Write-Host "  Deployment ID: $($sampleMachine.deploymentId)"
+        
+        Write-Host "`nAll available properties on machine:"
+        $sampleMachine.PSObject.Properties.Name | ForEach-Object { Write-Host "  - $_" -ForegroundColor Gray }
+    }
+}
+catch {
+    Write-Host "Machines API failed: $_" -ForegroundColor Red
+}
+
+# Test 4: Try different search methods for your specific server
+Write-Host "`n=== TEST 4: Searching for '$testServerName' ===" -ForegroundColor Cyan
+
+# Method 1: Search machines by name
+Write-Host "`nMethod 1: Machines API with filter" -ForegroundColor Yellow
+try {
+    $uri = "https://$vraServer/iaas/api/machines?`$filter=name eq '$testServerName'"
+    Write-Host "  URI: $uri" -ForegroundColor Gray
+    $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers
+    $machines = if ($response.content) { $response.content } else { $response }
+    
+    if ($machines.Count -gt 0) {
+        Write-Host "  ✓ FOUND via machines API!" -ForegroundColor Green
+        Write-Host "    Machine: $($machines[0].name)"
+        Write-Host "    Deployment ID: $($machines[0].deploymentId)"
+    } else {
+        Write-Host "  ✗ Not found" -ForegroundColor Red
+    }
+}
+catch {
+    Write-Host "  ✗ Failed: $($_.Exception.Message)" -ForegroundColor Red
+}
+
+# Method 2: Search all machines without filter
+Write-Host "`nMethod 2: Browse first 100 machines" -ForegroundColor Yellow
+try {
+    $response = Invoke-RestMethod -Uri "https://$vraServer/iaas/api/machines?`$top=100" -Method Get -Headers $headers
+    $machines = if ($response.content) { $response.content } else { $response }
+    
+    $found = $machines | Where-Object { $_.name -eq $testServerName }
+    if ($found) {
+        Write-Host "  ✓ FOUND in first 100 machines!" -ForegroundColor Green
+        Write-Host "    Machine: $($found.name)"
+        Write-Host "    Deployment ID: $($found.deploymentId)"
+    } else {
+        Write-Host "  ✗ Not in first 100 machines" -ForegroundColor Yellow
+        Write-Host "    Sample machine names found:"
+        $machines | Select-Object -First 5 | ForEach-Object { Write-Host "      - $($_.name)" -ForegroundColor Gray }
+    }
+}
+catch {
+    Write-Host "  ✗ Failed: $($_.Exception.Message)" -ForegroundColor Red
+}
+
+# Method 3: Search deployments
+Write-Host "`nMethod 3: Search deployments by name" -ForegroundColor Yellow
+try {
+    $uri = "https://$vraServer/iaas/api/deployments?`$filter=name eq '$testServerName'"
+    $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers
+    $deployments = if ($response.content) { $response.content } else { $response }
+    
+    if ($deployments.Count -gt 0) {
+        Write-Host "  ✓ FOUND deployment with that name!" -ForegroundColor Green
+        Write-Host "    Deployment: $($deployments[0].name)"
+    } else {
+        Write-Host "  ✗ No deployment with that exact name" -ForegroundColor Red
+    }
+}
+catch {
+    Write-Host "  ✗ Failed: $($_.Exception.Message)" -ForegroundColor Red
+}
+
+# Method 4: Manual search through deployments
+Write-Host "`nMethod 4: Manual search in first 50 deployments" -ForegroundColor Yellow
+try {
+    $response = Invoke-RestMethod -Uri "https://$vraServer/iaas/api/deployments?`$top=50" -Method Get -Headers $headers
+    $deployments = if ($response.content) { $response.content } else { $response }
+    
+    $foundInDeployment = $false
+    foreach ($dep in $deployments) {
+        if ($dep.resources) {
+            $matchingResource = $dep.resources | Where-Object { $_.name -eq $testServerName }
+            if ($matchingResource) {
+                Write-Host "  ✓ FOUND as resource in deployment!" -ForegroundColor Green
+                Write-Host "    Deployment Name: $($dep.name)"
+                Write-Host "    Deployment ID: $($dep.id)"
+                Write-Host "    Resource Name: $($matchingResource.name)"
+                Write-Host "    Resource Type: $($matchingResource.type)"
+                $foundInDeployment = $true
+                break
+            }
+        }
+    }
+    
+    if (-not $foundInDeployment) {
+        Write-Host "  ✗ Not found in first 50 deployments" -ForegroundColor Yellow
+    }
+}
+catch {
+    Write-Host "  ✗ Failed: $($_.Exception.Message)" -ForegroundColor Red
+}
+
+Write-Host "`n=== Troubleshooting Complete ===" -ForegroundColor Cyan
+Write-Host "Review the results above to determine the best search method." -ForegroundColor White
