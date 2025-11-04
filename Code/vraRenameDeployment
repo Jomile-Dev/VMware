@@ -94,7 +94,7 @@ function Get-vRADeployment {
             # Paginate through all deployments
             $allDeployments = @()
             $page = 0
-            $pageSize = 100
+            $pageSize = 200
             $hasMore = $true
             
             while ($hasMore) {
@@ -121,32 +121,58 @@ function Get-vRADeployment {
             
             Write-Host "Found $($allDeployments.Count) total deployments" -ForegroundColor Green
             
-            # Search for machine resources with the server name
-            Write-Host "Searching for machine: $DeploymentName" -ForegroundColor Cyan
+            # Search for resources with the server name
+            Write-Host "Searching for server: $DeploymentName" -ForegroundColor Cyan
             
+            $foundCount = 0
             foreach ($deployment in $allDeployments) {
                 # Check if deployment has resources
                 if ($deployment.resources) {
-                    # Look for Cloud.vSphere.Machine or similar machine types
-                    $machineResource = $deployment.resources | Where-Object { 
-                        ($_.type -like "*Machine*" -or $_.type -eq "Cloud.vSphere.Machine" -or $_.type -eq "Cloud.Machine") -and
-                        ($_.name -eq $DeploymentName -or $_.name -like "*$DeploymentName*")
-                    }
-                    
-                    if ($machineResource) {
-                        Write-Host "Found machine '$DeploymentName' in deployment: $($deployment.name)" -ForegroundColor Green
-                        Write-Host "  Machine Type: $($machineResource.type)" -ForegroundColor Cyan
-                        Write-Host "  Machine ID: $($machineResource.id)" -ForegroundColor Cyan
-                        return @{
-                            deployment = $deployment
-                            endpoint = $baseUri
-                            machine = $machineResource
+                    # Look through all resources
+                    foreach ($resource in $deployment.resources) {
+                        # Check if resource name matches (case-insensitive)
+                        if ($resource.name -eq $DeploymentName) {
+                            $foundCount++
+                            Write-Host "MATCH FOUND! Server: $($resource.name)" -ForegroundColor Green
+                            Write-Host "  Deployment Name: $($deployment.name)" -ForegroundColor Cyan
+                            Write-Host "  Deployment ID: $($deployment.id)" -ForegroundColor Cyan
+                            Write-Host "  Resource Type: $($resource.type)" -ForegroundColor Cyan
+                            Write-Host "  Resource ID: $($resource.id)" -ForegroundColor Cyan
+                            
+                            return @{
+                                deployment = $deployment
+                                endpoint = $baseUri
+                                resource = $resource
+                            }
                         }
                     }
                 }
             }
             
-            Write-Host "Machine '$DeploymentName' not found in this endpoint" -ForegroundColor Yellow
+            if ($foundCount -eq 0) {
+                Write-Host "No exact match found for: $DeploymentName" -ForegroundColor Yellow
+                Write-Host "Trying partial match search..." -ForegroundColor Cyan
+                
+                # Try partial match as fallback
+                foreach ($deployment in $allDeployments) {
+                    if ($deployment.resources) {
+                        foreach ($resource in $deployment.resources) {
+                            if ($resource.name -like "*$DeploymentName*") {
+                                Write-Host "PARTIAL MATCH: $($resource.name)" -ForegroundColor Yellow
+                                Write-Host "  In Deployment: $($deployment.name)" -ForegroundColor Cyan
+                                
+                                return @{
+                                    deployment = $deployment
+                                    endpoint = $baseUri
+                                    resource = $resource
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            Write-Host "Server '$DeploymentName' not found in this endpoint" -ForegroundColor Red
         }
         catch {
             Write-Host "Endpoint failed: $baseUri - $($_.Exception.Message)" -ForegroundColor Yellow
@@ -154,7 +180,7 @@ function Get-vRADeployment {
         }
     }
     
-    Write-Host "All endpoints failed. Unable to find machine: $DeploymentName" -ForegroundColor Red
+    Write-Host "All endpoints failed. Unable to find server: $DeploymentName" -ForegroundColor Red
     return $null
 }
 
