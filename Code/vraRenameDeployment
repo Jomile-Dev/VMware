@@ -62,47 +62,32 @@ $headers = @{
 function Find-Deployment {
     param($ServerName)
     
-    # Search for the server name - API will find deployments containing resources with this name
-    $searchUri = "https://$vraServer/deployment/api/deployments?search=$ServerName"
+    # Get all deployments (like the UI does), then search through them
+    $searchUri = "https://$vraServer/deployment/api/deployments"
     
     try {
-        Write-Log "  Searching: $searchUri" -Color Gray
+        Write-Log "  Fetching all deployments..." -Color Gray
         $response = Invoke-RestMethod -Uri $searchUri -Method Get -Headers $headers -ErrorAction Stop
         $deployments = if ($response.content) { $response.content } else { $response }
         
-        Write-Log "  Found $($deployments.Count) deployment(s) from search" -Color Gray
+        Write-Log "  Searching through $($deployments.Count) deployments" -Color Gray
         
         if ($deployments.Count -gt 0) {
-            # Check each deployment for a resource matching the server name
+            # Search through all deployments for one containing a resource with the server name
             foreach ($dep in $deployments) {
-                Write-Log "    Checking deployment: $($dep.name) (ID: $($dep.id))" -Color Gray
-                
                 if ($dep.resources) {
-                    Write-Log "      Has $($dep.resources.Count) resources" -Color Gray
-                    foreach ($res in $dep.resources) {
-                        Write-Log "        Resource: $($res.name) (Type: $($res.type))" -Color Gray
-                    }
-                    
                     $matchingResource = $dep.resources | Where-Object { $_.name -eq $ServerName }
                     if ($matchingResource) {
-                        Write-Log "      ✓ Found matching resource!" -Color Green
+                        Write-Log "  ✓ Found in deployment: $($dep.name)" -Color Green
                         return @{
                             DeploymentId = $dep.id
                             CurrentName = $dep.name
                             AlreadyNamed = ($dep.name -eq $ServerName)
                         }
                     }
-                    else {
-                        Write-Log "      ✗ No exact match for '$ServerName'" -Color Yellow
-                    }
-                }
-                else {
-                    Write-Log "      ✗ Deployment has no resources" -Color Yellow
                 }
             }
-        }
-        else {
-            Write-Log "  ✗ Search returned 0 results" -Color Yellow
+            Write-Log "  ✗ No deployment contains resource named '$ServerName'" -Color Yellow
         }
     }
     catch {
