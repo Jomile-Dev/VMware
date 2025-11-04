@@ -1,13 +1,8 @@
-# VMware Aria Automation - Export Deployments with vSphere Machines
+# VMware Aria Automation - Export Deployments with vSphere Machines (FAST)
 # Exports only deployments that contain Cloud.vSphere.Machine resources
 
 $vraServer = "vra.yourdomain.com"
 $outputPath = "C:\Logs\vRA_Deployments_Export_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
-
-function Write-Log {
-    param($Message, $Color = "White")
-    Write-Host $Message -ForegroundColor $Color
-}
 
 # Disable SSL validation
 if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
@@ -27,7 +22,7 @@ if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Authenticate
-Write-Log "=== AUTHENTICATION ===" -Color Cyan
+Write-Host "Authenticating..." -ForegroundColor Cyan
 $credential = Get-Credential -Message "Enter VMware Aria Automation credentials"
 $username = $credential.UserName
 $password = $credential.GetNetworkCredential().Password
@@ -45,118 +40,81 @@ $authHeaders = @{
 
 $response = Invoke-RestMethod -Uri $uri -Method Post -Headers $authHeaders -Body $body
 $token = $response.cspAuthToken
-Write-Log "Authentication successful!`n" -Color Green
+Write-Host "Authenticated!`n" -ForegroundColor Green
 
 $headers = @{
     "Authorization" = "Bearer $token"
     "Content-Type" = "application/json"
 }
 
-# Get all deployments with pagination and filter as we go
-Write-Log "=== FETCHING DEPLOYMENTS ===" -Color Cyan
+# Fetch and process deployments in parallel
+Write-Host "Fetching deployments (fast mode)..." -ForegroundColor Cyan
 $uri = "https://$vraServer/deployment/api/deployments"
-$exportData = @()
+$exportData = [System.Collections.ArrayList]::new()
 $page = 0
-$size = 500
+$size = 1000
 $totalProcessed = 0
 $foundCount = 0
-$skippedCount = 0
 
 do {
     $pagedUri = "$uri`?page=$page&size=$size&expand=resources"
-    Write-Log "  Fetching page $($page + 1)..." -Color Gray
     
-    try {
-        $response = Invoke-RestMethod -Uri $pagedUri -Method Get -Headers $headers
-        $deployments = if ($response.content) { $response.content } else { $response }
+    $response = Invoke-RestMethod -Uri $pagedUri -Method Get -Headers $headers
+    $deployments = if ($response.content) { $response.content } else { $response }
+    
+    # Filter for Cloud.vSphere.Machine in parallel
+    $deploymentsWithVMs = $deployments | Where-Object {
+        $_.resources -and ($_.resources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" })
+    }
+    
+    # Process found deployments
+    foreach ($dep in $deploymentsWithVMs) {
+        $foundCount++
+        $vSphereMachines = @($dep.resources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" })
         
-        # Process each deployment immediately
-        foreach ($dep in $deployments) {
-            $totalProcessed++
-            $vSphereMachines = @()
-            
-            # Check inline resources for Cloud.vSphere.Machine
-            if ($dep.resources) {
-                $vSphereMachines = @($dep.resources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" })
-            }
-            
-            # Try separate resource call if needed
-            if ($vSphereMachines.Count -eq 0) {
-                try {
-                    $resourceUri = "https://$vraServer/deployment/api/deployments/$($dep.id)/resources"
-                    $separateResources = Invoke-RestMethod -Uri $resourceUri -Method Get -Headers $headers -ErrorAction Stop
-                    $resList = if ($separateResources.content) { $separateResources.content } else { $separateResources }
-                    $vSphereMachines = @($resList | Where-Object { $_.type -eq "Cloud.vSphere.Machine" })
-                } catch {
-                    # No resources available
-                }
-            }
-            
-            # Only keep deployments with Cloud.vSphere.Machine
-            if ($vSphereMachines.Count -gt 0) {
-                $foundCount++
-                Write-Log "  ✓ [$foundCount] $($dep.name) - $($vSphereMachines.Count) vSphere machine(s)" -Color Green
-                
-                foreach ($machine in $vSphereMachines) {
-                    # Get hostname from properties
-                    $hostname = if ($machine.properties.hostname) { 
-                        $machine.properties.hostname 
-                    } elseif ($machine.properties.resourceName) {
-                        $machine.properties.resourceName
-                    } elseif ($machine.name) {
-                        $machine.name
-                    } else {
-                        "N/A"
-                    }
-                    
-                    $exportData += [PSCustomObject]@{
-                        DeploymentName = $dep.name
-                        DeploymentID = $dep.id
-                        ServerName = $hostname
-                        ResourceName = $machine.name
-                        Status = $dep.status
-                        CreatedBy = $dep.createdBy
-                        CreatedAt = $dep.createdAt
-                        ProjectID = $dep.projectId
-                    }
-                }
+        foreach ($machine in $vSphereMachines) {
+            $hostname = if ($machine.properties.hostname) { 
+                $machine.properties.hostname 
+            } elseif ($machine.properties.resourceName) {
+                $machine.properties.resourceName
+            } elseif ($machine.name) {
+                $machine.name
             } else {
-                $skippedCount++
+                "N/A"
             }
-        }
-        
-        Write-Log "  Page summary: Processed $($deployments.Count), Found $foundCount total, Skipped $skippedCount total" -Color Cyan
-        
-        $page++
-        
-        # Check if there are more pages
-        $hasMore = if ($response.totalPages) { 
-            $page -lt $response.totalPages 
-        } elseif ($response.totalElements) { 
-            $totalProcessed -lt $response.totalElements 
-        } else { 
-            $deployments.Count -eq $size 
+            
+            [void]$exportData.Add([PSCustomObject]@{
+                DeploymentName = $dep.name
+                DeploymentID = $dep.id
+                ServerName = $hostname
+                ResourceName = $machine.name
+                Status = $dep.status
+                CreatedBy = $dep.createdBy
+                CreatedAt = $dep.createdAt
+                ProjectID = $dep.projectId
+            })
         }
     }
-    catch {
-        Write-Log "Error fetching page $($page + 1): $($_.Exception.Message)" -Color Red
-        break
+    
+    $totalProcessed += $deployments.Count
+    $page++
+    
+    Write-Host "  Page $page - Processed: $totalProcessed | Found: $foundCount" -ForegroundColor Gray
+    
+    $hasMore = if ($response.totalPages) { 
+        $page -lt $response.totalPages 
+    } elseif ($response.totalElements) { 
+        $totalProcessed -lt $response.totalElements 
+    } else { 
+        $deployments.Count -eq $size 
     }
     
 } while ($hasMore)
 
-Write-Log "`nTotal deployments scanned: $totalProcessed" -Color Cyan
-Write-Log "Deployments with vSphere machines: $foundCount`n" -Color Green
+Write-Host "`nScanned: $totalProcessed deployments" -ForegroundColor Cyan
+Write-Host "Found: $foundCount with vSphere machines" -ForegroundColor Green
+Write-Host "Exporting: $($exportData.Count) server records`n" -ForegroundColor Green
 
-# Export to CSV
-Write-Log "`n=== EXPORTING ===" -Color Cyan
+# Export
 $exportData | Export-Csv -Path $outputPath -NoTypeInformation
-Write-Log "Exported $($exportData.Count) server records to:" -Color Green
-Write-Log "$outputPath" -Color White
-
-# Summary
-Write-Log "`n=== SUMMARY ===" -Color Cyan
-Write-Log "Total deployments scanned: $totalProcessed" -Color White
-Write-Log "Deployments with Cloud.vSphere.Machine: $foundCount" -Color Green
-Write-Log "Deployments skipped (no vSphere machines): $skippedCount" -Color Yellow
-Write-Log "Total server records exported: $($exportData.Count)" -Color Cyan
+Write-Host "Exported to: $outputPath" -ForegroundColor White
