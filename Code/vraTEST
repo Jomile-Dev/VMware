@@ -44,16 +44,17 @@ $headers = @{
     "Content-Type" = "application/json"
 }
 
-# Get all deployments with pagination - NOW WITH EXPAND PARAMETER
+# Get all deployments with pagination
 $uri = "https://$vraServer/deployment/api/deployments"
 $allDeployments = @()
 $page = 0
 $size = 100
 
+Write-Host "Fetching all deployments..." -ForegroundColor Cyan
+
 do {
-    # MODIFIED: Added expand=resources to include resource details
     $pagedUri = "$uri`?page=$page&size=$size&expand=resources"
-    Write-Host "Fetching page $($page + 1)..." -ForegroundColor Gray
+    Write-Host "  Fetching page $($page + 1)..." -ForegroundColor Gray
     
     $response = Invoke-RestMethod -Uri $pagedUri -Method Get -Headers $headers
     $deployments = if ($response.content) { $response.content } else { $response }
@@ -77,118 +78,92 @@ do {
 
 Write-Host "`nTotal deployments retrieved: $($allDeployments.Count)`n" -ForegroundColor Cyan
 
-# DETAILED DIAGNOSTIC: Show structure of first deployment with FULL JSON
-Write-Host "============================================" -ForegroundColor Magenta
-Write-Host "=== DETAILED FIRST DEPLOYMENT ANALYSIS ===" -ForegroundColor Magenta
-Write-Host "============================================`n" -ForegroundColor Magenta
+# Filter deployments that have Cloud.vSphere.Machine resources
+Write-Host "Filtering for Cloud.vSphere.Machine resources..." -ForegroundColor Cyan
 
-if ($allDeployments.Count -gt 0) {
-    $firstDep = $allDeployments[0]
+$vSphereDeployments = @()
+
+foreach ($dep in $allDeployments) {
+    $hasVSphereMachine = $false
+    $vSphereMachines = @()
     
-    Write-Host "Deployment Name: $($firstDep.name)" -ForegroundColor Yellow
-    Write-Host "Deployment ID: $($firstDep.id)" -ForegroundColor Gray
-    Write-Host "`nAll Properties Available:" -ForegroundColor Cyan
-    
-    $firstDep.PSObject.Properties | ForEach-Object {
-        $propName = $_.Name
-        $propValue = $_.Value
+    # Check if resources exist in the deployment object
+    if ($dep.resources -and $dep.resources.Count -gt 0) {
+        # Filter specifically for Cloud.vSphere.Machine type
+        $vSphereMachines = @($dep.resources | Where-Object { 
+            $_.type -eq "Cloud.vSphere.Machine" 
+        })
         
-        Write-Host "  Property: $propName" -ForegroundColor White
-        
-        if ($propValue -eq $null) {
-            Write-Host "    Value: NULL" -ForegroundColor Red
+        if ($vSphereMachines.Count -gt 0) {
+            $hasVSphereMachine = $true
+            Write-Host "  Found $($vSphereMachines.Count) Cloud.vSphere.Machine in deployment: $($dep.name)" -ForegroundColor Green
         }
-        elseif ($propValue -is [System.Collections.IEnumerable] -and $propValue -isnot [string]) {
-            $count = @($propValue).Count
-            Write-Host "    Type: Array/Collection" -ForegroundColor Yellow
-            Write-Host "    Count: $count items" -ForegroundColor Yellow
-            
-            if ($count -gt 0) {
-                Write-Host "    First item preview:" -ForegroundColor Gray
-                @($propValue)[0] | ConvertTo-Json -Depth 3 | ForEach-Object {
-                    $_ -split "`n" | Select-Object -First 20 | ForEach-Object {
-                        Write-Host "      $_" -ForegroundColor DarkGray
-                    }
-                }
-            }
-        }
-        elseif ($propValue -is [PSCustomObject]) {
-            Write-Host "    Type: Object" -ForegroundColor Yellow
-            Write-Host "    Object properties:" -ForegroundColor Gray
-            $propValue.PSObject.Properties | ForEach-Object {
-                Write-Host "      - $($_.Name): $($_.Value)" -ForegroundColor DarkGray
-            }
-        }
-        else {
-            $displayValue = if ($propValue.ToString().Length -gt 100) {
-                $propValue.ToString().Substring(0, 100) + "..."
-            } else {
-                $propValue.ToString()
-            }
-            Write-Host "    Value: $displayValue" -ForegroundColor Gray
-        }
-        Write-Host ""
     }
     
-    Write-Host "`n--- FULL JSON OF FIRST DEPLOYMENT ---" -ForegroundColor Magenta
-    $firstDep | ConvertTo-Json -Depth 5
-    Write-Host "`n"
-    
-    # Check for resources in first deployment
-    if ($firstDep.resources) {
-        Write-Host "RESOURCES FOUND IN FIRST DEPLOYMENT: $($firstDep.resources.Count)" -ForegroundColor Green
-        Write-Host "`nDetailed Resource Breakdown:" -ForegroundColor Cyan
-        
-        $firstDep.resources | ForEach-Object {
-            Write-Host "`n  Resource:" -ForegroundColor Yellow
-            Write-Host "    Type: $($_.type)" -ForegroundColor White
-            Write-Host "    Name: $($_.name)" -ForegroundColor White
-            Write-Host "    ID: $($_.id)" -ForegroundColor Gray
-            
-            if ($_.properties) {
-                Write-Host "    Properties ($($_.properties.PSObject.Properties.Count) total):" -ForegroundColor Cyan
-                $_.properties.PSObject.Properties | ForEach-Object {
-                    $value = if ($_.Value -is [string] -and $_.Value.Length -gt 80) {
-                        $_.Value.Substring(0, 80) + "..."
-                    } else {
-                        $_.Value
-                    }
-                    Write-Host "      - $($_.Name): $value" -ForegroundColor Gray
-                }
-            } else {
-                Write-Host "    Properties: NONE" -ForegroundColor Red
-            }
-        }
-    } else {
-        Write-Host "WARNING: No 'resources' property in first deployment!" -ForegroundColor Red
-        Write-Host "`nAttempting to fetch resources via separate API call..." -ForegroundColor Yellow
-        
+    # If not found, try fetching resources separately
+    if (-not $hasVSphereMachine) {
         try {
-            $resourceUri = "https://$vraServer/deployment/api/deployments/$($firstDep.id)/resources"
+            $resourceUri = "https://$vraServer/deployment/api/deployments/$($dep.id)/resources"
             $separateResources = Invoke-RestMethod -Uri $resourceUri -Method Get -Headers $headers
             $resList = if ($separateResources.content) { $separateResources.content } else { $separateResources }
             
-            Write-Host "SUCCESS! Found $($resList.Count) resources via separate API call" -ForegroundColor Green
-            Write-Host "`nFull JSON of resources:" -ForegroundColor Magenta
-            $resList | ConvertTo-Json -Depth 5
+            # Explicitly filter for Cloud.vSphere.Machine
+            $vSphereMachines = @($resList | Where-Object { 
+                $_.type -eq "Cloud.vSphere.Machine" 
+            })
+            
+            if ($vSphereMachines.Count -gt 0) {
+                $hasVSphereMachine = $true
+                Write-Host "  Found $($vSphereMachines.Count) Cloud.vSphere.Machine via separate call: $($dep.name)" -ForegroundColor Green
+                # Add resources to deployment object for consistent handling
+                $dep | Add-Member -MemberType NoteProperty -Name "resources" -Value $resList -Force
+            }
         } catch {
-            Write-Host "FAILED to fetch resources separately: $_" -ForegroundColor Red
+            # Silently continue if we can't fetch resources
+        }
+    }
+    
+    # Only add to results if we found Cloud.vSphere.Machine resources
+    if ($hasVSphereMachine -and $vSphereMachines.Count -gt 0) {
+        $vSphereDeployments += [PSCustomObject]@{
+            Deployment = $dep
+            vSphereMachines = $vSphereMachines
         }
     }
 }
 
-Write-Host "`n`n============================================" -ForegroundColor Magenta
-Write-Host "=== TOP 150 DEPLOYMENTS SUMMARY ===" -ForegroundColor Magenta
+Write-Host "Found $($vSphereDeployments.Count) deployments with Cloud.vSphere.Machine resources`n" -ForegroundColor Green
+
+if ($vSphereDeployments.Count -eq 0) {
+    Write-Host "No Cloud.vSphere.Machine resources found in any deployment!" -ForegroundColor Red
+    Write-Host "`nShowing first 5 deployments with their resource types for reference:" -ForegroundColor Yellow
+    
+    foreach ($dep in $allDeployments | Select-Object -First 5) {
+        Write-Host "`nDeployment: $($dep.name)" -ForegroundColor Cyan
+        if ($dep.resources) {
+            $types = $dep.resources | Select-Object -ExpandProperty type -Unique
+            Write-Host "  Resource Types: $($types -join ', ')" -ForegroundColor Gray
+        } else {
+            Write-Host "  No resources property" -ForegroundColor Red
+        }
+    }
+    
+    exit
+}
+
+# Display detailed information for each deployment with Cloud.vSphere.Machine
+Write-Host "============================================" -ForegroundColor Magenta
+Write-Host "=== DEPLOYMENTS WITH Cloud.vSphere.Machine ===" -ForegroundColor Magenta
 Write-Host "============================================`n" -ForegroundColor Magenta
 
-$top150 = $allDeployments | Select-Object -First 150
-
-foreach ($i in 0..([Math]::Min(149, $top150.Count - 1))) {
-    $dep = $top150[$i]
-    $num = $i + 1
+$count = 0
+foreach ($item in $vSphereDeployments) {
+    $count++
+    $dep = $item.Deployment
+    $machines = $item.vSphereMachines
     
-    Write-Host "[$num] Deployment: $($dep.name)" -ForegroundColor Yellow
-    Write-Host "    ID: $($dep.id)" -ForegroundColor Gray
+    Write-Host "[$count] DEPLOYMENT: $($dep.name)" -ForegroundColor Yellow
+    Write-Host "    Deployment ID: $($dep.id)" -ForegroundColor Gray
     Write-Host "    Status: $($dep.status)" -ForegroundColor $(if ($dep.status -eq "CREATE_SUCCESSFUL") { "Green" } else { "Yellow" })
     
     if ($dep.projectId) {
@@ -203,91 +178,119 @@ foreach ($i in 0..([Math]::Min(149, $top150.Count - 1))) {
         Write-Host "    Created By: $($dep.createdBy)" -ForegroundColor Gray
     }
     
-    # Resource information
-    if ($dep.resources) {
-        $resourceCount = $dep.resources.Count
-        Write-Host "    Resources: $resourceCount" -ForegroundColor Cyan
+    Write-Host "    Cloud.vSphere.Machine Count: $($machines.Count)" -ForegroundColor Cyan
+    Write-Host ""
+    
+    # Display each vSphere Machine in detail
+    $machineNum = 0
+    foreach ($machine in $machines) {
+        $machineNum++
         
-        $resourcesByType = $dep.resources | Group-Object -Property type
-        foreach ($group in $resourcesByType) {
-            Write-Host "      - $($group.Name): $($group.Count)" -ForegroundColor White
-        }
+        Write-Host "    [$machineNum] vSphere Machine Resource" -ForegroundColor Cyan
+        Write-Host "        Resource Name: $($machine.name)" -ForegroundColor White
+        Write-Host "        Resource ID: $($machine.id)" -ForegroundColor Gray
         
-        # Show first resource in detail
-        if ($resourceCount -gt 0) {
-            $firstResource = $dep.resources[0]
-            Write-Host "`n      First Resource Details:" -ForegroundColor Cyan
-            Write-Host "        Type: $($firstResource.type)" -ForegroundColor White
-            Write-Host "        Name: $($firstResource.name)" -ForegroundColor White
+        if ($machine.properties) {
+            Write-Host ""
+            Write-Host "        === ALL PROPERTIES ===" -ForegroundColor Yellow
             
-            if ($firstResource.properties) {
-                Write-Host "        Properties (first 15):" -ForegroundColor Yellow
-                $firstResource.properties.PSObject.Properties | Select-Object -First 15 | ForEach-Object {
-                    $value = if ($_.Value -is [string] -and $_.Value.Length -gt 60) {
-                        $_.Value.Substring(0, 60) + "..."
-                    } else {
-                        $_.Value
+            $sortedProps = $machine.properties.PSObject.Properties | Sort-Object Name
+            
+            foreach ($prop in $sortedProps) {
+                $propName = $prop.Name
+                $propValue = $prop.Value
+                
+                # Handle different value types
+                if ($propValue -eq $null) {
+                    Write-Host "        $propName : NULL" -ForegroundColor DarkGray
+                }
+                elseif ($propValue -is [System.Collections.IEnumerable] -and $propValue -isnot [string]) {
+                    $count = @($propValue).Count
+                    Write-Host "        $propName : [Array with $count items]" -ForegroundColor Gray
+                    
+                    # Show array items
+                    $itemNum = 0
+                    foreach ($item in $propValue) {
+                        if ($itemNum -lt 5) { # Show first 5 items
+                            if ($item -is [PSCustomObject]) {
+                                Write-Host "          [$itemNum] Object:" -ForegroundColor DarkGray
+                                $item.PSObject.Properties | ForEach-Object {
+                                    Write-Host "            - $($_.Name): $($_.Value)" -ForegroundColor DarkGray
+                                }
+                            } else {
+                                Write-Host "          [$itemNum] $item" -ForegroundColor DarkGray
+                            }
+                        }
+                        $itemNum++
                     }
-                    Write-Host "          - $($_.Name): $value" -ForegroundColor Gray
+                    if ($count -gt 5) {
+                        Write-Host "          ... and $($count - 5) more items" -ForegroundColor DarkGray
+                    }
                 }
-                
-                $totalProps = ($firstResource.properties.PSObject.Properties | Measure-Object).Count
-                if ($totalProps -gt 15) {
-                    Write-Host "          ... and $($totalProps - 15) more properties" -ForegroundColor DarkGray
+                elseif ($propValue -is [PSCustomObject]) {
+                    Write-Host "        $propName : [Object]" -ForegroundColor Gray
+                    $propValue.PSObject.Properties | ForEach-Object {
+                        Write-Host "          - $($_.Name): $($_.Value)" -ForegroundColor DarkGray
+                    }
+                }
+                else {
+                    # Regular value
+                    $displayValue = $propValue.ToString()
+                    if ($displayValue.Length -gt 100) {
+                        $displayValue = $displayValue.Substring(0, 100) + "..."
+                    }
+                    Write-Host "        $propName : $displayValue" -ForegroundColor Gray
                 }
             }
-        }
-    } else {
-        Write-Host "    Resources: NONE or not loaded" -ForegroundColor Red
-        
-        # Try to fetch resources for this deployment
-        Write-Host "    Attempting to fetch resources..." -ForegroundColor Yellow
-        try {
-            $resourceUri = "https://$vraServer/deployment/api/deployments/$($dep.id)/resources"
-            $separateResources = Invoke-RestMethod -Uri $resourceUri -Method Get -Headers $headers
-            $resList = if ($separateResources.content) { $separateResources.content } else { $separateResources }
             
-            if ($resList.Count -gt 0) {
-                Write-Host "    Found $($resList.Count) resources!" -ForegroundColor Green
-                
-                $resourcesByType = $resList | Group-Object -Property type
-                foreach ($group in $resourcesByType) {
-                    Write-Host "      - $($group.Name): $($group.Count)" -ForegroundColor White
-                }
-            }
-        } catch {
-            Write-Host "    Could not fetch: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host ""
+            Write-Host "        Total Properties: $($sortedProps.Count)" -ForegroundColor Cyan
         }
+        else {
+            Write-Host "        NO PROPERTIES FOUND" -ForegroundColor Red
+        }
+        
+        Write-Host ""
+        Write-Host "        --- FULL JSON ---" -ForegroundColor Magenta
+        $machine | ConvertTo-Json -Depth 5
+        Write-Host ""
     }
     
-    Write-Host ""
+    Write-Host "----------------------------------------`n" -ForegroundColor DarkGray
 }
 
-# Summary statistics
+# Summary
 Write-Host "`n============================================" -ForegroundColor Magenta
-Write-Host "=== OVERALL STATISTICS ===" -ForegroundColor Magenta
-Write-Host "============================================`n" -ForegroundColor Magenta
+Write-Host "=== SUMMARY ===" -ForegroundColor Magenta
+Write-Host "============================================" -ForegroundColor Magenta
 
-Write-Host "Total Deployments: $($allDeployments.Count)" -ForegroundColor Cyan
-$deploymentsWithResources = $allDeployments | Where-Object { $_.resources -and $_.resources.Count -gt 0 }
-Write-Host "Deployments with Resources: $($deploymentsWithResources.Count)" -ForegroundColor Cyan
-Write-Host "Deployments without Resources: $($allDeployments.Count - $deploymentsWithResources.Count)" -ForegroundColor Yellow
+Write-Host "Total Deployments Scanned: $($allDeployments.Count)" -ForegroundColor Cyan
+Write-Host "Deployments with Cloud.vSphere.Machine: $($vSphereDeployments.Count)" -ForegroundColor Green
 
-if ($deploymentsWithResources.Count -gt 0) {
-    Write-Host "`nResource Type Summary:" -ForegroundColor Cyan
-    $allResourceTypes = $deploymentsWithResources | ForEach-Object { $_.resources } | Group-Object -Property type | Sort-Object Count -Descending
-    
-    foreach ($type in $allResourceTypes) {
-        Write-Host "  $($type.Name): $($type.Count) instances" -ForegroundColor White
+$totalVSphereMachines = ($vSphereDeployments | ForEach-Object { $_.vSphereMachines.Count } | Measure-Object -Sum).Sum
+Write-Host "Total Cloud.vSphere.Machine Resources: $totalVSphereMachines" -ForegroundColor Green
+
+# Property analysis across all vSphere machines
+Write-Host "`n--- Property Analysis Across All vSphere Machines ---" -ForegroundColor Yellow
+
+$allProperties = @{}
+foreach ($item in $vSphereDeployments) {
+    foreach ($machine in $item.vSphereMachines) {
+        if ($machine.properties) {
+            $machine.properties.PSObject.Properties | ForEach-Object {
+                $propName = $_.Name
+                if (-not $allProperties.ContainsKey($propName)) {
+                    $allProperties[$propName] = 0
+                }
+                $allProperties[$propName]++
+            }
+        }
     }
-    
-    # Count Cloud.vSphere.Machine specifically
-    $vsphereMachineCount = ($allResourceTypes | Where-Object { $_.Name -eq "Cloud.vSphere.Machine" }).Count
-    if ($vsphereMachineCount -gt 0) {
-        Write-Host "`nCloud.vSphere.Machine Resources: $vsphereMachineCount" -ForegroundColor Green
-    } else {
-        Write-Host "`nCloud.vSphere.Machine Resources: 0" -ForegroundColor Red
-    }
+}
+
+Write-Host "`nCommon Properties (found in vSphere machines):" -ForegroundColor Cyan
+$allProperties.GetEnumerator() | Sort-Object Value -Descending | ForEach-Object {
+    Write-Host "  $($_.Key): found in $($_.Value) machines" -ForegroundColor Gray
 }
 
 Write-Host "`n============================================" -ForegroundColor Magenta
