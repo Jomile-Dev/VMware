@@ -32,6 +32,7 @@ function Get-vRAToken {
         [string]$Password
     )
     
+    # Try the standard vRA API endpoint first
     $uri = "https://$Server/csp/gateway/am/api/login"
     $body = @{
         username = $Username
@@ -44,13 +45,26 @@ function Get-vRAToken {
     }
     
     try {
+        Write-Host "Attempting authentication to: $uri" -ForegroundColor Cyan
         $response = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body
         Write-Host "Successfully authenticated to VMware Aria Automation" -ForegroundColor Green
         return $response.cspAuthToken
     }
     catch {
-        Write-Host "Failed to authenticate: $_" -ForegroundColor Red
-        return $null
+        Write-Host "CSP endpoint failed, trying legacy vRA endpoint..." -ForegroundColor Yellow
+        
+        # Try legacy vRA authentication endpoint
+        $uri = "https://$Server/iaas/api/login"
+        try {
+            $response = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body
+            Write-Host "Successfully authenticated using legacy endpoint" -ForegroundColor Green
+            return $response.token
+        }
+        catch {
+            Write-Host "Failed to authenticate: $_" -ForegroundColor Red
+            Write-Host "Error Details: $($_.Exception.Message)" -ForegroundColor Red
+            return $null
+        }
     }
 }
 
@@ -62,18 +76,47 @@ function Get-vRADeployment {
         [string]$DeploymentName
     )
     
-    $uri = "https://$Server/deployment/api/deployments?`$filter=name eq '$DeploymentName'"
+    # Try to get all deployments and search for the server name
+    $uri = "https://$Server/deployment/api/deployments"
     $headers = @{
         "Authorization" = "Bearer $Token"
         "Content-Type" = "application/json"
     }
     
     try {
+        Write-Host "Searching for deployment containing: $DeploymentName" -ForegroundColor Cyan
         $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers
-        return $response.content[0]
+        
+        # Search through all deployments for matching server name
+        $matchingDeployment = $response.content | Where-Object {
+            $_.name -eq $DeploymentName -or 
+            $_.name -like "*$DeploymentName*" -or
+            ($_.resources | Where-Object { $_.name -eq $DeploymentName -or $_.name -like "*$DeploymentName*" })
+        } | Select-Object -First 1
+        
+        if ($matchingDeployment) {
+            Write-Host "Found deployment: $($matchingDeployment.name) (ID: $($matchingDeployment.id))" -ForegroundColor Green
+            return $matchingDeployment
+        }
+        else {
+            # Try searching in resources within deployments
+            foreach ($deployment in $response.content) {
+                $matchingResource = $deployment.resources | Where-Object { 
+                    $_.name -eq $DeploymentName -or $_.name -like "*$DeploymentName*" 
+                }
+                if ($matchingResource) {
+                    Write-Host "Found server in deployment: $($deployment.name)" -ForegroundColor Green
+                    return $deployment
+                }
+            }
+            
+            Write-Host "No deployment found for server: $DeploymentName" -ForegroundColor Yellow
+            return $null
+        }
     }
     catch {
-        Write-Host "Failed to get deployment '$DeploymentName': $_" -ForegroundColor Yellow
+        Write-Host "Failed to search deployments: $_" -ForegroundColor Red
+        Write-Host "Error Details: $($_.Exception.Message)" -ForegroundColor Red
         return $null
     }
 }
