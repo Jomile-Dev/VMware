@@ -1,11 +1,23 @@
-# VMware Aria Automation Troubleshooting Script
-$vraServer = "vra.yourdomain.com"  # Replace with your Aria Automation FQDN
-$testServerName = "WSPO000110"     # Replace with a server name you know exists
+# VMware Aria Automation - Bulk Deployment Renamer
+# This script reads server names from a CSV and renames their deployments
 
-# Prompt for credentials
-$credential = Get-Credential -Message "Enter VMware Aria Automation credentials"
-$username = $credential.UserName
-$password = $credential.GetNetworkCredential().Password
+# Configuration
+$vraServer = "vra.yourdomain.com"  # Replace with your Aria Automation FQDN
+$csvPath = "C:\Path\To\Servers.csv"  # Replace with your CSV file path
+$logPath = "C:\Logs\DeploymentRename_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+
+# Create log directory if it doesn't exist
+$logDir = Split-Path $logPath -Parent
+if (-not (Test-Path $logDir)) {
+    New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+}
+
+# Function to write to console and log
+function Write-Log {
+    param($Message, $Color = "White")
+    Write-Host $Message -ForegroundColor $Color
+    Add-Content -Path $logPath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - $Message"
+}
 
 # Disable SSL certificate validation
 if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
@@ -24,26 +36,57 @@ if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) 
 }
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-# Get token
-Write-Host "=== AUTHENTICATION ===" -ForegroundColor Cyan
+# Verify CSV exists
+if (-not (Test-Path $csvPath)) {
+    Write-Log "ERROR: CSV file not found at $csvPath" -Color Red
+    exit
+}
+
+# Import CSV
+try {
+    $servers = Import-Csv -Path $csvPath
+    if (-not $servers -or $servers.Count -eq 0) {
+        Write-Log "ERROR: CSV file is empty or invalid" -Color Red
+        exit
+    }
+    
+    # Check for Name column
+    if (-not ($servers[0].PSObject.Properties.Name -contains "Name")) {
+        Write-Log "ERROR: CSV must have a 'Name' column" -Color Red
+        exit
+    }
+    
+    Write-Log "Successfully loaded $($servers.Count) servers from CSV" -Color Green
+}
+catch {
+    Write-Log "ERROR: Failed to read CSV: $_" -Color Red
+    exit
+}
+
+# Authenticate
+Write-Log "`n=== AUTHENTICATION ===" -Color Cyan
+$credential = Get-Credential -Message "Enter VMware Aria Automation credentials"
+$username = $credential.UserName
+$password = $credential.GetNetworkCredential().Password
+
 $uri = "https://$vraServer/csp/gateway/am/api/login"
 $body = @{
     username = $username
     password = $password
 } | ConvertTo-Json
 
-$headers = @{
+$authHeaders = @{
     "Content-Type" = "application/json"
     "Accept" = "application/json"
 }
 
 try {
-    $response = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body
+    $response = Invoke-RestMethod -Uri $uri -Method Post -Headers $authHeaders -Body $body
     $token = $response.cspAuthToken
-    Write-Host "Authentication successful!`n" -ForegroundColor Green
+    Write-Log "Authentication successful!" -Color Green
 }
 catch {
-    Write-Host "Authentication failed: $_" -ForegroundColor Red
+    Write-Log "ERROR: Authentication failed: $_" -Color Red
     exit
 }
 
@@ -52,171 +95,186 @@ $headers = @{
     "Content-Type" = "application/json"
 }
 
-# Test 1: Check available API endpoints
-Write-Host "=== TEST 1: Available Endpoints ===" -ForegroundColor Cyan
-$endpoints = @(
-    "https://$vraServer/iaas/api/machines",
-    "https://$vraServer/iaas/api/deployments",
-    "https://$vraServer/deployment/api/deployments",
-    "https://$vraServer/catalog/api/deployments"
-)
-
-foreach ($endpoint in $endpoints) {
-    Write-Host "Testing: $endpoint" -ForegroundColor Yellow
+# Function to find deployment by server name
+function Find-Deployment {
+    param($ServerName)
+    
+    # Method 1: Try machines API with filter
     try {
-        $response = Invoke-RestMethod -Uri "$endpoint`?`$top=1" -Method Get -Headers $headers -ErrorAction Stop
-        Write-Host "  ✓ SUCCESS - Endpoint is accessible" -ForegroundColor Green
-    }
-    catch {
-        Write-Host "  ✗ FAILED - $($_.Exception.Message)" -ForegroundColor Red
-    }
-}
-
-# Test 2: Sample a deployment to see its structure
-Write-Host "`n=== TEST 2: Deployment Structure ===" -ForegroundColor Cyan
-try {
-    $response = Invoke-RestMethod -Uri "https://$vraServer/iaas/api/deployments?`$top=5" -Method Get -Headers $headers
-    $deployments = if ($response.content) { $response.content } else { $response }
-    
-    Write-Host "Found $($deployments.Count) sample deployments" -ForegroundColor Green
-    
-    $sampleDep = $deployments[0]
-    Write-Host "`nSample Deployment:" -ForegroundColor Yellow
-    Write-Host "  Name: $($sampleDep.name)"
-    Write-Host "  ID: $($sampleDep.id)"
-    Write-Host "  Has Resources: $(if ($sampleDep.resources) { 'YES' } else { 'NO' })"
-    
-    if ($sampleDep.resources) {
-        Write-Host "`n  Resources in this deployment:"
-        foreach ($res in $sampleDep.resources) {
-            Write-Host "    - Name: $($res.name)"
-            Write-Host "      Type: $($res.type)"
-            Write-Host "      ID: $($res.id)"
-        }
-    }
-    
-    Write-Host "`nAll available properties on deployment:"
-    $sampleDep.PSObject.Properties.Name | ForEach-Object { Write-Host "  - $_" -ForegroundColor Gray }
-}
-catch {
-    Write-Host "Failed to get deployment structure: $_" -ForegroundColor Red
-}
-
-# Test 3: Try machines API
-Write-Host "`n=== TEST 3: Machines API ===" -ForegroundColor Cyan
-try {
-    $response = Invoke-RestMethod -Uri "https://$vraServer/iaas/api/machines?`$top=5" -Method Get -Headers $headers
-    $machines = if ($response.content) { $response.content } else { $response }
-    
-    Write-Host "Found $($machines.Count) sample machines" -ForegroundColor Green
-    
-    if ($machines.Count -gt 0) {
-        $sampleMachine = $machines[0]
-        Write-Host "`nSample Machine:" -ForegroundColor Yellow
-        Write-Host "  Name: $($sampleMachine.name)"
-        Write-Host "  Type: $($sampleMachine.type)"
-        Write-Host "  ID: $($sampleMachine.id)"
-        Write-Host "  Deployment ID: $($sampleMachine.deploymentId)"
+        $uri = "https://$vraServer/iaas/api/machines?`$filter=name eq '$ServerName'"
+        $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers -ErrorAction Stop
+        $machines = if ($response.content) { $response.content } else { $response }
         
-        Write-Host "`nAll available properties on machine:"
-        $sampleMachine.PSObject.Properties.Name | ForEach-Object { Write-Host "  - $_" -ForegroundColor Gray }
-    }
-}
-catch {
-    Write-Host "Machines API failed: $_" -ForegroundColor Red
-}
-
-# Test 4: Try different search methods for your specific server
-Write-Host "`n=== TEST 4: Searching for '$testServerName' ===" -ForegroundColor Cyan
-
-# Method 1: Search machines by name
-Write-Host "`nMethod 1: Machines API with filter" -ForegroundColor Yellow
-try {
-    $uri = "https://$vraServer/iaas/api/machines?`$filter=name eq '$testServerName'"
-    Write-Host "  URI: $uri" -ForegroundColor Gray
-    $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers
-    $machines = if ($response.content) { $response.content } else { $response }
-    
-    if ($machines.Count -gt 0) {
-        Write-Host "  ✓ FOUND via machines API!" -ForegroundColor Green
-        Write-Host "    Machine: $($machines[0].name)"
-        Write-Host "    Deployment ID: $($machines[0].deploymentId)"
-    } else {
-        Write-Host "  ✗ Not found" -ForegroundColor Red
-    }
-}
-catch {
-    Write-Host "  ✗ Failed: $($_.Exception.Message)" -ForegroundColor Red
-}
-
-# Method 2: Search all machines without filter
-Write-Host "`nMethod 2: Browse first 100 machines" -ForegroundColor Yellow
-try {
-    $response = Invoke-RestMethod -Uri "https://$vraServer/iaas/api/machines?`$top=100" -Method Get -Headers $headers
-    $machines = if ($response.content) { $response.content } else { $response }
-    
-    $found = $machines | Where-Object { $_.name -eq $testServerName }
-    if ($found) {
-        Write-Host "  ✓ FOUND in first 100 machines!" -ForegroundColor Green
-        Write-Host "    Machine: $($found.name)"
-        Write-Host "    Deployment ID: $($found.deploymentId)"
-    } else {
-        Write-Host "  ✗ Not in first 100 machines" -ForegroundColor Yellow
-        Write-Host "    Sample machine names found:"
-        $machines | Select-Object -First 5 | ForEach-Object { Write-Host "      - $($_.name)" -ForegroundColor Gray }
-    }
-}
-catch {
-    Write-Host "  ✗ Failed: $($_.Exception.Message)" -ForegroundColor Red
-}
-
-# Method 3: Search deployments
-Write-Host "`nMethod 3: Search deployments by name" -ForegroundColor Yellow
-try {
-    $uri = "https://$vraServer/iaas/api/deployments?`$filter=name eq '$testServerName'"
-    $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers
-    $deployments = if ($response.content) { $response.content } else { $response }
-    
-    if ($deployments.Count -gt 0) {
-        Write-Host "  ✓ FOUND deployment with that name!" -ForegroundColor Green
-        Write-Host "    Deployment: $($deployments[0].name)"
-    } else {
-        Write-Host "  ✗ No deployment with that exact name" -ForegroundColor Red
-    }
-}
-catch {
-    Write-Host "  ✗ Failed: $($_.Exception.Message)" -ForegroundColor Red
-}
-
-# Method 4: Manual search through deployments
-Write-Host "`nMethod 4: Manual search in first 50 deployments" -ForegroundColor Yellow
-try {
-    $response = Invoke-RestMethod -Uri "https://$vraServer/iaas/api/deployments?`$top=50" -Method Get -Headers $headers
-    $deployments = if ($response.content) { $response.content } else { $response }
-    
-    $foundInDeployment = $false
-    foreach ($dep in $deployments) {
-        if ($dep.resources) {
-            $matchingResource = $dep.resources | Where-Object { $_.name -eq $testServerName }
-            if ($matchingResource) {
-                Write-Host "  ✓ FOUND as resource in deployment!" -ForegroundColor Green
-                Write-Host "    Deployment Name: $($dep.name)"
-                Write-Host "    Deployment ID: $($dep.id)"
-                Write-Host "    Resource Name: $($matchingResource.name)"
-                Write-Host "    Resource Type: $($matchingResource.type)"
-                $foundInDeployment = $true
-                break
+        if ($machines.Count -gt 0 -and $machines[0].deploymentId) {
+            return @{
+                DeploymentId = $machines[0].deploymentId
+                Method = "Machines API"
             }
         }
     }
-    
-    if (-not $foundInDeployment) {
-        Write-Host "  ✗ Not found in first 50 deployments" -ForegroundColor Yellow
+    catch {
+        Write-Log "  Warning: Machines API filter failed: $($_.Exception.Message)" -Color Yellow
     }
-}
-catch {
-    Write-Host "  ✗ Failed: $($_.Exception.Message)" -ForegroundColor Red
+    
+    # Method 2: Try deployment with same name
+    try {
+        $uri = "https://$vraServer/iaas/api/deployments?`$filter=name eq '$ServerName'"
+        $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers -ErrorAction Stop
+        $deployments = if ($response.content) { $response.content } else { $response }
+        
+        if ($deployments.Count -gt 0) {
+            return @{
+                DeploymentId = $deployments[0].id
+                Method = "Direct Match"
+                AlreadyNamed = $true
+            }
+        }
+    }
+    catch {
+        Write-Log "  Warning: Deployment filter failed: $($_.Exception.Message)" -Color Yellow
+    }
+    
+    # Method 3: Search through deployments for resource match (slower but thorough)
+    try {
+        $page = 0
+        $pageSize = 50
+        $maxPages = 20  # Limit to prevent excessive API calls
+        
+        while ($page -lt $maxPages) {
+            $uri = "https://$vraServer/iaas/api/deployments?`$top=$pageSize&`$skip=$($page * $pageSize)"
+            $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers -ErrorAction Stop
+            $deployments = if ($response.content) { $response.content } else { $response }
+            
+            if ($deployments.Count -eq 0) { break }
+            
+            foreach ($dep in $deployments) {
+                if ($dep.resources) {
+                    $matchingResource = $dep.resources | Where-Object { $_.name -eq $ServerName }
+                    if ($matchingResource) {
+                        return @{
+                            DeploymentId = $dep.id
+                            Method = "Resource Search"
+                            CurrentName = $dep.name
+                        }
+                    }
+                }
+            }
+            
+            $page++
+        }
+    }
+    catch {
+        Write-Log "  Warning: Resource search failed: $($_.Exception.Message)" -Color Yellow
+    }
+    
+    return $null
 }
 
-Write-Host "`n=== Troubleshooting Complete ===" -ForegroundColor Cyan
-Write-Host "Review the results above to determine the best search method." -ForegroundColor White
+# Function to rename deployment
+function Rename-Deployment {
+    param($DeploymentId, $NewName)
+    
+    $uri = "https://$vraServer/iaas/api/deployments/$DeploymentId"
+    $body = @{
+        name = $NewName
+    } | ConvertTo-Json
+    
+    try {
+        $response = Invoke-RestMethod -Uri $uri -Method Patch -Headers $headers -Body $body -ErrorAction Stop
+        return $true
+    }
+    catch {
+        Write-Log "  ERROR: Failed to rename: $($_.Exception.Message)" -Color Red
+        return $false
+    }
+}
+
+# Process each server
+Write-Log "`n=== PROCESSING SERVERS ===" -Color Cyan
+$results = @()
+
+$counter = 0
+foreach ($server in $servers) {
+    $counter++
+    $serverName = $server.Name.Trim()
+    
+    Write-Log "`n[$counter/$($servers.Count)] Processing: $serverName" -Color Yellow
+    
+    # Find deployment
+    $deployment = Find-Deployment -ServerName $serverName
+    
+    if (-not $deployment) {
+        Write-Log "  ✗ FAILED: Could not find deployment" -Color Red
+        $results += [PSCustomObject]@{
+            ServerName = $serverName
+            Status = "Not Found"
+            DeploymentId = "N/A"
+            Method = "N/A"
+        }
+        continue
+    }
+    
+    Write-Log "  ✓ Found deployment via $($deployment.Method)" -Color Green
+    Write-Log "    Deployment ID: $($deployment.DeploymentId)" -Color Gray
+    
+    if ($deployment.AlreadyNamed) {
+        Write-Log "  ℹ Deployment already named correctly - skipping" -Color Cyan
+        $results += [PSCustomObject]@{
+            ServerName = $serverName
+            Status = "Already Named"
+            DeploymentId = $deployment.DeploymentId
+            Method = $deployment.Method
+        }
+        continue
+    }
+    
+    if ($deployment.CurrentName) {
+        Write-Log "    Current Name: $($deployment.CurrentName)" -Color Gray
+    }
+    
+    # Rename deployment
+    Write-Log "  Renaming deployment to: $serverName" -Color Yellow
+    $success = Rename-Deployment -DeploymentId $deployment.DeploymentId -NewName $serverName
+    
+    if ($success) {
+        Write-Log "  ✓ SUCCESS: Deployment renamed!" -Color Green
+        $results += [PSCustomObject]@{
+            ServerName = $serverName
+            Status = "Renamed"
+            DeploymentId = $deployment.DeploymentId
+            Method = $deployment.Method
+        }
+    }
+    else {
+        $results += [PSCustomObject]@{
+            ServerName = $serverName
+            Status = "Rename Failed"
+            DeploymentId = $deployment.DeploymentId
+            Method = $deployment.Method
+        }
+    }
+    
+    # Small delay to avoid rate limiting
+    Start-Sleep -Milliseconds 200
+}
+
+# Summary
+Write-Log "`n=== SUMMARY ===" -Color Cyan
+$successCount = ($results | Where-Object { $_.Status -eq "Renamed" }).Count
+$alreadyNamedCount = ($results | Where-Object { $_.Status -eq "Already Named" }).Count
+$notFoundCount = ($results | Where-Object { $_.Status -eq "Not Found" }).Count
+$failedCount = ($results | Where-Object { $_.Status -eq "Rename Failed" }).Count
+
+Write-Log "Total Servers: $($servers.Count)" -Color White
+Write-Log "Successfully Renamed: $successCount" -Color Green
+Write-Log "Already Named Correctly: $alreadyNamedCount" -Color Cyan
+Write-Log "Not Found: $notFoundCount" -Color Red
+Write-Log "Failed to Rename: $failedCount" -Color Red
+
+# Export results
+$resultsPath = Join-Path (Split-Path $logPath -Parent) "RenameResults_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+$results | Export-Csv -Path $resultsPath -NoTypeInformation
+Write-Log "`nResults exported to: $resultsPath" -Color Green
+Write-Log "Full log saved to: $logPath" -Color Green
+
+Write-Log "`n=== COMPLETE ===" -Color Cyan
