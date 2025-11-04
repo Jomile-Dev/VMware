@@ -1,13 +1,13 @@
-# VMware Aria Automation Debug Script
+# VMware Aria Automation Configuration
 $vraServer = "vra.yourdomain.com"  # Replace with your Aria Automation FQDN
-$serverToFind = "WSPO000110"       # The server you're looking for
+$csvFile = "C:\Temp\serverList.csv"
 
 # Prompt for credentials
 $credential = Get-Credential -Message "Enter VMware Aria Automation credentials"
 $username = $credential.UserName
 $password = $credential.GetNetworkCredential().Password
 
-# Disable SSL certificate validation
+# Disable SSL certificate validation (only for self-signed certs)
 if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
     Add-Type @"
     using System.Net;
@@ -24,102 +24,228 @@ if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) 
 }
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-# Get token
-Write-Host "Authenticating..." -ForegroundColor Cyan
-$uri = "https://$vraServer/csp/gateway/am/api/login"
-$body = @{
-    username = $username
-    password = $password
-} | ConvertTo-Json
-
-$headers = @{
-    "Content-Type" = "application/json"
-    "Accept" = "application/json"
-}
-
-try {
-    $response = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body
-    $token = $response.cspAuthToken
-    Write-Host "Authentication successful!" -ForegroundColor Green
-}
-catch {
-    Write-Host "Authentication failed: $_" -ForegroundColor Red
-    exit
-}
-
-# Search for the specific server
-$headers = @{
-    "Authorization" = "Bearer $token"
-    "Content-Type" = "application/json"
-}
-
-$uri = "https://$vraServer/catalog/api/deployments"
-Write-Host "`nFetching first 10 deployments to inspect structure..." -ForegroundColor Cyan
-
-try {
-    $response = Invoke-RestMethod -Uri "$uri`?`$top=10" -Method Get -Headers $headers
-    $deployments = if ($response.content) { $response.content } else { $response }
+# Function to get authentication token
+function Get-vRAToken {
+    param(
+        [string]$Server,
+        [string]$Username,
+        [string]$Password
+    )
     
-    Write-Host "Sample Deployment Structure:" -ForegroundColor Yellow
-    $sampleDeployment = $deployments[0]
-    Write-Host "Deployment Name: $($sampleDeployment.name)" -ForegroundColor Cyan
-    Write-Host "Deployment ID: $($sampleDeployment.id)" -ForegroundColor Cyan
+    # Try the standard vRA API endpoint first
+    $uri = "https://$Server/csp/gateway/am/api/login"
+    $body = @{
+        username = $Username
+        password = $Password
+    } | ConvertTo-Json
     
-    if ($sampleDeployment.resources) {
-        Write-Host "`nResources in this deployment:" -ForegroundColor Yellow
-        foreach ($resource in $sampleDeployment.resources) {
-            Write-Host "  - Resource Name: $($resource.name)" -ForegroundColor White
-            Write-Host "    Resource Type: $($resource.type)" -ForegroundColor Gray
-            Write-Host "    Resource ID: $($resource.id)" -ForegroundColor Gray
-        }
-    } else {
-        Write-Host "No resources property found!" -ForegroundColor Red
-        Write-Host "Available properties:" -ForegroundColor Yellow
-        $sampleDeployment.PSObject.Properties.Name | ForEach-Object { Write-Host "  - $_" }
+    $headers = @{
+        "Content-Type" = "application/json"
+        "Accept" = "application/json"
     }
     
-    # Now try to find your specific server
-    Write-Host "`n`n=== Searching for server: $serverToFind ===" -ForegroundColor Cyan
-    
-    $page = 0
-    $pageSize = 100
-    $found = $false
-    
-    while ($page -lt 10 -and -not $found) {  # Limit to first 1000 deployments for testing
-        $uri = "https://$vraServer/catalog/api/deployments?`$skip=$($page * $pageSize)&`$top=$pageSize"
-        $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers
-        $deployments = if ($response.content) { $response.content } else { $response }
+    try {
+        Write-Host "Attempting authentication to: $uri" -ForegroundColor Cyan
+        $response = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body
+        Write-Host "Successfully authenticated to VMware Aria Automation" -ForegroundColor Green
+        return $response.cspAuthToken
+    }
+    catch {
+        Write-Host "CSP endpoint failed, trying legacy vRA endpoint..." -ForegroundColor Yellow
         
-        Write-Host "Checking page $($page + 1) ($($deployments.Count) deployments)..." -ForegroundColor Gray
+        # Try legacy vRA authentication endpoint
+        $uri = "https://$Server/iaas/api/login"
+        try {
+            $response = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body
+            Write-Host "Successfully authenticated using legacy endpoint" -ForegroundColor Green
+            return $response.token
+        }
+        catch {
+            Write-Host "Failed to authenticate: $_" -ForegroundColor Red
+            Write-Host "Error Details: $($_.Exception.Message)" -ForegroundColor Red
+            return $null
+        }
+    }
+}
+
+# Function to get deployment by machine name
+function Get-vRADeployment {
+    param(
+        [string]$Server,
+        [string]$Token,
+        [string]$MachineName
+    )
+    
+    # Try IaaS endpoint (most common for vRA 8.x)
+    $baseUri = "https://$Server/iaas/api/deployments"
+    
+    $headers = @{
+        "Authorization" = "Bearer $Token"
+        "Content-Type" = "application/json"
+    }
+    
+    try {
+        Write-Host "Searching for machine: $MachineName" -ForegroundColor Cyan
         
-        foreach ($deployment in $deployments) {
-            if ($deployment.resources) {
-                foreach ($resource in $deployment.resources) {
-                    if ($resource.name -eq $serverToFind) {
-                        Write-Host "`n*** FOUND IT! ***" -ForegroundColor Green
-                        Write-Host "Deployment Name: $($deployment.name)" -ForegroundColor Cyan
-                        Write-Host "Deployment ID: $($deployment.id)" -ForegroundColor Cyan
-                        Write-Host "Resource Name: $($resource.name)" -ForegroundColor Cyan
-                        Write-Host "Resource Type: $($resource.type)" -ForegroundColor Cyan
-                        Write-Host "Resource ID: $($resource.id)" -ForegroundColor Cyan
-                        $found = $true
-                        break
+        # Search using API filter for Cloud.vSphere.Machine resources
+        # This is much faster than fetching all deployments
+        $searchUri = "$baseUri`?`$filter=resources.name eq '$MachineName'"
+        
+        Write-Host "Trying filtered search..." -ForegroundColor Cyan
+        try {
+            $response = Invoke-RestMethod -Uri $searchUri -Method Get -Headers $headers -ErrorAction Stop
+            $deployments = if ($response.content) { $response.content } else { $response }
+            
+            if ($deployments -and $deployments.Count -gt 0) {
+                $deployment = $deployments[0]
+                $machine = $deployment.resources | Where-Object { $_.name -eq $MachineName -and $_.type -eq "Cloud.vSphere.Machine" }
+                
+                if ($machine) {
+                    Write-Host "Found machine in deployment: $($deployment.name)" -ForegroundColor Green
+                    return @{
+                        deployment = $deployment
+                        endpoint = $baseUri
+                        resource = $machine
                     }
                 }
             }
-            if ($found) { break }
+        }
+        catch {
+            Write-Host "Filtered search failed, falling back to full search..." -ForegroundColor Yellow
         }
         
-        if ($deployments.Count -lt $pageSize) { break }
-        $page++
+        # Fallback: paginate through all deployments
+        Write-Host "Performing full search through all deployments..." -ForegroundColor Cyan
+        $page = 0
+        $pageSize = 200
+        $hasMore = $true
+        $checkedCount = 0
+        
+        while ($hasMore) {
+            $uri = "$baseUri`?`$skip=$($page * $pageSize)&`$top=$pageSize"
+            
+            $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers -ErrorAction Stop
+            $deployments = if ($response.content) { $response.content } elseif ($response.items) { $response.items } else { $response }
+            
+            if ($deployments.Count -eq 0) {
+                $hasMore = $false
+                break
+            }
+            
+            $checkedCount += $deployments.Count
+            
+            # Only show progress every 10 pages (2000 deployments)
+            if ($page % 10 -eq 0) {
+                Write-Host "Checked $checkedCount deployments..." -ForegroundColor Gray
+            }
+            
+            foreach ($deployment in $deployments) {
+                if ($deployment.resources) {
+                    # Look specifically for Cloud.vSphere.Machine resources
+                    $machine = $deployment.resources | Where-Object { 
+                        $_.type -eq "Cloud.vSphere.Machine" -and $_.name -eq $MachineName
+                    }
+                    
+                    if ($machine) {
+                        Write-Host "Found machine '$MachineName' in deployment: $($deployment.name)" -ForegroundColor Green
+                        Write-Host "  Total deployments checked: $checkedCount" -ForegroundColor Cyan
+                        return @{
+                            deployment = $deployment
+                            endpoint = $baseUri
+                            resource = $machine
+                        }
+                    }
+                }
+            }
+            
+            if ($deployments.Count -lt $pageSize) {
+                $hasMore = $false
+            }
+            $page++
+        }
+        
+        Write-Host "Machine '$MachineName' not found after checking $checkedCount deployments" -ForegroundColor Red
+        return $null
+    }
+    catch {
+        Write-Host "Search failed: $($_.Exception.Message)" -ForegroundColor Red
+        return $null
+    }
+}
+
+# Function to update deployment name
+function Update-vRADeploymentName {
+    param(
+        [string]$Server,
+        [string]$Token,
+        [string]$DeploymentId,
+        [string]$NewName,
+        [string]$Description,
+        [string]$Endpoint
+    )
+    
+    # Determine the correct update endpoint based on where we found the deployment
+    $baseEndpoint = $Endpoint -replace "/deployments.*", "/deployments"
+    $uri = "$baseEndpoint/$DeploymentId"
+    
+    $headers = @{
+        "Authorization" = "Bearer $Token"
+        "Content-Type" = "application/json"
     }
     
-    if (-not $found) {
-        Write-Host "`nServer not found in first 1000 deployments." -ForegroundColor Yellow
-        Write-Host "Please verify the exact server name in VRA UI." -ForegroundColor Yellow
+    $body = @{
+        name = $NewName
+        description = $Description
+    } | ConvertTo-Json
+    
+    try {
+        Write-Host "Updating deployment at: $uri" -ForegroundColor Cyan
+        $response = Invoke-RestMethod -Uri $uri -Method Patch -Headers $headers -Body $body
+        Write-Host "Successfully updated deployment to '$NewName'" -ForegroundColor Green
+        return $true
+    }
+    catch {
+        Write-Host "Failed to update deployment: $_" -ForegroundColor Red
+        Write-Host "Error Details: $($_.Exception.Message)" -ForegroundColor Red
+        return $false
     }
 }
-catch {
-    Write-Host "Error: $_" -ForegroundColor Red
-    Write-Host $_.Exception.Message -ForegroundColor Red
+
+# Main Script
+Write-Host "=== VMware Aria Automation Deployment Update ===" -ForegroundColor Cyan
+
+# Get authentication token
+$token = Get-vRAToken -Server $vraServer -Username $username -Password $password
+
+if ($null -eq $token) {
+    Write-Host "Exiting due to authentication failure" -ForegroundColor Red
+    exit
 }
+
+# Import CSV file
+if (-not (Test-Path $csvFile)) {
+    Write-Host "CSV file not found: $csvFile" -ForegroundColor Red
+    exit
+}
+
+$servers = Import-Csv -Path $csvFile
+Write-Host "`nProcessing $($servers.Count) servers from CSV..." -ForegroundColor Cyan
+
+# Process each server
+foreach ($server in $servers) {
+    Write-Host "`n--- Processing: $($server.Name) ---" -ForegroundColor Yellow
+    
+    # Get the deployment
+    $result = Get-vRADeployment -Server $vraServer -Token $token -DeploymentName $server.Name
+    
+    if ($null -ne $result -and $null -ne $result.deployment) {
+        # Update deployment with description
+        $newDescription = if ($server.Description) { $server.Description } else { "Updated from CSV" }
+        Update-vRADeploymentName -Server $vraServer -Token $token -DeploymentId $result.deployment.id -NewName $server.Name -Description $newDescription -Endpoint $result.endpoint
+    }
+    else {
+        Write-Host "Deployment not found for: $($server.Name)" -ForegroundColor Red
+    }
+}
+
+Write-Host "`n=== Update Process Complete ===" -ForegroundColor Cyan
