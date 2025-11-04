@@ -1,5 +1,6 @@
-# VMware Aria Automation - Bulk Deployment Renamer
+# VMware Aria Automation - Bulk Deployment Renamer (Service Broker API)
 # This script reads server names from a CSV and renames their deployments
+# Uses the Catalog/Service Broker API (same as the UI)
 
 # Configuration
 $vraServer = "vra.yourdomain.com"  # Replace with your Aria Automation FQDN
@@ -95,96 +96,153 @@ $headers = @{
     "Content-Type" = "application/json"
 }
 
-# Function to find deployment by server name
+# Function to find deployment by server name using Service Broker API
 function Find-Deployment {
     param($ServerName)
     
-    # Method 1: Try machines API with filter
+    Write-Log "  Searching Service Broker API for: $ServerName" -Color Gray
+    
+    # Method 1: Use the Catalog API search (same as UI)
+    try {
+        # This is the same search the UI uses
+        $searchUri = "https://$vraServer/catalog/api/deployments?search=$ServerName"
+        Write-Log "    Trying: $searchUri" -Color Gray
+        
+        $response = Invoke-RestMethod -Uri $searchUri -Method Get -Headers $headers -ErrorAction Stop
+        $deployments = if ($response.content) { $response.content } else { $response }
+        
+        if ($deployments.Count -gt 0) {
+            # Look for exact match
+            $exactMatch = $deployments | Where-Object { $_.name -eq $ServerName }
+            if ($exactMatch) {
+                Write-Log "    ✓ Found exact match" -Color Green
+                return @{
+                    DeploymentId = $exactMatch.id
+                    CurrentName = $exactMatch.name
+                    Method = "Catalog Search (Exact)"
+                    AlreadyNamed = $true
+                }
+            }
+            
+            # Look for deployment containing the server name
+            foreach ($dep in $deployments) {
+                Write-Log "    Checking deployment: $($dep.name)" -Color Gray
+                # The deployment might have the server as a resource inside it
+                return @{
+                    DeploymentId = $dep.id
+                    CurrentName = $dep.name
+                    Method = "Catalog Search"
+                }
+            }
+        }
+    }
+    catch {
+        Write-Log "    Warning: Catalog search failed: $($_.Exception.Message)" -Color Yellow
+    }
+    
+    # Method 2: Try deployment/api endpoint (alternative Service Broker API)
+    try {
+        $searchUri = "https://$vraServer/deployment/api/deployments?search=$ServerName"
+        Write-Log "    Trying: $searchUri" -Color Gray
+        
+        $response = Invoke-RestMethod -Uri $searchUri -Method Get -Headers $headers -ErrorAction Stop
+        $deployments = if ($response.content) { $response.content } else { $response }
+        
+        if ($deployments.Count -gt 0) {
+            $exactMatch = $deployments | Where-Object { $_.name -eq $ServerName }
+            if ($exactMatch) {
+                Write-Log "    ✓ Found exact match" -Color Green
+                return @{
+                    DeploymentId = $exactMatch.id
+                    CurrentName = $exactMatch.name
+                    Method = "Deployment API (Exact)"
+                    AlreadyNamed = $true
+                }
+            }
+            
+            return @{
+                DeploymentId = $deployments[0].id
+                CurrentName = $deployments[0].name
+                Method = "Deployment API"
+            }
+        }
+    }
+    catch {
+        Write-Log "    Warning: Deployment API search failed: $($_.Exception.Message)" -Color Yellow
+    }
+    
+    # Method 3: Fallback to IaaS API with filter
     try {
         $uri = "https://$vraServer/iaas/api/machines?`$filter=name eq '$ServerName'"
+        Write-Log "    Trying: $uri" -Color Gray
+        
         $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers -ErrorAction Stop
         $machines = if ($response.content) { $response.content } else { $response }
         
         if ($machines.Count -gt 0 -and $machines[0].deploymentId) {
+            # Now get the deployment details from catalog
+            $depId = $machines[0].deploymentId
+            $depUri = "https://$vraServer/catalog/api/deployments/$depId"
+            $depResponse = Invoke-RestMethod -Uri $depUri -Method Get -Headers $headers -ErrorAction Stop
+            
             return @{
-                DeploymentId = $machines[0].deploymentId
-                Method = "Machines API"
+                DeploymentId = $depResponse.id
+                CurrentName = $depResponse.name
+                Method = "IaaS Machine Lookup"
             }
         }
     }
     catch {
-        Write-Log "  Warning: Machines API filter failed: $($_.Exception.Message)" -Color Yellow
-    }
-    
-    # Method 2: Try deployment with same name
-    try {
-        $uri = "https://$vraServer/iaas/api/deployments?`$filter=name eq '$ServerName'"
-        $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers -ErrorAction Stop
-        $deployments = if ($response.content) { $response.content } else { $response }
-        
-        if ($deployments.Count -gt 0) {
-            return @{
-                DeploymentId = $deployments[0].id
-                Method = "Direct Match"
-                AlreadyNamed = $true
-            }
-        }
-    }
-    catch {
-        Write-Log "  Warning: Deployment filter failed: $($_.Exception.Message)" -Color Yellow
-    }
-    
-    # Method 3: Search through deployments for resource match (slower but thorough)
-    try {
-        $page = 0
-        $pageSize = 50
-        $maxPages = 20  # Limit to prevent excessive API calls
-        
-        while ($page -lt $maxPages) {
-            $uri = "https://$vraServer/iaas/api/deployments?`$top=$pageSize&`$skip=$($page * $pageSize)"
-            $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers -ErrorAction Stop
-            $deployments = if ($response.content) { $response.content } else { $response }
-            
-            if ($deployments.Count -eq 0) { break }
-            
-            foreach ($dep in $deployments) {
-                if ($dep.resources) {
-                    $matchingResource = $dep.resources | Where-Object { $_.name -eq $ServerName }
-                    if ($matchingResource) {
-                        return @{
-                            DeploymentId = $dep.id
-                            Method = "Resource Search"
-                            CurrentName = $dep.name
-                        }
-                    }
-                }
-            }
-            
-            $page++
-        }
-    }
-    catch {
-        Write-Log "  Warning: Resource search failed: $($_.Exception.Message)" -Color Yellow
+        Write-Log "    Warning: IaaS API failed: $($_.Exception.Message)" -Color Yellow
     }
     
     return $null
 }
 
-# Function to rename deployment
+# Function to rename deployment using Service Broker API
 function Rename-Deployment {
-    param($DeploymentId, $NewName)
+    param($DeploymentId, $NewName, $CurrentName)
     
-    $uri = "https://$vraServer/iaas/api/deployments/$DeploymentId"
+    Write-Log "    Attempting rename..." -Color Gray
+    
+    # Try catalog API first
+    $uri = "https://$vraServer/catalog/api/deployments/$DeploymentId"
     $body = @{
         name = $NewName
     } | ConvertTo-Json
     
     try {
+        Write-Log "      Trying: PATCH $uri" -Color Gray
         $response = Invoke-RestMethod -Uri $uri -Method Patch -Headers $headers -Body $body -ErrorAction Stop
+        Write-Log "      ✓ Success via Catalog API" -Color Green
         return $true
     }
     catch {
-        Write-Log "  ERROR: Failed to rename: $($_.Exception.Message)" -Color Red
+        Write-Log "      Warning: Catalog API failed: $($_.Exception.Message)" -Color Yellow
+    }
+    
+    # Try deployment API as fallback
+    $uri = "https://$vraServer/deployment/api/deployments/$DeploymentId"
+    try {
+        Write-Log "      Trying: PATCH $uri" -Color Gray
+        $response = Invoke-RestMethod -Uri $uri -Method Patch -Headers $headers -Body $body -ErrorAction Stop
+        Write-Log "      ✓ Success via Deployment API" -Color Green
+        return $true
+    }
+    catch {
+        Write-Log "      Warning: Deployment API failed: $($_.Exception.Message)" -Color Yellow
+    }
+    
+    # Try IaaS API as last resort
+    $uri = "https://$vraServer/iaas/api/deployments/$DeploymentId"
+    try {
+        Write-Log "      Trying: PATCH $uri" -Color Gray
+        $response = Invoke-RestMethod -Uri $uri -Method Patch -Headers $headers -Body $body -ErrorAction Stop
+        Write-Log "      ✓ Success via IaaS API" -Color Green
+        return $true
+    }
+    catch {
+        Write-Log "      ERROR: All rename methods failed. Last error: $($_.Exception.Message)" -Color Red
         return $false
     }
 }
@@ -209,6 +267,7 @@ foreach ($server in $servers) {
             ServerName = $serverName
             Status = "Not Found"
             DeploymentId = "N/A"
+            CurrentName = "N/A"
             Method = "N/A"
         }
         continue
@@ -216,6 +275,7 @@ foreach ($server in $servers) {
     
     Write-Log "  ✓ Found deployment via $($deployment.Method)" -Color Green
     Write-Log "    Deployment ID: $($deployment.DeploymentId)" -Color Gray
+    Write-Log "    Current Name: $($deployment.CurrentName)" -Color Gray
     
     if ($deployment.AlreadyNamed) {
         Write-Log "  ℹ Deployment already named correctly - skipping" -Color Cyan
@@ -223,18 +283,15 @@ foreach ($server in $servers) {
             ServerName = $serverName
             Status = "Already Named"
             DeploymentId = $deployment.DeploymentId
+            CurrentName = $deployment.CurrentName
             Method = $deployment.Method
         }
         continue
     }
     
-    if ($deployment.CurrentName) {
-        Write-Log "    Current Name: $($deployment.CurrentName)" -Color Gray
-    }
-    
     # Rename deployment
-    Write-Log "  Renaming deployment to: $serverName" -Color Yellow
-    $success = Rename-Deployment -DeploymentId $deployment.DeploymentId -NewName $serverName
+    Write-Log "  Renaming: '$($deployment.CurrentName)' → '$serverName'" -Color Yellow
+    $success = Rename-Deployment -DeploymentId $deployment.DeploymentId -NewName $serverName -CurrentName $deployment.CurrentName
     
     if ($success) {
         Write-Log "  ✓ SUCCESS: Deployment renamed!" -Color Green
@@ -242,6 +299,7 @@ foreach ($server in $servers) {
             ServerName = $serverName
             Status = "Renamed"
             DeploymentId = $deployment.DeploymentId
+            CurrentName = $deployment.CurrentName
             Method = $deployment.Method
         }
     }
@@ -250,6 +308,7 @@ foreach ($server in $servers) {
             ServerName = $serverName
             Status = "Rename Failed"
             DeploymentId = $deployment.DeploymentId
+            CurrentName = $deployment.CurrentName
             Method = $deployment.Method
         }
     }
