@@ -62,43 +62,69 @@ $headers = @{
 function Find-Deployment {
     param($ServerName)
     
-    # Get all deployments and search for the server name inside their resources
+    # Get all deployments and search for Machine resources with the server name
     $searchUri = "https://$vraServer/deployment/api/deployments"
     
     try {
         $response = Invoke-RestMethod -Uri $searchUri -Method Get -Headers $headers -ErrorAction Stop
         $deployments = if ($response.content) { $response.content } else { $response }
         
-        Write-Log "  Searching through $($deployments.Count) deployments for resource '$ServerName'" -Color Gray
+        Write-Log "  Searching through $($deployments.Count) deployments for Machine resource" -Color Gray
         
         if ($deployments.Count -gt 0) {
-            # Search through all deployments for a resource with the server name
+            # Search for Machine resources containing the server name
             foreach ($dep in $deployments) {
                 if ($dep.resources) {
-                    $matchingResource = $dep.resources | Where-Object { $_.name -eq $ServerName }
-                    if ($matchingResource) {
-                        Write-Log "  ✓ Found resource in deployment: $($dep.name)" -Color Green
-                        return @{
-                            DeploymentId = $dep.id
-                            CurrentName = $dep.name
-                            AlreadyNamed = ($dep.name -eq $ServerName)
+                    # Filter by Machine resource type
+                    $machineResources = $dep.resources | Where-Object { $_.type -eq "Machine" }
+                    
+                    foreach ($machine in $machineResources) {
+                        # Check name property
+                        if ($machine.name -eq $ServerName) {
+                            Write-Log "  ✓ Found Machine resource in deployment: $($dep.name)" -Color Green
+                            return @{
+                                DeploymentId = $dep.id
+                                CurrentName = $dep.name
+                                AlreadyNamed = ($dep.name -eq $ServerName)
+                            }
+                        }
+                        
+                        # Check properties object for the name
+                        if ($machine.properties) {
+                            # Check various property names where server name might be
+                            $propNames = @("name", "resourceName", "vmName", "hostName", "computerName")
+                            foreach ($propName in $propNames) {
+                                if ($machine.properties.$propName -eq $ServerName) {
+                                    Write-Log "  ✓ Found in Machine resource properties ($propName) in: $($dep.name)" -Color Green
+                                    return @{
+                                        DeploymentId = $dep.id
+                                        CurrentName = $dep.name
+                                        AlreadyNamed = ($dep.name -eq $ServerName)
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
             
-            # Not found - show sample resource names for debugging
-            Write-Log "  ✗ Resource not found. Sample resources from first 3 deployments:" -Color Yellow
-            $deployments | Select-Object -First 3 | ForEach-Object {
-                Write-Log "    Deployment: $($_.name)" -Color Gray
-                if ($_.resources) {
-                    $_.resources | ForEach-Object {
-                        Write-Log "      - Resource: $($_.name)" -Color Gray
+            # Not found - show sample Machine resources for debugging
+            Write-Log "  ✗ Machine resource not found. Sample Machine resources:" -Color Yellow
+            $count = 0
+            foreach ($dep in $deployments) {
+                if ($dep.resources) {
+                    $machines = $dep.resources | Where-Object { $_.type -eq "Machine" }
+                    foreach ($machine in $machines) {
+                        Write-Log "    Deployment: $($dep.name)" -Color Gray
+                        Write-Log "      Machine name: $($machine.name)" -Color Gray
+                        if ($machine.properties) {
+                            Write-Log "      Properties: name=$($machine.properties.name), resourceName=$($machine.properties.resourceName)" -Color Gray
+                        }
+                        $count++
+                        if ($count -ge 3) { break }
                     }
                 }
-                else {
-                    Write-Log "      - No resources" -Color Gray
-                }
+                if ($count -ge 3) { break }
             }
         }
     }
