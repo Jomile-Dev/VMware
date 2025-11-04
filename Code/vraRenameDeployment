@@ -32,15 +32,9 @@ if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Import CSV
-try {
-    $servers = Import-Csv -Path $csvPath
-    Write-Host "Loaded $($servers.Count) servers from CSV" -ForegroundColor Green
-}
-catch {
-    Write-Host "ERROR: Failed to import CSV from '$csvPath': $_" -ForegroundColor Red
-    Write-Host "Please verify the file path and format." -ForegroundColor Yellow
-    exit
-}
+$servers = Import-Csv -Path $csvPath
+$serverCount = @($servers).Count
+Write-Host "Loaded $serverCount servers from CSV" -ForegroundColor Green
 
 # Authenticate
 Write-Log "`n=== AUTHENTICATION ===" -Color Cyan
@@ -82,7 +76,7 @@ function Find-Deployment {
     
     # This matches the UI: Consume > Deployments > Search
     try {
-        $searchUri = "https://$vraServer/catalog/api/deployments?search=$ServerName"
+        $searchUri = "https://$vraServer/deployment/api/deployments?size=20&sort=createdAt%2ClastUpdatedAt%2CDESC&search=$ServerName"
         Write-Log "    API: $searchUri" -Color Gray
         
         $response = Invoke-RestMethod -Uri $searchUri -Method Get -Headers $headers -ErrorAction Stop
