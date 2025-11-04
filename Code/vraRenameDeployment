@@ -32,8 +32,8 @@ if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Import CSV
-$servers = Import-Csv -Path $csvPath
-$serverCount = @($servers).Count
+$servers = @(Import-Csv -Path $csvPath)
+$serverCount = $servers.Count
 Write-Host "Loaded $serverCount servers from CSV" -ForegroundColor Green
 
 # Authenticate
@@ -113,7 +113,7 @@ function Find-Deployment {
 function Rename-Deployment {
     param($DeploymentId, $NewName)
     
-    $uri = "https://$vraServer/catalog/api/deployments/$DeploymentId"
+    $uri = "https://$vraServer/deployment/api/deployments/$DeploymentId"
     $body = @{
         name = $NewName
     } | ConvertTo-Json
