@@ -66,23 +66,43 @@ function Find-Deployment {
     $searchUri = "https://$vraServer/deployment/api/deployments?search=$ServerName"
     
     try {
+        Write-Log "  Searching: $searchUri" -Color Gray
         $response = Invoke-RestMethod -Uri $searchUri -Method Get -Headers $headers -ErrorAction Stop
         $deployments = if ($response.content) { $response.content } else { $response }
+        
+        Write-Log "  Found $($deployments.Count) deployment(s) from search" -Color Gray
         
         if ($deployments.Count -gt 0) {
             # Check each deployment for a resource matching the server name
             foreach ($dep in $deployments) {
+                Write-Log "    Checking deployment: $($dep.name) (ID: $($dep.id))" -Color Gray
+                
                 if ($dep.resources) {
+                    Write-Log "      Has $($dep.resources.Count) resources" -Color Gray
+                    foreach ($res in $dep.resources) {
+                        Write-Log "        Resource: $($res.name) (Type: $($res.type))" -Color Gray
+                    }
+                    
                     $matchingResource = $dep.resources | Where-Object { $_.name -eq $ServerName }
                     if ($matchingResource) {
+                        Write-Log "      ✓ Found matching resource!" -Color Green
                         return @{
                             DeploymentId = $dep.id
                             CurrentName = $dep.name
                             AlreadyNamed = ($dep.name -eq $ServerName)
                         }
                     }
+                    else {
+                        Write-Log "      ✗ No exact match for '$ServerName'" -Color Yellow
+                    }
+                }
+                else {
+                    Write-Log "      ✗ Deployment has no resources" -Color Yellow
                 }
             }
+        }
+        else {
+            Write-Log "  ✗ Search returned 0 results" -Color Yellow
         }
     }
     catch {
