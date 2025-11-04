@@ -62,33 +62,22 @@ $headers = @{
 function Find-Deployment {
     param($ServerName)
     
-    # Get all deployments (like the UI does), then search through them
+    # Get all deployments and search for the server name inside their resources
     $searchUri = "https://$vraServer/deployment/api/deployments"
     
     try {
         $response = Invoke-RestMethod -Uri $searchUri -Method Get -Headers $headers -ErrorAction Stop
         $deployments = if ($response.content) { $response.content } else { $response }
         
-        Write-Log "  Retrieved $($deployments.Count) total deployments" -Color Gray
+        Write-Log "  Searching through $($deployments.Count) deployments for resource '$ServerName'" -Color Gray
         
         if ($deployments.Count -gt 0) {
-            # First check if deployment name matches
-            $depMatch = $deployments | Where-Object { $_.name -eq $ServerName }
-            if ($depMatch) {
-                Write-Log "  ✓ Found as deployment name" -Color Green
-                return @{
-                    DeploymentId = $depMatch.id
-                    CurrentName = $depMatch.name
-                    AlreadyNamed = $true
-                }
-            }
-            
-            # Search through all deployments for one containing a resource with the server name
+            # Search through all deployments for a resource with the server name
             foreach ($dep in $deployments) {
                 if ($dep.resources) {
                     $matchingResource = $dep.resources | Where-Object { $_.name -eq $ServerName }
                     if ($matchingResource) {
-                        Write-Log "  ✓ Found as resource in: $($dep.name)" -Color Green
+                        Write-Log "  ✓ Found resource in deployment: $($dep.name)" -Color Green
                         return @{
                             DeploymentId = $dep.id
                             CurrentName = $dep.name
@@ -98,14 +87,17 @@ function Find-Deployment {
                 }
             }
             
-            # Still not found - show first 5 deployment/resource names for debugging
-            Write-Log "  ✗ Not found. Sample deployment names:" -Color Yellow
-            $deployments | Select-Object -First 5 | ForEach-Object {
-                Write-Log "      - $($_.name)" -Color Gray
+            # Not found - show sample resource names for debugging
+            Write-Log "  ✗ Resource not found. Sample resources from first 3 deployments:" -Color Yellow
+            $deployments | Select-Object -First 3 | ForEach-Object {
+                Write-Log "    Deployment: $($_.name)" -Color Gray
                 if ($_.resources) {
-                    $_.resources | Select-Object -First 2 | ForEach-Object {
-                        Write-Log "          Resource: $($_.name)" -Color Gray
+                    $_.resources | ForEach-Object {
+                        Write-Log "      - Resource: $($_.name)" -Color Gray
                     }
+                }
+                else {
+                    Write-Log "      - No resources" -Color Gray
                 }
             }
         }
