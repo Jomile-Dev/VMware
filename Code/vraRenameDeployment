@@ -1,0 +1,147 @@
+# VMware Aria Automation Configuration
+$vraServer = "vra.yourdomain.com"  # Replace with your Aria Automation FQDN
+$username = "admin@local"           # Replace with your username
+$password = "YourPassword"          # Replace with your password
+$csvFile = "C:\Temp\serverList.csv"
+
+# Disable SSL certificate validation (only for self-signed certs)
+if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
+    Add-Type @"
+    using System.Net;
+    using System.Security.Cryptography.X509Certificates;
+    public class TrustAllCertsPolicy : ICertificatePolicy {
+        public bool CheckValidationResult(
+            ServicePoint svcPoint, X509Certificate certificate,
+            WebRequest request, int certificateProblem) {
+            return true;
+        }
+    }
+"@
+    [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+}
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# Function to get authentication token
+function Get-vRAToken {
+    param(
+        [string]$Server,
+        [string]$Username,
+        [string]$Password
+    )
+    
+    $uri = "https://$Server/csp/gateway/am/api/login"
+    $body = @{
+        username = $Username
+        password = $Password
+    } | ConvertTo-Json
+    
+    $headers = @{
+        "Content-Type" = "application/json"
+        "Accept" = "application/json"
+    }
+    
+    try {
+        $response = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body
+        Write-Host "Successfully authenticated to VMware Aria Automation" -ForegroundColor Green
+        return $response.cspAuthToken
+    }
+    catch {
+        Write-Host "Failed to authenticate: $_" -ForegroundColor Red
+        return $null
+    }
+}
+
+# Function to get deployment by name
+function Get-vRADeployment {
+    param(
+        [string]$Server,
+        [string]$Token,
+        [string]$DeploymentName
+    )
+    
+    $uri = "https://$Server/deployment/api/deployments?`$filter=name eq '$DeploymentName'"
+    $headers = @{
+        "Authorization" = "Bearer $Token"
+        "Content-Type" = "application/json"
+    }
+    
+    try {
+        $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers
+        return $response.content[0]
+    }
+    catch {
+        Write-Host "Failed to get deployment '$DeploymentName': $_" -ForegroundColor Yellow
+        return $null
+    }
+}
+
+# Function to update deployment name
+function Update-vRADeploymentName {
+    param(
+        [string]$Server,
+        [string]$Token,
+        [string]$DeploymentId,
+        [string]$NewName,
+        [string]$Description
+    )
+    
+    $uri = "https://$Server/deployment/api/deployments/$DeploymentId"
+    $headers = @{
+        "Authorization" = "Bearer $Token"
+        "Content-Type" = "application/json"
+    }
+    
+    $body = @{
+        name = $NewName
+        description = $Description
+    } | ConvertTo-Json
+    
+    try {
+        $response = Invoke-RestMethod -Uri $uri -Method Patch -Headers $headers -Body $body
+        Write-Host "Successfully updated deployment to '$NewName'" -ForegroundColor Green
+        return $true
+    }
+    catch {
+        Write-Host "Failed to update deployment: $_" -ForegroundColor Red
+        return $false
+    }
+}
+
+# Main Script
+Write-Host "=== VMware Aria Automation Deployment Update ===" -ForegroundColor Cyan
+
+# Get authentication token
+$token = Get-vRAToken -Server $vraServer -Username $username -Password $password
+
+if ($null -eq $token) {
+    Write-Host "Exiting due to authentication failure" -ForegroundColor Red
+    exit
+}
+
+# Import CSV file
+if (-not (Test-Path $csvFile)) {
+    Write-Host "CSV file not found: $csvFile" -ForegroundColor Red
+    exit
+}
+
+$servers = Import-Csv -Path $csvFile
+Write-Host "`nProcessing $($servers.Count) servers from CSV..." -ForegroundColor Cyan
+
+# Process each server
+foreach ($server in $servers) {
+    Write-Host "`n--- Processing: $($server.Name) ---" -ForegroundColor Yellow
+    
+    # Get the deployment
+    $deployment = Get-vRADeployment -Server $vraServer -Token $token -DeploymentName $server.Name
+    
+    if ($null -ne $deployment) {
+        # Update deployment with description
+        $newDescription = if ($server.Description) { $server.Description } else { "Updated from CSV" }
+        Update-vRADeploymentName -Server $vraServer -Token $token -DeploymentId $deployment.id -NewName $server.Name -Description $newDescription
+    }
+    else {
+        Write-Host "Deployment not found for: $($server.Name)" -ForegroundColor Red
+    }
+}
+
+Write-Host "`n=== Update Process Complete ===" -ForegroundColor Cyan
