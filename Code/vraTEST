@@ -76,9 +76,61 @@ do {
 
 Write-Host "`nTotal deployments retrieved: $($allDeployments.Count)`n" -ForegroundColor Cyan
 
-# Filter for deployments with Cloud.vSphere.Machine resources
+# Show sample of each unique resource type
+Write-Host "=== SAMPLE DEPLOYMENTS BY RESOURCE TYPE ===" -ForegroundColor Cyan
+
+$resourceTypes = @{}
+
+foreach ($dep in $allDeployments) {
+    if ($dep.resources) {
+        foreach ($res in $dep.resources) {
+            $type = $res.type
+            
+            if (-not $resourceTypes.ContainsKey($type)) {
+                $resourceTypes[$type] = @{
+                    Deployment = $dep
+                    Resource = $res
+                }
+            }
+        }
+    }
+}
+
+Write-Host "`nFound $($resourceTypes.Count) unique resource types:`n" -ForegroundColor Green
+
+foreach ($type in $resourceTypes.Keys | Sort-Object) {
+    $sample = $resourceTypes[$type]
+    
+    Write-Host "Resource Type: $type" -ForegroundColor Yellow
+    Write-Host "  Example Deployment: $($sample.Deployment.name)" -ForegroundColor White
+    Write-Host "  Resource Name: $($sample.Resource.name)" -ForegroundColor White
+    
+    if ($sample.Resource.properties) {
+        Write-Host "  Properties:" -ForegroundColor Cyan
+        $sample.Resource.properties.PSObject.Properties | Select-Object -First 10 | ForEach-Object {
+            $value = if ($_.Value -is [string] -and $_.Value.Length -gt 50) { 
+                $_.Value.Substring(0, 50) + "..." 
+            } else { 
+                $_.Value 
+            }
+            Write-Host "    - $($_.Name) = $value" -ForegroundColor Gray
+        }
+        
+        $propCount = ($sample.Resource.properties.PSObject.Properties | Measure-Object).Count
+        if ($propCount -gt 10) {
+            Write-Host "    ... and $($propCount - 10) more properties" -ForegroundColor Gray
+        }
+    }
+    else {
+        Write-Host "  No properties" -ForegroundColor Red
+    }
+    
+    Write-Host ""
+}
+
+Write-Host "`n=== DEPLOYMENTS WITH Cloud.vSphere.Machine ===" -ForegroundColor Cyan
 $count = 0
-foreach ($dep in $deployments) {
+foreach ($dep in $allDeployments) {
     if ($dep.resources) {
         $vsphereMachines = $dep.resources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" }
         
