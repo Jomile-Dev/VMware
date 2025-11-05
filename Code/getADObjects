@@ -6,7 +6,12 @@ $OUPath = "OU=Servers,DC=yourdomain,DC=com"
 
 # Get only Windows Server computer objects, excluding clusters
 $Servers = Get-ADComputer -Filter {OperatingSystem -like "*Windows Server*"} -SearchBase $OUPath -Properties Description, OperatingSystem | 
-    Where-Object {$_.Name -notlike "*CLUSTER*" -and $_.Name -notlike "*CLU*"}
+    Where-Object {
+        $_.Name -notlike "*CLUSTER*" -and 
+        $_.Name -notlike "*CLU*" -and
+        $_.Description -notlike "*CLUSTER OBJECT*" -and
+        $_.Description -notlike "*failover cluster*"
+    }
 
 # Test connectivity and export only online servers
 $OnlineServers = $Servers | ForEach-Object {
