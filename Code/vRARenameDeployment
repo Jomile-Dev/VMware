@@ -1,5 +1,5 @@
 # VMware Aria Automation - Bulk Deployment Renamer
-# Finds deployments by server name and renames them based on the Description column
+# Renames deployments based on CSV input (Name column = server to find, Description = new deployment name)
 
 $vraServer = "vra.yourdomain.com"
 $csvPath = "C:\Path\To\Servers.csv"
@@ -11,142 +11,86 @@ function Write-Log {
     Add-Content -Path $logPath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - $Message"
 }
 
-# Disable SSL validation
-if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
-    Add-Type @"
-    using System.Net;
-    using System.Security.Cryptography.X509Certificates;
-    public class TrustAllCertsPolicy : ICertificatePolicy {
-        public bool CheckValidationResult(
-            ServicePoint svcPoint, X509Certificate certificate,
-            WebRequest request, int certificateProblem) {
-            return true;
-        }
-    }
-"@
-    [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
-}
+# Configure TLS 1.2
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+[System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
 
 # Import CSV
 $servers = @(Import-Csv -Path $csvPath)
 Write-Host "Loaded $($servers.Count) servers from CSV`n" -ForegroundColor Green
 
-# Authenticate
+# Authenticate to VMware Aria
 Write-Log "=== AUTHENTICATION ===" -Color Cyan
 $credential = Get-Credential -Message "Enter VMware Aria Automation credentials"
-$username = $credential.UserName
-$password = $credential.GetNetworkCredential().Password
 
-$uri = "https://$vraServer/csp/gateway/am/api/login"
-$body = @{
-    username = $username
-    password = $password
+$authBody = @{
+    username = $credential.UserName
+    password = $credential.GetNetworkCredential().Password
 } | ConvertTo-Json
 
-$authHeaders = @{
-    "Content-Type" = "application/json"
-    "Accept" = "application/json"
-}
-
-$response = Invoke-RestMethod -Uri $uri -Method Post -Headers $authHeaders -Body $body
-$token = $response.cspAuthToken
-Write-Log "Authentication successful!`n" -Color Green
+$authResponse = Invoke-RestMethod -Uri "https://$vraServer/csp/gateway/am/api/login" `
+    -Method Post -Headers @{"Content-Type"="application/json"} -Body $authBody
 
 $headers = @{
-    "Authorization" = "Bearer $token"
+    "Authorization" = "Bearer $($authResponse.cspAuthToken)"
     "Content-Type" = "application/json"
 }
+Write-Log "Authentication successful!`n" -Color Green
 
 # Get all deployments with pagination
 function Get-AllDeployments {
     Write-Log "Fetching all deployments..." -Color Cyan
-    
-    $uri = "https://$vraServer/deployment/api/deployments"
     $allDeployments = @()
     $page = 0
     $size = 100
     
     do {
-        $pagedUri = "$uri`?page=$page&size=$size&expand=resources"
-        Write-Log "  Page $($page + 1)..." -Color Gray
+        $uri = "https://$vraServer/deployment/api/deployments?page=$page&size=$size&expand=resources"
+        Write-Log "  Page $($page + 1)..." -Gray
         
-        $response = Invoke-RestMethod -Uri $pagedUri -Method Get -Headers $headers
+        $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers
         $deployments = if ($response.content) { $response.content } else { $response }
-        
         $allDeployments += $deployments
+        
+        $hasMore = ($response.totalPages -and $page -lt $response.totalPages - 1) -or 
+                   ($deployments.Count -eq $size)
         $page++
-        
-        $hasMore = if ($response.totalPages) { 
-            $page -lt $response.totalPages 
-        } elseif ($response.totalElements) { 
-            $allDeployments.Count -lt $response.totalElements 
-        } else { 
-            $deployments.Count -eq $size 
-        }
-        
     } while ($hasMore)
     
     Write-Log "Total deployments: $($allDeployments.Count)`n" -Color Cyan
     return $allDeployments
 }
 
-# Find deployment containing the server
+# Find deployment containing the specified server
 function Find-Deployment {
     param($ServerName, $AllDeployments)
     
     foreach ($dep in $AllDeployments) {
-        $vSphereMachines = @()
+        $machines = @($dep.resources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" })
         
-        # Check inline resources
-        if ($dep.resources) {
-            $vSphereMachines = @($dep.resources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" })
-        }
-        
-        # Try separate resource call if needed
-        if ($vSphereMachines.Count -eq 0) {
-            try {
-                $resourceUri = "https://$vraServer/deployment/api/deployments/$($dep.id)/resources"
-                $separateResources = Invoke-RestMethod -Uri $resourceUri -Method Get -Headers $headers -ErrorAction Stop
-                $resList = if ($separateResources.content) { $separateResources.content } else { $separateResources }
-                $vSphereMachines = @($resList | Where-Object { $_.type -eq "Cloud.vSphere.Machine" })
-            } catch {
-                continue
-            }
-        }
-        
-        # Check each vSphere machine
-        foreach ($machine in $vSphereMachines) {
-            if ($machine.name -eq $ServerName) {
+        foreach ($machine in $machines) {
+            # Check machine name or hostname properties
+            if ($machine.name -eq $ServerName -or 
+                $machine.properties.hostname -eq $ServerName -or 
+                $machine.properties.resourceName -eq $ServerName) {
                 return @{
                     DeploymentId = $dep.id
                     CurrentName = $dep.name
                 }
             }
-            
-            if ($machine.properties) {
-                if ($machine.properties.hostname -eq $ServerName -or $machine.properties.resourceName -eq $ServerName) {
-                    return @{
-                        DeploymentId = $dep.id
-                        CurrentName = $dep.name
-                    }
-                }
-            }
         }
     }
-    
     return $null
 }
 
-# Rename deployment
+# Rename deployment via PATCH API
 function Rename-Deployment {
     param($DeploymentId, $NewName)
     
-    $uri = "https://$vraServer/deployment/api/deployments/$DeploymentId"
-    $body = @{ name = $NewName } | ConvertTo-Json
-    
     try {
-        Invoke-RestMethod -Uri $uri -Method Patch -Headers $headers -Body $body -ErrorAction Stop | Out-Null
+        $body = @{ name = $NewName } | ConvertTo-Json
+        Invoke-RestMethod -Uri "https://$vraServer/deployment/api/deployments/$DeploymentId" `
+            -Method Patch -Headers $headers -Body $body -ErrorAction Stop | Out-Null
         return $true
     }
     catch {
@@ -155,66 +99,41 @@ function Rename-Deployment {
     }
 }
 
-# Get all deployments once
+# Main processing
 $allDeployments = Get-AllDeployments
-
-# Process servers
 Write-Log "=== PROCESSING SERVERS ===" -Color Cyan
 $results = @()
-$counter = 0
 
-foreach ($server in $servers) {
-    $counter++
+for ($i = 0; $i -lt $servers.Count; $i++) {
+    $server = $servers[$i]
     $serverName = $server.Name.Trim()
-    $newDeploymentName = $server.Description.Trim()
+    $newName = $server.Description.Trim()
     
-    Write-Log "`n[$counter/$($servers.Count)] $serverName → $newDeploymentName" -Color Yellow
+    Write-Log "`n[$($i+1)/$($servers.Count)] $serverName → $newName" -Color Yellow
     
     $deployment = Find-Deployment -ServerName $serverName -AllDeployments $allDeployments
     
     if (-not $deployment) {
         Write-Log "  ✗ Not found" -Color Red
-        $results += [PSCustomObject]@{
-            ServerName = $serverName
-            NewName = $newDeploymentName
-            Status = "Not Found"
-            OldName = "N/A"
-        }
+        $results += [PSCustomObject]@{ ServerName=$serverName; NewName=$newName; Status="Not Found"; OldName="N/A" }
         continue
     }
     
-    Write-Log "  Current: $($deployment.CurrentName)" -Color Gray
+    Write-Log "  Current: $($deployment.CurrentName)" -Gray
     
-    if ($deployment.CurrentName -eq $newDeploymentName) {
+    if ($deployment.CurrentName -eq $newName) {
         Write-Log "  ℹ Already correct" -Color Cyan
-        $results += [PSCustomObject]@{
-            ServerName = $serverName
-            NewName = $newDeploymentName
-            Status = "Already Named"
-            OldName = $deployment.CurrentName
-        }
+        $results += [PSCustomObject]@{ ServerName=$serverName; NewName=$newName; Status="Already Named"; OldName=$deployment.CurrentName }
         continue
     }
     
-    $success = Rename-Deployment -DeploymentId $deployment.DeploymentId -NewName $newDeploymentName
-    
-    if ($success) {
+    if (Rename-Deployment -DeploymentId $deployment.DeploymentId -NewName $newName) {
         Write-Log "  ✓ Renamed" -Color Green
-        $results += [PSCustomObject]@{
-            ServerName = $serverName
-            NewName = $newDeploymentName
-            Status = "Renamed"
-            OldName = $deployment.CurrentName
-        }
+        $results += [PSCustomObject]@{ ServerName=$serverName; NewName=$newName; Status="Renamed"; OldName=$deployment.CurrentName }
     }
     else {
         Write-Log "  ✗ Failed" -Color Red
-        $results += [PSCustomObject]@{
-            ServerName = $serverName
-            NewName = $newDeploymentName
-            Status = "Failed"
-            OldName = $deployment.CurrentName
-        }
+        $results += [PSCustomObject]@{ ServerName=$serverName; NewName=$newName; Status="Failed"; OldName=$deployment.CurrentName }
     }
     
     Start-Sleep -Milliseconds 200
@@ -222,16 +141,11 @@ foreach ($server in $servers) {
 
 # Summary
 Write-Log "`n=== SUMMARY ===" -Color Cyan
-$renamed = ($results | Where-Object { $_.Status -eq "Renamed" }).Count
-$alreadyNamed = ($results | Where-Object { $_.Status -eq "Already Named" }).Count
-$notFound = ($results | Where-Object { $_.Status -eq "Not Found" }).Count
-$failed = ($results | Where-Object { $_.Status -eq "Failed" }).Count
+Write-Log "Renamed: $(($results | Where-Object Status -eq 'Renamed').Count)" -Green
+Write-Log "Already Named: $(($results | Where-Object Status -eq 'Already Named').Count)" -Cyan
+Write-Log "Not Found: $(($results | Where-Object Status -eq 'Not Found').Count)" -Red
+Write-Log "Failed: $(($results | Where-Object Status -eq 'Failed').Count)" -Red
 
-Write-Log "Renamed: $renamed" -Color Green
-Write-Log "Already Named: $alreadyNamed" -Color Cyan
-Write-Log "Not Found: $notFound" -Color Red
-Write-Log "Failed: $failed" -Color Red
-
-$resultsPath = Join-Path (Split-Path $logPath -Parent) "Results_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+$resultsPath = "$(Split-Path $logPath -Parent)\Results_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
 $results | Export-Csv -Path $resultsPath -NoTypeInformation
-Write-Log "`nResults: $resultsPath" -Color White
+Write-Log "`nResults: $resultsPath" -White
