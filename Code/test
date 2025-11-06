@@ -1,0 +1,15 @@
+# Add this after authentication and before fetching deployments
+
+# Fetch all projects and create a lookup hashtable
+Write-Host "Fetching projects..." -ForegroundColor Cyan
+$projectsUri = "https://$vraServer/iaas/api/projects"
+$projectsResponse = Invoke-RestMethod -Uri $projectsUri -Method Get -Headers $headers
+$projects = if ($projectsResponse.content) { $projectsResponse.content } else { $projectsResponse }
+
+# Create hashtable for quick lookup
+$projectLookup = @{}
+foreach ($proj in $projects) {
+    $projectLookup[$proj.id] = $proj.name
+}
+Write-Host "Loaded $($projectLookup.Count) projects`n" -ForegroundColor Green
+
