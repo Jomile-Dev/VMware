@@ -82,44 +82,23 @@ foreach ($vCenter in $connectedServers) {
                 $vmView = $vmViewHash[$vm.Name]
                 
                 if (-not $vmView) {
-                    Write-Host "    WARNING: $($vm.Name) - VM view not found in hash, skipping" -ForegroundColor Yellow
-                    throw "VM view not found in hash"
+                    throw "VM view not found"
                 }
                 
-                # Get hardware version with error handling
+                # Get hardware version
                 $hwVersion = "Unknown"
-                try {
-                    if ($vmView.Config -and $vmView.Config.Version) {
-                        $hwVersion = $vmView.Config.Version
-                    }
-                    else {
-                        Write-Host "    WARNING: $($vm.Name) - Config.Version is null or empty" -ForegroundColor Yellow
-                    }
-                }
-                catch {
-                    Write-Host "    ERROR: $($vm.Name) - Failed to get Config.Version: $_" -ForegroundColor Red
+                if ($vmView.Config -and $vmView.Config.Version) {
+                    $hwVersion = $vmView.Config.Version
                 }
                 
                 # Get network names
                 $networkNames = "None"
-                try {
-                    # Get network names directly from VM object
-                    $vmNetworks = $vm.NetworkAdapters
-                    if ($vmNetworks -and $vmNetworks.Count -gt 0) {
-                        $networkList = @()
-                        foreach ($adapter in $vmNetworks) {
-                            if ($adapter.NetworkName) {
-                                $networkList += $adapter.NetworkName
-                            }
-                        }
-                        if ($networkList.Count -gt 0) {
-                            $networkNames = ($networkList | Select-Object -Unique) -join ", "
-                        }
+                $networkAdapters = Get-NetworkAdapter -VM $vm -Server $vCenter -ErrorAction SilentlyContinue
+                if ($networkAdapters) {
+                    $networkList = $networkAdapters | Select-Object -ExpandProperty NetworkName | Where-Object { $_ }
+                    if ($networkList) {
+                        $networkNames = ($networkList | Select-Object -Unique) -join ", "
                     }
-                }
-                catch {
-                    Write-Host "    ERROR: $($vm.Name) - Failed to get network info: $_" -ForegroundColor Red
-                    $networkNames = "Error: $_"
                 }
                 
                 # Create result object
@@ -135,17 +114,13 @@ foreach ($vCenter in $connectedServers) {
                 $totalVMCount++
             }
             catch {
-                Write-Host "    ERROR: $($vm.Name) - General processing error: $_" -ForegroundColor Red
-                Write-Host "    Error details: $($_.Exception.Message)" -ForegroundColor Red
-                Write-Host "    Stack trace: $($_.ScriptStackTrace)" -ForegroundColor Red
-                
                 # Add minimal info for failed VM
                 $result = [PSCustomObject]@{
                     VMName                 = $vm.Name
                     vCenter                = $vCenter.Name
                     PowerState             = $vm.PowerState
-                    CurrentHardwareVersion = "Error: $_"
-                    Networks               = "Error: $_"
+                    CurrentHardwareVersion = "Error"
+                    Networks               = "Error"
                 }
                 
                 $results += $result
