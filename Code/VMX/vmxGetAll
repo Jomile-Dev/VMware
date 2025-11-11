@@ -59,7 +59,7 @@ foreach ($vCenter in $connectedServers) {
         
         # Get all VM views in one call
         Write-Host "  Retrieving VM details..." -ForegroundColor Gray
-        $vmViews = Get-View -ViewType VirtualMachine -Server $vCenter -Property Name,Config.Version,Runtime.PowerState,ScheduledHardwareUpgradeInfo,Network -ErrorAction Stop
+        $vmViews = Get-View -ViewType VirtualMachine -Server $vCenter -Property Name,Config.Version,Runtime.PowerState,Network -ErrorAction Stop
         
         # Build VM view lookup hash
         $vmViewHash = @{}
@@ -99,14 +99,6 @@ foreach ($vCenter in $connectedServers) {
                     throw "VM view not found"
                 }
                 
-                # Check if upgrade is scheduled
-                $scheduledUpgrade = "No"
-                $scheduledVersion = ""
-                if ($vmView.ScheduledHardwareUpgradeInfo -and $vmView.ScheduledHardwareUpgradeInfo.VersionKey) {
-                    $scheduledUpgrade = "Yes"
-                    $scheduledVersion = $vmView.ScheduledHardwareUpgradeInfo.VersionKey
-                }
-                
                 # Get VDS information from network property
                 $vdsList = @()
                 if ($vmView.Network) {
@@ -132,8 +124,6 @@ foreach ($vCenter in $connectedServers) {
                     vCenter                = $vCenter.Name
                     PowerState             = $vm.PowerState
                     CurrentHardwareVersion = $vmView.Config.Version
-                    UpgradeScheduled       = $scheduledUpgrade
-                    ScheduledVersion       = $scheduledVersion
                     VDS                    = $vdsNames
                 }
                 
@@ -147,8 +137,6 @@ foreach ($vCenter in $connectedServers) {
                     vCenter                = $vCenter.Name
                     PowerState             = $vm.PowerState
                     CurrentHardwareVersion = "Error"
-                    UpgradeScheduled       = "Error"
-                    ScheduledVersion       = ""
                     VDS                    = "Error"
                 }
                 
@@ -189,11 +177,6 @@ $vcenterGroups = $results | Group-Object vCenter | Sort-Object Name
 foreach ($group in $vcenterGroups) {
     Write-Host "  $($group.Name): $($group.Count) VMs" -ForegroundColor White
 }
-
-# Scheduled upgrades
-$scheduledCount = ($results | Where-Object { $_.UpgradeScheduled -eq "Yes" }).Count
-Write-Host "`nScheduled Upgrades:" -ForegroundColor Cyan
-Write-Host "  VMs with scheduled upgrades: $scheduledCount" -ForegroundColor White
 
 # Power state
 Write-Host "`nPower State:" -ForegroundColor Cyan
