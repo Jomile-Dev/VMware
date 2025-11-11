@@ -26,6 +26,38 @@ $SnapshotDescription = "Snapshot created before VM hardware compatibility upgrad
 # END SNAPSHOT CONFIGURATION
 # ============================================================
 
+# Helper function to convert Version to comparable number
+function Get-VersionNumber {
+    param($version)
+    # Handle null or empty
+    if ([string]::IsNullOrEmpty($version)) {
+        return 0
+    }
+    # Extract the numeric part from version string (e.g., "v13" -> 13, "vmx-19" -> 19)
+    if ($version -match 'v?m?x?-?(\d+)') {
+        return [int]$matches[1]
+    }
+    return 0
+}
+
+# Helper function to convert vmx format to v format for Set-VM cmdlet
+function Convert-ToVMwareVersion {
+    param($version)
+    # Handle null or empty
+    if ([string]::IsNullOrEmpty($version)) {
+        return $null
+    }
+    # If already in v format, return as-is
+    if ($version -match '^v\d+$') {
+        return $version
+    }
+    # Convert vmx-21 to v21
+    if ($version -match 'vmx-(\d+)') {
+        return "v$($matches[1])"
+    }
+    return $version
+}
+
 # Connect to multiple vCenter Servers
 $vCenterServers = @("vc01", "vc02", "vc03", "vc04")  # Update with your vCenter servers
 $Credential = Get-Credential -Message "Enter vCenter credentials"
@@ -39,6 +71,7 @@ foreach ($vCenter in $vCenterServers) {
         $connection = Connect-VIServer -Server $vCenter -Credential $Credential -ErrorAction Stop -WarningAction SilentlyContinue -Force
         if ($connection) {
             $connectedServers += $connection
+            Write-Host "  Connected to $vCenter" -ForegroundColor Green
         }
     }
     catch {
@@ -71,48 +104,37 @@ $allVMs = @{}
 $totalVMCount = 0
 foreach ($vCenter in $connectedServers) {
     Write-Host "  Retrieving VMs from $($vCenter.Name)..." -ForegroundColor Gray
-    $vms = Get-VM -Server $vCenter
-    foreach ($vm in $vms) {
-        # Create unique key: VMName + vCenter to handle duplicates across vCenters
-        $uniqueKey = "$($vm.Name)|$($vCenter.Name)"
-        $allVMs[$uniqueKey] = @{
-            VM = $vm
-            vCenter = $vCenter.Name
-            Server = $vCenter
-        }
-        # Also store by just VM name for initial lookup attempt
-        if (-not $allVMs.ContainsKey($vm.Name)) {
-            $allVMs[$vm.Name] = @{
+    try {
+        $vms = Get-VM -Server $vCenter -ErrorAction Stop
+        foreach ($vm in $vms) {
+            # Create unique key: VMName + vCenter to handle duplicates across vCenters
+            $uniqueKey = "$($vm.Name)|$($vCenter.Name)"
+            $allVMs[$uniqueKey] = @{
                 VM = $vm
                 vCenter = $vCenter.Name
                 Server = $vCenter
             }
+            # Also store by just VM name for initial lookup attempt
+            if (-not $allVMs.ContainsKey($vm.Name)) {
+                $allVMs[$vm.Name] = @{
+                    VM = $vm
+                    vCenter = $vCenter.Name
+                    Server = $vCenter
+                }
+            }
         }
+        $totalVMCount += $vms.Count
+        Write-Host "    Retrieved $($vms.Count) VMs" -ForegroundColor Gray
     }
-    $totalVMCount += $vms.Count
-    Write-Host "    Retrieved $($vms.Count) VMs" -ForegroundColor Gray
+    catch {
+        Write-Host "    Error retrieving VMs: $_" -ForegroundColor Red
+    }
 }
 Write-Host "Total VMs in cache: $totalVMCount" -ForegroundColor Green
 Write-Host ""
 
 # Initialize results array
 $results = @()
-
-# Helper function to convert Version to comparable string
-function Get-VersionNumber {
-    param($version)
-    # Extract the numeric part from version string (e.g., "v13" -> 13, "vmx-19" -> 19)
-    if ($version -match 'v?m?x?-?(\d+)') {
-        return [int]$matches[1]
-    }
-    return 0
-}
-
-# Helper function to convert vmx format to v format for Set-VM cmdlet
-function Convert-ToVMwareVersion {
-    param($version)
-    # If already in v format, return as-is
-    if ($version -match '^v\d+
 
 foreach ($vmEntry in $vmList) {
     $vmName = $vmEntry.VMName  # Assumes CSV has a column named "VMName"
@@ -122,7 +144,7 @@ foreach ($vmEntry in $vmList) {
     $result = [PSCustomObject]@{
         VMName = $vmName
         CurrentVersion = ""
-        HostMaxVersion = ""
+        TargetVersion = ""
         UpgradedToVersion = ""
         UpgradeNeeded = ""
         SnapshotCreated = "No"
@@ -144,7 +166,7 @@ foreach ($vmEntry in $vmList) {
         $vm = $vmInfo.VM
         $foundOnVC = $vmInfo.vCenter
         $vcServer = $vmInfo.Server
-        Write-Host "  Found VM on: $foundOnVC (Location: $($vm.Folder.Name))" -ForegroundColor Green
+        Write-Host "  Found VM on: $foundOnVC" -ForegroundColor Green
     }
     else {
         Write-Host "  Error: VM not found on any connected vCenter server" -ForegroundColor Red
@@ -156,7 +178,10 @@ foreach ($vmEntry in $vmList) {
     }
     
     try {
-        $result.CurrentVersion = $vm.Version
+        # Get the VM's view for detailed info
+        $vmView = Get-View -Id $vm.Id -Server $vcServer -ErrorAction Stop
+        $configuredVersion = $vmView.Config.Version
+        $result.CurrentVersion = $configuredVersion
         
         # Determine target version
         if ($TargetVersion) {
@@ -166,38 +191,49 @@ foreach ($vmEntry in $vmList) {
         }
         else {
             # Get the host the VM is running on and its max supported version
-            $vmHost = Get-VMHost -Id $vm.VMHostId -Server $vcServer
-            $vmHostView = Get-View -Id $vmHost.Id -Server $vcServer
-            
-            # Get max supported version from host capability
-            $hostMaxVersion = $vmHostView.Config.MaxSupportedVmVersion
-            if (-not $hostMaxVersion) {
-                # Fallback: try getting from hardware info
-                $hostMaxVersion = $vmHostView.Capability.SupportedVMXVersions | Sort-Object -Descending | Select-Object -First 1
+            try {
+                $vmHost = Get-VMHost -Id $vm.VMHostId -Server $vcServer -ErrorAction Stop
+                $vmHostView = Get-View -Id $vmHost.Id -Server $vcServer -ErrorAction Stop
+                
+                # Try multiple methods to get max supported version
+                $hostMaxVersion = $null
+                if ($vmHostView.Config.MaxSupportedVmVersion) {
+                    $hostMaxVersion = $vmHostView.Config.MaxSupportedVmVersion
+                }
+                elseif ($vmHostView.Capability.SupportedVMXVersions) {
+                    $hostMaxVersion = $vmHostView.Capability.SupportedVMXVersions | Sort-Object -Descending | Select-Object -First 1
+                }
+                
+                if ($hostMaxVersion) {
+                    # Convert from vmx-XX format to vXX format
+                    $upgradeToVersion = Convert-ToVMwareVersion -version $hostMaxVersion
+                    Write-Host "  Using host's maximum supported version: $upgradeToVersion" -ForegroundColor Cyan
+                }
+                else {
+                    Write-Host "  Error: Could not determine host max version and no target version configured" -ForegroundColor Red
+                    $result.ErrorMessage = "Could not determine target version"
+                    $result.Status = "Failed - No Target Version"
+                    $results += $result
+                    continue
+                }
             }
-            if (-not $hostMaxVersion) {
-                Write-Host "  Error: Could not determine host max version and no target version configured" -ForegroundColor Red
-                $result.ErrorMessage = "Could not determine target version"
-                $result.Status = "Failed - No Target Version"
+            catch {
+                Write-Host "  Error retrieving host information: $_" -ForegroundColor Red
+                $result.ErrorMessage = "Host info error: $_"
+                $result.Status = "Failed - Host Info Error"
                 $results += $result
                 continue
             }
-            # Convert from vmx-XX format to vXX format
-            $upgradeToVersion = Convert-ToVMwareVersion -version $hostMaxVersion
-            Write-Host "  Using host's maximum supported version: $upgradeToVersion" -ForegroundColor Cyan
         }
         
-        $result.HostMaxVersion = $upgradeToVersion
+        $result.TargetVersion = $upgradeToVersion
         
-        # Get the guest's configured version (the version it will upgrade to on next power cycle)
-        $vmView = Get-View -Id $vm.Id -Server $vcServer
-        $configuredVersion = $vmView.Config.Version
+        # Get scheduled upgrade info if exists
         $scheduledVersion = $vmView.ScheduledHardwareUpgradeInfo.VersionKey
         
-        Write-Host "  Current VM version: $($vm.Version)" -ForegroundColor Gray
-        Write-Host "  Configured version: $configuredVersion" -ForegroundColor Gray
+        Write-Host "  Current configured version: $configuredVersion" -ForegroundColor Gray
         if ($scheduledVersion) {
-            Write-Host "  Scheduled upgrade version: $scheduledVersion" -ForegroundColor Gray
+            Write-Host "  Already scheduled upgrade to: $scheduledVersion" -ForegroundColor Gray
         }
         Write-Host "  Target upgrade version: $upgradeToVersion" -ForegroundColor Gray
         
@@ -211,7 +247,7 @@ foreach ($vmEntry in $vmList) {
         if ($currentVersionNum -ge $targetVersionNum) {
             Write-Host "  VM is already at or scheduled for the target version" -ForegroundColor Cyan
             $result.UpgradeNeeded = "No"
-            $result.Status = "Already at latest version"
+            $result.Status = "Already at target version"
             $results += $result
             continue
         }
@@ -257,12 +293,15 @@ foreach ($vmEntry in $vmList) {
             Set-VM -VM $vm -Version $upgradeToVersion -Confirm:$false -ErrorAction Stop
             
             # Verify the upgrade was scheduled by re-querying the VM on the correct vCenter
-            $vmUpdated = Get-VM -Name $vmName -Server $vcServer
-            $result.UpgradedToVersion = $vmUpdated.Version
+            Start-Sleep -Seconds 2
+            $vmUpdated = Get-VM -Name $vmName -Server $vcServer -ErrorAction Stop
+            $vmViewUpdated = Get-View -Id $vmUpdated.Id -Server $vcServer -ErrorAction Stop
+            
+            $result.UpgradedToVersion = $vmViewUpdated.Config.Version
             $result.UpgradeScheduled = "Yes"
             $result.Status = "Success - Upgrade Scheduled"
             Write-Host "  Compatibility upgrade scheduled successfully" -ForegroundColor Green
-            Write-Host "  Version: $($result.CurrentVersion) -> $($result.UpgradedToVersion)" -ForegroundColor Green
+            Write-Host "  Version after scheduling: $($result.UpgradedToVersion)" -ForegroundColor Green
         }
         catch {
             Write-Host "  Failed to schedule upgrade: $_" -ForegroundColor Red
@@ -290,209 +329,17 @@ Write-Host "Report saved to: $ReportPath" -ForegroundColor Green
 # Display summary
 $successful = ($results | Where-Object { $_.Status -like "*Success*" }).Count
 $failed = ($results | Where-Object { $_.Status -like "*Failed*" }).Count
-$alreadyUpgraded = ($results | Where-Object { $_.Status -like "*Already*" }).Count
+$alreadyUpgraded = ($results | Where-Object { $_.Status -like "*target*" }).Count
+$notFound = ($results | Where-Object { $_.Status -like "*Not Found*" }).Count
 
 Write-Host "`nSummary:" -ForegroundColor Cyan
 Write-Host "  Total VMs processed: $($results.Count)"
-Write-Host "  Successful: $successful" -ForegroundColor Green
+Write-Host "  Successful upgrades scheduled: $successful" -ForegroundColor Green
 Write-Host "  Failed: $failed" -ForegroundColor Red
-Write-Host "  Already at latest version: $alreadyUpgraded" -ForegroundColor Yellow
+Write-Host "  Already at target version: $alreadyUpgraded" -ForegroundColor Yellow
+Write-Host "  VMs not found: $notFound" -ForegroundColor Magenta
 
 # Disconnect from all vCenter servers
-Disconnect-VIServer -Confirm:$false
-Write-Host "`nDisconnected from all vCenter servers" -ForegroundColor Green
-) {
-        return $version
-    }
-    # Convert vmx-21 to v21
-    if ($version -match 'vmx-(\d+)') {
-        return "v$($matches[1])"
-    }
-    return $version
-}
-
-foreach ($vmEntry in $vmList) {
-    $vmName = $vmEntry.VMName  # Assumes CSV has a column named "VMName"
-    
-    Write-Host "`nProcessing VM: $vmName" -ForegroundColor Yellow
-    
-    $result = [PSCustomObject]@{
-        VMName = $vmName
-        CurrentVersion = ""
-        HostMaxVersion = ""
-        UpgradedToVersion = ""
-        UpgradeNeeded = ""
-        SnapshotCreated = "No"
-        SnapshotName = ""
-        UpgradeScheduled = "No"
-        Status = ""
-        Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-        ErrorMessage = ""
-    }
-    
-    # Search for VM in the pre-built cache (instant lookup)
-    $vm = $null
-    $foundOnVC = $null
-    $vcServer = $null
-    
-    Write-Host "  Looking up VM in cache..." -ForegroundColor Gray
-    if ($allVMs.ContainsKey($vmName)) {
-        $vmInfo = $allVMs[$vmName]
-        $vm = $vmInfo.VM
-        $foundOnVC = $vmInfo.vCenter
-        $vcServer = $vmInfo.Server
-        Write-Host "  Found VM on: $foundOnVC (Location: $($vm.Folder.Name))" -ForegroundColor Green
-    }
-    else {
-        Write-Host "  Error: VM not found on any connected vCenter server" -ForegroundColor Red
-        Write-Host "  Searched: $($connectedServers.Name -join ', ')" -ForegroundColor Gray
-        $result.ErrorMessage = "VM not found on any connected vCenter"
-        $result.Status = "Failed - VM Not Found"
-        $results += $result
-        continue
-    }
-    
-    try {
-        $result.CurrentVersion = $vm.Version
-        
-        # Determine target version
-        if ($TargetVersion) {
-            # Use the configured target version
-            $upgradeToVersion = $TargetVersion
-            Write-Host "  Using configured target version: $upgradeToVersion" -ForegroundColor Cyan
-        }
-        else {
-            # Get the host the VM is running on and its max supported version
-            $vmHost = Get-VMHost -Id $vm.VMHostId -Server $vcServer
-            $vmHostView = Get-View -Id $vmHost.Id -Server $vcServer
-            
-            # Get max supported version from host capability
-            $upgradeToVersion = $vmHostView.Config.MaxSupportedVmVersion
-            if (-not $upgradeToVersion) {
-                # Fallback: try getting from hardware info
-                $upgradeToVersion = $vmHostView.Capability.SupportedVMXVersions | Sort-Object -Descending | Select-Object -First 1
-            }
-            if (-not $upgradeToVersion) {
-                Write-Host "  Error: Could not determine host max version and no target version configured" -ForegroundColor Red
-                $result.ErrorMessage = "Could not determine target version"
-                $result.Status = "Failed - No Target Version"
-                $results += $result
-                continue
-            }
-            Write-Host "  Using host's maximum supported version: $upgradeToVersion" -ForegroundColor Cyan
-        }
-        
-        $result.HostMaxVersion = $upgradeToVersion
-        
-        # Get the guest's configured version (the version it will upgrade to on next power cycle)
-        $vmView = Get-View -Id $vm.Id -Server $vcServer
-        $configuredVersion = $vmView.Config.Version
-        $scheduledVersion = $vmView.ScheduledHardwareUpgradeInfo.VersionKey
-        
-        Write-Host "  Current VM version: $($vm.Version)" -ForegroundColor Gray
-        Write-Host "  Configured version: $configuredVersion" -ForegroundColor Gray
-        if ($scheduledVersion) {
-            Write-Host "  Scheduled upgrade version: $scheduledVersion" -ForegroundColor Gray
-        }
-        Write-Host "  Target upgrade version: $upgradeToVersion" -ForegroundColor Gray
-        
-        # Convert versions to comparable numbers
-        $currentVersionNum = Get-VersionNumber -version $configuredVersion
-        $targetVersionNum = Get-VersionNumber -version $upgradeToVersion
-        
-        Write-Host "  Comparing versions: $currentVersionNum vs $targetVersionNum" -ForegroundColor Gray
-        
-        # Check if VM is already scheduled for or at the target version
-        if ($currentVersionNum -ge $targetVersionNum) {
-            Write-Host "  VM is already at or scheduled for the target version" -ForegroundColor Cyan
-            $result.UpgradeNeeded = "No"
-            $result.Status = "Already at latest version"
-            $results += $result
-            continue
-        }
-        
-        Write-Host "  Upgrade needed: $configuredVersion -> $upgradeToVersion" -ForegroundColor Yellow
-        $result.UpgradeNeeded = "Yes"
-        
-        # Check if VM is powered on
-        $vmPowerState = $vm.PowerState
-        Write-Host "  VM Power State: $vmPowerState" -ForegroundColor Gray
-        
-        if ($CreateSnapshots) {
-            # Create snapshot
-            Write-Host "  Creating snapshot..." -ForegroundColor Cyan
-            try {
-                $snapshot = New-Snapshot -VM $vm -Name $SnapshotName -Description $SnapshotDescription -Memory:$false -Quiesce:$false -ErrorAction Stop
-                $result.SnapshotCreated = "Yes"
-                $result.SnapshotName = $snapshot.Name
-                Write-Host "  Snapshot created successfully: $($snapshot.Name)" -ForegroundColor Green
-            }
-            catch {
-                Write-Host "  Failed to create snapshot: $_" -ForegroundColor Red
-                $result.ErrorMessage = "Snapshot failed: $_"
-                $result.Status = "Failed - Snapshot Error"
-                $results += $result
-                continue
-            }
-        }
-        else {
-            Write-Host "  Snapshot creation disabled (skipping)" -ForegroundColor Yellow
-            $result.SnapshotCreated = "Disabled"
-        }
-        
-        # Schedule VM compatibility upgrade
-        Write-Host "  Scheduling compatibility upgrade to $upgradeToVersion..." -ForegroundColor Cyan
-        try {
-            # Use Set-VM to upgrade the VM hardware version
-            # Note: This requires the VM to be powered off for the upgrade to take effect
-            if ($vmPowerState -eq "PoweredOn") {
-                Write-Host "  Note: VM must be powered off and on again for upgrade to apply" -ForegroundColor Yellow
-            }
-            
-            Set-VM -VM $vm -Version $upgradeToVersion -Confirm:$false -ErrorAction Stop
-            
-            # Verify the upgrade was scheduled by re-querying the VM on the correct vCenter
-            $vmUpdated = Get-VM -Name $vmName -Server $vcServer
-            $result.UpgradedToVersion = $vmUpdated.Version
-            $result.UpgradeScheduled = "Yes"
-            $result.Status = "Success - Upgrade Scheduled"
-            Write-Host "  Compatibility upgrade scheduled successfully" -ForegroundColor Green
-            Write-Host "  Version: $($result.CurrentVersion) -> $($result.UpgradedToVersion)" -ForegroundColor Green
-        }
-        catch {
-            Write-Host "  Failed to schedule upgrade: $_" -ForegroundColor Red
-            $result.ErrorMessage = "Upgrade failed: $_"
-            $result.Status = "Failed - Upgrade Error"
-        }
-    }
-    catch {
-        Write-Host "  Error processing VM: $_" -ForegroundColor Red
-        $result.ErrorMessage = "General error: $_"
-        $result.Status = "Failed - Processing Error"
-    }
-    
-    $results += $result
-}
-
-# Generate report
-Write-Host "`n========================================" -ForegroundColor Cyan
-Write-Host "Generating Report..." -ForegroundColor Cyan
-Write-Host "========================================" -ForegroundColor Cyan
-
-$results | Export-Csv -Path $ReportPath -NoTypeInformation
-Write-Host "Report saved to: $ReportPath" -ForegroundColor Green
-
-# Display summary
-$successful = ($results | Where-Object { $_.Status -like "*Success*" }).Count
-$failed = ($results | Where-Object { $_.Status -like "*Failed*" }).Count
-$alreadyUpgraded = ($results | Where-Object { $_.Status -like "*Already*" }).Count
-
-Write-Host "`nSummary:" -ForegroundColor Cyan
-Write-Host "  Total VMs processed: $($results.Count)"
-Write-Host "  Successful: $successful" -ForegroundColor Green
-Write-Host "  Failed: $failed" -ForegroundColor Red
-Write-Host "  Already at latest version: $alreadyUpgraded" -ForegroundColor Yellow
-
-# Disconnect from all vCenter servers
-Disconnect-VIServer -Confirm:$false
-Write-Host "`nDisconnected from all vCenter servers" -ForegroundColor Green
+Write-Host "`nDisconnecting from vCenter servers..." -ForegroundColor Cyan
+Disconnect-VIServer -Server * -Confirm:$false -ErrorAction SilentlyContinue
+Write-Host "Disconnected from all vCenter servers" -ForegroundColor Green
