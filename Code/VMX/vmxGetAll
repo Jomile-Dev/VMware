@@ -67,32 +67,6 @@ foreach ($vCenter in $connectedServers) {
             $vmViewHash[$vmView.Name] = $vmView
         }
         
-        # Get all distributed port groups with VLAN info
-        Write-Host "  Retrieving VDS port groups..." -ForegroundColor Gray
-        $allPortGroups = Get-VDPortgroup -Server $vCenter -ErrorAction SilentlyContinue
-        $portGroupInfoHash = @{}
-        foreach ($pg in $allPortGroups) {
-            if ($pg.Name) {
-                $vlanConfig = $pg.VlanConfiguration
-                $vlanId = "No VLAN"
-                
-                if ($vlanConfig) {
-                    if ($vlanConfig.VlanId) {
-                        $vlanId = $vlanConfig.VlanId
-                    }
-                    elseif ($vlanConfig.VlanType -eq "Trunk") {
-                        $vlanId = "Trunk"
-                    }
-                }
-                
-                $portGroupInfoHash[$pg.Name] = @{
-                    Name = $pg.Name
-                    VLAN = $vlanId
-                    VDS  = (Get-VDSwitch -Id $pg.VDSwitchId -Server $vCenter -ErrorAction SilentlyContinue).Name
-                }
-            }
-        }
-        
         Write-Host "  Processing VM data..." -ForegroundColor Gray
         $vmCounter = 0
         foreach ($vm in $vms) {
@@ -126,8 +100,8 @@ foreach ($vCenter in $connectedServers) {
                     Write-Host "    ERROR: $($vm.Name) - Failed to get Config.Version: $_" -ForegroundColor Red
                 }
                 
-                # Get network adapter names with VLAN info
-                $networkDetails = "None"
+                # Get network names
+                $networkNames = "None"
                 try {
                     # Get network names directly from VM object
                     $vmNetworks = $vm.NetworkAdapters
@@ -135,27 +109,17 @@ foreach ($vCenter in $connectedServers) {
                         $networkList = @()
                         foreach ($adapter in $vmNetworks) {
                             if ($adapter.NetworkName) {
-                                $pgName = $adapter.NetworkName
-                                
-                                # Look up port group info
-                                if ($portGroupInfoHash.ContainsKey($pgName)) {
-                                    $pgInfo = $portGroupInfoHash[$pgName]
-                                    $networkList += "$pgName (VLAN: $($pgInfo.VLAN))"
-                                }
-                                else {
-                                    # Standard switch or not found
-                                    $networkList += "$pgName (Standard)"
-                                }
+                                $networkList += $adapter.NetworkName
                             }
                         }
                         if ($networkList.Count -gt 0) {
-                            $networkDetails = ($networkList | Select-Object -Unique) -join " | "
+                            $networkNames = ($networkList | Select-Object -Unique) -join ", "
                         }
                     }
                 }
                 catch {
                     Write-Host "    ERROR: $($vm.Name) - Failed to get network info: $_" -ForegroundColor Red
-                    $networkDetails = "Error: $_"
+                    $networkNames = "Error: $_"
                 }
                 
                 # Create result object
@@ -164,7 +128,7 @@ foreach ($vCenter in $connectedServers) {
                     vCenter                = $vCenter.Name
                     PowerState             = $vm.PowerState
                     CurrentHardwareVersion = $hwVersion
-                    Networks               = $networkDetails
+                    Networks               = $networkNames
                 }
                 
                 $results += $result
