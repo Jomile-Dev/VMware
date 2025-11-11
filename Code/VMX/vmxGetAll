@@ -61,10 +61,10 @@ foreach ($vCenter in $connectedServers) {
         Write-Host "  Retrieving VM details..." -ForegroundColor Gray
         $vmViews = Get-View -ViewType VirtualMachine -Server $vCenter -Property Name,Config.Version,Runtime.PowerState,Network -ErrorAction Stop
         
-        # Build VM view lookup hash
+        # Build VM view lookup hash by name
         $vmViewHash = @{}
         foreach ($vmView in $vmViews) {
-            $vmViewHash[$vmView.MoRef.Value] = $vmView
+            $vmViewHash[$vmView.Name] = $vmView
         }
         
         # Get all VDS port groups and switches at once
@@ -92,10 +92,11 @@ foreach ($vCenter in $connectedServers) {
             }
             
             try {
-                # Lookup VM view from hash
-                $vmView = $vmViewHash[$vm.Id]
+                # Lookup VM view from hash by name
+                $vmView = $vmViewHash[$vm.Name]
                 
                 if (-not $vmView) {
+                    Write-Host "    WARNING: $($vm.Name) - VM view not found in hash, skipping" -ForegroundColor Yellow
                     throw "VM view not found in hash"
                 }
                 
