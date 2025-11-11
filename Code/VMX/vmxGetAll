@@ -59,29 +59,12 @@ foreach ($vCenter in $connectedServers) {
         
         # Get all VM views in one call
         Write-Host "  Retrieving VM details..." -ForegroundColor Gray
-        $vmViews = Get-View -ViewType VirtualMachine -Server $vCenter -Property Name,Config.Version,Runtime.PowerState,Network -ErrorAction Stop
+        $vmViews = Get-View -ViewType VirtualMachine -Server $vCenter -Property Name,Config.Version,Runtime.PowerState -ErrorAction Stop
         
         # Build VM view lookup hash by name
         $vmViewHash = @{}
         foreach ($vmView in $vmViews) {
             $vmViewHash[$vmView.Name] = $vmView
-        }
-        
-        # Get all VDS port groups and switches at once
-        Write-Host "  Retrieving network information..." -ForegroundColor Gray
-        $allVDPortGroups = Get-VDPortgroup -Server $vCenter -ErrorAction SilentlyContinue
-        $portGroupHash = @{}
-        foreach ($pg in $allVDPortGroups) {
-            # Use Name as key instead of Key
-            if ($pg.Name) {
-                $portGroupHash[$pg.Name] = $pg
-            }
-        }
-        
-        $allVDSwitches = Get-VDSwitch -Server $vCenter -ErrorAction SilentlyContinue
-        $vdsHash = @{}
-        foreach ($vds in $allVDSwitches) {
-            $vdsHash[$vds.Id] = $vds.Name
         }
         
         Write-Host "  Processing VM data..." -ForegroundColor Gray
