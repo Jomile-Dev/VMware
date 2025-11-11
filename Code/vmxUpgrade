@@ -27,44 +27,49 @@ $connectionErrors = @()
 
 foreach ($vCenter in $vCenterServers) {
     try {
-        Write-Host "  Attempting to connect to: $vCenter" -ForegroundColor Gray
         $connection = Connect-VIServer -Server $vCenter -Credential $Credential -ErrorAction Stop -WarningAction SilentlyContinue -Force
         if ($connection) {
-            Write-Host "    SUCCESS: Connected to $vCenter" -ForegroundColor Green
             $connectedServers += $connection
         }
     }
     catch {
-        Write-Host "    FAILED: Could not connect to $vCenter" -ForegroundColor Red
-        Write-Host "    Error: $_" -ForegroundColor Red
+        Write-Host "  FAILED: Could not connect to $vCenter - $_" -ForegroundColor Red
         $connectionErrors += "$vCenter : $_"
     }
 }
 
-Write-Host ""
-
 # Verify we're connected to at least one vCenter
 if ($connectedServers.Count -eq 0) {
     Write-Host "ERROR: No vCenter connections established. Exiting." -ForegroundColor Red
-    Write-Host "`nConnection Errors:" -ForegroundColor Yellow
-    $connectionErrors | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
     exit
 }
 
-Write-Host "Successfully connected to $($connectedServers.Count) of $($vCenterServers.Count) vCenter server(s):" -ForegroundColor Green
-$connectedServers | ForEach-Object { Write-Host "  - $($_.Name) (User: $($_.User), SessionId: $($_.SessionId))" -ForegroundColor Gray }
-
-if ($connectionErrors.Count -gt 0) {
-    Write-Host "`nFailed connections ($($connectionErrors.Count)):" -ForegroundColor Yellow
-    $connectionErrors | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
-}
-Write-Host ""
+Write-Host "Connected to $($connectedServers.Count) vCenter(s)" -ForegroundColor Green
 
 # Get the latest VM hardware version supported across all vCenters
-$latestVersion = ($connectedServers | ForEach-Object { 
-    Get-VMHost -Server $_ | Select-Object -First 1 
-} | Select-Object -First 1).MaxVMVersion
-Write-Host "`nLatest VM hardware version available: $latestVersion" -ForegroundColor Cyan
+Write-Host "`nDetermining latest VM hardware version..." -ForegroundColor Cyan
+$latestVersion = $null
+foreach ($vCenter in $connectedServers) {
+    try {
+        $host = Get-VMHost -Server $vCenter | Select-Object -First 1
+        if ($host -and $host.MaxVMVersion) {
+            if (-not $latestVersion -or $host.MaxVMVersion -gt $latestVersion) {
+                $latestVersion = $host.MaxVMVersion
+            }
+        }
+    }
+    catch {
+        Write-Host "  Warning: Could not get MaxVMVersion from $($vCenter.Name)" -ForegroundColor Yellow
+    }
+}
+
+if (-not $latestVersion) {
+    Write-Host "ERROR: Could not determine latest VM hardware version from any vCenter" -ForegroundColor Red
+    Disconnect-VIServer -Confirm:$false
+    exit
+}
+
+Write-Host "Latest VM hardware version available: $latestVersion" -ForegroundColor Cyan
 
 # Read VMs from CSV
 if (-not (Test-Path $CsvPath)) {
