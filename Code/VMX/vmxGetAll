@@ -72,7 +72,10 @@ foreach ($vCenter in $connectedServers) {
         $allVDPortGroups = Get-VDPortgroup -Server $vCenter -ErrorAction SilentlyContinue
         $portGroupHash = @{}
         foreach ($pg in $allVDPortGroups) {
-            $portGroupHash[$pg.Key] = $pg
+            # Use Name as key instead of Key
+            if ($pg.Name) {
+                $portGroupHash[$pg.Name] = $pg
+            }
         }
         
         $allVDSwitches = Get-VDSwitch -Server $vCenter -ErrorAction SilentlyContinue
@@ -114,20 +117,25 @@ foreach ($vCenter in $connectedServers) {
                     Write-Host "    ERROR: $($vm.Name) - Failed to get Config.Version: $_" -ForegroundColor Red
                 }
                 
-                # Get VDS information from network property
+                # Get VDS information from network names
                 $vdsList = @()
                 $vdsNames = "Standard Switch"
                 try {
-                    if ($vmView.Network) {
-                        foreach ($networkMoRef in $vmView.Network) {
-                            $pgKey = $networkMoRef.Value
-                            if ($portGroupHash.ContainsKey($pgKey)) {
-                                $pg = $portGroupHash[$pgKey]
-                                $vdsId = $pg.VDSwitchId
-                                if ($vdsHash.ContainsKey($vdsId)) {
-                                    $vdsName = $vdsHash[$vdsId]
-                                    if ($vdsName -notin $vdsList) {
-                                        $vdsList += $vdsName
+                    # Get network adapter info directly from VM
+                    $networks = $vm | Get-NetworkAdapter -ErrorAction SilentlyContinue
+                    if ($networks) {
+                        foreach ($network in $networks) {
+                            $networkName = $network.NetworkName
+                            if ($networkName) {
+                                # Check if this network is a VDS port group
+                                if ($portGroupHash.ContainsKey($networkName)) {
+                                    $pg = $portGroupHash[$networkName]
+                                    $vdsId = $pg.VDSwitchId
+                                    if ($vdsHash.ContainsKey($vdsId)) {
+                                        $vdsName = $vdsHash[$vdsId]
+                                        if ($vdsName -notin $vdsList) {
+                                            $vdsList += $vdsName
+                                        }
                                     }
                                 }
                             }
