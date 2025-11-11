@@ -26,8 +26,10 @@ $connectionErrors = @()
 foreach ($vCenter in $vCenterServers) {
     try {
         Write-Host "  Attempting to connect to: $vCenter" -ForegroundColor Gray
-        Connect-VIServer -Server $vCenter -Credential $Credential -ErrorAction Stop -WarningAction SilentlyContinue | Out-Null
-        Write-Host "    SUCCESS: Connected to $vCenter" -ForegroundColor Green
+        $connection = Connect-VIServer -Server $vCenter -Credential $Credential -ErrorAction Stop -WarningAction SilentlyContinue
+        if ($connection) {
+            Write-Host "    SUCCESS: Connected to $vCenter" -ForegroundColor Green
+        }
     }
     catch {
         Write-Host "    FAILED: Could not connect to $vCenter" -ForegroundColor Red
@@ -39,7 +41,7 @@ foreach ($vCenter in $vCenterServers) {
 Write-Host ""
 
 # Verify we're connected to at least one vCenter
-$connectedServers = $global:DefaultVIServers
+$connectedServers = @($global:DefaultVIServers)
 if ($connectedServers.Count -eq 0) {
     Write-Host "ERROR: No vCenter connections established. Exiting." -ForegroundColor Red
     Write-Host "`nConnection Errors:" -ForegroundColor Yellow
@@ -48,12 +50,13 @@ if ($connectedServers.Count -eq 0) {
 }
 
 Write-Host "Successfully connected to $($connectedServers.Count) of $($vCenterServers.Count) vCenter server(s):" -ForegroundColor Green
-$connectedServers | ForEach-Object { Write-Host "  - $($_.Name)" -ForegroundColor Gray }
+$connectedServers | ForEach-Object { Write-Host "  - $($_.Name) (User: $($_.User))" -ForegroundColor Gray }
 
 if ($connectionErrors.Count -gt 0) {
-    Write-Host "`nFailed connections:" -ForegroundColor Yellow
+    Write-Host "`nFailed connections ($($connectionErrors.Count)):" -ForegroundColor Yellow
     $connectionErrors | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
 }
+Write-Host ""
 
 # Get the latest VM hardware version supported across all vCenters
 $latestVersion = ($connectedServers | ForEach-Object { 
