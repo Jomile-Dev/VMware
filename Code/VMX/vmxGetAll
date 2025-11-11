@@ -1,0 +1,194 @@
+# VMware VM Hardware Version Inventory Report
+# Requires VMware PowerCLI module
+
+#Requires -Modules VMware.VimAutomation.Core
+
+# Configuration
+$ReportPath = "C:\VM_Hardware_Inventory_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+
+# Connect to multiple vCenter servers
+$vCenterServers = @("vc01", "vc02", "vc03", "vc04")  # Update with your vCenter servers
+$Credential = Get-Credential -Message "Enter vCenter credentials"
+
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host "VMware VM Hardware Version Inventory" -ForegroundColor Cyan
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host ""
+
+Write-Host "Connecting to vCenter servers..." -ForegroundColor Cyan
+$connectedServers = @()
+$connectionErrors = @()
+
+foreach ($vCenter in $vCenterServers) {
+    try {
+        $connection = Connect-VIServer -Server $vCenter -Credential $Credential -ErrorAction Stop -WarningAction SilentlyContinue -Force
+        if ($connection) {
+            $connectedServers += $connection
+            Write-Host "  Connected to $vCenter" -ForegroundColor Green
+        }
+    }
+    catch {
+        Write-Host "  FAILED: Could not connect to $vCenter - $_" -ForegroundColor Red
+        $connectionErrors += "$vCenter : $_"
+    }
+}
+
+# Verify we're connected to at least one vCenter
+if ($connectedServers.Count -eq 0) {
+    Write-Host "ERROR: No vCenter connections established. Exiting." -ForegroundColor Red
+    exit
+}
+
+Write-Host "Connected to $($connectedServers.Count) vCenter(s)" -ForegroundColor Green
+Write-Host ""
+
+# Initialize results array
+$results = @()
+$totalVMCount = 0
+
+# Retrieve VMs from all vCenters
+Write-Host "Retrieving VM inventory from all vCenters..." -ForegroundColor Cyan
+
+foreach ($vCenter in $connectedServers) {
+    Write-Host "`nProcessing vCenter: $($vCenter.Name)" -ForegroundColor Yellow
+    
+    try {
+        $vms = Get-VM -Server $vCenter -ErrorAction Stop
+        Write-Host "  Found $($vms.Count) VMs" -ForegroundColor Gray
+        
+        $vmCounter = 0
+        foreach ($vm in $vms) {
+            $vmCounter++
+            
+            # Show progress every 50 VMs
+            if ($vmCounter % 50 -eq 0) {
+                Write-Host "    Processing VM $vmCounter of $($vms.Count)..." -ForegroundColor Gray
+            }
+            
+            try {
+                # Get detailed VM info
+                $vmView = Get-View -Id $vm.Id -Server $vCenter -ErrorAction Stop
+                
+                # Get host information
+                $vmHost = Get-VMHost -Id $vm.VMHostId -Server $vCenter -ErrorAction Stop
+                $vmHostView = Get-View -Id $vmHost.Id -Server $vCenter -ErrorAction Stop
+                
+                # Get host max supported version
+                $hostMaxVersion = "Unknown"
+                if ($vmHostView.Config.MaxSupportedVmVersion) {
+                    $hostMaxVersion = $vmHostView.Config.MaxSupportedVmVersion
+                }
+                elseif ($vmHostView.Capability.SupportedVMXVersions -and $vmHostView.Capability.SupportedVMXVersions.Count -gt 0) {
+                    $hostMaxVersion = ($vmHostView.Capability.SupportedVMXVersions | Sort-Object -Descending)[0]
+                }
+                
+                # Check if upgrade is scheduled
+                $scheduledUpgrade = "No"
+                $scheduledVersion = ""
+                if ($vmView.ScheduledHardwareUpgradeInfo -and $vmView.ScheduledHardwareUpgradeInfo.VersionKey) {
+                    $scheduledUpgrade = "Yes"
+                    $scheduledVersion = $vmView.ScheduledHardwareUpgradeInfo.VersionKey
+                }
+                
+                # Create result object
+                $result = [PSCustomObject]@{
+                    VMName                = $vm.Name
+                    vCenter               = $vCenter.Name
+                    PowerState            = $vm.PowerState
+                    CurrentHardwareVersion = $vmView.Config.Version
+                    HostName              = $vmHost.Name
+                    HostMaxVersion        = $hostMaxVersion
+                    UpgradeScheduled      = $scheduledUpgrade
+                    ScheduledVersion      = $scheduledVersion
+                    NumCPU                = $vm.NumCpu
+                    MemoryGB              = $vm.MemoryGB
+                    GuestOS               = $vm.Guest.OSFullName
+                    VMToolsVersion        = $vm.Guest.ToolsVersion
+                    VMToolsStatus         = $vm.Guest.ToolsStatus
+                    Folder                = $vm.Folder.Name
+                    ResourcePool          = $vm.ResourcePool.Name
+                    Notes                 = $vm.Notes
+                }
+                
+                $results += $result
+                $totalVMCount++
+            }
+            catch {
+                Write-Host "    Error processing VM $($vm.Name): $_" -ForegroundColor Red
+                
+                # Add minimal info for failed VM
+                $result = [PSCustomObject]@{
+                    VMName                = $vm.Name
+                    vCenter               = $vCenter.Name
+                    PowerState            = $vm.PowerState
+                    CurrentHardwareVersion = "Error"
+                    HostName              = "Error"
+                    HostMaxVersion        = "Error"
+                    UpgradeScheduled      = "Error"
+                    ScheduledVersion      = ""
+                    NumCPU                = $vm.NumCpu
+                    MemoryGB              = $vm.MemoryGB
+                    GuestOS               = "Error"
+                    VMToolsVersion        = "Error"
+                    VMToolsStatus         = "Error"
+                    Folder                = "Error"
+                    ResourcePool          = "Error"
+                    Notes                 = "Error: $_"
+                }
+                
+                $results += $result
+                $totalVMCount++
+            }
+        }
+        
+        Write-Host "  Completed processing $($vms.Count) VMs from $($vCenter.Name)" -ForegroundColor Green
+    }
+    catch {
+        Write-Host "  Error retrieving VMs from $($vCenter.Name): $_" -ForegroundColor Red
+    }
+}
+
+# Generate report
+Write-Host "`n========================================" -ForegroundColor Cyan
+Write-Host "Generating Report..." -ForegroundColor Cyan
+Write-Host "========================================" -ForegroundColor Cyan
+
+$results | Export-Csv -Path $ReportPath -NoTypeInformation
+Write-Host "Report saved to: $ReportPath" -ForegroundColor Green
+
+# Generate statistics
+Write-Host "`nInventory Statistics:" -ForegroundColor Cyan
+Write-Host "  Total VMs: $totalVMCount" -ForegroundColor White
+
+# Group by hardware version
+Write-Host "`nVMs by Hardware Version:" -ForegroundColor Cyan
+$versionGroups = $results | Where-Object { $_.CurrentHardwareVersion -ne "Error" } | Group-Object CurrentHardwareVersion | Sort-Object Name
+foreach ($group in $versionGroups) {
+    Write-Host "  $($group.Name): $($group.Count) VMs" -ForegroundColor White
+}
+
+# Group by vCenter
+Write-Host "`nVMs by vCenter:" -ForegroundColor Cyan
+$vcenterGroups = $results | Group-Object vCenter | Sort-Object Name
+foreach ($group in $vcenterGroups) {
+    Write-Host "  $($group.Name): $($group.Count) VMs" -ForegroundColor White
+}
+
+# Scheduled upgrades
+$scheduledCount = ($results | Where-Object { $_.UpgradeScheduled -eq "Yes" }).Count
+Write-Host "`nScheduled Upgrades:" -ForegroundColor Cyan
+Write-Host "  VMs with scheduled upgrades: $scheduledCount" -ForegroundColor White
+
+# Power state
+Write-Host "`nPower State:" -ForegroundColor Cyan
+$powerGroups = $results | Group-Object PowerState | Sort-Object Name
+foreach ($group in $powerGroups) {
+    Write-Host "  $($group.Name): $($group.Count) VMs" -ForegroundColor White
+}
+
+# Disconnect from all vCenter servers
+Write-Host "`nDisconnecting from vCenter servers..." -ForegroundColor Cyan
+Disconnect-VIServer -Server * -Confirm:$false -ErrorAction SilentlyContinue
+Write-Host "Disconnected from all vCenter servers" -ForegroundColor Green
+
+Write-Host "`nInventory collection complete!" -ForegroundColor Green
