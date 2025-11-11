@@ -89,6 +89,16 @@ Write-Host ""
 # Initialize results array
 $results = @()
 
+# Helper function to convert Version to comparable string
+function Get-VersionNumber {
+    param($version)
+    # Extract the numeric part from version string (e.g., "v13" -> 13)
+    if ($version -match 'v(\d+)') {
+        return [int]$matches[1]
+    }
+    return 0
+}
+
 foreach ($vmEntry in $vmList) {
     $vmName = $vmEntry.VMName  # Assumes CSV has a column named "VMName"
     
@@ -141,8 +151,14 @@ foreach ($vmEntry in $vmList) {
         Write-Host "  Current VM version: $($vm.Version)" -ForegroundColor Gray
         Write-Host "  Host supports up to: $hostMaxVersion" -ForegroundColor Gray
         
+        # Convert versions to comparable numbers
+        $currentVersionNum = Get-VersionNumber -version $vm.Version
+        $maxVersionNum = Get-VersionNumber -version $hostMaxVersion
+        
+        Write-Host "  Comparing versions: $currentVersionNum vs $maxVersionNum" -ForegroundColor Gray
+        
         # Check if VM version is older than what the host supports
-        if ($vm.Version -ge $hostMaxVersion) {
+        if ($currentVersionNum -ge $maxVersionNum) {
             Write-Host "  VM is already at or above the host's maximum supported version" -ForegroundColor Cyan
             $result.UpgradeNeeded = "No"
             $result.Status = "No upgrade needed"
