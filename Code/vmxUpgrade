@@ -6,25 +6,47 @@
 # Configuration
 $CsvPath = "C:\VMList.csv"  # Update with your CSV path
 $ReportPath = "C:\VM_Upgrade_Report_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+
+# ============================================================
+# SNAPSHOT CONFIGURATION (DELETE THIS SECTION IF NOT REQUIRED)
+# ============================================================
+$CreateSnapshots = $true  # Set to $false to disable snapshots
 $SnapshotName = "Pre-Compatibility-Upgrade"
 $SnapshotDescription = "Snapshot created before VM hardware compatibility upgrade - $(Get-Date)"
+# ============================================================
+# END SNAPSHOT CONFIGURATION
+# ============================================================
 
-# Connect to vCenter (update with your credentials)
-$vCenterServer = Read-Host "Enter vCenter Server"
+# Connect to multiple vCenter Servers
+$vCenterServers = @("vc01", "vc02")  # Update with your vCenter servers
 $Credential = Get-Credential -Message "Enter vCenter credentials"
 
-try {
-    Connect-VIServer -Server $vCenterServer -Credential $Credential -ErrorAction Stop
-    Write-Host "Connected to vCenter: $vCenterServer" -ForegroundColor Green
+Write-Host "Connecting to vCenter servers..." -ForegroundColor Cyan
+foreach ($vCenter in $vCenterServers) {
+    try {
+        Connect-VIServer -Server $vCenter -Credential $Credential -ErrorAction Stop | Out-Null
+        Write-Host "  Connected to: $vCenter" -ForegroundColor Green
+    }
+    catch {
+        Write-Host "  Failed to connect to $vCenter : $_" -ForegroundColor Red
+    }
 }
-catch {
-    Write-Host "Failed to connect to vCenter: $_" -ForegroundColor Red
+
+# Verify we're connected to at least one vCenter
+$connectedServers = $global:DefaultVIServers
+if ($connectedServers.Count -eq 0) {
+    Write-Host "No vCenter connections established. Exiting." -ForegroundColor Red
     exit
 }
 
-# Get the latest VM hardware version supported by the vCenter
-$latestVersion = (Get-VMHost | Select-Object -First 1).MaxVMVersion
-Write-Host "Latest VM hardware version available: $latestVersion" -ForegroundColor Cyan
+Write-Host "`nConnected to $($connectedServers.Count) vCenter server(s):" -ForegroundColor Green
+$connectedServers | ForEach-Object { Write-Host "  - $($_.Name)" -ForegroundColor Gray }
+
+# Get the latest VM hardware version supported across all vCenters
+$latestVersion = ($connectedServers | ForEach-Object { 
+    Get-VMHost -Server $_ | Select-Object -First 1 
+} | Select-Object -First 1).MaxVMVersion
+Write-Host "`nLatest VM hardware version available: $latestVersion" -ForegroundColor Cyan
 
 # Read VMs from CSV
 if (-not (Test-Path $CsvPath)) {
@@ -36,6 +58,25 @@ if (-not (Test-Path $CsvPath)) {
 $vmList = Import-Csv $CsvPath
 Write-Host "Loaded $($vmList.Count) VMs from CSV" -ForegroundColor Green
 
+# Build VM inventory cache from all vCenters for faster lookups
+Write-Host "`nBuilding VM inventory cache from all vCenters (this may take a moment)..." -ForegroundColor Cyan
+$allVMs = @{}
+foreach ($vCenter in $connectedServers) {
+    Write-Host "  Retrieving VMs from $($vCenter.Name)..." -ForegroundColor Gray
+    $vms = Get-VM -Server $vCenter
+    foreach ($vm in $vms) {
+        # Store VM with its vCenter server info
+        $allVMs[$vm.Name] = @{
+            VM = $vm
+            vCenter = $vCenter.Name
+            Server = $vCenter
+        }
+    }
+    Write-Host "    Retrieved $($vms.Count) VMs" -ForegroundColor Gray
+}
+Write-Host "Total VMs in cache: $($allVMs.Count)" -ForegroundColor Green
+Write-Host ""
+
 # Initialize results array
 $results = @()
 
@@ -46,6 +87,7 @@ foreach ($vmEntry in $vmList) {
     
     $result = [PSCustomObject]@{
         VMName = $vmName
+        FoundOnVC = ""
         OriginalVersion = ""
         UpgradedToVersion = ""
         SnapshotCreated = "No"
@@ -56,9 +98,30 @@ foreach ($vmEntry in $vmList) {
         ErrorMessage = ""
     }
     
+    # Search for VM in the pre-built cache (instant lookup)
+    $vm = $null
+    $foundOnVC = $null
+    $vcServer = $null
+    
+    Write-Host "  Looking up VM in cache..." -ForegroundColor Gray
+    if ($allVMs.ContainsKey($vmName)) {
+        $vmInfo = $allVMs[$vmName]
+        $vm = $vmInfo.VM
+        $foundOnVC = $vmInfo.vCenter
+        $vcServer = $vmInfo.Server
+        Write-Host "  Found VM on: $foundOnVC (Location: $($vm.Folder.Name))" -ForegroundColor Green
+        $result.FoundOnVC = $foundOnVC
+    }
+    else {
+        Write-Host "  Error: VM not found on any connected vCenter server" -ForegroundColor Red
+        Write-Host "  Searched: $($connectedServers.Name -join ', ')" -ForegroundColor Gray
+        $result.ErrorMessage = "VM not found on any connected vCenter"
+        $result.Status = "Failed - VM Not Found"
+        $results += $result
+        continue
+    }
+    
     try {
-        # Get VM object
-        $vm = Get-VM -Name $vmName -ErrorAction Stop
         $result.OriginalVersion = $vm.Version
         
         # Check if VM is already at the latest version
@@ -69,25 +132,37 @@ foreach ($vmEntry in $vmList) {
             continue
         }
         
-        # Check if VM is powered on (snapshots work better when VM is powered on)
+        # Check if VM is powered on
         $vmPowerState = $vm.PowerState
         Write-Host "  VM Power State: $vmPowerState" -ForegroundColor Gray
         
-        # Create snapshot
-        Write-Host "  Creating snapshot..." -ForegroundColor Cyan
-        try {
-            $snapshot = New-Snapshot -VM $vm -Name $SnapshotName -Description $SnapshotDescription -ErrorAction Stop
-            $result.SnapshotCreated = "Yes"
-            $result.SnapshotName = $snapshot.Name
-            Write-Host "  Snapshot created successfully: $($snapshot.Name)" -ForegroundColor Green
+        # ============================================================
+        # SNAPSHOT SECTION (DELETE THIS SECTION IF NOT REQUIRED)
+        # ============================================================
+        if ($CreateSnapshots) {
+            # Create snapshot
+            Write-Host "  Creating snapshot..." -ForegroundColor Cyan
+            try {
+                $snapshot = New-Snapshot -VM $vm -Name $SnapshotName -Description $SnapshotDescription -ErrorAction Stop
+                $result.SnapshotCreated = "Yes"
+                $result.SnapshotName = $snapshot.Name
+                Write-Host "  Snapshot created successfully: $($snapshot.Name)" -ForegroundColor Green
+            }
+            catch {
+                Write-Host "  Failed to create snapshot: $_" -ForegroundColor Red
+                $result.ErrorMessage = "Snapshot failed: $_"
+                $result.Status = "Failed - Snapshot Error"
+                $results += $result
+                continue
+            }
         }
-        catch {
-            Write-Host "  Failed to create snapshot: $_" -ForegroundColor Red
-            $result.ErrorMessage = "Snapshot failed: $_"
-            $result.Status = "Failed - Snapshot Error"
-            $results += $result
-            continue
+        else {
+            Write-Host "  Snapshot creation disabled (skipping)" -ForegroundColor Yellow
+            $result.SnapshotCreated = "Disabled"
         }
+        # ============================================================
+        # END SNAPSHOT SECTION
+        # ============================================================
         
         # Schedule VM compatibility upgrade
         Write-Host "  Scheduling compatibility upgrade to $latestVersion..." -ForegroundColor Cyan
@@ -100,8 +175,8 @@ foreach ($vmEntry in $vmList) {
             
             Set-VM -VM $vm -Version $latestVersion -Confirm:$false -ErrorAction Stop
             
-            # Verify the upgrade was scheduled by re-querying the VM
-            $vmUpdated = Get-VM -Name $vmName
+            # Verify the upgrade was scheduled by re-querying the VM on the correct vCenter
+            $vmUpdated = Get-VM -Name $vmName -Server $vcServer
             $result.UpgradedToVersion = $vmUpdated.Version
             $result.UpgradeScheduled = "Yes"
             $result.Status = "Success - Upgrade Scheduled"
@@ -117,7 +192,7 @@ foreach ($vmEntry in $vmList) {
     catch {
         Write-Host "  Error processing VM: $_" -ForegroundColor Red
         $result.ErrorMessage = "General error: $_"
-        $result.Status = "Failed - VM Not Found or Access Error"
+        $result.Status = "Failed - Processing Error"
     }
     
     $results += $result
@@ -142,6 +217,11 @@ Write-Host "  Successful: $successful" -ForegroundColor Green
 Write-Host "  Failed: $failed" -ForegroundColor Red
 Write-Host "  Already at latest version: $alreadyUpgraded" -ForegroundColor Yellow
 
-# Disconnect from vCenter
+Write-Host "`nVMs by vCenter:" -ForegroundColor Cyan
+$results | Where-Object { $_.FoundOnVC } | Group-Object FoundOnVC | ForEach-Object {
+    Write-Host "  $($_.Name): $($_.Count) VMs" -ForegroundColor Gray
+}
+
+# Disconnect from all vCenter servers
 Disconnect-VIServer -Confirm:$false
-Write-Host "`nDisconnected from vCenter" -ForegroundColor Green
+Write-Host "`nDisconnected from all vCenter servers" -ForegroundColor Green
