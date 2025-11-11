@@ -53,33 +53,50 @@ foreach ($vCenter in $connectedServers) {
     Write-Host "`nProcessing vCenter: $($vCenter.Name)" -ForegroundColor Yellow
     
     try {
+        # Get all VMs at once
         $vms = Get-VM -Server $vCenter -ErrorAction Stop
         Write-Host "  Found $($vms.Count) VMs" -ForegroundColor Gray
         
+        # Get all VM views in one call
+        Write-Host "  Retrieving VM details..." -ForegroundColor Gray
+        $vmViews = Get-View -ViewType VirtualMachine -Server $vCenter -Property Name,Config.Version,Runtime.PowerState,ScheduledHardwareUpgradeInfo,Network -ErrorAction Stop
+        
+        # Build VM view lookup hash
+        $vmViewHash = @{}
+        foreach ($vmView in $vmViews) {
+            $vmViewHash[$vmView.MoRef.Value] = $vmView
+        }
+        
+        # Get all VDS port groups and switches at once
+        Write-Host "  Retrieving network information..." -ForegroundColor Gray
+        $allVDPortGroups = Get-VDPortgroup -Server $vCenter -ErrorAction SilentlyContinue
+        $portGroupHash = @{}
+        foreach ($pg in $allVDPortGroups) {
+            $portGroupHash[$pg.Key] = $pg
+        }
+        
+        $allVDSwitches = Get-VDSwitch -Server $vCenter -ErrorAction SilentlyContinue
+        $vdsHash = @{}
+        foreach ($vds in $allVDSwitches) {
+            $vdsHash[$vds.Id] = $vds.Name
+        }
+        
+        Write-Host "  Processing VM data..." -ForegroundColor Gray
         $vmCounter = 0
         foreach ($vm in $vms) {
             $vmCounter++
             
-            # Show progress every 50 VMs
-            if ($vmCounter % 50 -eq 0) {
-                Write-Host "    Processing VM $vmCounter of $($vms.Count)..." -ForegroundColor Gray
+            # Show progress every 100 VMs
+            if ($vmCounter % 100 -eq 0) {
+                Write-Host "    Processed $vmCounter of $($vms.Count) VMs..." -ForegroundColor Gray
             }
             
             try {
-                # Get detailed VM info
-                $vmView = Get-View -Id $vm.Id -Server $vCenter -ErrorAction Stop
+                # Lookup VM view from hash
+                $vmView = $vmViewHash[$vm.Id]
                 
-                # Get host information
-                $vmHost = Get-VMHost -Id $vm.VMHostId -Server $vCenter -ErrorAction Stop
-                $vmHostView = Get-View -Id $vmHost.Id -Server $vCenter -ErrorAction Stop
-                
-                # Get host max supported version
-                $hostMaxVersion = "Unknown"
-                if ($vmHostView.Config.MaxSupportedVmVersion) {
-                    $hostMaxVersion = $vmHostView.Config.MaxSupportedVmVersion
-                }
-                elseif ($vmHostView.Capability.SupportedVMXVersions -and $vmHostView.Capability.SupportedVMXVersions.Count -gt 0) {
-                    $hostMaxVersion = ($vmHostView.Capability.SupportedVMXVersions | Sort-Object -Descending)[0]
+                if (-not $vmView) {
+                    throw "VM view not found"
                 }
                 
                 # Check if upgrade is scheduled
@@ -90,50 +107,49 @@ foreach ($vCenter in $connectedServers) {
                     $scheduledVersion = $vmView.ScheduledHardwareUpgradeInfo.VersionKey
                 }
                 
+                # Get VDS information from network property
+                $vdsList = @()
+                if ($vmView.Network) {
+                    foreach ($networkMoRef in $vmView.Network) {
+                        $pgKey = $networkMoRef.Value
+                        if ($portGroupHash.ContainsKey($pgKey)) {
+                            $pg = $portGroupHash[$pgKey]
+                            $vdsId = $pg.VDSwitchId
+                            if ($vdsHash.ContainsKey($vdsId)) {
+                                $vdsName = $vdsHash[$vdsId]
+                                if ($vdsName -notin $vdsList) {
+                                    $vdsList += $vdsName
+                                }
+                            }
+                        }
+                    }
+                }
+                $vdsNames = if ($vdsList.Count -gt 0) { $vdsList -join ", " } else { "Standard Switch" }
+                
                 # Create result object
                 $result = [PSCustomObject]@{
-                    VMName                = $vm.Name
-                    vCenter               = $vCenter.Name
-                    PowerState            = $vm.PowerState
+                    VMName                 = $vm.Name
+                    vCenter                = $vCenter.Name
+                    PowerState             = $vm.PowerState
                     CurrentHardwareVersion = $vmView.Config.Version
-                    HostName              = $vmHost.Name
-                    HostMaxVersion        = $hostMaxVersion
-                    UpgradeScheduled      = $scheduledUpgrade
-                    ScheduledVersion      = $scheduledVersion
-                    NumCPU                = $vm.NumCpu
-                    MemoryGB              = $vm.MemoryGB
-                    GuestOS               = $vm.Guest.OSFullName
-                    VMToolsVersion        = $vm.Guest.ToolsVersion
-                    VMToolsStatus         = $vm.Guest.ToolsStatus
-                    Folder                = $vm.Folder.Name
-                    ResourcePool          = $vm.ResourcePool.Name
-                    Notes                 = $vm.Notes
+                    UpgradeScheduled       = $scheduledUpgrade
+                    ScheduledVersion       = $scheduledVersion
+                    VDS                    = $vdsNames
                 }
                 
                 $results += $result
                 $totalVMCount++
             }
             catch {
-                Write-Host "    Error processing VM $($vm.Name): $_" -ForegroundColor Red
-                
                 # Add minimal info for failed VM
                 $result = [PSCustomObject]@{
-                    VMName                = $vm.Name
-                    vCenter               = $vCenter.Name
-                    PowerState            = $vm.PowerState
+                    VMName                 = $vm.Name
+                    vCenter                = $vCenter.Name
+                    PowerState             = $vm.PowerState
                     CurrentHardwareVersion = "Error"
-                    HostName              = "Error"
-                    HostMaxVersion        = "Error"
-                    UpgradeScheduled      = "Error"
-                    ScheduledVersion      = ""
-                    NumCPU                = $vm.NumCpu
-                    MemoryGB              = $vm.MemoryGB
-                    GuestOS               = "Error"
-                    VMToolsVersion        = "Error"
-                    VMToolsStatus         = "Error"
-                    Folder                = "Error"
-                    ResourcePool          = "Error"
-                    Notes                 = "Error: $_"
+                    UpgradeScheduled       = "Error"
+                    ScheduledVersion       = ""
+                    VDS                    = "Error"
                 }
                 
                 $results += $result
