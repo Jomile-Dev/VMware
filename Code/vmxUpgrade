@@ -163,14 +163,11 @@ foreach ($vmEntry in $vmList) {
         $vmPowerState = $vm.PowerState
         Write-Host "  VM Power State: $vmPowerState" -ForegroundColor Gray
         
-        # ============================================================
-        # SNAPSHOT SECTION (DELETE THIS SECTION IF NOT REQUIRED)
-        # ============================================================
         if ($CreateSnapshots) {
             # Create snapshot
             Write-Host "  Creating snapshot..." -ForegroundColor Cyan
             try {
-                $snapshot = New-Snapshot -VM $vm -Name $SnapshotName -Description $SnapshotDescription -ErrorAction Stop
+                $snapshot = New-Snapshot -VM $vm -Name $SnapshotName -Description $SnapshotDescription -Memory:$false -Quiesce:$false -ErrorAction Stop
                 $result.SnapshotCreated = "Yes"
                 $result.SnapshotName = $snapshot.Name
                 Write-Host "  Snapshot created successfully: $($snapshot.Name)" -ForegroundColor Green
@@ -187,9 +184,6 @@ foreach ($vmEntry in $vmList) {
             Write-Host "  Snapshot creation disabled (skipping)" -ForegroundColor Yellow
             $result.SnapshotCreated = "Disabled"
         }
-        # ============================================================
-        # END SNAPSHOT SECTION
-        # ============================================================
         
         # Schedule VM compatibility upgrade
         Write-Host "  Scheduling compatibility upgrade to $latestVersion..." -ForegroundColor Cyan
