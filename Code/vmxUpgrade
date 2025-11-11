@@ -148,25 +148,34 @@ foreach ($vmEntry in $vmList) {
         $hostMaxVersion = $vmHost.MaxVMVersion
         $result.HostMaxVersion = $hostMaxVersion
         
+        # Get the guest's configured version (the version it will upgrade to on next power cycle)
+        $vmView = Get-View -Id $vm.Id -Server $vcServer
+        $configuredVersion = $vmView.Config.Version
+        $scheduledVersion = $vmView.ScheduledHardwareUpgradeInfo.VersionKey
+        
         Write-Host "  Current VM version: $($vm.Version)" -ForegroundColor Gray
+        Write-Host "  Configured version: $configuredVersion" -ForegroundColor Gray
+        if ($scheduledVersion) {
+            Write-Host "  Scheduled upgrade version: $scheduledVersion" -ForegroundColor Gray
+        }
         Write-Host "  Host supports up to: $hostMaxVersion" -ForegroundColor Gray
         
         # Convert versions to comparable numbers
-        $currentVersionNum = Get-VersionNumber -version $vm.Version
+        $currentVersionNum = Get-VersionNumber -version $configuredVersion
         $maxVersionNum = Get-VersionNumber -version $hostMaxVersion
         
         Write-Host "  Comparing versions: $currentVersionNum vs $maxVersionNum" -ForegroundColor Gray
         
-        # Check if VM version is older than what the host supports (if equal or newer, skip)
+        # Check if VM is already scheduled for or at the latest version
         if ($currentVersionNum -ge $maxVersionNum) {
-            Write-Host "  VM is already at the host's maximum supported version" -ForegroundColor Cyan
+            Write-Host "  VM is already at or scheduled for the host's maximum supported version" -ForegroundColor Cyan
             $result.UpgradeNeeded = "No"
             $result.Status = "Already at latest version"
             $results += $result
             continue
         }
         
-        Write-Host "  Upgrade needed: $($vm.Version) -> $hostMaxVersion" -ForegroundColor Yellow
+        Write-Host "  Upgrade needed: $configuredVersion -> $hostMaxVersion" -ForegroundColor Yellow
         $result.UpgradeNeeded = "Yes"
         
         # Check if VM is powered on
