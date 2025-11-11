@@ -96,34 +96,57 @@ foreach ($vCenter in $connectedServers) {
                 $vmView = $vmViewHash[$vm.Id]
                 
                 if (-not $vmView) {
-                    throw "VM view not found"
+                    throw "VM view not found in hash"
+                }
+                
+                # Get hardware version with error handling
+                $hwVersion = "Unknown"
+                try {
+                    if ($vmView.Config -and $vmView.Config.Version) {
+                        $hwVersion = $vmView.Config.Version
+                    }
+                    else {
+                        Write-Host "    WARNING: $($vm.Name) - Config.Version is null or empty" -ForegroundColor Yellow
+                    }
+                }
+                catch {
+                    Write-Host "    ERROR: $($vm.Name) - Failed to get Config.Version: $_" -ForegroundColor Red
                 }
                 
                 # Get VDS information from network property
                 $vdsList = @()
-                if ($vmView.Network) {
-                    foreach ($networkMoRef in $vmView.Network) {
-                        $pgKey = $networkMoRef.Value
-                        if ($portGroupHash.ContainsKey($pgKey)) {
-                            $pg = $portGroupHash[$pgKey]
-                            $vdsId = $pg.VDSwitchId
-                            if ($vdsHash.ContainsKey($vdsId)) {
-                                $vdsName = $vdsHash[$vdsId]
-                                if ($vdsName -notin $vdsList) {
-                                    $vdsList += $vdsName
+                $vdsNames = "Standard Switch"
+                try {
+                    if ($vmView.Network) {
+                        foreach ($networkMoRef in $vmView.Network) {
+                            $pgKey = $networkMoRef.Value
+                            if ($portGroupHash.ContainsKey($pgKey)) {
+                                $pg = $portGroupHash[$pgKey]
+                                $vdsId = $pg.VDSwitchId
+                                if ($vdsHash.ContainsKey($vdsId)) {
+                                    $vdsName = $vdsHash[$vdsId]
+                                    if ($vdsName -notin $vdsList) {
+                                        $vdsList += $vdsName
+                                    }
                                 }
                             }
                         }
+                        if ($vdsList.Count -gt 0) {
+                            $vdsNames = $vdsList -join ", "
+                        }
                     }
                 }
-                $vdsNames = if ($vdsList.Count -gt 0) { $vdsList -join ", " } else { "Standard Switch" }
+                catch {
+                    Write-Host "    ERROR: $($vm.Name) - Failed to get VDS info: $_" -ForegroundColor Red
+                    $vdsNames = "Error: $_"
+                }
                 
                 # Create result object
                 $result = [PSCustomObject]@{
                     VMName                 = $vm.Name
                     vCenter                = $vCenter.Name
                     PowerState             = $vm.PowerState
-                    CurrentHardwareVersion = $vmView.Config.Version
+                    CurrentHardwareVersion = $hwVersion
                     VDS                    = $vdsNames
                 }
                 
@@ -131,13 +154,17 @@ foreach ($vCenter in $connectedServers) {
                 $totalVMCount++
             }
             catch {
+                Write-Host "    ERROR: $($vm.Name) - General processing error: $_" -ForegroundColor Red
+                Write-Host "    Error details: $($_.Exception.Message)" -ForegroundColor Red
+                Write-Host "    Stack trace: $($_.ScriptStackTrace)" -ForegroundColor Red
+                
                 # Add minimal info for failed VM
                 $result = [PSCustomObject]@{
                     VMName                 = $vm.Name
                     vCenter                = $vCenter.Name
                     PowerState             = $vm.PowerState
-                    CurrentHardwareVersion = "Error"
-                    VDS                    = "Error"
+                    CurrentHardwareVersion = "Error: $_"
+                    VDS                    = "Error: $_"
                 }
                 
                 $results += $result
