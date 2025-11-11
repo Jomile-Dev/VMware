@@ -8,6 +8,14 @@ $CsvPath = "C:\VMList.csv"  # Update with your CSV path
 $ReportPath = "C:\VM_Upgrade_Report_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
 
 # ============================================================
+# TARGET VERSION CONFIGURATION
+# ============================================================
+$TargetVersion = "vmx-21"  # Set the target hardware version to upgrade to
+# Examples: "vmx-19", "vmx-21", "vmx-23", etc.
+# Set to $null to use the host's maximum supported version
+# ============================================================
+
+# ============================================================
 # SNAPSHOT CONFIGURATION (DELETE THIS SECTION IF NOT REQUIRED)
 # ============================================================
 $CreateSnapshots = $true  # Set to $false to disable snapshots
@@ -92,8 +100,8 @@ $results = @()
 # Helper function to convert Version to comparable string
 function Get-VersionNumber {
     param($version)
-    # Extract the numeric part from version string (e.g., "v13" -> 13)
-    if ($version -match 'v(\d+)') {
+    # Extract the numeric part from version string (e.g., "v13" -> 13, "vmx-19" -> 19)
+    if ($version -match 'v?m?x?-?(\d+)') {
         return [int]$matches[1]
     }
     return 0
@@ -143,10 +151,34 @@ foreach ($vmEntry in $vmList) {
     try {
         $result.CurrentVersion = $vm.Version
         
-        # Get the host the VM is running on and its max supported version
-        $vmHost = Get-VMHost -Id $vm.VMHostId -Server $vcServer
-        $hostMaxVersion = $vmHost.MaxVMVersion
-        $result.HostMaxVersion = $hostMaxVersion
+        # Determine target version
+        if ($TargetVersion) {
+            # Use the configured target version
+            $upgradeToVersion = $TargetVersion
+            Write-Host "  Using configured target version: $upgradeToVersion" -ForegroundColor Cyan
+        }
+        else {
+            # Get the host the VM is running on and its max supported version
+            $vmHost = Get-VMHost -Id $vm.VMHostId -Server $vcServer
+            $vmHostView = Get-View -Id $vmHost.Id -Server $vcServer
+            
+            # Get max supported version from host capability
+            $upgradeToVersion = $vmHostView.Config.MaxSupportedVmVersion
+            if (-not $upgradeToVersion) {
+                # Fallback: try getting from hardware info
+                $upgradeToVersion = $vmHostView.Capability.SupportedVMXVersions | Sort-Object -Descending | Select-Object -First 1
+            }
+            if (-not $upgradeToVersion) {
+                Write-Host "  Error: Could not determine host max version and no target version configured" -ForegroundColor Red
+                $result.ErrorMessage = "Could not determine target version"
+                $result.Status = "Failed - No Target Version"
+                $results += $result
+                continue
+            }
+            Write-Host "  Using host's maximum supported version: $upgradeToVersion" -ForegroundColor Cyan
+        }
+        
+        $result.HostMaxVersion = $upgradeToVersion
         
         # Get the guest's configured version (the version it will upgrade to on next power cycle)
         $vmView = Get-View -Id $vm.Id -Server $vcServer
@@ -158,24 +190,24 @@ foreach ($vmEntry in $vmList) {
         if ($scheduledVersion) {
             Write-Host "  Scheduled upgrade version: $scheduledVersion" -ForegroundColor Gray
         }
-        Write-Host "  Host supports up to: $hostMaxVersion" -ForegroundColor Gray
+        Write-Host "  Target upgrade version: $upgradeToVersion" -ForegroundColor Gray
         
         # Convert versions to comparable numbers
         $currentVersionNum = Get-VersionNumber -version $configuredVersion
-        $maxVersionNum = Get-VersionNumber -version $hostMaxVersion
+        $targetVersionNum = Get-VersionNumber -version $upgradeToVersion
         
-        Write-Host "  Comparing versions: $currentVersionNum vs $maxVersionNum" -ForegroundColor Gray
+        Write-Host "  Comparing versions: $currentVersionNum vs $targetVersionNum" -ForegroundColor Gray
         
-        # Check if VM is already scheduled for or at the latest version
-        if ($currentVersionNum -ge $maxVersionNum) {
-            Write-Host "  VM is already at or scheduled for the host's maximum supported version" -ForegroundColor Cyan
+        # Check if VM is already scheduled for or at the target version
+        if ($currentVersionNum -ge $targetVersionNum) {
+            Write-Host "  VM is already at or scheduled for the target version" -ForegroundColor Cyan
             $result.UpgradeNeeded = "No"
             $result.Status = "Already at latest version"
             $results += $result
             continue
         }
         
-        Write-Host "  Upgrade needed: $configuredVersion -> $hostMaxVersion" -ForegroundColor Yellow
+        Write-Host "  Upgrade needed: $configuredVersion -> $upgradeToVersion" -ForegroundColor Yellow
         $result.UpgradeNeeded = "Yes"
         
         # Check if VM is powered on
@@ -205,7 +237,7 @@ foreach ($vmEntry in $vmList) {
         }
         
         # Schedule VM compatibility upgrade
-        Write-Host "  Scheduling compatibility upgrade to $hostMaxVersion..." -ForegroundColor Cyan
+        Write-Host "  Scheduling compatibility upgrade to $upgradeToVersion..." -ForegroundColor Cyan
         try {
             # Use Set-VM to upgrade the VM hardware version
             # Note: This requires the VM to be powered off for the upgrade to take effect
@@ -213,7 +245,7 @@ foreach ($vmEntry in $vmList) {
                 Write-Host "  Note: VM must be powered off and on again for upgrade to apply" -ForegroundColor Yellow
             }
             
-            Set-VM -VM $vm -Version $hostMaxVersion -Confirm:$false -ErrorAction Stop
+            Set-VM -VM $vm -Version $upgradeToVersion -Confirm:$false -ErrorAction Stop
             
             # Verify the upgrade was scheduled by re-querying the VM on the correct vCenter
             $vmUpdated = Get-VM -Name $vmName -Server $vcServer
