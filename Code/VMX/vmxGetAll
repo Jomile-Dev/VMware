@@ -100,37 +100,26 @@ foreach ($vCenter in $connectedServers) {
                     Write-Host "    ERROR: $($vm.Name) - Failed to get Config.Version: $_" -ForegroundColor Red
                 }
                 
-                # Get VDS information from network names
-                $vdsList = @()
-                $vdsNames = "Standard Switch"
+                # Get network adapter names
+                $networkNames = "None"
                 try {
-                    # Get network adapter info directly from VM
-                    $networks = $vm | Get-NetworkAdapter -ErrorAction SilentlyContinue
-                    if ($networks) {
-                        foreach ($network in $networks) {
-                            $networkName = $network.NetworkName
-                            if ($networkName) {
-                                # Check if this network is a VDS port group
-                                if ($portGroupHash.ContainsKey($networkName)) {
-                                    $pg = $portGroupHash[$networkName]
-                                    $vdsId = $pg.VDSwitchId
-                                    if ($vdsHash.ContainsKey($vdsId)) {
-                                        $vdsName = $vdsHash[$vdsId]
-                                        if ($vdsName -notin $vdsList) {
-                                            $vdsList += $vdsName
-                                        }
-                                    }
-                                }
+                    # Get network names directly from VM object
+                    $vmNetworks = $vm.NetworkAdapters
+                    if ($vmNetworks -and $vmNetworks.Count -gt 0) {
+                        $networkList = @()
+                        foreach ($adapter in $vmNetworks) {
+                            if ($adapter.NetworkName) {
+                                $networkList += $adapter.NetworkName
                             }
                         }
-                        if ($vdsList.Count -gt 0) {
-                            $vdsNames = $vdsList -join ", "
+                        if ($networkList.Count -gt 0) {
+                            $networkNames = ($networkList | Select-Object -Unique) -join ", "
                         }
                     }
                 }
                 catch {
-                    Write-Host "    ERROR: $($vm.Name) - Failed to get VDS info: $_" -ForegroundColor Red
-                    $vdsNames = "Error: $_"
+                    Write-Host "    ERROR: $($vm.Name) - Failed to get network info: $_" -ForegroundColor Red
+                    $networkNames = "Error: $_"
                 }
                 
                 # Create result object
@@ -139,7 +128,7 @@ foreach ($vCenter in $connectedServers) {
                     vCenter                = $vCenter.Name
                     PowerState             = $vm.PowerState
                     CurrentHardwareVersion = $hwVersion
-                    VDS                    = $vdsNames
+                    Networks               = $networkNames
                 }
                 
                 $results += $result
@@ -156,7 +145,7 @@ foreach ($vCenter in $connectedServers) {
                     vCenter                = $vCenter.Name
                     PowerState             = $vm.PowerState
                     CurrentHardwareVersion = "Error: $_"
-                    VDS                    = "Error: $_"
+                    Networks               = "Error: $_"
                 }
                 
                 $results += $result
