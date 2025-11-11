@@ -89,10 +89,20 @@ if (-not (Test-Path $CsvPath)) {
 $vmList = Import-Csv $CsvPath
 Write-Host "Loaded $($vmList.Count) VMs from CSV" -ForegroundColor Green
 
-] = @{
-                    VM = $vm
+# Build VM inventory cache from all vCenters for faster lookups
+Write-Host "`nBuilding VM inventory cache from all vCenters (this may take a moment)..." -ForegroundColor Cyan
+$allVMs = @{}
+$totalVMCount = 0
+foreach ($vCenter in $connectedServers) {
+    Write-Host "  Retrieving VMs from $($vCenter.Name)..." -ForegroundColor Gray
+    try {
+        $vms = Get-VM -Server $vCenter -ErrorAction Stop
+        foreach ($vm in $vms) {
+            if (-not $allVMs.ContainsKey($vm.Name)) {
+                $allVMs[$vm.Name] = @{
+                    VM      = $vm
                     vCenter = $vCenter.Name
-                    Server = $vCenter
+                    Server  = $vCenter
                 }
             }
         }
