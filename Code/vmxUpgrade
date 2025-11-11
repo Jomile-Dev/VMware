@@ -6,7 +6,6 @@
 # Configuration
 $CsvPath = "C:\VMList.csv"  # Update with your CSV path
 $ReportPath = "C:\VM_Upgrade_Report_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
-
 $TargetVersion = "v21"
 
 # ============================================================
@@ -16,10 +15,8 @@ $CreateSnapshots = $true  # Set to $false to disable snapshots
 $SnapshotName = "Pre-Compatibility-Upgrade"
 $SnapshotDescription = "Snapshot created before VM hardware compatibility upgrade - $(Get-Date)"
 # ============================================================
-# END SNAPSHOT CONFIGURATION
-# ============================================================
 
-# Connect to multiple vCenter Servers
+# Connect to multiple vCenter servers
 $vCenterServers = @("vc01", "vc02", "vc03", "vc04")  # Update with your vCenter servers
 $Credential = Get-Credential -Message "Enter vCenter credentials"
 
@@ -99,7 +96,7 @@ foreach ($vCenter in $connectedServers) {
                 vCenter = $vCenter.Name
                 Server = $vCenter
             }
-            # Also store by just VM name for initial lookup attempt
+            # Also store by VM name only for initial lookup attempt
             if (-not $allVMs.ContainsKey($vm.Name)) {
                 $allVMs[$vm.Name] = @{
                     VM = $vm
@@ -198,7 +195,7 @@ foreach ($vmEntry in $vmList) {
                     Write-Host "  Using host's maximum supported version: $upgradeToVersion" -ForegroundColor Cyan
                 }
                 else {
-                    Write-Host "  Error: Could not determine host max version and no target version configured" -ForegroundColor Red
+                    Write-Host "  Error: Could not determine host maximum version and no target version configured" -ForegroundColor Red
                     $result.ErrorMessage = "Could not determine target version"
                     $result.Status = "Failed - No Target Version"
                     $results += $result
@@ -215,7 +212,7 @@ foreach ($vmEntry in $vmList) {
         }
         
         if (-not $upgradeToVersion) {
-            Write-Host "  Error: Could not determine upgrade target version" -ForegroundColor Red
+            Write-Host "  Error: Could not determine target upgrade version" -ForegroundColor Red
             $result.ErrorMessage = "No target version available"
             $result.Status = "Failed - No Target Version"
             $results += $result
@@ -244,7 +241,7 @@ foreach ($vmEntry in $vmList) {
         
         # Check if VM is already scheduled for or at the target version
         if ($currentVersionNum -ge $targetVersionNum) {
-            Write-Host "  VM is already at or scheduled for the target version" -ForegroundColor Cyan
+            Write-Host "  VM is already at or above the target version" -ForegroundColor Cyan
             $result.UpgradeNeeded = "No"
             $result.Status = "Already at target version"
             $results += $result
