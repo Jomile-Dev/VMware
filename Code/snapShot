@@ -1,18 +1,11 @@
 # Get credentials from user
-$credential = Import-Clixml -Path "D:\XXXXXXXX\getcred.xml"
+$credential = Import-Clixml -Path "D:\Working\WROPS Script\getcred.xml"
 
 # VRA Configuration (for unknown snapshot creators)
-$vRAServer = "vra.example.com"
 $vRAEnabled = $true
-$vRACredential = Import-Clixml -Path "D:\XXXXXXXX\vracred.xml"
-
-# Email Configuration
-$SendEmail = $true
-$EmailTo = "admin@example.com"
-$EmailFrom = "vcenter-reports@example.com"
-$EmailSubject = "vCenter Snapshot Report - $(Get-Date -Format 'yyyy-MM-dd')"
-$SMTPServer = "smtp.example.com"
-$SMTPPort = 25
+$vRAServer = "vra.example.com"  # Update with your vRA server
+$vRACredential = Import-Clixml -Path "D:\Working\WROPS Script\vracred.xml"
+$vRACheckUser = "xyz"  # If creator equals this user, check vRA
 
 # Function to get creator from VRA
 function Get-VRASnapshotCreator {
@@ -52,19 +45,26 @@ function Get-VRASnapshotCreator {
         $queryUrl = "$eventsUrl`?`$filter=eventTime ge $startTime and eventTime le $endTime"
         $events = Invoke-RestMethod -Uri $queryUrl -Method Get -Headers $headers
         
-        # Find matching event with "Create Snapshot" in title
+        # Find matching event with "Create Snapshot" in title and the VM name
         $matchingEvent = $events.content | Where-Object { 
             $_.title -like "*Create Snapshot*" -and $_.title -like "*$VMName*"
         } | Select-Object -First 1
         
-        if ($matchingEvent -and $matchingEvent.title -match "Create Snapshot.*?(\w+)$") {
-            return $matches[1]
+        if ($matchingEvent) {
+            # Extract username from title - format is usually "Create Snapshot username"
+            if ($matchingEvent.title -match "Create Snapshot.*?(\w+)$") {
+                return $matches[1]
+            }
+            # Alternative: check if there's a userName field in the event data
+            elseif ($matchingEvent.userName) {
+                return $matchingEvent.userName
+            }
         }
         
         return $null
     }
     catch {
-        Write-Host "  VRA lookup failed: $_" -ForegroundColor Yellow
+        Write-Host "  VRA lookup failed for $VMName : $_" -ForegroundColor Yellow
         return $null
     }
 }
@@ -84,12 +84,12 @@ $vCenterServers | ForEach-Object {
             
             $creator = if ($events) { $events[0].UserName } else { "Unknown" }
             
-            # If creator contains "xyz" or is "Unknown", try VRA lookup
-            if ($vRAEnabled -and ($creator -like "*xyz*" -or $creator -eq "Unknown")) {
-                Write-Host "  Looking up creator in vRA for snapshot: $($snap.Name) on $($vm.Name)" -ForegroundColor Cyan
+            # If creator equals the vRACheckUser or is "Unknown", try VRA lookup
+            if ($vRAEnabled -and ($creator -eq $vRACheckUser -or $creator -eq "Unknown")) {
+                Write-Host "  Checking vRA Deployment User Events for: $($snap.Name) on $($vm.Name)" -ForegroundColor Cyan
                 $vraCreator = Get-VRASnapshotCreator -VMName $vm.Name -SnapshotTime $snap.Created
                 if ($vraCreator) {
-                    $creator = "$vraCreator (from vRA)"
+                    $creator = "$vraCreator (vRA)"
                 }
             }
             
@@ -97,13 +97,13 @@ $vCenterServers | ForEach-Object {
             $createdFormatted = $snap.Created.ToString("dd-MM-yyyy")
             
             $snapshotReport += [PSCustomObject]@{
-                VMName          = $vm.Name
-                SnapshotName    = $snap.Name
-                Description     = $snap.Description
-                Created         = $createdFormatted
-                CreatedBy       = $creator
-                Size            = [math]::Round($snap.SizeGB, 2)
-                AgeDays         = $ageDays
+                VMName = $vm.Name
+                SnapshotName = $snap.Name
+                Description = $snap.Description
+                Created = $createdFormatted
+                CreatedBy = $creator
+                Size = [math]::Round($snap.SizeGB, 2)
+                AgeDays = $ageDays
             }
         }
     }
@@ -116,7 +116,7 @@ $snapshotReport = $snapshotReport | Sort-Object -Property AgeDays -Descending
 
 # Generate HTML content
 if ($snapshotReport.Count -eq 0) {
-    $htmlBody = @"
+    $emailBody = @"
 <html>
 <head>
 <style>
@@ -132,7 +132,7 @@ body { font-family: Arial; }
 } else {
     $htmlTable = $snapshotReport | ConvertTo-Html -Property VMName, SnapshotName, Description, Created, CreatedBy, Size, AgeDays -Fragment
     
-    $htmlBody = @"
+    $emailBody = @"
 <html>
 <head>
 <style>
@@ -148,49 +148,4 @@ $htmlTable
 </body>
 </html>
 "@
-}
-
-# Export to CSV with timestamp
-$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$csvPath = ".\VM_Snapshots_$timestamp.csv"
-$snapshotReport | Export-Csv -Path $csvPath -NoTypeInformation
-Write-Host "`nExported to $csvPath" -ForegroundColor Green
-
-# Save HTML report
-$htmlPath = ".\VM_Snapshots_$timestamp.html"
-$htmlBody | Out-File -FilePath $htmlPath -Encoding UTF8
-Write-Host "HTML report saved to $htmlPath" -ForegroundColor Green
-
-# Send email report
-if ($SendEmail) {
-    Write-Host "`nSending email report..." -ForegroundColor Cyan
-
-    $reportTime = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $totalSnapshots = $snapshotReport.Count
-    $oldSnapshots = ($snapshotReport | Where-Object { $_.AgeDays -gt 7 }).Count
-    
-    $emailBody = @"
-Report Title: vCenter Snapshot Report
-
-Report Description:
-This report provides an overview of all VM snapshots across connected vCenter servers.
-
-Report Time: $reportTime
-
-Summary:
-- Total Snapshots: $totalSnapshots
-- Snapshots > 7 days old: $oldSnapshots
-
-Full details are available in the attached CSV file.
-"@
-
-    try {
-        Send-MailMessage -SmtpServer $SMTPServer -Port $SMTPPort -From $EmailFrom -To $EmailTo -Subject $EmailSubject -Body $emailBody -Attachments $csvPath
-        Write-Host "Email sent successfully to $EmailTo" -ForegroundColor Green
-    }
-    catch {
-        Write-Host "Failed to send email: $_" -ForegroundColor Red
-    }
-} else {
-    Write-Host "`nEmail sending is disabled" -ForegroundColor Yellow
 }
