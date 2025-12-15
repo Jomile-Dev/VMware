@@ -1,3 +1,13 @@
+#Requires -Modules VMware.VimAutomation.Core
+
+<#
+.SYNOPSIS
+    Multi-vCenter snapshot reporting with vRA user enrichment
+.DESCRIPTION
+    Connects to multiple vCenters, retrieves all snapshots with details,
+    enriches vRA-created snapshots with actual user information, and emails a report
+#>
+
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
@@ -11,7 +21,6 @@ $vCenters = @(
 
 # vRA Configuration
 $vraServer = "vra.domain.com"
-$vraRefreshToken = "your-vra-refresh-token-here"  # Use refresh token for authentication
 
 # Email Configuration
 $smtpServer = "smtp.domain.com"
@@ -25,6 +34,29 @@ $emailSubject = "vCenter Snapshot Report - $(Get-Date -Format 'yyyy-MM-dd')"
 # ============================================================================
 
 function Get-vRAAccessToken {
+    param(
+        [System.Management.Automation.PSCredential]$Credential,
+        [string]$Server
+    )
+    
+    $uri = "https://$Server/csp/gateway/am/api/login?access_token"
+    
+    $body = @{
+        username = $Credential.UserName
+        password = $Credential.GetNetworkCredential().Password
+    } | ConvertTo-Json
+    
+    try {
+        $response = Invoke-RestMethod -Uri $uri -Method Post -Body $body -ContentType "application/json" -SkipCertificateCheck
+        return $response.refresh_token
+    }
+    catch {
+        Write-Warning "Failed to get vRA refresh token: $_"
+        return $null
+    }
+}
+
+function Get-vRABearerToken {
     param([string]$RefreshToken, [string]$Server)
     
     $uri = "https://$Server/iaas/api/login"
@@ -35,7 +67,7 @@ function Get-vRAAccessToken {
         return $response.token
     }
     catch {
-        Write-Warning "Failed to get vRA access token: $_"
+        Write-Warning "Failed to get vRA bearer token: $_"
         return $null
     }
 }
@@ -144,7 +176,12 @@ function Get-SnapshotUserFromvRA {
 }
 
 function Get-AllSnapshots {
-    param([array]$vCenterServers, [string]$vraServer, [string]$vraToken)
+    param(
+        [array]$vCenterServers,
+        [string]$vraServer,
+        [string]$vraToken,
+        [System.Management.Automation.PSCredential]$Credential
+    )
     
     $allSnapshots = @()
     
@@ -152,8 +189,8 @@ function Get-AllSnapshots {
         Write-Host "Connecting to $vcServer..." -ForegroundColor Cyan
         
         try {
-            # Connect to vCenter (will prompt for credentials)
-            Connect-VIServer -Server $vcServer -ErrorAction Stop | Out-Null
+            # Connect to vCenter with provided credentials
+            Connect-VIServer -Server $vcServer -Credential $Credential -ErrorAction Stop | Out-Null
             
             Write-Host "Retrieving snapshots from $vcServer..." -ForegroundColor Yellow
             
@@ -298,16 +335,39 @@ Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "vCenter Snapshot Report with vRA Integration" -ForegroundColor Cyan
 Write-Host "========================================`n" -ForegroundColor Cyan
 
-# Get vRA access token
-Write-Host "Authenticating with vRA..." -ForegroundColor Yellow
-$vraAccessToken = Get-vRAAccessToken -RefreshToken $vraRefreshToken -Server $vraServer
+# Get credentials (used for both vCenter and vRA)
+Write-Host "Please enter credentials (used for both vCenter and vRA):" -ForegroundColor Yellow
+$credential = Get-Credential
 
-if (-not $vraAccessToken) {
+if (-not $credential) {
+    Write-Error "Credentials are required to continue."
+    exit
+}
+
+# Get vRA refresh token
+Write-Host "`nAuthenticating with vRA and generating refresh token..." -ForegroundColor Yellow
+$vraRefreshToken = Get-vRAAccessToken -Credential $credential -Server $vraServer
+
+if (-not $vraRefreshToken) {
     Write-Warning "Failed to authenticate with vRA. Continuing without vRA user enrichment."
+    $vraBearerToken = $null
+}
+else {
+    Write-Host "Successfully obtained vRA refresh token" -ForegroundColor Green
+    
+    # Get bearer token from refresh token
+    $vraBearerToken = Get-vRABearerToken -RefreshToken $vraRefreshToken -Server $vraServer
+    
+    if ($vraBearerToken) {
+        Write-Host "Successfully obtained vRA bearer token" -ForegroundColor Green
+    }
+    else {
+        Write-Warning "Failed to get vRA bearer token. Continuing without vRA user enrichment."
+    }
 }
 
 # Collect all snapshots
-$allSnapshots = Get-AllSnapshots -vCenterServers $vCenters -vraServer $vraServer -vraToken $vraAccessToken
+$allSnapshots = Get-AllSnapshots -vCenterServers $vCenters -vraServer $vraServer -vraToken $vraBearerToken -Credential $credential
 
 # Display summary
 Write-Host "`n========================================" -ForegroundColor Cyan
