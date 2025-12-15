@@ -28,6 +28,10 @@ $Credential = Get-Credential
 # Suppress certificate warnings (optional)
 Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session
 
+# Initialize results collection for email
+$allResults = @()
+$connectedServers = @()
+
 try {
     # Connect to vCenter Servers
     Write-Host "Connecting to vCenter Servers:" -ForegroundColor Green
@@ -38,8 +42,9 @@ try {
             if ($cleanServer -ne "") {
                 Write-Host "  Attempting connection to: $cleanServer" -ForegroundColor Cyan
                 try {
-                    Connect-VIServer -Server $cleanServer -Credential $Credential -ErrorAction Stop
+                    $connection = Connect-VIServer -Server $cleanServer -Credential $Credential -ErrorAction Stop
                     Write-Host "    ✓ Connected successfully" -ForegroundColor Green
+                    $connectedServers += $connection
                 } catch {
                     Write-Host "    ✗ Failed to connect: $($_.Exception.Message)" -ForegroundColor Red
                     continue
@@ -48,120 +53,131 @@ try {
         }
     }
 
-    # Get all clusters from all connected vCenter servers
-    $clusters = Get-Cluster | Where-Object { $_.HAEnabled -eq $true }
-    
-    # Initialize results collection for email
-    $allResults = @()
-    
+    if ($connectedServers.Count -eq 0) {
+        throw "No vCenter servers connected. Exiting."
+    }
+
     Write-Host "`nAnalyzing cluster capacity across all vCenter servers (N-2 model)..." -ForegroundColor Yellow
     
-    foreach ($cluster in $clusters) {
-        # Get the vCenter server this cluster belongs to
-        $vCenterName = [string]($cluster.Uid.Split('@')[1].Split(':')[0])
+    # Process each vCenter server individually
+    foreach ($vCenterConnection in $connectedServers) {
+        $vCenterName = $vCenterConnection.Name
+        Write-Host "`n=== Processing vCenter: $vCenterName ===" -ForegroundColor Magenta
         
-        Write-Host "Processing vCenter: $vCenterName, Cluster: $($cluster.Name)" -ForegroundColor Cyan
+        # Get clusters from THIS specific vCenter
+        $clusters = Get-Cluster -Server $vCenterConnection | Where-Object { $_.HAEnabled -eq $true }
         
-        # Get all connected hosts in cluster
-        $hosts = $cluster | Get-VMHost | Where-Object { $_.ConnectionState -eq "Connected" -and $_.PowerState -eq "PoweredOn" }
-        $totalHosts = [int]$hosts.Count
-        
-        if ($totalHosts -lt 3) {
-            Write-Host "  Insufficient hosts for N-2 analysis (need at least 3)" -ForegroundColor Yellow
+        if ($clusters.Count -eq 0) {
+            Write-Host "  No HA-enabled clusters found on $vCenterName" -ForegroundColor Yellow
             continue
         }
         
-        # Calculate total cluster resources - convert to proper numeric types
-        $totalCpuMhz = [double](($hosts | Measure-Object -Property CpuTotalMhz -Sum).Sum)
-        $totalMemoryMB = [double](($hosts | Measure-Object -Property MemoryTotalMB -Sum).Sum)
-        $totalCpuCores = [int](($hosts | Measure-Object -Property NumCpu -Sum).Sum)
-        
-        # Calculate N-2 usable capacity (remove any 2 hosts)
-        # Use average host capacity for N-2 calculation
-        $avgCpuMhzPerHost = [double]($totalCpuMhz / $totalHosts)
-        $avgMemoryMBPerHost = [double]($totalMemoryMB / $totalHosts)
-        $avgCpuCoresPerHost = [double]($totalCpuCores / $totalHosts)
-        
-        $n2CpuMhz = [double]($totalCpuMhz - (2 * $avgCpuMhzPerHost))
-        $n2MemoryMB = [double]($totalMemoryMB - (2 * $avgMemoryMBPerHost))
-        $n2CpuCores = [int]($totalCpuCores - (2 * $avgCpuCoresPerHost))
-        
-        # Calculate N-2 usable CPU cores with overcommit
-        $n2UsableCpuCores = [double]($n2CpuCores * $CpuOvercommitRatio)
-        
-        # Get vSAN datastore info if available
-        $vSanDatastore = $cluster | Get-Datastore | Where-Object { $_.Type -eq "vsan" } | Select-Object -First 1
-        $totalvSanTB = 0
-        $n2vSanUsableTB = 0
-        $vSanUsedTB = 0
-        
-        if ($vSanDatastore) {
-            $totalvSanTB = [math]::Round($vSanDatastore.CapacityGB / 1024, 2)  # Convert to TB
-            $vSanUsedTB = [math]::Round(($vSanDatastore.CapacityGB - $vSanDatastore.FreeSpaceGB) / 1024, 2)  # Used space in TB
-            # For vSAN N-2, lose ~2 hosts worth of capacity
-            $avgStoragePerHostTB = $totalvSanTB / $totalHosts
-            $n2vSanUsableTB = [math]::Round($totalvSanTB - (2 * $avgStoragePerHostTB), 2)
+        foreach ($cluster in $clusters) {
+            Write-Host "  Processing Cluster: $($cluster.Name)" -ForegroundColor Cyan
+            
+            # Get all connected hosts in cluster
+            $hosts = $cluster | Get-VMHost | Where-Object { $_.ConnectionState -eq "Connected" -and $_.PowerState -eq "PoweredOn" }
+            $totalHosts = [int]$hosts.Count
+            
+            if ($totalHosts -lt 3) {
+                Write-Host "    Insufficient hosts for N-2 analysis (need at least 3)" -ForegroundColor Yellow
+                continue
+            }
+            
+            # Calculate total cluster resources - convert to proper numeric types
+            $totalCpuMhz = [double](($hosts | Measure-Object -Property CpuTotalMhz -Sum).Sum)
+            $totalMemoryMB = [double](($hosts | Measure-Object -Property MemoryTotalMB -Sum).Sum)
+            $totalCpuCores = [int](($hosts | Measure-Object -Property NumCpu -Sum).Sum)
+            
+            # Calculate N-2 usable capacity (remove any 2 hosts)
+            # Use average host capacity for N-2 calculation
+            $avgCpuMhzPerHost = [double]($totalCpuMhz / $totalHosts)
+            $avgMemoryMBPerHost = [double]($totalMemoryMB / $totalHosts)
+            $avgCpuCoresPerHost = [double]($totalCpuCores / $totalHosts)
+            
+            $n2CpuMhz = [double]($totalCpuMhz - (2 * $avgCpuMhzPerHost))
+            $n2MemoryMB = [double]($totalMemoryMB - (2 * $avgMemoryMBPerHost))
+            $n2CpuCores = [int]($totalCpuCores - (2 * $avgCpuCoresPerHost))
+            
+            # Calculate N-2 usable CPU cores with overcommit
+            $n2UsableCpuCores = [double]($n2CpuCores * $CpuOvercommitRatio)
+            
+            # Get vSAN datastore info if available
+            $vSanDatastore = $cluster | Get-Datastore | Where-Object { $_.Type -eq "vsan" } | Select-Object -First 1
+            $totalvSanTB = 0
+            $n2vSanUsableTB = 0
+            $vSanUsedTB = 0
+            
+            if ($vSanDatastore) {
+                $totalvSanTB = [math]::Round($vSanDatastore.CapacityGB / 1024, 2)  # Convert to TB
+                $vSanUsedTB = [math]::Round(($vSanDatastore.CapacityGB - $vSanDatastore.FreeSpaceGB) / 1024, 2)  # Used space in TB
+                # For vSAN N-2, lose ~2 hosts worth of capacity
+                $avgStoragePerHostTB = $totalvSanTB / $totalHosts
+                $n2vSanUsableTB = [math]::Round($totalvSanTB - (2 * $avgStoragePerHostTB), 2)
+            }
+            
+            # Get ALL VMs in the cluster (regardless of power state)
+            $allVMs = $cluster | Get-VM
+            $totalVMs = [int]$allVMs.Count
+            $poweredOnVMs = $allVMs | Where-Object { $_.PowerState -eq "PoweredOn" }
+            $poweredOnCount = [int]$poweredOnVMs.Count
+            $poweredOffCount = $totalVMs - $poweredOnCount
+            
+            # Calculate VM resource demands using ONLY powered-on VMs (allocated resources)
+            $allocatedCpuCores = [int](($poweredOnVMs | Measure-Object -Property NumCpu -Sum).Sum)
+            $allocatedMemoryMB = [double](($poweredOnVMs | Measure-Object -Property MemoryMB -Sum).Sum)
+            
+            # Calculate vCPU to pCPU ratio
+            $vCpuToPcpuRatio = [math]::Round([double]$allocatedCpuCores / [double]$totalCpuCores, 2)
+            
+            # Calculate total usable CPU cores with 3:1 overcommit
+            $totalUsableCpuCores = [double]($totalCpuCores * $CpuOvercommitRatio)
+            
+            # Calculate utilisation percentages against N-2 usable capacity
+            $n2CpuUtilPct = if ($n2UsableCpuCores -gt 0) { [math]::Round(([double]$allocatedCpuCores / [double]$n2UsableCpuCores) * 100, 2) } else { 0 }
+            $n2MemUtilPct = if ($n2MemoryMB -gt 0) { [math]::Round(($allocatedMemoryMB / $n2MemoryMB) * 100, 2) } else { 0 }
+            $n2vSanUtilPct = if ($n2vSanUsableTB -gt 0) { [math]::Round(($vSanUsedTB / $n2vSanUsableTB) * 100, 2) } else { 0 }
+            
+            # Create the cluster result object
+            $clusterResult = @{
+                vCenter = $vCenterName
+                Cluster = [string]$cluster.Name
+                TotalHosts = $totalHosts
+                TotalVMs = $totalVMs
+                PoweredOnVMs = $poweredOnCount
+                PoweredOffVMs = $poweredOffCount
+                vCpuToPcpuRatio = "$($vCpuToPcpuRatio):1"
+                
+                # Currently assigned/used resources (from powered-on VMs only)
+                vCPU_Assigned = $allocatedCpuCores
+                Memory_Assigned_GB = [math]::Round($allocatedMemoryMB / 1024, 2)      # Convert to GB
+                vSAN_Used_TB = if ($vSanUsedTB -gt 0) { $vSanUsedTB } else { 0 }
+                
+                # Total capacity (without N-2)
+                Total_CPU_Cores = $totalCpuCores
+                Total_CPU_Usable = $totalUsableCpuCores
+                Total_Memory_GB = [math]::Round($totalMemoryMB / 1024, 2)    # Convert to GB
+                Total_vSAN_TB = if ($totalvSanTB -gt 0) { $totalvSanTB } else { 0 }
+                
+                # N-2 capacity
+                N2_CPU_Cores = $n2CpuCores
+                N2_CPU_Usable = $n2UsableCpuCores
+                N2_Memory_GB = [math]::Round($n2MemoryMB / 1024, 2)         # Convert to GB
+                N2_vSAN_Usable_TB = if ($n2vSanUsableTB -gt 0) { $n2vSanUsableTB } else { 0 }
+                
+                # Utilisation against N-2 usable capacity
+                N2_CPU_Util = "$($n2CpuUtilPct)%"
+                N2_Memory_Util = "$($n2MemUtilPct)%"
+                N2_vSAN_Util = if ($n2vSanUsableTB -gt 0) { "$($n2vSanUtilPct)%" } else { "N/A" }
+            }
+            
+            $allResults += $clusterResult
+            Write-Host "    ✓ Analysis complete" -ForegroundColor Green
         }
-        
-        # Get ALL VMs in the cluster (regardless of power state)
-        $allVMs = $cluster | Get-VM
-        $totalVMs = [int]$allVMs.Count
-        $poweredOnVMs = $allVMs | Where-Object { $_.PowerState -eq "PoweredOn" }
-        $poweredOnCount = [int]$poweredOnVMs.Count
-        $poweredOffCount = $totalVMs - $poweredOnCount
-        
-        # Calculate VM resource demands using ONLY powered-on VMs (allocated resources)
-        $allocatedCpuCores = [int](($poweredOnVMs | Measure-Object -Property NumCpu -Sum).Sum)
-        $allocatedMemoryMB = [double](($poweredOnVMs | Measure-Object -Property MemoryMB -Sum).Sum)
-        
-        # Calculate vCPU to pCPU ratio
-        $vCpuToPcpuRatio = [math]::Round([double]$allocatedCpuCores / [double]$totalCpuCores, 2)
-        
-        # Calculate total usable CPU cores with 3:1 overcommit
-        $totalUsableCpuCores = [double]($totalCpuCores * $CpuOvercommitRatio)
-        
-        # Calculate utilisation percentages against N-2 usable capacity
-        $n2CpuUtilPct = if ($n2UsableCpuCores -gt 0) { [math]::Round(([double]$allocatedCpuCores / [double]$n2UsableCpuCores) * 100, 2) } else { 0 }
-        $n2MemUtilPct = if ($n2MemoryMB -gt 0) { [math]::Round(($allocatedMemoryMB / $n2MemoryMB) * 100, 2) } else { 0 }
-        $n2vSanUtilPct = if ($n2vSanUsableTB -gt 0) { [math]::Round(($vSanUsedTB / $n2vSanUsableTB) * 100, 2) } else { 0 }
-        
-        # Create the cluster result object
-        $clusterResult = @{
-            Cluster = [string]$cluster.Name
-            TotalHosts = $totalHosts
-            TotalVMs = $totalVMs
-            PoweredOnVMs = $poweredOnCount
-            PoweredOffVMs = $poweredOffCount
-            vCpuToPcpuRatio = "$($vCpuToPcpuRatio):1"
-            
-            # Currently assigned/used resources (from powered-on VMs only)
-            vCPU_Assigned = $allocatedCpuCores
-            Memory_Assigned_GB = [math]::Round($allocatedMemoryMB / 1024, 2)      # Convert to GB
-            vSAN_Used_TB = if ($vSanUsedTB -gt 0) { $vSanUsedTB } else { 0 }
-            
-            # Total capacity (without N-2)
-            Total_CPU_Cores = $totalCpuCores
-            Total_CPU_Usable = $totalUsableCpuCores
-            Total_Memory_GB = [math]::Round($totalMemoryMB / 1024, 2)    # Convert to GB
-            Total_vSAN_TB = if ($totalvSanTB -gt 0) { $totalvSanTB } else { 0 }
-            
-            # N-2 capacity
-            N2_CPU_Cores = $n2CpuCores
-            N2_CPU_Usable = $n2UsableCpuCores
-            N2_Memory_GB = [math]::Round($n2MemoryMB / 1024, 2)         # Convert to GB
-            N2_vSAN_Usable_TB = if ($n2vSanUsableTB -gt 0) { $n2vSanUsableTB } else { 0 }
-            
-            # Utilisation against N-2 usable capacity
-            N2_CPU_Util = "$($n2CpuUtilPct)%"
-            N2_Memory_Util = "$($n2MemUtilPct)%"
-            N2_vSAN_Util = if ($n2vSanUsableTB -gt 0) { "$($n2vSanUtilPct)%" } else { "N/A" }
-        }
-        
-        $allResults += $clusterResult
     }
     
-    # Sort results by Cluster name
-    $sortedResults = $allResults | Sort-Object { $_.Cluster }
+    # Sort results by vCenter name first, then by Cluster name
+    $sortedResults = $allResults | Sort-Object { $_.vCenter }, { $_.Cluster }
     
     # Send email report if configured
     if ($SendEmail -and $sortedResults.Count -gt 0) {
@@ -188,6 +204,7 @@ try {
 <body>
     <h1>VMware Cluster Capacity Analysis Report (N-2 Model)</h1>
     <p><strong>Generated:</strong> $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</p>
+    <p><strong>vCenter Servers Analyzed:</strong> $($connectedServers.Count) ($($connectedServers.Name -join ', '))</p>
     
     <div class="summary">
         <h3>Analysis Parameters</h3>
@@ -201,6 +218,7 @@ try {
     <h2>Cluster Capacity Analysis - N-2 Model</h2>
     <table>
         <tr>
+            <th rowspan="2">vCenter</th>
             <th rowspan="2">Cluster</th>
             <th rowspan="2">Total<br>Hosts</th>
             <th colspan="3" style="background-color: #e8f4f8; text-align: center;">VM Counts</th>
@@ -235,6 +253,7 @@ try {
             $vSanUsedDisplay = if ($result.vSAN_Used_TB -gt 0) { $result.vSAN_Used_TB } else { "N/A" }
             
             $htmlBody += "<tr>"
+            $htmlBody += "<td>$($result.vCenter)</td>"
             $htmlBody += "<td>$($result.Cluster)</td>"
             $htmlBody += "<td class='center-text'>$($result.TotalHosts)</td>"
             # VM counts
@@ -301,6 +320,8 @@ try {
         } catch {
             Write-Host "✗ Failed to send email: $($_.Exception.Message)" -ForegroundColor Red
         }
+    } elseif ($sortedResults.Count -eq 0) {
+        Write-Host "`nNo clusters found to analyze across all vCenter servers." -ForegroundColor Yellow
     }
     
 } catch {
