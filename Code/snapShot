@@ -183,8 +183,6 @@ function Get-SnapshotUserFromvRA {
 function Get-AllSnapshots {
     param(
         [array]$vCenterServers,
-        [string]$vraServer,
-        [string]$vraToken,
         [System.Management.Automation.PSCredential]$Credential
     )
     
@@ -209,25 +207,8 @@ function Get-AllSnapshots {
                 foreach ($snap in $snapshots) {
                     $ageDays = [Math]::Round(((Get-Date) - $snap.Created).TotalDays, 2)
                     
-                    # Get the creator from vCenter
+                    # Get the creator from vCenter snapshot
                     $vcCreator = if ($snap.Creator) { $snap.Creator } else { "Unknown" }
-                    
-                    # Check if vCenter creator contains "vravc" - if so, get actual user from vRA
-                    $vraUser = "N/A"
-                    $vraDate = "N/A"
-                    $finalCreator = $vcCreator
-                    
-                    if ($vcCreator -match "vravc") {
-                        Write-Host "    Found vRA-created snapshot, querying vRA for actual user..." -ForegroundColor Gray
-                        $vraInfo = Get-SnapshotUserFromvRA -VMName $vm.Name -SnapshotCreated $snap.Created -Server $vraServer -AccessToken $vraToken
-                        $vraUser = $vraInfo.User
-                        $vraDate = $vraInfo.Date
-                        
-                        # Use vRA user if found, otherwise keep vravc account
-                        if ($vraUser -ne "N/A") {
-                            $finalCreator = $vraUser
-                        }
-                    }
                     
                     $allSnapshots += [PSCustomObject]@{
                         vCenter         = $vcServer
@@ -235,11 +216,9 @@ function Get-AllSnapshots {
                         SnapshotName    = $snap.Name
                         Description     = $snap.Description
                         CreatedDate     = $snap.Created
-                        CreatedBy       = $finalCreator
+                        CreatedBy       = $vcCreator
                         SizeGB          = [Math]::Round($snap.SizeGB, 2)
                         AgeDays         = $ageDays
-                        vRAUser         = $vraUser
-                        vRADate         = $vraDate
                     }
                 }
             }
@@ -254,6 +233,55 @@ function Get-AllSnapshots {
     
     # Sort by age (oldest first)
     return $allSnapshots | Sort-Object AgeDays -Descending
+}
+
+function Enrich-SnapshotsWithvRA {
+    param(
+        [array]$Snapshots,
+        [string]$vraServer,
+        [string]$vraToken
+    )
+    
+    Write-Host "`nEnriching vRA-created snapshots with actual user information..." -ForegroundColor Yellow
+    
+    $enrichedSnapshots = @()
+    $vraCount = 0
+    
+    foreach ($snap in $Snapshots) {
+        $enrichedSnap = $snap.PSObject.Copy()
+        
+        # Check if the creator contains "vravc"
+        if ($snap.CreatedBy -match "vravc") {
+            $vraCount++
+            Write-Host "  Processing vRA snapshot for $($snap.VMName)..." -ForegroundColor Gray
+            
+            $vraInfo = Get-SnapshotUserFromvRA -VMName $snap.VMName -SnapshotCreated $snap.CreatedDate -Server $vraServer -AccessToken $vraToken
+            
+            # Add vRA info as new properties
+            $enrichedSnap | Add-Member -NotePropertyName "vRAUser" -NotePropertyValue $vraInfo.User -Force
+            $enrichedSnap | Add-Member -NotePropertyName "vRADate" -NotePropertyValue $vraInfo.Date -Force
+            
+            # Update CreatedBy if we found the actual user
+            if ($vraInfo.User -ne "N/A") {
+                $enrichedSnap.CreatedBy = $vraInfo.User
+                Write-Host "    Found actual user: $($vraInfo.User)" -ForegroundColor Green
+            }
+            else {
+                $enrichedSnap | Add-Member -NotePropertyName "vRAUser" -NotePropertyValue "N/A" -Force
+                $enrichedSnap | Add-Member -NotePropertyName "vRADate" -NotePropertyValue "N/A" -Force
+            }
+        }
+        else {
+            # Add N/A for non-vRA snapshots
+            $enrichedSnap | Add-Member -NotePropertyName "vRAUser" -NotePropertyValue "N/A" -Force
+            $enrichedSnap | Add-Member -NotePropertyName "vRADate" -NotePropertyValue "N/A" -Force
+        }
+        
+        $enrichedSnapshots += $enrichedSnap
+    }
+    
+    Write-Host "Enriched $vraCount vRA-created snapshots" -ForegroundColor Green
+    return $enrichedSnapshots
 }
 
 function Send-SnapshotReport {
@@ -389,9 +417,26 @@ else {
 
 # Collect all snapshots
 Write-Host "`nStarting snapshot collection from all vCenters..." -ForegroundColor Yellow
-$allSnapshots = Get-AllSnapshots -vCenterServers $vCenters -vraServer $vraServer -vraToken $vraBearerToken -Credential $credential
+$allSnapshots = Get-AllSnapshots -vCenterServers $vCenters -Credential $credential
 
-Write-Host "`nSnapshot collection completed. Processing results..." -ForegroundColor Green
+Write-Host "`nSnapshot collection completed." -ForegroundColor Green
+Write-Host "Total snapshots found: $($allSnapshots.Count)" -ForegroundColor Green
+
+# Enrich with vRA data if we have a token
+if ($vraBearerToken) {
+    $allSnapshots = Enrich-SnapshotsWithvRA -Snapshots $allSnapshots -vraServer $vraServer -vraToken $vraBearerToken
+}
+else {
+    Write-Host "`nSkipping vRA enrichment (no bearer token available)" -ForegroundColor Yellow
+    # Add empty vRA fields for consistency
+    $allSnapshots = $allSnapshots | ForEach-Object {
+        $_ | Add-Member -NotePropertyName "vRAUser" -NotePropertyValue "N/A" -Force
+        $_ | Add-Member -NotePropertyName "vRADate" -NotePropertyValue "N/A" -Force
+        $_
+    }
+}
+
+Write-Host "`nProcessing completed." -ForegroundColor Green
 
 # Display summary
 Write-Host "`n========================================" -ForegroundColor Cyan
