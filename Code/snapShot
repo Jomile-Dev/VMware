@@ -201,6 +201,34 @@ function Get-SnapshotUserFromvRA {
     Write-Host "`n    Step 3: Matching snapshot event..." -ForegroundColor Yellow
     Write-Host "    Looking for events near: $snapshotDate" -ForegroundColor Yellow
     
+    Write-Host "`n    DEBUG: Filtering events..." -ForegroundColor Magenta
+    Write-Host "    Total events to check: $($events.Count)" -ForegroundColor Magenta
+    
+    # Show what we're checking against
+    $debugCount = 0
+    $events | ForEach-Object {
+        if ($_.actionId -eq "Cloud.vSphere.Machine.Snapshot.Create") {
+            $debugCount++
+            Write-Host "    Snapshot Event #$debugCount" -ForegroundColor Yellow
+            Write-Host "      ActionId: $($_.actionId)" -ForegroundColor Gray
+            Write-Host "      UpdatedAt: '$($_.updatedAt)'" -ForegroundColor Gray
+            
+            if ($_.updatedAt) {
+                try {
+                    $eventDate = [DateTime]::Parse($_.updatedAt)
+                    $timeDiff = ($eventDate - $snapshotDate).TotalMinutes
+                    Write-Host "      Time difference: $([Math]::Round($timeDiff, 2)) minutes" -ForegroundColor $(if([Math]::Abs($timeDiff) -lt 10){"Green"}else{"Red"})
+                    Write-Host "      Within 10 min window? $([Math]::Abs($timeDiff) -lt 10)" -ForegroundColor $(if([Math]::Abs($timeDiff) -lt 10){"Green"}else{"Red"})
+                } catch {
+                    Write-Host "      ERROR parsing date: $_" -ForegroundColor Red
+                }
+            } else {
+                Write-Host "      UpdatedAt is NULL or empty!" -ForegroundColor Red
+            }
+            Write-Host ""
+        }
+    }
+    
     # Find snapshot create events around the creation time
     $matchingEvents = $events | Where-Object {
         $_.actionId -eq "Cloud.vSphere.Machine.Snapshot.Create" -and
