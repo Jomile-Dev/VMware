@@ -207,23 +207,20 @@ function Get-AllSnapshots {
                 foreach ($snap in $snapshots) {
                     $ageDays = [Math]::Round(((Get-Date) - $snap.Created).TotalDays, 2)
                     
-                    # Debug: Output all snapshot properties for the first snapshot
-                    if ($allSnapshots.Count -eq 0) {
-                        Write-Host "`n=== DEBUG: First Snapshot Properties ===" -ForegroundColor Magenta
-                        $snap | Format-List *
-                        Write-Host "=== END DEBUG ===`n" -ForegroundColor Magenta
-                    }
-                    
-                    # Get the creator from vCenter snapshot - try multiple properties
+                    # Get creator from vCenter events
                     $vcCreator = "Unknown"
-                    if ($snap.Creator) {
-                        $vcCreator = $snap.Creator
+                    try {
+                        $events = Get-VIEvent -Entity $vm -Types Info -Start $snap.Created.AddMinutes(-1) -Finish $snap.Created.AddMinutes(1) |
+                            Where-Object { $_.FullFormattedMessage -match "snapshot" -or $_.GetType().Name -match "Snapshot" } |
+                            Sort-Object CreatedTime -Descending |
+                            Select-Object -First 1
+                        
+                        if ($events) {
+                            $vcCreator = $events.UserName
+                        }
                     }
-                    elseif ($snap.ExtensionData.Config.CreateBy) {
-                        $vcCreator = $snap.ExtensionData.Config.CreateBy
-                    }
-                    elseif ($snap.Description -match "Created by (.+)") {
-                        $vcCreator = $Matches[1]
+                    catch {
+                        Write-Warning "Could not retrieve event for snapshot $($snap.Name): $_"
                     }
                     
                     $allSnapshots += [PSCustomObject]@{
