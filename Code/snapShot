@@ -1,3 +1,125 @@
+#Requires -Modules VMware.VimAutomation.Core
+
+<#
+.SYNOPSIS
+    Multi-vCenter snapshot reporting with vRA user enrichment
+.DESCRIPTION
+    Connects to multiple vCenters, retrieves all snapshots with details,
+    enriches vRA-created snapshots with actual user information, and emails a report
+#>
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+# vCenter Configuration - ADD YOUR VCENTER SERVERS HERE
+$vCenters = @(
+    "vcenter1.domain.com",
+    "vcenter2.domain.com",
+    "vcenter3.domain.com"
+)
+
+Write-Host "Configuration loaded:" -ForegroundColor Yellow
+Write-Host "  vCenters configured: $($vCenters.Count)" -ForegroundColor Yellow
+Write-Host "  vCenter list: $($vCenters -join ', ')" -ForegroundColor Yellow
+Write-Host ""
+
+# vRA Configuration
+$vraServer = "vra.domain.com"
+
+# Email Configuration
+$smtpServer = "smtp.domain.com"
+$smtpPort = 25
+$emailFrom = "snapshots@domain.com"
+$emailTo = @("admin@domain.com")
+$emailSubject = "vCenter Snapshot Report - $(Get-Date -Format 'yyyy-MM-dd')"
+
+# ============================================================================
+# FUNCTIONS
+# ============================================================================
+
+function Get-vRAAccessToken {
+    param(
+        [System.Management.Automation.PSCredential]$Credential,
+        [string]$Server
+    )
+    
+    $uri = "https://$Server/csp/gateway/am/api/login?access_token"
+    
+    $body = @{
+        username = $Credential.UserName
+        password = $Credential.GetNetworkCredential().Password
+    } | ConvertTo-Json
+    
+    try {
+        $response = Invoke-RestMethod -Uri $uri -Method Post -Body $body -ContentType "application/json"
+        return $response.refresh_token
+    }
+    catch {
+        Write-Warning "Failed to get vRA refresh token: $_"
+        return $null
+    }
+}
+
+function Get-vRABearerToken {
+    param([string]$RefreshToken, [string]$Server)
+    
+    $uri = "https://$Server/iaas/api/login"
+    $body = @{ refreshToken = $RefreshToken } | ConvertTo-Json
+    
+    try {
+        $response = Invoke-RestMethod -Uri $uri -Method Post -Body $body -ContentType "application/json"
+        return $response.token
+    }
+    catch {
+        Write-Warning "Failed to get vRA bearer token: $_"
+        return $null
+    }
+}
+
+function Get-vRACloudMachineByName {
+    param([string]$VMName, [string]$Server, [string]$AccessToken)
+    
+    $headers = @{
+        "Authorization" = "Bearer $AccessToken"
+        "Content-Type" = "application/json"
+    }
+    
+    $uri = "https://$Server/iaas/api/machines?`$filter=name eq '$VMName'"
+    
+    try {
+        $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers
+        if ($response.content -and $response.content.Count -gt 0) {
+            return $response.content[0]
+        }
+        return $null
+    }
+    catch {
+        Write-Warning "Failed to get vRA machine for $VMName : $_"
+        return $null
+    }
+}
+
+function Get-vRADeploymentEvents {
+    param([string]$DeploymentId, [string]$Server, [string]$AccessToken)
+    
+    $headers = @{
+        "Authorization" = "Bearer $AccessToken"
+        "Content-Type" = "application/json"
+    }
+    
+    $uri = "https://$Server/deployment/api/deployments/$DeploymentId/events"
+    
+    try {
+        $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers
+        return $response.content
+    }
+    catch {
+        Write-Warning "Failed to get deployment events for $DeploymentId : $_"
+        return $null
+    }
+}
+
 function Get-SnapshotUserFromvRA {
     param(
         [string]$VMName,
@@ -68,10 +190,8 @@ function Get-SnapshotUserFromvRA {
         
         # Debug: Show ALL properties of the event
         Write-Host "        ALL PROPERTIES:" -ForegroundColor Yellow
-        $_ | Get-Member -MemberType Properties | ForEach-Object {
-            $propName = $_.Name
-            $propValue = $_.$propName
-            Write-Host "          $propName : $propValue" -ForegroundColor DarkGray
+        $_.PSObject.Properties | ForEach-Object {
+            Write-Host "          $($_.Name) : $($_.Value)" -ForegroundColor DarkGray
         }
         Write-Host "" -ForegroundColor Gray
     }
@@ -134,8 +254,8 @@ function Get-SnapshotUserFromvRA {
         else {
             Write-Host "`n    ✗ Match Found but NO USER FIELD available" -ForegroundColor Red
             Write-Host "    Available event properties:" -ForegroundColor Yellow
-            $event | Get-Member -MemberType Properties | ForEach-Object {
-                Write-Host "      - $($_.Name)" -ForegroundColor Gray
+            $event.PSObject.Properties | ForEach-Object {
+                Write-Host "      - $($_.Name): $($_.Value)" -ForegroundColor Gray
             }
         }
         
@@ -160,3 +280,352 @@ function Get-SnapshotUserFromvRA {
         Date = "N/A"
     }
 }
+
+function Get-AllSnapshots {
+    param(
+        [array]$vCenterServers,
+        [System.Management.Automation.PSCredential]$Credential
+    )
+    
+    $allSnapshots = @()
+    
+    foreach ($vcServer in $vCenterServers) {
+        Write-Host "`nConnecting to $vcServer..." -ForegroundColor Cyan
+        
+        try {
+            Connect-VIServer -Server $vcServer -Credential $Credential -ErrorAction Stop | Out-Null
+            
+            Write-Host "Retrieving snapshots from $vcServer..." -ForegroundColor Yellow
+            
+            # Get all VMs with snapshots
+            $vms = Get-VM | Where-Object { $_.ExtensionData.Snapshot }
+            
+            foreach ($vm in $vms) {
+                Write-Host "  Processing VM: $($vm.Name)" -ForegroundColor Gray
+                $snapshots = Get-Snapshot -VM $vm
+                Write-Host "    Found $($snapshots.Count) snapshot(s)" -ForegroundColor Gray
+                
+                foreach ($snap in $snapshots) {
+                    $ageDays = [Math]::Round(((Get-Date) - $snap.Created).TotalDays, 2)
+                    
+                    # Get creator from vCenter events
+                    $vcCreator = "Unknown"
+                    try {
+                        $events = Get-VIEvent -Entity $vm -Types Info -Start $snap.Created.AddMinutes(-1) -Finish $snap.Created.AddMinutes(1) |
+                            Where-Object { $_.FullFormattedMessage -match "snapshot" -or $_.GetType().Name -match "Snapshot" } |
+                            Sort-Object CreatedTime -Descending |
+                            Select-Object -First 1
+                        
+                        if ($events) {
+                            $vcCreator = $events.UserName
+                        }
+                    }
+                    catch {
+                        Write-Warning "Could not retrieve event for snapshot $($snap.Name): $_"
+                    }
+                    
+                    $allSnapshots += [PSCustomObject]@{
+                        vCenter         = $vcServer
+                        VMName          = $vm.Name
+                        SnapshotName    = $snap.Name
+                        Description     = $snap.Description
+                        CreatedDate     = $snap.Created
+                        CreatedBy       = $vcCreator
+                        SizeGB          = [Math]::Round($snap.SizeGB, 2)
+                        AgeDays         = $ageDays
+                    }
+                }
+            }
+            
+            Disconnect-VIServer -Server $vcServer -Confirm:$false
+            Write-Host "Completed processing $vcServer - Found $($allSnapshots.Count) total snapshots so far" -ForegroundColor Green
+        }
+        catch {
+            Write-Warning "Error processing $vcServer : $_"
+        }
+    }
+    
+    # Sort by age (oldest first)
+    return $allSnapshots | Sort-Object AgeDays -Descending
+}
+
+function Enrich-SnapshotsWithvRA {
+    param(
+        [array]$Snapshots,
+        [string]$vraServer,
+        [string]$vraToken
+    )
+    
+    Write-Host "`nEnriching vRA-created snapshots with actual user information..." -ForegroundColor Yellow
+    
+    $enrichedSnapshots = @()
+    $vraCount = 0
+    
+    foreach ($snap in $Snapshots) {
+        # Debug output
+        Write-Host "`nDEBUG: Checking snapshot - CreatedBy: '$($snap.CreatedBy)'" -ForegroundColor Magenta
+        Write-Host "DEBUG: Contains 'vravc'? $($snap.CreatedBy -like '*vravc*')" -ForegroundColor Magenta
+        
+        # Check if the creator contains "vravc" anywhere in the string
+        if ($snap.CreatedBy -like "*vravc*") {
+            $vraCount++
+            Write-Host "  ✓ MATCHED! Processing vRA snapshot for $($snap.VMName) (Creator: $($snap.CreatedBy))..." -ForegroundColor Yellow
+            
+            if (-not $vraToken) {
+                Write-Host "    WARNING: No vRA token available, skipping vRA lookup" -ForegroundColor Red
+                $enrichedSnapshots += [PSCustomObject]@{
+                    vCenter         = $snap.vCenter
+                    VMName          = $snap.VMName
+                    SnapshotName    = $snap.SnapshotName
+                    Description     = $snap.Description
+                    CreatedDate     = $snap.CreatedDate
+                    CreatedBy       = $snap.CreatedBy
+                    SizeGB          = $snap.SizeGB
+                    AgeDays         = $snap.AgeDays
+                    vRAUser         = "N/A (No Token)"
+                    vRADate         = "N/A"
+                }
+                continue
+            }
+            
+            $vraInfo = Get-SnapshotUserFromvRA -VMName $snap.VMName -SnapshotCreated $snap.CreatedDate -SnapshotName $snap.SnapshotName -SnapshotDescription $snap.Description -Server $vraServer -AccessToken $vraToken
+            
+            Write-Host "    vRA returned - User: '$($vraInfo.User)', Date: '$($vraInfo.Date)'" -ForegroundColor Cyan
+            
+            # Update CreatedBy if we found the actual user
+            if ($vraInfo.User -ne "N/A" -and $vraInfo.User -ne $null -and $vraInfo.User -ne "") {
+                Write-Host "    ✓ Found actual user: $($vraInfo.User) - REPLACING vravc account" -ForegroundColor Green
+                
+                $enrichedSnapshots += [PSCustomObject]@{
+                    vCenter         = $snap.vCenter
+                    VMName          = $snap.VMName
+                    SnapshotName    = $snap.SnapshotName
+                    Description     = $snap.Description
+                    CreatedDate     = $snap.CreatedDate
+                    CreatedBy       = $vraInfo.User
+                    SizeGB          = $snap.SizeGB
+                    AgeDays         = $snap.AgeDays
+                    vRAUser         = $vraInfo.User
+                    vRADate         = $vraInfo.Date
+                }
+            }
+            else {
+                Write-Host "    ✗ Could not find actual user, keeping vravc account" -ForegroundColor Yellow
+                
+                $enrichedSnapshots += [PSCustomObject]@{
+                    vCenter         = $snap.vCenter
+                    VMName          = $snap.VMName
+                    SnapshotName    = $snap.SnapshotName
+                    Description     = $snap.Description
+                    CreatedDate     = $snap.CreatedDate
+                    CreatedBy       = $snap.CreatedBy
+                    SizeGB          = $snap.SizeGB
+                    AgeDays         = $snap.AgeDays
+                    vRAUser         = "N/A"
+                    vRADate         = "N/A"
+                }
+            }
+        }
+        else {
+            Write-Host "  Regular snapshot (not vRA) - keeping as-is" -ForegroundColor Gray
+            # Add non-vRA snapshot as-is with N/A fields
+            $enrichedSnapshots += [PSCustomObject]@{
+                vCenter         = $snap.vCenter
+                VMName          = $snap.VMName
+                SnapshotName    = $snap.SnapshotName
+                Description     = $snap.Description
+                CreatedDate     = $snap.CreatedDate
+                CreatedBy       = $snap.CreatedBy
+                SizeGB          = $snap.SizeGB
+                AgeDays         = $snap.AgeDays
+                vRAUser         = "N/A"
+                vRADate         = "N/A"
+            }
+        }
+    }
+    
+    Write-Host "`n=== Enrichment Summary ===" -ForegroundColor Green
+    Write-Host "Total snapshots processed: $($Snapshots.Count)" -ForegroundColor Green
+    Write-Host "vRA snapshots found: $vraCount" -ForegroundColor Green
+    Write-Host "========================`n" -ForegroundColor Green
+    
+    return $enrichedSnapshots
+}
+
+function Send-SnapshotReport {
+    param(
+        [array]$Snapshots,
+        [string]$SmtpServer,
+        [int]$SmtpPort,
+        [string]$From,
+        [array]$To,
+        [string]$Subject
+    )
+    
+    # Build HTML email
+    $html = @"
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        body { font-family: Arial, sans-serif; }
+        h2 { color: #2c3e50; }
+        table { border-collapse: collapse; width: 100%; margin-top: 20px; }
+        th { background-color: #3498db; color: white; padding: 12px; text-align: left; }
+        td { border: 1px solid #ddd; padding: 10px; }
+        tr:nth-child(even) { background-color: #f2f2f2; }
+        tr:hover { background-color: #e8f4f8; }
+        .summary { background-color: #ecf0f1; padding: 15px; border-radius: 5px; margin-bottom: 20px; }
+        .old { color: #e74c3c; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <h2>vCenter Snapshot Report</h2>
+    <div class="summary">
+        <strong>Report Generated:</strong> $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')<br>
+        <strong>Total Snapshots:</strong> $($Snapshots.Count)<br>
+        <strong>Total Size:</strong> $([Math]::Round(($Snapshots | Measure-Object -Property SizeGB -Sum).Sum, 2)) GB<br>
+        <strong>Snapshots > 30 days:</strong> $(($Snapshots | Where-Object { $_.AgeDays -gt 30 }).Count)
+    </div>
+    
+    <table>
+        <tr>
+            <th>vCenter</th>
+            <th>VM Name</th>
+            <th>Snapshot Name</th>
+            <th>Description</th>
+            <th>Created Date</th>
+            <th>Created By</th>
+            <th>Size (GB)</th>
+            <th>Age (Days)</th>
+        </tr>
+"@
+    
+    foreach ($snap in $Snapshots) {
+        $ageClass = if ($snap.AgeDays -gt 30) { " class='old'" } else { "" }
+        $createdBy = if ($snap.vRAUser -ne "N/A") { "$($snap.vRAUser) (vRA: $($snap.vRADate))" } else { $snap.CreatedBy }
+        
+        $html += @"
+        <tr>
+            <td>$($snap.vCenter)</td>
+            <td>$($snap.VMName)</td>
+            <td>$($snap.SnapshotName)</td>
+            <td>$($snap.Description)</td>
+            <td>$($snap.CreatedDate.ToString('yyyy-MM-dd HH:mm'))</td>
+            <td>$createdBy</td>
+            <td>$($snap.SizeGB)</td>
+            <td$ageClass>$($snap.AgeDays)</td>
+        </tr>
+"@
+    }
+    
+    $html += @"
+    </table>
+</body>
+</html>
+"@
+    
+    # Send email
+    try {
+        Send-MailMessage `
+            -To $To `
+            -From $From `
+            -Subject $Subject `
+            -Body $html `
+            -BodyAsHtml `
+            -SmtpServer $SmtpServer `
+            -Port $SmtpPort `
+            -ErrorAction Stop
+        
+        Write-Host "`nEmail sent successfully to $($To -join ', ')" -ForegroundColor Green
+    }
+    catch {
+        Write-Warning "Failed to send email: $_"
+    }
+}
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host "vCenter Snapshot Report with vRA Integration" -ForegroundColor Cyan
+Write-Host "========================================`n" -ForegroundColor Cyan
+
+# Get credentials (used for both vCenter and vRA)
+Write-Host "Please enter credentials (used for both vCenter and vRA):" -ForegroundColor Yellow
+$credential = Get-Credential
+
+if (-not $credential) {
+    Write-Error "Credentials are required to continue."
+    exit
+}
+
+# Get vRA refresh token
+Write-Host "`nAuthenticating with vRA and generating refresh token..." -ForegroundColor Yellow
+$vraRefreshToken = Get-vRAAccessToken -Credential $credential -Server $vraServer
+
+if (-not $vraRefreshToken) {
+    Write-Warning "Failed to authenticate with vRA. Continuing without vRA user enrichment."
+    $vraBearerToken = $null
+}
+else {
+    Write-Host "Successfully obtained vRA refresh token" -ForegroundColor Green
+    
+    # Get bearer token from refresh token
+    $vraBearerToken = Get-vRABearerToken -RefreshToken $vraRefreshToken -Server $vraServer
+    
+    if ($vraBearerToken) {
+        Write-Host "Successfully obtained vRA bearer token" -ForegroundColor Green
+    }
+    else {
+        Write-Warning "Failed to get vRA bearer token. Continuing without vRA user enrichment."
+    }
+}
+
+# Collect all snapshots
+Write-Host "`nStarting snapshot collection from all vCenters..." -ForegroundColor Yellow
+$allSnapshots = Get-AllSnapshots -vCenterServers $vCenters -Credential $credential
+
+Write-Host "`nSnapshot collection completed." -ForegroundColor Green
+Write-Host "Total snapshots found: $($allSnapshots.Count)" -ForegroundColor Green
+
+# Enrich with vRA data if we have a token
+if ($vraBearerToken) {
+    $allSnapshots = Enrich-SnapshotsWithvRA -Snapshots $allSnapshots -vraServer $vraServer -vraToken $vraBearerToken
+}
+else {
+    Write-Host "`nSkipping vRA enrichment (no bearer token available)" -ForegroundColor Yellow
+    # Add empty vRA fields for consistency
+    $allSnapshots = $allSnapshots | ForEach-Object {
+        $_ | Add-Member -NotePropertyName "vRAUser" -NotePropertyValue "N/A" -Force
+        $_ | Add-Member -NotePropertyName "vRADate" -NotePropertyValue "N/A" -Force
+        $_
+    }
+}
+
+Write-Host "`nProcessing completed." -ForegroundColor Green
+
+# Display summary
+Write-Host "`n========================================" -ForegroundColor Cyan
+Write-Host "SUMMARY" -ForegroundColor Cyan
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host "Total Snapshots: $($allSnapshots.Count)"
+Write-Host "Total Size: $([Math]::Round(($allSnapshots | Measure-Object -Property SizeGB -Sum).Sum, 2)) GB"
+Write-Host "Oldest Snapshot: $([Math]::Round(($allSnapshots | Measure-Object -Property AgeDays -Maximum).Maximum, 2)) days"
+Write-Host ""
+
+# Display table in console
+$allSnapshots | Format-Table -Property vCenter, VMName, SnapshotName, CreatedDate, CreatedBy, SizeGB, AgeDays -AutoSize
+
+# Export to CSV (optional)
+$csvPath = ".\SnapshotReport_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+$allSnapshots | Export-Csv -Path $csvPath -NoTypeInformation
+Write-Host "CSV exported to: $csvPath" -ForegroundColor Green
+
+# Send email report
+Write-Host "`nSending email report..." -ForegroundColor Yellow
+Send-SnapshotReport -Snapshots $allSnapshots -SmtpServer $smtpServer -SmtpPort $smtpPort `
+    -From $emailFrom -To $emailTo -Subject $emailSubject
+
+Write-Host "`nScript completed!" -ForegroundColor Green
