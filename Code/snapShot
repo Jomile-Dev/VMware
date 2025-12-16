@@ -247,7 +247,7 @@ function Get-AllSnapshots {
                 
                 foreach ($snap in $snapshots) {
                     # Calculate snapshot age
-                    $ageDays = [Math]::Round(((Get-Date) - $snap.Created).TotalDays, 2)
+                    $ageDays = [Math]::Round(((Get-Date) - $snap.Created).TotalDays, 0)
                     
                     # Try to get creator from vCenter events
                     $vcCreator = "Unknown"
@@ -390,7 +390,7 @@ function Send-SnapshotReport {
     # Add each snapshot as a table row
     foreach ($snap in $Snapshots) {
         $ageClass = if ($snap.AgeDays -gt 30) { " class='old'" } else { "" }
-        $createdBy = if ($snap.vRAUser -ne "N/A") { "$($snap.CreatedBy) (vRA: $($snap.vRADate))" } else { $snap.CreatedBy }
+        $createdBy = if ($snap.vRAUser -ne "N/A") { "$($snap.CreatedBy) (vRA)" } else { $snap.CreatedBy }
         
         $html += @"
         <tr>
@@ -492,7 +492,7 @@ else {
 
 # Display summary to console
 $totalSize = [Math]::Round(($allSnapshots | Measure-Object -Property SizeGB -Sum).Sum, 2)
-$oldestSnapshot = [Math]::Round(($allSnapshots | Measure-Object -Property AgeDays -Maximum).Maximum, 2)
+$oldestSnapshot = [Math]::Round(($allSnapshots | Measure-Object -Property AgeDays -Maximum).Maximum, 0)
 
 Write-Host "`n========================================" -ForegroundColor Cyan
 Write-Host "SUMMARY" -ForegroundColor Cyan
