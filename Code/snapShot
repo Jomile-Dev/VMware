@@ -261,36 +261,62 @@ function Enrich-SnapshotsWithvRA {
     $vraCount = 0
     
     foreach ($snap in $Snapshots) {
-        $enrichedSnap = $snap.PSObject.Copy()
-        
         # Check if the creator contains "vravc"
         if ($snap.CreatedBy -match "vravc") {
             $vraCount++
-            Write-Host "  Processing vRA snapshot for $($snap.VMName)..." -ForegroundColor Gray
+            Write-Host "  Processing vRA snapshot for $($snap.VMName) (Creator: $($snap.CreatedBy))..." -ForegroundColor Gray
             
             $vraInfo = Get-SnapshotUserFromvRA -VMName $snap.VMName -SnapshotCreated $snap.CreatedDate -Server $vraServer -AccessToken $vraToken
             
-            # Add vRA info as new properties
-            $enrichedSnap | Add-Member -NotePropertyName "vRAUser" -NotePropertyValue $vraInfo.User -Force
-            $enrichedSnap | Add-Member -NotePropertyName "vRADate" -NotePropertyValue $vraInfo.Date -Force
-            
             # Update CreatedBy if we found the actual user
             if ($vraInfo.User -ne "N/A") {
-                $enrichedSnap.CreatedBy = $vraInfo.User
                 Write-Host "    Found actual user: $($vraInfo.User)" -ForegroundColor Green
+                
+                $enrichedSnapshots += [PSCustomObject]@{
+                    vCenter         = $snap.vCenter
+                    VMName          = $snap.VMName
+                    SnapshotName    = $snap.SnapshotName
+                    Description     = $snap.Description
+                    CreatedDate     = $snap.CreatedDate
+                    CreatedBy       = $vraInfo.User
+                    SizeGB          = $snap.SizeGB
+                    AgeDays         = $snap.AgeDays
+                    vRAUser         = $vraInfo.User
+                    vRADate         = $vraInfo.Date
+                }
             }
             else {
-                $enrichedSnap | Add-Member -NotePropertyName "vRAUser" -NotePropertyValue "N/A" -Force
-                $enrichedSnap | Add-Member -NotePropertyName "vRADate" -NotePropertyValue "N/A" -Force
+                Write-Host "    Could not find actual user, keeping vravc account" -ForegroundColor Yellow
+                
+                $enrichedSnapshots += [PSCustomObject]@{
+                    vCenter         = $snap.vCenter
+                    VMName          = $snap.VMName
+                    SnapshotName    = $snap.SnapshotName
+                    Description     = $snap.Description
+                    CreatedDate     = $snap.CreatedDate
+                    CreatedBy       = $snap.CreatedBy
+                    SizeGB          = $snap.SizeGB
+                    AgeDays         = $snap.AgeDays
+                    vRAUser         = "N/A"
+                    vRADate         = "N/A"
+                }
             }
         }
         else {
-            # Add N/A for non-vRA snapshots
-            $enrichedSnap | Add-Member -NotePropertyName "vRAUser" -NotePropertyValue "N/A" -Force
-            $enrichedSnap | Add-Member -NotePropertyName "vRADate" -NotePropertyValue "N/A" -Force
+            # Add non-vRA snapshot as-is with N/A fields
+            $enrichedSnapshots += [PSCustomObject]@{
+                vCenter         = $snap.vCenter
+                VMName          = $snap.VMName
+                SnapshotName    = $snap.SnapshotName
+                Description     = $snap.Description
+                CreatedDate     = $snap.CreatedDate
+                CreatedBy       = $snap.CreatedBy
+                SizeGB          = $snap.SizeGB
+                AgeDays         = $snap.AgeDays
+                vRAUser         = "N/A"
+                vRADate         = "N/A"
+            }
         }
-        
-        $enrichedSnapshots += $enrichedSnap
     }
     
     Write-Host "Enriched $vraCount vRA-created snapshots" -ForegroundColor Green
