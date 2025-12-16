@@ -174,43 +174,24 @@ function Get-SnapshotUserFromvRA {
     
     Write-Host "    ✓ Found $($events.Count) total events" -ForegroundColor Green
     
-    # Show all event types and messages
-    Write-Host "`n    All Events:" -ForegroundColor Cyan
+    # Show the first event's properties to see what's available
+    Write-Host "`n    First Event Properties:" -ForegroundColor Magenta
+    $events[0] | Format-List * | Out-String | Write-Host -ForegroundColor Gray
+    
+    Write-Host "`n    First Event as JSON:" -ForegroundColor Magenta
+    $events[0] | ConvertTo-Json -Depth 3 | Write-Host -ForegroundColor Gray
+    
+    Write-Host "`n    All Events (attempting multiple property names):" -ForegroundColor Cyan
     $events | ForEach-Object {
-        Write-Host "      - Type: $($_.eventType) | Time: $($_.eventLogTime) | User: $($_.userName) | Message: $($_.message)" -ForegroundColor Gray
+        $evt = $_
+        $type = if ($_.eventType) { $_.eventType } elseif ($_.type) { $_.type } else { "UNKNOWN" }
+        $time = if ($_.eventLogTime) { $_.eventLogTime } elseif ($_.timestamp) { $_.timestamp } elseif ($_.createdAt) { $_.createdAt } else { "UNKNOWN" }
+        $user = if ($_.userName) { $_.userName } elseif ($_.user) { $_.user } elseif ($_.createdBy) { $_.createdBy } else { "UNKNOWN" }
+        $msg = if ($_.message) { $_.message } elseif ($_.description) { $_.description } elseif ($_.text) { $_.text } else { "UNKNOWN" }
+        
+        Write-Host "      - Type: $type | Time: $time | User: $user | Message: $msg" -ForegroundColor Gray
     }
     
-    # Convert snapshot created date to comparable format
-    $snapshotDate = [DateTime]::Parse($SnapshotCreated)
-    Write-Host "`n    Step 3: Looking for snapshot events near $snapshotDate..." -ForegroundColor Yellow
-    
-    # Find USER events related to snapshots around the creation time (within 5 minutes)
-    $snapshotEvents = $events | Where-Object {
-        $_.eventType -eq "USER" -and
-        $_.message -match "snapshot" -and
-        [Math]::Abs(([DateTime]::Parse($_.eventLogTime) - $snapshotDate).TotalMinutes) -lt 5
-    }
-    
-    Write-Host "    Found $($snapshotEvents.Count) snapshot-related USER events within 5 minutes" -ForegroundColor Yellow
-    
-    if ($snapshotEvents) {
-        Write-Host "`n    Snapshot Events Found:" -ForegroundColor Cyan
-        $snapshotEvents | ForEach-Object {
-            Write-Host "      - Type: $($_.eventType) | Time: $($_.eventLogTime) | User: $($_.userName) | Message: $($_.message)" -ForegroundColor Green
-        }
-        
-        $snapshotEvent = $snapshotEvents | Sort-Object eventLogTime -Descending | Select-Object -First 1
-        
-        Write-Host "`n    ✓ Using event: User=$($snapshotEvent.userName), Time=$($snapshotEvent.eventLogTime)" -ForegroundColor Green
-        Write-Host "    === END DEBUG ===`n" -ForegroundColor Cyan
-        
-        return @{
-            User = $snapshotEvent.userName
-            Date = ([DateTime]::Parse($snapshotEvent.eventLogTime)).ToString("yyyy-MM-dd")
-        }
-    }
-    
-    Write-Host "    ✗ No matching snapshot events found" -ForegroundColor Red
     Write-Host "    === END DEBUG ===`n" -ForegroundColor Cyan
     
     return @{
