@@ -261,16 +261,39 @@ function Enrich-SnapshotsWithvRA {
     $vraCount = 0
     
     foreach ($snap in $Snapshots) {
-        # Check if the creator contains "vravc"
-        if ($snap.CreatedBy -match "vravc") {
+        # Debug output
+        Write-Host "`nDEBUG: Checking snapshot - CreatedBy: '$($snap.CreatedBy)'" -ForegroundColor Magenta
+        Write-Host "DEBUG: Contains 'vravc'? $($snap.CreatedBy -like '*vravc*')" -ForegroundColor Magenta
+        
+        # Check if the creator contains "vravc" anywhere in the string
+        if ($snap.CreatedBy -like "*vravc*") {
             $vraCount++
-            Write-Host "  Processing vRA snapshot for $($snap.VMName) (Creator: $($snap.CreatedBy))..." -ForegroundColor Gray
+            Write-Host "  ✓ MATCHED! Processing vRA snapshot for $($snap.VMName) (Creator: $($snap.CreatedBy))..." -ForegroundColor Yellow
+            
+            if (-not $vraToken) {
+                Write-Host "    WARNING: No vRA token available, skipping vRA lookup" -ForegroundColor Red
+                $enrichedSnapshots += [PSCustomObject]@{
+                    vCenter         = $snap.vCenter
+                    VMName          = $snap.VMName
+                    SnapshotName    = $snap.SnapshotName
+                    Description     = $snap.Description
+                    CreatedDate     = $snap.CreatedDate
+                    CreatedBy       = $snap.CreatedBy
+                    SizeGB          = $snap.SizeGB
+                    AgeDays         = $snap.AgeDays
+                    vRAUser         = "N/A (No Token)"
+                    vRADate         = "N/A"
+                }
+                continue
+            }
             
             $vraInfo = Get-SnapshotUserFromvRA -VMName $snap.VMName -SnapshotCreated $snap.CreatedDate -Server $vraServer -AccessToken $vraToken
             
+            Write-Host "    vRA returned - User: '$($vraInfo.User)', Date: '$($vraInfo.Date)'" -ForegroundColor Cyan
+            
             # Update CreatedBy if we found the actual user
-            if ($vraInfo.User -ne "N/A") {
-                Write-Host "    Found actual user: $($vraInfo.User)" -ForegroundColor Green
+            if ($vraInfo.User -ne "N/A" -and $vraInfo.User -ne $null -and $vraInfo.User -ne "") {
+                Write-Host "    ✓ Found actual user: $($vraInfo.User) - REPLACING vravc account" -ForegroundColor Green
                 
                 $enrichedSnapshots += [PSCustomObject]@{
                     vCenter         = $snap.vCenter
@@ -286,7 +309,7 @@ function Enrich-SnapshotsWithvRA {
                 }
             }
             else {
-                Write-Host "    Could not find actual user, keeping vravc account" -ForegroundColor Yellow
+                Write-Host "    ✗ Could not find actual user, keeping vravc account" -ForegroundColor Yellow
                 
                 $enrichedSnapshots += [PSCustomObject]@{
                     vCenter         = $snap.vCenter
@@ -303,6 +326,7 @@ function Enrich-SnapshotsWithvRA {
             }
         }
         else {
+            Write-Host "  Regular snapshot (not vRA) - keeping as-is" -ForegroundColor Gray
             # Add non-vRA snapshot as-is with N/A fields
             $enrichedSnapshots += [PSCustomObject]@{
                 vCenter         = $snap.vCenter
@@ -319,7 +343,11 @@ function Enrich-SnapshotsWithvRA {
         }
     }
     
-    Write-Host "Enriched $vraCount vRA-created snapshots" -ForegroundColor Green
+    Write-Host "`n=== Enrichment Summary ===" -ForegroundColor Green
+    Write-Host "Total snapshots processed: $($Snapshots.Count)" -ForegroundColor Green
+    Write-Host "vRA snapshots found: $vraCount" -ForegroundColor Green
+    Write-Host "========================`n" -ForegroundColor Green
+    
     return $enrichedSnapshots
 }
 
