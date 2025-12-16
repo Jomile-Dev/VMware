@@ -128,51 +128,90 @@ function Get-SnapshotUserFromvRA {
         [string]$AccessToken
     )
     
+    Write-Host "`n    === DEBUG: vRA Lookup Process ===" -ForegroundColor Cyan
+    Write-Host "    VM Name: $VMName" -ForegroundColor Cyan
+    Write-Host "    Snapshot Created: $SnapshotCreated" -ForegroundColor Cyan
+    
     # Get the cloud machine resource
+    Write-Host "`n    Step 1: Looking up machine in vRA..." -ForegroundColor Yellow
     $machine = Get-vRACloudMachineByName -VMName $VMName -Server $Server -AccessToken $AccessToken
     
     if (-not $machine) {
+        Write-Host "    ✗ Machine not found in vRA" -ForegroundColor Red
         return @{
             User = "N/A"
             Date = "N/A"
         }
     }
+    
+    Write-Host "    ✓ Machine found in vRA" -ForegroundColor Green
+    Write-Host "    Machine ID: $($machine.id)" -ForegroundColor Gray
+    Write-Host "    Machine Name: $($machine.name)" -ForegroundColor Gray
     
     $deploymentId = $machine.deploymentId
     
     if (-not $deploymentId) {
+        Write-Host "    ✗ No deploymentId found for machine" -ForegroundColor Red
         return @{
             User = "N/A"
             Date = "N/A"
         }
     }
     
+    Write-Host "    ✓ Deployment ID: $deploymentId" -ForegroundColor Green
+    
     # Get deployment events
+    Write-Host "`n    Step 2: Retrieving deployment events..." -ForegroundColor Yellow
     $events = Get-vRADeploymentEvents -DeploymentId $deploymentId -Server $Server -AccessToken $AccessToken
     
     if (-not $events) {
+        Write-Host "    ✗ No events found for deployment" -ForegroundColor Red
         return @{
             User = "N/A"
             Date = "N/A"
         }
+    }
+    
+    Write-Host "    ✓ Found $($events.Count) total events" -ForegroundColor Green
+    
+    # Show all event types and messages
+    Write-Host "`n    All Events:" -ForegroundColor Cyan
+    $events | ForEach-Object {
+        Write-Host "      - Type: $($_.eventType) | Time: $($_.eventLogTime) | User: $($_.userName) | Message: $($_.message)" -ForegroundColor Gray
     }
     
     # Convert snapshot created date to comparable format
     $snapshotDate = [DateTime]::Parse($SnapshotCreated)
+    Write-Host "`n    Step 3: Looking for snapshot events near $snapshotDate..." -ForegroundColor Yellow
     
     # Find USER events related to snapshots around the creation time (within 5 minutes)
-    $snapshotEvent = $events | Where-Object {
+    $snapshotEvents = $events | Where-Object {
         $_.eventType -eq "USER" -and
         $_.message -match "snapshot" -and
         [Math]::Abs(([DateTime]::Parse($_.eventLogTime) - $snapshotDate).TotalMinutes) -lt 5
-    } | Sort-Object eventLogTime -Descending | Select-Object -First 1
+    }
     
-    if ($snapshotEvent) {
+    Write-Host "    Found $($snapshotEvents.Count) snapshot-related USER events within 5 minutes" -ForegroundColor Yellow
+    
+    if ($snapshotEvents) {
+        Write-Host "`n    Snapshot Events Found:" -ForegroundColor Cyan
+        $snapshotEvents | ForEach-Object {
+            Write-Host "      - Type: $($_.eventType) | Time: $($_.eventLogTime) | User: $($_.userName) | Message: $($_.message)" -ForegroundColor Green
+        }
+        
+        $snapshotEvent = $snapshotEvents | Sort-Object eventLogTime -Descending | Select-Object -First 1
+        
+        Write-Host "`n    ✓ Using event: User=$($snapshotEvent.userName), Time=$($snapshotEvent.eventLogTime)" -ForegroundColor Green
+        Write-Host "    === END DEBUG ===`n" -ForegroundColor Cyan
+        
         return @{
             User = $snapshotEvent.userName
             Date = ([DateTime]::Parse($snapshotEvent.eventLogTime)).ToString("yyyy-MM-dd")
         }
     }
+    
+    Write-Host "    ✗ No matching snapshot events found" -ForegroundColor Red
+    Write-Host "    === END DEBUG ===`n" -ForegroundColor Cyan
     
     return @{
         User = "N/A"
