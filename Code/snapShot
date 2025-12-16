@@ -47,7 +47,7 @@ function Get-vRAAccessToken {
     } | ConvertTo-Json
     
     try {
-        $response = Invoke-RestMethod -Uri $uri -Method Post -Body $body -ContentType "application/json" -SkipCertificateCheck
+        $response = Invoke-RestMethod -Uri $uri -Method Post -Body $body -ContentType "application/json"
         return $response.refresh_token
     }
     catch {
@@ -63,7 +63,7 @@ function Get-vRABearerToken {
     $body = @{ refreshToken = $RefreshToken } | ConvertTo-Json
     
     try {
-        $response = Invoke-RestMethod -Uri $uri -Method Post -Body $body -ContentType "application/json" -SkipCertificateCheck
+        $response = Invoke-RestMethod -Uri $uri -Method Post -Body $body -ContentType "application/json"
         return $response.token
     }
     catch {
@@ -83,7 +83,7 @@ function Get-vRACloudMachineByName {
     $uri = "https://$Server/iaas/api/machines?`$filter=name eq '$VMName'"
     
     try {
-        $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers -SkipCertificateCheck
+        $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers
         if ($response.content -and $response.content.Count -gt 0) {
             return $response.content[0]
         }
@@ -106,7 +106,7 @@ function Get-vRADeploymentEvents {
     $uri = "https://$Server/deployment/api/deployments/$DeploymentId/events"
     
     try {
-        $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers -SkipCertificateCheck
+        $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers
         return $response.content
     }
     catch {
