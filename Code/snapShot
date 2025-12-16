@@ -196,7 +196,21 @@ function Get-SnapshotUserFromvRA {
     
     # Extract user from the event (check multiple possible fields)
     $event = $matchingEvents[0]
-    $actualUser = $event.requestedBy ?? $event.inputs.requestedBy ?? $event.user ?? $event.inputs.user ?? $null
+    
+    # PowerShell 5.1 compatible null-coalescing
+    $actualUser = $null
+    if ($event.requestedBy) {
+        $actualUser = $event.requestedBy
+    }
+    elseif ($event.inputs -and $event.inputs.requestedBy) {
+        $actualUser = $event.inputs.requestedBy
+    }
+    elseif ($event.user) {
+        $actualUser = $event.user
+    }
+    elseif ($event.inputs -and $event.inputs.user) {
+        $actualUser = $event.inputs.user
+    }
     
     if ($actualUser) {
         return @{
