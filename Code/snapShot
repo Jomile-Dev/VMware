@@ -183,22 +183,32 @@ function Get-AllSnapshots {
         [System.Management.Automation.PSCredential]$Credential
     )
     
+    Write-Host "DEBUG: Get-AllSnapshots function called" -ForegroundColor Magenta
+    Write-Host "DEBUG: vCenter count: $($vCenterServers.Count)" -ForegroundColor Magenta
+    Write-Host "DEBUG: vCenters: $($vCenterServers -join ', ')" -ForegroundColor Magenta
+    
     $allSnapshots = @()
     
     foreach ($vcServer in $vCenterServers) {
-        Write-Host "Connecting to $vcServer..." -ForegroundColor Cyan
+        Write-Host "`nConnecting to $vcServer..." -ForegroundColor Cyan
         
         try {
             # Connect to vCenter with provided credentials
+            Write-Host "DEBUG: Attempting connection to $vcServer" -ForegroundColor Magenta
             Connect-VIServer -Server $vcServer -Credential $Credential -ErrorAction Stop | Out-Null
+            Write-Host "DEBUG: Successfully connected to $vcServer" -ForegroundColor Magenta
             
             Write-Host "Retrieving snapshots from $vcServer..." -ForegroundColor Yellow
             
             # Get all VMs with snapshots
+            Write-Host "DEBUG: Getting VMs with snapshots..." -ForegroundColor Magenta
             $vms = Get-VM | Where-Object { $_.ExtensionData.Snapshot }
+            Write-Host "DEBUG: Found $($vms.Count) VMs with snapshots" -ForegroundColor Magenta
             
             foreach ($vm in $vms) {
+                Write-Host "  Processing VM: $($vm.Name)" -ForegroundColor Gray
                 $snapshots = Get-Snapshot -VM $vm
+                Write-Host "    Found $($snapshots.Count) snapshot(s)" -ForegroundColor Gray
                 
                 foreach ($snap in $snapshots) {
                     $ageDays = [Math]::Round(((Get-Date) - $snap.Created).TotalDays, 2)
@@ -230,13 +240,16 @@ function Get-AllSnapshots {
             }
             
             Disconnect-VIServer -Server $vcServer -Confirm:$false
-            Write-Host "Completed processing $vcServer" -ForegroundColor Green
+            Write-Host "Completed processing $vcServer - Found $($allSnapshots.Count) total snapshots so far" -ForegroundColor Green
         }
         catch {
             Write-Warning "Error processing $vcServer : $_"
+            Write-Host "DEBUG: Full error: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "DEBUG: Stack trace: $($_.ScriptStackTrace)" -ForegroundColor Red
         }
     }
     
+    Write-Host "`nDEBUG: Returning $($allSnapshots.Count) snapshots total" -ForegroundColor Magenta
     # Sort by age (oldest first)
     return $allSnapshots | Sort-Object AgeDays -Descending
 }
@@ -367,7 +380,10 @@ else {
 }
 
 # Collect all snapshots
+Write-Host "`nStarting snapshot collection from all vCenters..." -ForegroundColor Yellow
 $allSnapshots = Get-AllSnapshots -vCenterServers $vCenters -vraServer $vraServer -vraToken $vraBearerToken -Credential $credential
+
+Write-Host "`nSnapshot collection completed. Processing results..." -ForegroundColor Green
 
 # Display summary
 Write-Host "`n========================================" -ForegroundColor Cyan
