@@ -215,8 +215,19 @@ function Get-SnapshotUserFromvRA {
         Write-Host "    Multiple events found, trying to match by name/description..." -ForegroundColor Yellow
         
         $bestMatch = $matchingEvents | Where-Object {
-            ($_.message -like "*$SnapshotName*") -or 
-            ($_.message -like "*$SnapshotDescription*")
+            # Check in message
+            $messageMatch = ($_.message -like "*$SnapshotName*") -or ($_.message -like "*$SnapshotDescription*")
+            
+            # Check in inputs object if it exists
+            $inputsMatch = $false
+            if ($_.inputs) {
+                $inputsMatch = ($_.inputs.name -eq $SnapshotName) -or 
+                               ($_.inputs.description -eq $SnapshotDescription) -or
+                               ($_.inputs.name -like "*$SnapshotName*") -or
+                               ($_.inputs.description -like "*$SnapshotDescription*")
+            }
+            
+            $messageMatch -or $inputsMatch
         } | Select-Object -First 1
         
         if ($bestMatch) {
@@ -251,26 +262,41 @@ function Get-SnapshotUserFromvRA {
         
         # TRY MULTIPLE FIELDS FOR USER - PRIORITIZE requestedBy
         $actualUser = $null
+        $userSource = ""
         
+        # Check top-level properties first
         if ($event.requestedBy -and $event.requestedBy -ne "" -and $event.requestedBy -ne $null) {
             $actualUser = $event.requestedBy
-            Write-Host "`n    ✓ Match Found! (using requestedBy field)" -ForegroundColor Green
+            $userSource = "requestedBy (top-level)"
         }
         elseif ($event.user -and $event.user -ne "" -and $event.user -ne $null) {
             $actualUser = $event.user
-            Write-Host "`n    ✓ Match Found! (using user field)" -ForegroundColor Green
+            $userSource = "user (top-level)"
         }
         elseif ($event.userName -and $event.userName -ne "" -and $event.userName -ne $null) {
             $actualUser = $event.userName
-            Write-Host "`n    ✓ Match Found! (using userName field)" -ForegroundColor Green
+            $userSource = "userName (top-level)"
         }
         elseif ($event.owner -and $event.owner -ne "" -and $event.owner -ne $null) {
             $actualUser = $event.owner
-            Write-Host "`n    ✓ Match Found! (using owner field)" -ForegroundColor Green
+            $userSource = "owner (top-level)"
+        }
+        # Check inside inputs object
+        elseif ($event.inputs -and $event.inputs.requestedBy) {
+            $actualUser = $event.inputs.requestedBy
+            $userSource = "inputs.requestedBy"
+        }
+        elseif ($event.inputs -and $event.inputs.user) {
+            $actualUser = $event.inputs.user
+            $userSource = "inputs.user"
+        }
+        
+        if ($actualUser) {
+            Write-Host "`n    ✓ Match Found! (using $userSource field)" -ForegroundColor Green
         }
         else {
             Write-Host "`n    ✗ Match Found but NO USER FIELD available in any known field" -ForegroundColor Red
-            Write-Host "    Checked fields: requestedBy, user, userName, owner - all empty or null" -ForegroundColor Red
+            Write-Host "    Checked fields: requestedBy, user, userName, owner (top-level and in inputs) - all empty or null" -ForegroundColor Red
         }
         
         if ($actualUser) {
