@@ -355,10 +355,6 @@ function Send-SnapshotReport {
         [string]$Subject
     )
     
-    # Calculate summary stats
-    $totalSize = [Math]::Round(($Snapshots | Measure-Object -Property SizeGB -Sum).Sum, 2)
-    $oldSnapshots = ($Snapshots | Where-Object { $_.AgeDays -gt 30 }).Count
-    
     # Build HTML email with table
     $html = @"
 <!DOCTYPE html>
@@ -366,7 +362,6 @@ function Send-SnapshotReport {
 <head>
     <style>
         body { font-family: Arial, sans-serif; }
-        h2 { color: #2c3e50; }
         table { border-collapse: collapse; width: 100%; margin-top: 20px; }
         th { background-color: #3498db; color: white; padding: 12px; text-align: left; }
         td { border: 1px solid #ddd; padding: 10px; }
@@ -377,16 +372,11 @@ function Send-SnapshotReport {
     </style>
 </head>
 <body>
-    <h2>vCenter Snapshot Report</h2>
     <div class="summary">
-        <strong>Report Generated:</strong> $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')<br>
-        <strong>Total Snapshots:</strong> $($Snapshots.Count)<br>
-        <strong>Total Size:</strong> $totalSize GB<br>
-        <strong>Snapshots > 30 days:</strong> $oldSnapshots
+        <strong>Total Snapshots:</strong> $($Snapshots.Count)
     </div>
     <table>
         <tr>
-            <th>vCenter</th>
             <th>VM Name</th>
             <th>Snapshot Name</th>
             <th>Description</th>
@@ -404,7 +394,6 @@ function Send-SnapshotReport {
         
         $html += @"
         <tr>
-            <td>$($snap.vCenter)</td>
             <td>$($snap.VMName)</td>
             <td>$($snap.SnapshotName)</td>
             <td>$($snap.Description)</td>
