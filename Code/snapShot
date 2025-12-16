@@ -213,21 +213,42 @@ function Get-SnapshotUserFromvRA {
     # If we have multiple matches, try to narrow down by name/description
     if ($matchingEvents.Count -gt 1 -and ($SnapshotName -or $SnapshotDescription)) {
         Write-Host "    Multiple events found, trying to match by name/description..." -ForegroundColor Yellow
+        Write-Host "    Looking for:" -ForegroundColor Cyan
+        Write-Host "      Snapshot Name: '$SnapshotName'" -ForegroundColor Cyan
+        Write-Host "      Snapshot Description: '$SnapshotDescription'" -ForegroundColor Cyan
         
+        Write-Host "`n    Checking each event:" -ForegroundColor Yellow
+        $matchIndex = 0
         $bestMatch = $matchingEvents | Where-Object {
+            $matchIndex++
+            Write-Host "      Event #$matchIndex" -ForegroundColor Gray
+            
             # Check in message
+            Write-Host "        Message: '$($_.message)'" -ForegroundColor DarkGray
             $messageMatch = ($_.message -like "*$SnapshotName*") -or ($_.message -like "*$SnapshotDescription*")
+            Write-Host "        Message Match: $messageMatch" -ForegroundColor $(if($messageMatch){"Green"}else{"DarkGray"})
             
             # Check in inputs object if it exists
             $inputsMatch = $false
             if ($_.inputs) {
+                Write-Host "        Inputs.name: '$($_.inputs.name)'" -ForegroundColor DarkGray
+                Write-Host "        Inputs.description: '$($_.inputs.description)'" -ForegroundColor DarkGray
+                
                 $inputsMatch = ($_.inputs.name -eq $SnapshotName) -or 
                                ($_.inputs.description -eq $SnapshotDescription) -or
                                ($_.inputs.name -like "*$SnapshotName*") -or
                                ($_.inputs.description -like "*$SnapshotDescription*")
+                Write-Host "        Inputs Match: $inputsMatch" -ForegroundColor $(if($inputsMatch){"Green"}else{"DarkGray"})
+            }
+            else {
+                Write-Host "        No inputs object found" -ForegroundColor DarkGray
             }
             
-            $messageMatch -or $inputsMatch
+            $overallMatch = $messageMatch -or $inputsMatch
+            Write-Host "        Overall Match: $overallMatch" -ForegroundColor $(if($overallMatch){"Green"}else{"Red"})
+            Write-Host ""
+            
+            $overallMatch
         } | Select-Object -First 1
         
         if ($bestMatch) {
