@@ -472,6 +472,43 @@ $allSnapshots = Get-AllSnapshots -vCenterServers $vCenters -Credential $credenti
 
 if ($allSnapshots.Count -eq 0) {
     Write-Host "No snapshots found." -ForegroundColor Yellow
+    
+    # Send email with no snapshots message
+    $html = @"
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        body { font-family: Arial, sans-serif; }
+        .summary { background-color: #ecf0f1; padding: 15px; border-radius: 5px; margin-bottom: 20px; }
+    </style>
+</head>
+<body>
+    <div class="summary">
+        <strong>No snapshots found</strong>
+    </div>
+</body>
+</html>
+"@
+    
+    try {
+        Send-MailMessage `
+            -To $emailTo `
+            -From $emailFrom `
+            -Subject $emailSubject `
+            -Body $html `
+            -BodyAsHtml `
+            -SmtpServer $smtpServer `
+            -Port $smtpPort `
+            -UseSsl `
+            -ErrorAction Stop
+        
+        Write-Host "Email sent successfully" -ForegroundColor Green
+    }
+    catch {
+        Write-Warning "Failed to send email: $_"
+    }
+    
     exit 0
 }
 
