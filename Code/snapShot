@@ -124,6 +124,8 @@ function Get-SnapshotUserFromvRA {
     param(
         [string]$VMName,
         [string]$SnapshotCreated,
+        [string]$SnapshotName,
+        [string]$SnapshotDescription,
         [string]$Server,
         [string]$AccessToken
     )
@@ -131,6 +133,8 @@ function Get-SnapshotUserFromvRA {
     Write-Host "`n    === DEBUG: vRA Lookup Process ===" -ForegroundColor Cyan
     Write-Host "    VM Name: $VMName" -ForegroundColor Cyan
     Write-Host "    Snapshot Created: $SnapshotCreated" -ForegroundColor Cyan
+    Write-Host "    Snapshot Name: $SnapshotName" -ForegroundColor Cyan
+    Write-Host "    Snapshot Description: $SnapshotDescription" -ForegroundColor Cyan
     
     # Get the cloud machine resource
     Write-Host "`n    Step 1: Looking up machine in vRA..." -ForegroundColor Yellow
@@ -145,8 +149,6 @@ function Get-SnapshotUserFromvRA {
     }
     
     Write-Host "    ✓ Machine found in vRA" -ForegroundColor Green
-    Write-Host "    Machine ID: $($machine.id)" -ForegroundColor Gray
-    Write-Host "    Machine Name: $($machine.name)" -ForegroundColor Gray
     
     $deploymentId = $machine.deploymentId
     
@@ -174,24 +176,68 @@ function Get-SnapshotUserFromvRA {
     
     Write-Host "    ✓ Found $($events.Count) total events" -ForegroundColor Green
     
-    # Show the first event's properties to see what's available
-    Write-Host "`n    First Event Properties:" -ForegroundColor Magenta
-    $events[0] | Format-List * | Out-String | Write-Host -ForegroundColor Gray
+    # Show all snapshot create events
+    Write-Host "`n    Snapshot Create Events:" -ForegroundColor Cyan
+    $snapshotCreateEvents = $events | Where-Object { $_.actionId -eq "Cloud.vSphere.Machine.Snapshot.Create" }
+    Write-Host "    Found $($snapshotCreateEvents.Count) snapshot create events" -ForegroundColor Yellow
     
-    Write-Host "`n    First Event as JSON:" -ForegroundColor Magenta
-    $events[0] | ConvertTo-Json -Depth 3 | Write-Host -ForegroundColor Gray
-    
-    Write-Host "`n    All Events (attempting multiple property names):" -ForegroundColor Cyan
-    $events | ForEach-Object {
-        $evt = $_
-        $type = if ($_.eventType) { $_.eventType } elseif ($_.type) { $_.type } else { "UNKNOWN" }
-        $time = if ($_.eventLogTime) { $_.eventLogTime } elseif ($_.timestamp) { $_.timestamp } elseif ($_.createdAt) { $_.createdAt } else { "UNKNOWN" }
-        $user = if ($_.userName) { $_.userName } elseif ($_.user) { $_.user } elseif ($_.createdBy) { $_.createdBy } else { "UNKNOWN" }
-        $msg = if ($_.message) { $_.message } elseif ($_.description) { $_.description } elseif ($_.text) { $_.text } else { "UNKNOWN" }
-        
-        Write-Host "      - Type: $type | Time: $time | User: $user | Message: $msg" -ForegroundColor Gray
+    $snapshotCreateEvents | ForEach-Object {
+        Write-Host "      - ActionId: $($_.actionId)" -ForegroundColor Gray
+        Write-Host "        UpdatedAt: $($_.updatedAt)" -ForegroundColor Gray
+        Write-Host "        User: $($_.user)" -ForegroundColor Gray
+        Write-Host "        Message: $($_.message)" -ForegroundColor Gray
+        Write-Host "" -ForegroundColor Gray
     }
     
+    # Convert snapshot created date to comparable format
+    $snapshotDate = [DateTime]::Parse($SnapshotCreated)
+    Write-Host "`n    Step 3: Matching snapshot event..." -ForegroundColor Yellow
+    Write-Host "    Looking for events near: $snapshotDate" -ForegroundColor Yellow
+    
+    # Find snapshot create events around the creation time
+    $matchingEvents = $events | Where-Object {
+        $_.actionId -eq "Cloud.vSphere.Machine.Snapshot.Create" -and
+        $_.updatedAt -and
+        [Math]::Abs(([DateTime]::Parse($_.updatedAt) - $snapshotDate).TotalMinutes) -lt 10
+    }
+    
+    Write-Host "    Found $($matchingEvents.Count) events within 10 minutes" -ForegroundColor Yellow
+    
+    # If we have multiple matches, try to narrow down by name/description
+    if ($matchingEvents.Count -gt 1 -and ($SnapshotName -or $SnapshotDescription)) {
+        Write-Host "    Multiple events found, trying to match by name/description..." -ForegroundColor Yellow
+        
+        $bestMatch = $matchingEvents | Where-Object {
+            ($_.message -like "*$SnapshotName*") -or 
+            ($_.message -like "*$SnapshotDescription*")
+        } | Select-Object -First 1
+        
+        if ($bestMatch) {
+            Write-Host "    ✓ Found match by name/description!" -ForegroundColor Green
+            $matchingEvents = @($bestMatch)
+        }
+        else {
+            Write-Host "    No name/description match, using closest by time" -ForegroundColor Yellow
+            $matchingEvents = $matchingEvents | Sort-Object { [Math]::Abs(([DateTime]::Parse($_.updatedAt) - $snapshotDate).TotalSeconds) } | Select-Object -First 1
+        }
+    }
+    
+    if ($matchingEvents -and $matchingEvents.Count -gt 0) {
+        $event = $matchingEvents[0]
+        
+        Write-Host "`n    ✓ Match Found!" -ForegroundColor Green
+        Write-Host "      User: $($event.user)" -ForegroundColor Green
+        Write-Host "      UpdatedAt: $($event.updatedAt)" -ForegroundColor Green
+        Write-Host "      Message: $($event.message)" -ForegroundColor Green
+        Write-Host "    === END DEBUG ===`n" -ForegroundColor Cyan
+        
+        return @{
+            User = $event.user
+            Date = ([DateTime]::Parse($event.updatedAt)).ToString("yyyy-MM-dd")
+        }
+    }
+    
+    Write-Host "    ✗ No matching snapshot events found" -ForegroundColor Red
     Write-Host "    === END DEBUG ===`n" -ForegroundColor Cyan
     
     return @{
@@ -307,7 +353,7 @@ function Enrich-SnapshotsWithvRA {
                 continue
             }
             
-            $vraInfo = Get-SnapshotUserFromvRA -VMName $snap.VMName -SnapshotCreated $snap.CreatedDate -Server $vraServer -AccessToken $vraToken
+            $vraInfo = Get-SnapshotUserFromvRA -VMName $snap.VMName -SnapshotCreated $snap.CreatedDate -SnapshotName $snap.SnapshotName -SnapshotDescription $snap.Description -Server $vraServer -AccessToken $vraToken
             
             Write-Host "    vRA returned - User: '$($vraInfo.User)', Date: '$($vraInfo.Date)'" -ForegroundColor Cyan
             
