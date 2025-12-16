@@ -209,15 +209,24 @@ function Get-AllSnapshots {
                 foreach ($snap in $snapshots) {
                     $ageDays = [Math]::Round(((Get-Date) - $snap.Created).TotalDays, 2)
                     
-                    # Check if CreatedBy contains "vravc"
+                    # Get the creator from vCenter
+                    $vcCreator = if ($snap.Creator) { $snap.Creator } else { "Unknown" }
+                    
+                    # Check if vCenter creator contains "vravc" - if so, get actual user from vRA
                     $vraUser = "N/A"
                     $vraDate = "N/A"
+                    $finalCreator = $vcCreator
                     
-                    if ($snap.Description -match "vravc" -or $snap.Name -match "vravc") {
-                        Write-Host "  Found vRA snapshot for $($vm.Name), querying vRA..." -ForegroundColor Gray
+                    if ($vcCreator -match "vravc") {
+                        Write-Host "    Found vRA-created snapshot, querying vRA for actual user..." -ForegroundColor Gray
                         $vraInfo = Get-SnapshotUserFromvRA -VMName $vm.Name -SnapshotCreated $snap.Created -Server $vraServer -AccessToken $vraToken
                         $vraUser = $vraInfo.User
                         $vraDate = $vraInfo.Date
+                        
+                        # Use vRA user if found, otherwise keep vravc account
+                        if ($vraUser -ne "N/A") {
+                            $finalCreator = $vraUser
+                        }
                     }
                     
                     $allSnapshots += [PSCustomObject]@{
@@ -226,7 +235,7 @@ function Get-AllSnapshots {
                         SnapshotName    = $snap.Name
                         Description     = $snap.Description
                         CreatedDate     = $snap.Created
-                        CreatedBy       = if ($vraUser -ne "N/A") { $vraUser } else { "Unknown" }
+                        CreatedBy       = $finalCreator
                         SizeGB          = [Math]::Round($snap.SizeGB, 2)
                         AgeDays         = $ageDays
                         vRAUser         = $vraUser
