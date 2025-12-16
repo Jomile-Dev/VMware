@@ -188,27 +188,18 @@ function Get-AllSnapshots {
         [System.Management.Automation.PSCredential]$Credential
     )
     
-    Write-Host "DEBUG: Get-AllSnapshots function called" -ForegroundColor Magenta
-    Write-Host "DEBUG: vCenter count: $($vCenterServers.Count)" -ForegroundColor Magenta
-    Write-Host "DEBUG: vCenters: $($vCenterServers -join ', ')" -ForegroundColor Magenta
-    
     $allSnapshots = @()
     
     foreach ($vcServer in $vCenterServers) {
         Write-Host "`nConnecting to $vcServer..." -ForegroundColor Cyan
         
         try {
-            # Connect to vCenter with provided credentials
-            Write-Host "DEBUG: Attempting connection to $vcServer" -ForegroundColor Magenta
             Connect-VIServer -Server $vcServer -Credential $Credential -ErrorAction Stop | Out-Null
-            Write-Host "DEBUG: Successfully connected to $vcServer" -ForegroundColor Magenta
             
             Write-Host "Retrieving snapshots from $vcServer..." -ForegroundColor Yellow
             
             # Get all VMs with snapshots
-            Write-Host "DEBUG: Getting VMs with snapshots..." -ForegroundColor Magenta
             $vms = Get-VM | Where-Object { $_.ExtensionData.Snapshot }
-            Write-Host "DEBUG: Found $($vms.Count) VMs with snapshots" -ForegroundColor Magenta
             
             foreach ($vm in $vms) {
                 Write-Host "  Processing VM: $($vm.Name)" -ForegroundColor Gray
@@ -249,12 +240,9 @@ function Get-AllSnapshots {
         }
         catch {
             Write-Warning "Error processing $vcServer : $_"
-            Write-Host "DEBUG: Full error: $($_.Exception.Message)" -ForegroundColor Red
-            Write-Host "DEBUG: Stack trace: $($_.ScriptStackTrace)" -ForegroundColor Red
         }
     }
     
-    Write-Host "`nDEBUG: Returning $($allSnapshots.Count) snapshots total" -ForegroundColor Magenta
     # Sort by age (oldest first)
     return $allSnapshots | Sort-Object AgeDays -Descending
 }
@@ -334,9 +322,15 @@ function Send-SnapshotReport {
     
     # Send email
     try {
-        Send-MailMessage -SmtpServer $SmtpServer -Port $SmtpPort `
-            -From $From -To $To -Subject $Subject `
-            -Body $html -BodyAsHtml -ErrorAction Stop
+        Send-MailMessage `
+            -To $To `
+            -From $From `
+            -Subject $Subject `
+            -Body $html `
+            -BodyAsHtml `
+            -SmtpServer $SmtpServer `
+            -Port $SmtpPort `
+            -ErrorAction Stop
         
         Write-Host "`nEmail sent successfully to $($To -join ', ')" -ForegroundColor Green
     }
@@ -398,6 +392,9 @@ Write-Host "Total Snapshots: $($allSnapshots.Count)"
 Write-Host "Total Size: $([Math]::Round(($allSnapshots | Measure-Object -Property SizeGB -Sum).Sum, 2)) GB"
 Write-Host "Oldest Snapshot: $([Math]::Round(($allSnapshots | Measure-Object -Property AgeDays -Maximum).Maximum, 2)) days"
 Write-Host ""
+
+# Display table in console
+$allSnapshots | Format-Table -Property vCenter, VMName, SnapshotName, CreatedDate, CreatedBy, SizeGB, AgeDays -AutoSize
 
 # Export to CSV (optional)
 $csvPath = ".\SnapshotReport_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
