@@ -12,8 +12,9 @@ $vCenters = @(
 
 $vraServer = "vra.domain.com"
 
+# Email settings
 $smtpServer = "smtp.domain.com"
-$smtpPort = 25
+$smtpPort = 587
 $emailFrom = "snapshots@domain.com"
 $emailTo = @("admin@domain.com")
 $emailSubject = "vCenter Snapshot Report - $(Get-Date -Format 'yyyy-MM-dd')"
@@ -23,12 +24,10 @@ $emailSubject = "vCenter Snapshot Report - $(Get-Date -Format 'yyyy-MM-dd')"
 # ============================================================================
 
 function Get-vRAAccessToken {
-    [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)]
-        [System.Management.Automation.PSCredential]$Credential,
-        
-        [Parameter(Mandatory = $true)]
+        [Parameter(Mandatory)]
+        [PSCredential]$Credential,
+        [Parameter(Mandatory)]
         [string]$Server
     )
     
@@ -49,12 +48,10 @@ function Get-vRAAccessToken {
 }
 
 function Get-vRABearerToken {
-    [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)]
+        [Parameter(Mandatory)]
         [string]$RefreshToken,
-        
-        [Parameter(Mandatory = $true)]
+        [Parameter(Mandatory)]
         [string]$Server
     )
     
@@ -72,15 +69,12 @@ function Get-vRABearerToken {
 }
 
 function Get-vRACloudMachineByName {
-    [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)]
+        [Parameter(Mandatory)]
         [string]$VMName,
-        
-        [Parameter(Mandatory = $true)]
+        [Parameter(Mandatory)]
         [string]$Server,
-        
-        [Parameter(Mandatory = $true)]
+        [Parameter(Mandatory)]
         [string]$AccessToken
     )
     
@@ -93,10 +87,7 @@ function Get-vRACloudMachineByName {
     
     try {
         $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers -ErrorAction Stop
-        if ($response.content -and $response.content.Count -gt 0) {
-            return $response.content[0]
-        }
-        return $null
+        return $response.content[0]
     }
     catch {
         Write-Warning "Failed to get vRA machine for $VMName : $_"
@@ -105,15 +96,12 @@ function Get-vRACloudMachineByName {
 }
 
 function Get-vRADeploymentEvents {
-    [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)]
+        [Parameter(Mandatory)]
         [string]$DeploymentId,
-        
-        [Parameter(Mandatory = $true)]
+        [Parameter(Mandatory)]
         [string]$Server,
-        
-        [Parameter(Mandatory = $true)]
+        [Parameter(Mandatory)]
         [string]$AccessToken
     )
     
@@ -135,45 +123,30 @@ function Get-vRADeploymentEvents {
 }
 
 function Get-SnapshotUserFromvRA {
-    [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)]
+        [Parameter(Mandatory)]
         [string]$VMName,
-        
-        [Parameter(Mandatory = $true)]
+        [Parameter(Mandatory)]
         [string]$SnapshotCreated,
-        
-        [Parameter(Mandatory = $true)]
+        [Parameter(Mandatory)]
         [string]$SnapshotName,
-        
-        [Parameter(Mandatory = $false)]
         [string]$SnapshotDescription,
-        
-        [Parameter(Mandatory = $true)]
+        [Parameter(Mandatory)]
         [string]$Server,
-        
-        [Parameter(Mandatory = $true)]
+        [Parameter(Mandatory)]
         [string]$AccessToken
     )
     
-    # Get the cloud machine resource
+    # Get the VM from vRA
     $machine = Get-vRACloudMachineByName -VMName $VMName -Server $Server -AccessToken $AccessToken
-    
     if (-not $machine -or -not $machine.deploymentId) {
-        return @{
-            User = "N/A"
-            Date = "N/A"
-        }
+        return @{ User = "N/A"; Date = "N/A" }
     }
     
     # Get deployment events
     $events = Get-vRADeploymentEvents -DeploymentId $machine.deploymentId -Server $Server -AccessToken $AccessToken
-    
     if (-not $events) {
-        return @{
-            User = "N/A"
-            Date = "N/A"
-        }
+        return @{ User = "N/A"; Date = "N/A" }
     }
     
     # Find snapshot create events within 10 minutes of snapshot creation
@@ -184,16 +157,13 @@ function Get-SnapshotUserFromvRA {
         [Math]::Abs(([DateTime]::Parse($_.updatedAt) - $snapshotDate).TotalMinutes) -lt 10
     }
     
-    if (-not $matchingEvents -or $matchingEvents.Count -eq 0) {
-        return @{
-            User = "N/A"
-            Date = "N/A"
-        }
+    if (-not $matchingEvents) {
+        return @{ User = "N/A"; Date = "N/A" }
     }
     
-    # If multiple matches, try to narrow down by snapshot name/description
+    # If multiple matches found, try to match by snapshot name/description
     if ($matchingEvents.Count -gt 1) {
-        # Try exact match first
+        # Try exact match
         $bestMatch = $matchingEvents | Where-Object {
             $_.inputs -and (
                 ($_.inputs.name -eq $SnapshotName) -or
@@ -201,7 +171,7 @@ function Get-SnapshotUserFromvRA {
             )
         } | Select-Object -First 1
         
-        # If no exact match, try partial match
+        # Try partial match if no exact match
         if (-not $bestMatch) {
             $bestMatch = $matchingEvents | Where-Object {
                 ($_.message -like "*$SnapshotName*") -or 
@@ -213,7 +183,7 @@ function Get-SnapshotUserFromvRA {
             } | Select-Object -First 1
         }
         
-        # If still no match, use closest by time
+        # Use closest by time if still no match
         if ($bestMatch) {
             $matchingEvents = @($bestMatch)
         }
@@ -224,26 +194,9 @@ function Get-SnapshotUserFromvRA {
         }
     }
     
-    # Extract user information
+    # Extract user from the event (check multiple possible fields)
     $event = $matchingEvents[0]
-    $actualUser = $null
-    
-    # Check requestedBy field (primary location)
-    if ($event.requestedBy) {
-        $actualUser = $event.requestedBy
-    }
-    # Check inputs.requestedBy
-    elseif ($event.inputs -and $event.inputs.requestedBy) {
-        $actualUser = $event.inputs.requestedBy
-    }
-    # Fallback to user field
-    elseif ($event.user) {
-        $actualUser = $event.user
-    }
-    # Fallback to inputs.user
-    elseif ($event.inputs -and $event.inputs.user) {
-        $actualUser = $event.inputs.user
-    }
+    $actualUser = $event.requestedBy ?? $event.inputs.requestedBy ?? $event.user ?? $event.inputs.user ?? $null
     
     if ($actualUser) {
         return @{
@@ -252,20 +205,15 @@ function Get-SnapshotUserFromvRA {
         }
     }
     
-    return @{
-        User = "N/A"
-        Date = "N/A"
-    }
+    return @{ User = "N/A"; Date = "N/A" }
 }
 
 function Get-AllSnapshots {
-    [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)]
+        [Parameter(Mandatory)]
         [array]$vCenterServers,
-        
-        [Parameter(Mandatory = $true)]
-        [System.Management.Automation.PSCredential]$Credential
+        [Parameter(Mandatory)]
+        [PSCredential]$Credential
     )
     
     $allSnapshots = @()
@@ -274,18 +222,20 @@ function Get-AllSnapshots {
         Write-Host "Processing $vcServer..." -ForegroundColor Cyan
         
         try {
+            # Connect to vCenter
             Connect-VIServer -Server $vcServer -Credential $Credential -ErrorAction Stop | Out-Null
             
-            # Get all VMs with snapshots
+            # Get all VMs that have snapshots
             $vms = Get-VM | Where-Object { $_.ExtensionData.Snapshot }
             
             foreach ($vm in $vms) {
                 $snapshots = Get-Snapshot -VM $vm
                 
                 foreach ($snap in $snapshots) {
+                    # Calculate snapshot age
                     $ageDays = [Math]::Round(((Get-Date) - $snap.Created).TotalDays, 2)
                     
-                    # Get creator from vCenter events
+                    # Try to get creator from vCenter events
                     $vcCreator = "Unknown"
                     try {
                         $events = Get-VIEvent -Entity $vm -Types Info -Start $snap.Created.AddMinutes(-1) -Finish $snap.Created.AddMinutes(1) -ErrorAction SilentlyContinue |
@@ -297,10 +247,9 @@ function Get-AllSnapshots {
                             $vcCreator = $events.UserName
                         }
                     }
-                    catch {
-                        Write-Verbose "Could not retrieve event for snapshot $($snap.Name): $_"
-                    }
+                    catch { }
                     
+                    # Add snapshot to collection
                     $allSnapshots += [PSCustomObject]@{
                         vCenter      = $vcServer
                         VMName       = $vm.Name
@@ -315,40 +264,39 @@ function Get-AllSnapshots {
             }
             
             Disconnect-VIServer -Server $vcServer -Confirm:$false -ErrorAction SilentlyContinue
-            Write-Host "Completed $vcServer - Total snapshots: $($allSnapshots.Count)" -ForegroundColor Green
+            Write-Host "Completed $vcServer" -ForegroundColor Green
         }
         catch {
             Write-Warning "Error processing $vcServer : $_"
         }
     }
     
+    # Return snapshots sorted by age (oldest first)
     return $allSnapshots | Sort-Object AgeDays -Descending
 }
 
 function Invoke-vRAEnrichment {
-    [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)]
+        [Parameter(Mandatory)]
         [array]$Snapshots,
-        
-        [Parameter(Mandatory = $true)]
+        [Parameter(Mandatory)]
         [string]$Server,
-        
-        [Parameter(Mandatory = $true)]
+        [Parameter(Mandatory)]
         [string]$Token
     )
     
     Write-Host "`nEnriching vRA-created snapshots..." -ForegroundColor Yellow
     
-    $enrichedSnapshots = @()
     $vraSnapshotCount = ($Snapshots | Where-Object { $_.CreatedBy -like "*vravc*" }).Count
     $processedCount = 0
     
     foreach ($snap in $Snapshots) {
+        # Check if snapshot was created by vRA (contains "vravc" in username)
         if ($snap.CreatedBy -like "*vravc*") {
             $processedCount++
-            Write-Host "  Processing vRA snapshot $processedCount of $vraSnapshotCount for $($snap.VMName)..." -ForegroundColor Gray
+            Write-Host "  Processing vRA snapshot $processedCount of $vraSnapshotCount..." -ForegroundColor Gray
             
+            # Get actual user from vRA API
             $vraInfo = Get-SnapshotUserFromvRA `
                 -VMName $snap.VMName `
                 -SnapshotCreated $snap.CreatedDate `
@@ -357,50 +305,47 @@ function Invoke-vRAEnrichment {
                 -Server $Server `
                 -AccessToken $Token
             
+            # Replace "vravc" account with actual user if found
             if ($vraInfo.User -ne "N/A") {
                 $snap.CreatedBy = $vraInfo.User
             }
             
+            # Add vRA metadata
             $snap | Add-Member -NotePropertyName "vRAUser" -NotePropertyValue $vraInfo.User -Force
             $snap | Add-Member -NotePropertyName "vRADate" -NotePropertyValue $vraInfo.Date -Force
         }
         else {
+            # Not a vRA snapshot, add empty vRA fields
             $snap | Add-Member -NotePropertyName "vRAUser" -NotePropertyValue "N/A" -Force
             $snap | Add-Member -NotePropertyName "vRADate" -NotePropertyValue "N/A" -Force
         }
-        
-        $enrichedSnapshots += $snap
     }
     
     Write-Host "Enrichment complete - Processed $processedCount vRA snapshots" -ForegroundColor Green
-    return $enrichedSnapshots
+    return $Snapshots
 }
 
 function Send-SnapshotReport {
-    [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)]
+        [Parameter(Mandatory)]
         [array]$Snapshots,
-        
-        [Parameter(Mandatory = $true)]
+        [Parameter(Mandatory)]
         [string]$SmtpServer,
-        
-        [Parameter(Mandatory = $true)]
+        [Parameter(Mandatory)]
         [int]$SmtpPort,
-        
-        [Parameter(Mandatory = $true)]
+        [Parameter(Mandatory)]
         [string]$From,
-        
-        [Parameter(Mandatory = $true)]
+        [Parameter(Mandatory)]
         [array]$To,
-        
-        [Parameter(Mandatory = $true)]
+        [Parameter(Mandatory)]
         [string]$Subject
     )
     
+    # Calculate summary stats
     $totalSize = [Math]::Round(($Snapshots | Measure-Object -Property SizeGB -Sum).Sum, 2)
     $oldSnapshots = ($Snapshots | Where-Object { $_.AgeDays -gt 30 }).Count
     
+    # Build HTML email with table
     $html = @"
 <!DOCTYPE html>
 <html>
@@ -438,6 +383,7 @@ function Send-SnapshotReport {
         </tr>
 "@
     
+    # Add each snapshot as a table row
     foreach ($snap in $Snapshots) {
         $ageClass = if ($snap.AgeDays -gt 30) { " class='old'" } else { "" }
         $createdBy = if ($snap.vRAUser -ne "N/A") { "$($snap.CreatedBy) (vRA: $($snap.vRADate))" } else { $snap.CreatedBy }
@@ -462,6 +408,7 @@ function Send-SnapshotReport {
 </html>
 "@
     
+    # Send the email
     try {
         Send-MailMessage `
             -To $To `
@@ -471,6 +418,7 @@ function Send-SnapshotReport {
             -BodyAsHtml `
             -SmtpServer $SmtpServer `
             -Port $SmtpPort `
+            -UseSsl `
             -ErrorAction Stop
         
         Write-Host "Email sent successfully to $($To -join ', ')" -ForegroundColor Green
@@ -488,9 +436,8 @@ Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "vCenter Snapshot Report with vRA Integration" -ForegroundColor Cyan
 Write-Host "========================================`n" -ForegroundColor Cyan
 
-# Get credentials
+# Get credentials for vCenter and vRA
 $credential = Get-Credential -Message "Enter credentials for vCenter and vRA"
-
 if (-not $credential) {
     Write-Error "Credentials are required to continue."
     exit 1
@@ -527,12 +474,12 @@ if ($allSnapshots.Count -eq 0) {
 
 Write-Host "`nTotal snapshots found: $($allSnapshots.Count)" -ForegroundColor Green
 
-# Enrich with vRA data if authentication succeeded
+# Enrich vRA snapshots with actual user information
 if ($vraBearerToken) {
     $allSnapshots = Invoke-vRAEnrichment -Snapshots $allSnapshots -Server $vraServer -Token $vraBearerToken
 }
 else {
-    # Add empty vRA fields for consistency
+    # Add empty vRA fields if authentication failed
     $allSnapshots = $allSnapshots | ForEach-Object {
         $_ | Add-Member -NotePropertyName "vRAUser" -NotePropertyValue "N/A" -Force
         $_ | Add-Member -NotePropertyName "vRADate" -NotePropertyValue "N/A" -Force
@@ -540,7 +487,7 @@ else {
     }
 }
 
-# Display summary
+# Display summary to console
 $totalSize = [Math]::Round(($allSnapshots | Measure-Object -Property SizeGB -Sum).Sum, 2)
 $oldestSnapshot = [Math]::Round(($allSnapshots | Measure-Object -Property AgeDays -Maximum).Maximum, 2)
 
@@ -560,7 +507,7 @@ $csvPath = ".\SnapshotReport_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
 $allSnapshots | Export-Csv -Path $csvPath -NoTypeInformation
 Write-Host "CSV exported to: $csvPath" -ForegroundColor Green
 
-# Send email report
+# Send HTML email report
 Write-Host "`nSending email report..." -ForegroundColor Yellow
 Send-SnapshotReport `
     -Snapshots $allSnapshots `
