@@ -210,6 +210,38 @@ function Get-SnapshotUserFromvRA {
     
     Write-Host "    Found $($matchingEvents.Count) events within 10 minutes" -ForegroundColor Yellow
     
+    if ($matchingEvents.Count -eq 0) {
+        Write-Host "    ✗ No matching snapshot events found" -ForegroundColor Red
+        Write-Host "    === END DEBUG ===`n" -ForegroundColor Cyan
+        return @{
+            User = "N/A"
+            Date = "N/A"
+        }
+    }
+    
+    Write-Host "`n    === MATCHED EVENTS DATA ===" -ForegroundColor Cyan
+    for ($i = 0; $i -lt $matchingEvents.Count; $i++) {
+        $evt = $matchingEvents[$i]
+        Write-Host "    Event #$($i+1):" -ForegroundColor Yellow
+        Write-Host "      ActionId: $($evt.actionId)" -ForegroundColor Gray
+        Write-Host "      UpdatedAt: $($evt.updatedAt)" -ForegroundColor Gray
+        Write-Host "      Message: $($evt.message)" -ForegroundColor Gray
+        Write-Host "      User: '$($evt.user)'" -ForegroundColor Magenta
+        Write-Host "      RequestedBy: '$($evt.requestedBy)'" -ForegroundColor Magenta
+        
+        if ($evt.inputs) {
+            Write-Host "      Inputs object exists:" -ForegroundColor Cyan
+            Write-Host "        inputs.name: '$($evt.inputs.name)'" -ForegroundColor DarkCyan
+            Write-Host "        inputs.description: '$($evt.inputs.description)'" -ForegroundColor DarkCyan
+            Write-Host "        inputs.requestedBy: '$($evt.inputs.requestedBy)'" -ForegroundColor Magenta
+            Write-Host "        inputs.user: '$($evt.inputs.user)'" -ForegroundColor Magenta
+        } else {
+            Write-Host "      No inputs object" -ForegroundColor Red
+        }
+        Write-Host ""
+    }
+    Write-Host "    === END MATCHED EVENTS DATA ===`n" -ForegroundColor Cyan
+    
     # If we have multiple matches, try to narrow down by name/description
     if ($matchingEvents.Count -gt 1 -and ($SnapshotName -or $SnapshotDescription)) {
         Write-Host "    Multiple events found, trying to match by name/description..." -ForegroundColor Yellow
