@@ -230,6 +230,23 @@ function Get-SnapshotUserFromvRA {
     }
     
     if ($matchingEvents -and $matchingEvents.Count -gt 0) {
+        Write-Host "`n    Step 4: Analyzing matched event(s)..." -ForegroundColor Yellow
+        Write-Host "    Found $($matchingEvents.Count) matching event(s)" -ForegroundColor Yellow
+        
+        # Show details of ALL matching events
+        for ($i = 0; $i -lt $matchingEvents.Count; $i++) {
+            $event = $matchingEvents[$i]
+            Write-Host "`n    === Matched Event #$($i + 1) Details ===" -ForegroundColor Cyan
+            Write-Host "    ALL Properties and Values:" -ForegroundColor Yellow
+            $event.PSObject.Properties | ForEach-Object {
+                $propName = $_.Name
+                $propValue = if ($_.Value) { $_.Value } else { "(empty)" }
+                Write-Host "      $propName : $propValue" -ForegroundColor Gray
+            }
+            Write-Host "    =========================" -ForegroundColor Cyan
+        }
+        
+        # Now try to extract user from first matching event
         $event = $matchingEvents[0]
         
         # TRY MULTIPLE FIELDS FOR USER - PRIORITIZE requestedBy
@@ -252,11 +269,8 @@ function Get-SnapshotUserFromvRA {
             Write-Host "`n    ✓ Match Found! (using owner field)" -ForegroundColor Green
         }
         else {
-            Write-Host "`n    ✗ Match Found but NO USER FIELD available" -ForegroundColor Red
-            Write-Host "    Available event properties:" -ForegroundColor Yellow
-            $event.PSObject.Properties | ForEach-Object {
-                Write-Host "      - $($_.Name): $($_.Value)" -ForegroundColor Gray
-            }
+            Write-Host "`n    ✗ Match Found but NO USER FIELD available in any known field" -ForegroundColor Red
+            Write-Host "    Checked fields: requestedBy, user, userName, owner - all empty or null" -ForegroundColor Red
         }
         
         if ($actualUser) {
