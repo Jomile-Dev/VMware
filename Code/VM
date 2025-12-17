@@ -21,8 +21,9 @@ $smtpSubject = "New Server Deployment Report - $(Get-Date -Format 'yyyy-MM-dd')"
 $daysBack = 1
 
 # Output
-$outputPath = "C:\Logs\NewServers_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
-$debugLog = "C:\Logs\NewServers_Debug_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+$timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$outputLog = "C:\Logs\NewServers_$timestamp.log"
+$outputCSV = "C:\Logs\NewServers_$timestamp.csv"
 #endregion
 
 #region Helper Functions
@@ -42,7 +43,7 @@ function Write-DebugLog {
     }
     
     Write-Host $logMessage -ForegroundColor $color
-    Add-Content -Path $debugLog -Value $logMessage
+    Add-Content -Path $outputLog -Value $logMessage
 }
 
 function Disable-SSLValidation {
@@ -68,11 +69,11 @@ function Disable-SSLValidation {
 try {
     Write-DebugLog "===== Script Started =====" "SUCCESS"
     Write-DebugLog "PowerShell Version: $($PSVersionTable.PSVersion)"
-    Write-DebugLog "Output CSV: $outputPath"
-    Write-DebugLog "Debug Log: $debugLog"
+    Write-DebugLog "Output CSV: $outputCSV"
+    Write-DebugLog "Combined Log: $outputLog"
     
     # Ensure log directory exists
-    $logDir = Split-Path $outputPath -Parent
+    $logDir = Split-Path $outputCSV -Parent
     if (!(Test-Path $logDir)) {
         New-Item -ItemType Directory -Path $logDir -Force | Out-Null
         Write-DebugLog "Created log directory: $logDir"
@@ -320,17 +321,44 @@ try {
                     
                     foreach ($machine in $vSphereMachines) {
                         # Get hostname from various possible properties
+                        # Check all Cloud.vSphere.Machine and Cloud.Machine properties
                         $hostname = $null
-                        if ($machine.properties.hostname) { 
-                            $hostname = $machine.properties.hostname 
-                        } elseif ($machine.properties.resourceName) {
-                            $hostname = $machine.properties.resourceName
-                        } elseif ($machine.name) {
+                        
+                        # Try common property names
+                        if ($machine.properties) {
+                            $props = $machine.properties
+                            
+                            # Priority order for finding hostname
+                            if ($props.hostname) { 
+                                $hostname = $props.hostname 
+                                Write-DebugLog "    Found hostname in properties.hostname: $hostname"
+                            } 
+                            elseif ($props.resourceName) {
+                                $hostname = $props.resourceName
+                                Write-DebugLog "    Found hostname in properties.resourceName: $hostname"
+                            }
+                            elseif ($props.name) {
+                                $hostname = $props.name
+                                Write-DebugLog "    Found hostname in properties.name: $hostname"
+                            }
+                            elseif ($props.address) {
+                                $hostname = $props.address
+                                Write-DebugLog "    Found hostname in properties.address: $hostname"
+                            }
+                            elseif ($props.hostName) {
+                                $hostname = $props.hostName
+                                Write-DebugLog "    Found hostname in properties.hostName: $hostname"
+                            }
+                        }
+                        
+                        # Fallback to machine name
+                        if (-not $hostname -and $machine.name) {
                             $hostname = $machine.name
+                            Write-DebugLog "    Found hostname in machine.name: $hostname"
                         }
                         
                         if ($hostname) {
-                            # Store deployment info for this machine
+                            # Only store if not already found in a previous vRA
                             if (-not $deploymentData.ContainsKey($hostname)) {
                                 $deploymentsFound++
                                 
@@ -343,15 +371,32 @@ try {
                                 $requestor = $requestedBy
                                 if ($dep.ownedBy) { $requestor = $dep.ownedBy }
                                 
+                                # Extract first part of FQDN (e.g., "vra1" from "vra1.yourdomain.com")
+                                $vraServerShort = ($vraServer -split '\.')[0]
+                                
                                 $deploymentData[$hostname] = @{
                                     DeploymentName = $dep.name
                                     Description = $description
                                     RequestedBy = $requestedBy
                                     Requestor = $requestor
-                                    vRAServer = $vraServer
+                                    vRAServer = $vraServerShort
                                     DeploymentID = $dep.id
                                     Status = $dep.status
                                 }
+                                
+                                Write-DebugLog "    Stored deployment for $hostname from $vraServer"
+                            }
+                            else {
+                                Write-DebugLog "    Skipping $hostname - already found in another vRA" "WARN"
+                            }
+                        }
+                        else {
+                            Write-DebugLog "    Could not determine hostname for machine in deployment $($dep.name)" "WARN"
+                            Write-DebugLog "    Machine type: $($machine.type), Machine ID: $($machine.id)"
+                            
+                            # Log all available properties for debugging
+                            if ($machine.properties) {
+                                Write-DebugLog "    Available properties: $($machine.properties.Keys -join ', ')"
                             }
                         }
                     }
@@ -370,7 +415,7 @@ try {
                 
             } while ($hasMore)
             
-            Write-DebugLog "Completed scanning $vraServer - Found $deploymentsFound deployments" "SUCCESS"
+            Write-DebugLog "Completed scanning $vraServer - Found $deploymentsFound new deployments" "SUCCESS"
         }
         catch {
             Write-DebugLog "Error processing vRA server $vraServer`: $($_.Exception.Message)" "ERROR"
@@ -379,6 +424,14 @@ try {
     }
     
     Write-DebugLog "`nTotal unique deployments found across all vRA servers: $($deploymentData.Count)" "SUCCESS"
+    
+    # Log which VMs were not found in any vRA
+    Write-DebugLog "`n--- VM to Deployment Matching ---" "INFO"
+    foreach ($vm in $newVMs) {
+        if (-not $deploymentData.ContainsKey($vm.Name)) {
+            Write-DebugLog "VM '$($vm.Name)' not found in any vRA deployment" "WARN"
+        }
+    }
     #endregion
     
     #region Build Final Report
@@ -423,8 +476,8 @@ try {
     #region Export to CSV
     Write-DebugLog "`n===== Exporting Data =====" "INFO"
     # Select properties in specific order for CSV
-    $reportData | Select-Object Name, Status, CreatedDate, DeploymentName, Description, RequestedBy, Requestor, vRAServer, DeploymentStatus | Export-Csv -Path $outputPath -NoTypeInformation
-    Write-DebugLog "Exported to: $outputPath" "SUCCESS"
+    $reportData | Select-Object Name, Status, CreatedDate, DeploymentName, Description, RequestedBy, Requestor, vRAServer, DeploymentStatus | Export-Csv -Path $outputCSV -NoTypeInformation
+    Write-DebugLog "Exported to: $outputCSV" "SUCCESS"
     #endregion
     
     #region Send Email
@@ -505,7 +558,7 @@ $htmlTable
                 -Port $smtpPort `
                 -UseSsl `
                 -Credential $smtpCredential `
-                -Attachments $outputPath `
+                -Attachments $outputCSV `
                 -ErrorAction Stop
             
             Write-DebugLog "Email sent successfully!" "SUCCESS"
@@ -527,8 +580,11 @@ $htmlTable
     }
     
     Write-DebugLog "`n===== Script Completed Successfully =====" "SUCCESS"
-    Write-DebugLog "Results saved to: $outputPath"
-    Write-DebugLog "Debug log saved to: $debugLog"
+    Write-DebugLog "Results saved to: $outputCSV"
+    Write-DebugLog "Log saved to: $outputLog"
+    Write-DebugLog "`n========================================`n"
+    Write-Host "`nPress any key to exit..." -ForegroundColor Yellow
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
     #endregion
 }
 catch {
