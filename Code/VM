@@ -133,15 +133,20 @@ try {
         foreach ($dep in $deployments) {
             $totalProcessed++
             
-            # Filter by name - but log what we're checking
+            # Filter by resources - check if deployment has Cloud.vSphere.Machine
             Write-Log "[$totalProcessed] Checking: $($dep.name)"
             
-            if ($dep.name -notmatch "Virtual Machine" -and $dep.name -notmatch "Database") {
-                Write-Log "[$totalProcessed] Skipping: $($dep.name) (not VM/Database)" "WARN"
+            $hasVMResource = $false
+            if ($dep.resources) {
+                $hasVMResource = ($dep.resources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" }).Count -gt 0
+            }
+            
+            if (-not $hasVMResource) {
+                Write-Log "[$totalProcessed] Skipping: $($dep.name) (no Cloud.vSphere.Machine resources)" "WARN"
                 continue
             }
             
-            Write-Log "[$totalProcessed] >>> MATCHES FILTER! Processing: $($dep.name) <<<" "SUCCESS"
+            Write-Log "[$totalProcessed] >>> HAS VM RESOURCES! Processing: $($dep.name) <<<" "SUCCESS"
             
             # Check date but log it for debugging
             $deleteDate = $null
@@ -169,16 +174,61 @@ try {
             Write-Log "Last Updated: $($dep.lastUpdatedAt)"
             Write-Log "Owner: $($dep.ownedBy)"
             
-            # Step 2: Get the request/action history for this deployment
+            # Step 2: Get the request/action history - Try multiple API endpoints
             Write-Log "`nFetching request history..." "SUCCESS"
             
+            $requests = $null
+            $historyFetchSuccess = $false
+            
+            # Try endpoint 1: Deployment API requests
             try {
                 $requestsUri = "https://$vraServer/deployment/api/deployments/$($dep.id)/requests"
+                Write-Log "Trying: $requestsUri"
                 $requestsResponse = Invoke-RestMethod -Uri $requestsUri -Method Get -Headers $vraHeaders -ErrorAction Stop
-                
                 $requests = if ($requestsResponse.content) { $requestsResponse.content } elseif ($requestsResponse.value) { $requestsResponse.value } else { $requestsResponse }
-                
-                Write-Log "Found $($requests.Count) requests/actions in history"
+                $historyFetchSuccess = $true
+                Write-Log "SUCCESS with deployment API" "SUCCESS"
+            }
+            catch {
+                Write-Log "Deployment API failed: $($_.Exception.Message)" "WARN"
+            }
+            
+            # Try endpoint 2: Catalog API consumer resources
+            if (-not $historyFetchSuccess) {
+                try {
+                    $requestsUri = "https://$vraServer/catalog/api/consumer/resources/$($dep.id)/requests"
+                    Write-Log "Trying: $requestsUri"
+                    $requestsResponse = Invoke-RestMethod -Uri $requestsUri -Method Get -Headers $vraHeaders -ErrorAction Stop
+                    $requests = if ($requestsResponse.content) { $requestsResponse.content } elseif ($requestsResponse.value) { $requestsResponse.value } else { $requestsResponse }
+                    $historyFetchSuccess = $true
+                    Write-Log "SUCCESS with catalog consumer API" "SUCCESS"
+                }
+                catch {
+                    Write-Log "Catalog consumer API failed: $($_.Exception.Message)" "WARN"
+                }
+            }
+            
+            # Try endpoint 3: Get deployment actions
+            if (-not $historyFetchSuccess) {
+                try {
+                    $requestsUri = "https://$vraServer/deployment/api/deployments/$($dep.id)/actions"
+                    Write-Log "Trying: $requestsUri"
+                    $requestsResponse = Invoke-RestMethod -Uri $requestsUri -Method Get -Headers $vraHeaders -ErrorAction Stop
+                    $requests = if ($requestsResponse.content) { $requestsResponse.content } elseif ($requestsResponse.value) { $requestsResponse.value } else { $requestsResponse }
+                    $historyFetchSuccess = $true
+                    Write-Log "SUCCESS with deployment actions API" "SUCCESS"
+                }
+                catch {
+                    Write-Log "Deployment actions API failed: $($_.Exception.Message)" "WARN"
+                }
+            }
+            
+            if (-not $historyFetchSuccess) {
+                Write-Log "ERROR: Could not fetch request history from any API endpoint" "ERROR"
+                continue
+            }
+            
+            if ($requests) {
                 
                 # Step 3: Find the DELETE action(s)
                 $deleteRequests = $requests | Where-Object { 
