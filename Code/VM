@@ -150,7 +150,7 @@ $htmlRows
     td { border: 1px solid #ddd; padding: 10px; }
     tr:nth-child(even) { background-color: #f2f2f2; }
     tr:hover { background-color: #e8e8e8; }
-    .summary { background-color: #f9f9f9; padding: 15px; border-left: 4px solid #4CAF50; margin-bottom: 20px; }
+    .summary { background-color: #f9f9f9; padding: 10px 15px; border-left: 4px solid #4CAF50; margin-bottom: 20px; }
     .legend { margin-top: 10px; font-size: 14px; }
     .legend-item { display: inline-block; margin-right: 20px; }
     .legend-color { display: inline-block; width: 20px; height: 20px; margin-right: 5px; vertical-align: middle; border: 1px solid #ddd; }
@@ -269,13 +269,12 @@ try {
                 continue
             }
             
-            # Get health status from Aria Operations
-            $healthProp = $response.property | Where-Object { $_.name -eq "summary|health" } | Select-Object -First 1
+            # Get power state from Aria Operations
             $powerStateProp = $response.property | Where-Object { $_.name -eq "summary|runtime|powerState" } | Select-Object -First 1
             
             $status = "Unknown"
             
-            # First check power state
+            # Check power state
             if ($powerStateProp -and $powerStateProp.value) {
                 switch ($powerStateProp.value) {
                     "Powered On" { $status = "Online" }
@@ -283,17 +282,12 @@ try {
                     "Powered Off" { $status = "Decomm/Offline" }
                     "poweredOff" { $status = "Decomm/Offline" }
                     "Suspended" { $status = "Decomm/Offline" }
-                    default { $status = "Unknown" }
-                }
-            }
-            # Then check health if power state not available
-            elseif ($healthProp -and $healthProp.value) {
-                switch ($healthProp.value) {
-                    "GREEN" { $status = "Online" }
-                    "YELLOW" { $status = "Online" }
-                    "ORANGE" { $status = "Online" }
                     default { $status = "Decomm/Offline" }
                 }
+            }
+            else {
+                # If no power state found, default to Decomm/Offline
+                $status = "Decomm/Offline"
             }
             
             $vmObject = [PSCustomObject]@{
@@ -519,10 +513,16 @@ foreach ($vraServer in $vraServers) {
                         # Extract first part of FQDN
                         $vraServerShort = ($vraServer -split '\.')[0]
                         
-                        # Get catalog item from _catalogItemName
+                        # Get catalog item from inputs._catalogItemName
                         $catalogItem = "N/A"
-                        if ($dep.customProperties -and $dep.customProperties._catalogItemName) {
-                            $catalogItem = $dep.customProperties._catalogItemName
+                        if ($dep.inputs -and $dep.inputs._catalogItemName) {
+                            $catalogItem = $dep.inputs._catalogItemName
+                        }
+                        
+                        # If deployment is deleted, mark as Decomm/Offline
+                        $deploymentStatus = $dep.status
+                        if ($deploymentStatus -eq "DELETED") {
+                            $deploymentStatus = "Decomm/Offline"
                         }
                         
                         $deploymentData[$hostname] = @{
@@ -534,6 +534,7 @@ foreach ($vraServer in $vraServers) {
                             DeploymentID = $dep.id
                             Status = $dep.status
                             CatalogItem = $catalogItem
+                            DeploymentStatus = $deploymentStatus
                         }
                         
                         Write-DebugLog "    Stored deployment for $hostname from $vraServer"
@@ -633,10 +634,17 @@ foreach ($vmData in $newVMsData) {
     if ($depInfo) {
         Write-DebugLog "Matched VM '$vmName' to vRA deployment: $($depInfo.DeploymentName)"
         
+        # Check if deployment was deleted - if so, override status to Decomm/Offline
+        $finalStatus = $vmData.Status
+        if ($depInfo.Status -eq "DELETED") {
+            $finalStatus = "Decomm/Offline"
+            Write-DebugLog "  Deployment is DELETED - setting status to Decomm/Offline"
+        }
+        
         # VM found in vRA
         $reportObject = New-Object PSObject -Property @{
             Name = $vmName
-            Status = $vmData.Status
+            Status = $finalStatus
             DeploymentName = $depInfo.DeploymentName
             CatalogItem = $depInfo.CatalogItem
             RequestedBy = $depInfo.RequestedBy
