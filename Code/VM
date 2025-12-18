@@ -1,6 +1,6 @@
 # New Server Tracker - Aria Operations + Multi-vRA + vCenter
 # PowerShell 5.1 Compatible
-# Tracks servers built in the last day from vCenter Events and correlates with vRA deployments
+# Tracks servers built in the last day from Aria Operations and correlates with vRA deployments
 
 # Configuration Variables
 $ariaOpsServer = "aria-ops.yourdomain.com"
@@ -25,8 +25,8 @@ $smtpFrom = "vra-reports@yourdomain.com"
 $smtpTo = @("admin@yourdomain.com")
 $smtpSubject = "New Server Deployment Report - $(Get-Date -Format 'yyyy-MM-dd')"
 
-# Time range for new VMs (in hours - 24 hours = last day)
-$hoursBack = 24
+# Time range for new VMs (in days)
+$daysBack = 1
 
 # Output
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
@@ -92,7 +92,7 @@ function Send-NewServerReport {
         [string]$Subject,
         
         [Parameter(Mandatory=$false)]
-        [int]$HoursBack = 24,
+        [int]$DaysBack = 1,
         
         [Parameter(Mandatory=$false)]
         [string]$CsvPath
@@ -105,20 +105,18 @@ function Send-NewServerReport {
     foreach ($record in $ReportData) {
         # Color code rows based on source
         $rowClass = ""
-        if ($record.Source -eq "vCenter Direct") {
+        if ($record.Source -notlike "*vRA*") {
             $rowClass = " style='background-color: #fff3cd;'"
         }
         
         $htmlRows += "<tr$rowClass>"
         $htmlRows += "<td>$($record.Name)</td>"
         $htmlRows += "<td>$($record.Status)</td>"
-        $htmlRows += "<td>$($record.CreatedDate)</td>"
         $htmlRows += "<td>$($record.Source)</td>"
-        $htmlRows += "<td>$($record.CreatedBy)</td>"
+        $htmlRows += "<td>$($record.RequestedBy)</td>"
+        $htmlRows += "<td>$($record.Requestor)</td>"
         $htmlRows += "<td>$($record.DeploymentName)</td>"
         $htmlRows += "<td>$($record.CatalogItem)</td>"
-        $htmlRows += "<td>$($record.vRAServer)</td>"
-        $htmlRows += "<td>$($record.vCenter)</td>"
         $htmlRows += "</tr>"
     }
     
@@ -128,13 +126,11 @@ function Send-NewServerReport {
 <tr>
 <th>Name</th>
 <th>Status</th>
-<th>Created Date</th>
 <th>Source</th>
-<th>Created By</th>
+<th>Requested By</th>
+<th>Requestor</th>
 <th>Deployment Name</th>
 <th>Catalog Item</th>
-<th>vRA Server</th>
-<th>vCenter</th>
 </tr>
 </thead>
 <tbody>
@@ -143,8 +139,8 @@ $htmlRows
 </table>
 "@
     
-    $vraCount = ($ReportData | Where-Object { $_.Source -eq "vRA" }).Count
-    $vcenterCount = ($ReportData | Where-Object { $_.Source -eq "vCenter Direct" }).Count
+    $vraCount = ($ReportData | Where-Object { $_.Source -like "*vRA*" }).Count
+    $vcenterCount = ($ReportData | Where-Object { $_.Source -notlike "*vRA*" }).Count
     
     $currentDate = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $htmlBody = @"
@@ -172,7 +168,7 @@ $htmlRows
     <p><strong>Total New Servers:</strong> $($ReportData.Count)</p>
     <p><strong>Built via vRA:</strong> $vraCount</p>
     <p><strong>Built directly in vCenter:</strong> $vcenterCount</p>
-    <p><strong>Time Range:</strong> Last $HoursBack hours</p>
+    <p><strong>Time Range:</strong> Last $DaysBack day(s)</p>
 </div>
 <div class="legend">
     <div class="legend-item"><span class="legend-color" style="background-color: #fff3cd;"></span>Built directly in vCenter</div>
@@ -214,7 +210,7 @@ Write-DebugLog "SSL validation disabled"
 
 # Get credentials once for all connections
 Write-DebugLog "Requesting credentials..."
-$credential = Get-Credential -Message "Enter credentials for vCenter, Aria Operations, and vRA"
+$credential = Get-Credential -Message "Enter credentials for Aria Operations, vRA, and vCenter"
 if (-not $credential) {
     Write-DebugLog "Credentials not provided. Exiting." "ERROR"
     exit
@@ -223,105 +219,110 @@ $username = $credential.UserName
 $password = $credential.GetNetworkCredential().Password
 Write-DebugLog "Credentials obtained for user: $username"
 
-# Calculate cutoff time
-$cutoffDate = (Get-Date).AddHours(-$hoursBack)
-Write-DebugLog "Searching for VMs created after: $cutoffDate (last $hoursBack hours)"
-
-# Connect to vCenters and Get New VMs from Events
-Write-DebugLog "`n===== Connecting to vCenter Servers =====" "INFO"
+# Connect to Aria Operations and Get New VMs
+Write-DebugLog "`n===== Connecting to Aria Operations =====" "INFO"
+$ariaToken = $null
 $newVMsData = @()
-$allVCenterVMs = @{}
 
-foreach ($vCenter in $vCenters) {
-    Write-DebugLog "`n--- Connecting to vCenter: $vCenter ---" "INFO"
+try {
+    Write-DebugLog "Authenticating to Aria Operations: $ariaOpsServer"
     
-    try {
-        # Connect to vCenter
-        Write-DebugLog "Connecting to $vCenter..."
-        $vcConnection = Connect-VIServer -Server $vCenter -Credential $credential -ErrorAction Stop
-        Write-DebugLog "Connected to $vCenter successfully" "SUCCESS"
+    # Build vROps username format: username@domain@AuthSource
+    $ariaUsername = "$username@$ariaOpsDomain@$ariaOpsAuthSource"
+    Write-DebugLog "vROps authentication username: $ariaUsername"
+    
+    $ariaAuthUri = "https://$ariaOpsServer/suite-api/api/auth/token/acquire"
+    $ariaAuthBody = @{
+        username = $ariaUsername
+        password = $password
+    } | ConvertTo-Json
+    
+    $ariaAuthHeaders = @{
+        "Content-Type" = "application/json"
+        "Accept" = "application/json"
+    }
+    
+    $ariaAuthResponse = Invoke-RestMethod -Uri $ariaAuthUri -Method Post -Headers $ariaAuthHeaders -Body $ariaAuthBody -ErrorAction Stop
+    $ariaToken = $ariaAuthResponse.token
+    Write-DebugLog "Authenticated to Aria Operations successfully" "SUCCESS"
+    
+    $ariaHeaders = @{
+        "Authorization" = "vRealizeOpsToken $ariaToken"
+        "Content-Type" = "application/json"
+        "Accept" = "application/json"
+        "X-Ops-API-use-unsupported" = "true"
+    }
+    
+    # Calculate cutoff date (yesterday in Unix milliseconds)
+    $yesterday = [DateTimeOffset]::Now.AddDays(-$daysBack).ToUnixTimeMilliseconds()
+    Write-DebugLog "Searching for VMs created after: $(Get-Date).AddDays(-$daysBack)"
+    Write-DebugLog "Unix timestamp (ms): $yesterday"
+    
+    # Query Aria Operations for VMs created in the last day
+    $ariaInternalURL = "https://$ariaOpsServer/suite-api/api/resources?resourceKind=VirtualMachine"
+    Write-DebugLog "Querying Aria Operations API: $ariaInternalURL"
+    
+    $response = Invoke-RestMethod -Uri $ariaInternalURL -Headers $ariaHeaders -Method Get
+    $vmIdentifiers = $response.resourceList | Where-Object { $_.creationTime -ge $yesterday } | Select-Object -ExpandProperty identifier
+    $allVMProperties = @()
+    
+    Write-DebugLog "Found $($vmIdentifiers.Count) VMs created in the last $daysBack day(s)"
+    
+    # Get properties for each VM
+    foreach ($identifier in $vmIdentifiers) {
+        $vmPropertiesURL = "https://$ariaOpsServer/suite-api/api/resources/$identifier/properties?_no_links=true"
         
-        # Query for VM creation events in the last X hours
-        Write-DebugLog "Querying VM creation events from the last $hoursBack hours..."
-        
-        # Get VM creation events (VmCreatedEvent, VmBeingDeployedEvent, VmRegisteredEvent)
-        $events = Get-VIEvent -Server $vCenter -Start $cutoffDate -MaxSamples 50000 | Where-Object {
-            $_.GetType().Name -in @('VmCreatedEvent', 'VmBeingDeployedEvent', 'VmRegisteredEvent', 'VmDeployedEvent') -and
-            $_.Vm.Name -ne $null
-        }
-        
-        Write-DebugLog "Found $($events.Count) VM creation/deployment events"
-        
-        # Process each event
-        $vmsFoundInVC = 0
-        foreach ($event in $events) {
-            $vmName = $event.Vm.Name
+        try {
+            $response = Invoke-RestMethod -Uri $vmPropertiesURL -Headers $ariaHeaders -Method Get
             
-            # Skip if we already processed this VM from another vCenter
-            if ($allVCenterVMs.ContainsKey($vmName)) {
+            # Extract VM name
+            $vmName = $null
+            $nameProp = $response.property | Where-Object { $_.name -eq "config|name" -or $_.name -eq "summary|config|name" } | Select-Object -First 1
+            if ($nameProp) {
+                $vmName = $nameProp.value
+            }
+            
+            if (-not $vmName) {
                 continue
             }
             
-            # Get the VM object to check if it still exists and get current status
-            $vm = Get-VM -Name $vmName -Server $vCenter -ErrorAction SilentlyContinue
-            
-            if ($vm) {
-                $vmsFoundInVC++
-                
-                # Determine status
-                $status = "Unknown"
-                switch ($vm.PowerState) {
-                    "PoweredOn" { $status = "Online" }
-                    "PoweredOff" { $status = "Decomm/Offline" }
-                    "Suspended" { $status = "Decomm/Offline" }
-                    default { $status = "Unknown" }
+            # Get health status
+            $healthProp = $response.property | Where-Object { $_.name -eq "summary|health" } | Select-Object -First 1
+            $status = "Unknown"
+            if ($healthProp) {
+                switch ($healthProp.value) {
+                    "GREEN" { $status = "Online" }
+                    "YELLOW" { $status = "Online" }
+                    "ORANGE" { $status = "Online" }
+                    default { $status = "Decomm/Offline" }
                 }
-                
-                # Get creator from event
-                $createdBy = "N/A"
-                if ($event.UserName) {
-                    $createdBy = $event.UserName
-                } elseif ($event.UserName) {
-                    $createdBy = $event.UserName
-                }
-                
-                # Extract vCenter short name
-                $vCenterShort = ($vCenter -split '\.')[0]
-                
-                $vmObject = [PSCustomObject]@{
-                    Name = $vmName
-                    CreatedDate = $event.CreatedTime
-                    Status = $status
-                    CreatedByUser = $createdBy
-                    vCenter = $vCenterShort
-                    PowerState = $vm.PowerState
-                }
-                
-                $newVMsData += $vmObject
-                $allVCenterVMs[$vmName] = $vmObject
-                
-                Write-DebugLog "  Found VM: $vmName | Created: $($event.CreatedTime) | By: $createdBy | Status: $status"
             }
+            
+            $vmObject = [PSCustomObject]@{
+                Name = $vmName
+                Status = $status
+                ResourceId = $identifier
+            }
+            
+            $newVMsData += $vmObject
+            Write-DebugLog "  Found VM: $vmName | Status: $status"
         }
-        
-        Write-DebugLog "Found $vmsFoundInVC new VMs in $vCenter" "SUCCESS"
-        
-        # Disconnect from vCenter
-        Disconnect-VIServer -Server $vCenter -Confirm:$false
-        Write-DebugLog "Disconnected from $vCenter"
+        catch {
+            Write-DebugLog "  Error getting properties for VM $identifier : $($_.Exception.Message)" "WARN"
+        }
     }
-    catch {
-        Write-DebugLog "Error connecting to vCenter $vCenter : $($_.Exception.Message)" "ERROR"
-        Write-DebugLog "Error details: $($_.Exception)" "ERROR"
-    }
+    
+    Write-DebugLog "Successfully retrieved $($newVMsData.Count) new VMs from Aria Operations" "SUCCESS"
+}
+catch {
+    Write-DebugLog "Failed to query Aria Operations: $($_.Exception.Message)" "ERROR"
+    Write-DebugLog "Error details: $($_.Exception)" "ERROR"
+    Write-DebugLog "Cannot continue without Aria Operations data. Exiting." "ERROR"
+    exit
 }
 
-Write-DebugLog "`nTotal unique VMs found across all vCenters: $($newVMsData.Count)" "SUCCESS"
-
-# Exit early if no new VMs found
 if ($newVMsData.Count -eq 0) {
-    Write-DebugLog "`nNo new VMs found in the last $hoursBack hours. No email will be sent." "WARN"
-    Write-DebugLog "Script completed - nothing to report." "SUCCESS"
+    Write-DebugLog "`nNo new VMs found in Aria Operations. Exiting." "WARN"
     Write-Host "`nPress any key to exit..." -ForegroundColor Yellow
     $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
     exit
@@ -471,7 +472,7 @@ foreach ($vraServer in $vraServers) {
                                 Requestor = $requestor
                                 vRAServer = $vraServerShort
                                 DeploymentID = $dep.id
-                                Status = $dep.Status
+                                Status = $dep.status
                                 CatalogItem = $catalogItem
                             }
                             
@@ -506,6 +507,71 @@ foreach ($vraServer in $vraServers) {
 
 Write-DebugLog "`nTotal unique deployments found across all vRA servers: $($deploymentData.Count)" "SUCCESS"
 
+# Connect to vCenter for VMs not found in vRA
+Write-DebugLog "`n===== Connecting to vCenter for Additional Info =====" "INFO"
+$vCenterLookup = @{}
+
+# Build list of VMs that need vCenter lookup (not in vRA)
+$vmsNeedingVCenterLookup = @()
+foreach ($vmData in $newVMsData) {
+    if (-not $deploymentData.ContainsKey($vmData.Name)) {
+        $vmsNeedingVCenterLookup += $vmData.Name
+    }
+}
+
+Write-DebugLog "VMs not found in vRA that need vCenter lookup: $($vmsNeedingVCenterLookup.Count)"
+
+if ($vmsNeedingVCenterLookup.Count -gt 0) {
+    foreach ($vCenter in $vCenters) {
+        Write-DebugLog "`n--- Connecting to vCenter: $vCenter ---" "INFO"
+        
+        try {
+            # Connect to vCenter
+            Write-DebugLog "Connecting to $vCenter..."
+            $vcConnection = Connect-VIServer -Server $vCenter -Credential $credential -ErrorAction Stop
+            Write-DebugLog "Connected to $vCenter successfully" "SUCCESS"
+            
+            # Query for VM creation events for the VMs we need info on
+            $cutoffDate = (Get-Date).AddDays(-$daysBack)
+            Write-DebugLog "Querying VM creation events from the last $daysBack day(s)..."
+            
+            $events = Get-VIEvent -Server $vCenter -Start $cutoffDate -MaxSamples 50000 | Where-Object {
+                $_.GetType().Name -in @('VmCreatedEvent', 'VmBeingDeployedEvent', 'VmRegisteredEvent', 'VmDeployedEvent') -and
+                $_.Vm.Name -in $vmsNeedingVCenterLookup
+            }
+            
+            Write-DebugLog "Found $($events.Count) relevant creation events in $vCenter"
+            
+            foreach ($event in $events) {
+                $vmName = $event.Vm.Name
+                
+                if (-not $vCenterLookup.ContainsKey($vmName)) {
+                    $createdBy = "N/A"
+                    if ($event.UserName) {
+                        $createdBy = $event.UserName
+                    }
+                    
+                    $vCenterShort = ($vCenter -split '\.')[0]
+                    
+                    $vCenterLookup[$vmName] = @{
+                        CreatedBy = $createdBy
+                        vCenter = $vCenterShort
+                    }
+                    
+                    Write-DebugLog "  Found creator for $vmName : $createdBy (from $vCenterShort)"
+                }
+            }
+            
+            # Disconnect from vCenter
+            Disconnect-VIServer -Server $vCenter -Confirm:$false
+            Write-DebugLog "Disconnected from $vCenter"
+        }
+        catch {
+            Write-DebugLog "Error connecting to vCenter $vCenter : $($_.Exception.Message)" "ERROR"
+        }
+    }
+}
+
 # Build Final Report
 Write-DebugLog "`n===== Building Final Report =====" "INFO"
 $reportData = @()
@@ -513,48 +579,60 @@ $reportData = @()
 foreach ($vmData in $newVMsData) {
     $vmName = $vmData.Name
     
-    # Try to find deployment info
+    # Try to find deployment info from vRA
     $depInfo = $null
     if ($deploymentData.ContainsKey($vmName)) {
         $depInfo = $deploymentData[$vmName]
     }
     
     if ($depInfo) {
-        Write-DebugLog "Matched VM '$vmName' to deployment: $($depInfo.DeploymentName)"
+        Write-DebugLog "Matched VM '$vmName' to vRA deployment: $($depInfo.DeploymentName)"
         
         # VM found in vRA
         $reportObject = New-Object PSObject -Property @{
             Name = $vmName
             Status = $vmData.Status
-            CreatedDate = $vmData.CreatedDate
             DeploymentName = $depInfo.DeploymentName
             CatalogItem = $depInfo.CatalogItem
             RequestedBy = $depInfo.RequestedBy
             Requestor = $depInfo.Requestor
-            vRAServer = $depInfo.vRAServer
-            DeploymentStatus = $depInfo.Status
-            CreatedBy = $depInfo.RequestedBy
-            Source = "vRA"
-            vCenter = $vmData.vCenter
+            Source = $depInfo.vRAServer
         }
     }
     else {
-        Write-DebugLog "No deployment found for VM: $vmName - Built directly in vCenter" "WARN"
+        Write-DebugLog "No vRA deployment found for VM: $vmName - Checking vCenter" "WARN"
         
-        # VM NOT found in vRA
-        $reportObject = New-Object PSObject -Property @{
-            Name = $vmName
-            Status = $vmData.Status
-            CreatedDate = $vmData.CreatedDate
-            DeploymentName = "N/A - Built in vCenter"
-            CatalogItem = "N/A"
-            RequestedBy = "N/A"
-            Requestor = "N/A"
-            vRAServer = "N/A"
-            DeploymentStatus = "N/A"
-            CreatedBy = $vmData.CreatedByUser
-            Source = "vCenter Direct"
-            vCenter = $vmData.vCenter
+        # VM NOT found in vRA - look up from vCenter
+        $vcInfo = $null
+        if ($vCenterLookup.ContainsKey($vmName)) {
+            $vcInfo = $vCenterLookup[$vmName]
+        }
+        
+        if ($vcInfo) {
+            Write-DebugLog "  Found vCenter info for $vmName : Created by $($vcInfo.CreatedBy)"
+            
+            $reportObject = New-Object PSObject -Property @{
+                Name = $vmName
+                Status = $vmData.Status
+                DeploymentName = "N/A"
+                CatalogItem = "N/A"
+                RequestedBy = $vcInfo.CreatedBy
+                Requestor = $vcInfo.CreatedBy
+                Source = $vcInfo.vCenter
+            }
+        }
+        else {
+            Write-DebugLog "  No vCenter info found for $vmName either" "WARN"
+            
+            $reportObject = New-Object PSObject -Property @{
+                Name = $vmName
+                Status = $vmData.Status
+                DeploymentName = "N/A"
+                CatalogItem = "N/A"
+                RequestedBy = "N/A"
+                Requestor = "N/A"
+                Source = "Unknown"
+            }
         }
     }
     
@@ -565,7 +643,7 @@ Write-DebugLog "Report contains $($reportData.Count) records" "SUCCESS"
 
 # Export to CSV
 Write-DebugLog "`n===== Exporting Data =====" "INFO"
-$reportData | Select-Object Name, Status, CreatedDate, Source, CreatedBy, DeploymentName, CatalogItem, RequestedBy, Requestor, vRAServer, DeploymentStatus, vCenter | Export-Csv -Path $outputCSV -NoTypeInformation
+$reportData | Select-Object Name, Status, Source, RequestedBy, Requestor, DeploymentName, CatalogItem | Export-Csv -Path $outputCSV -NoTypeInformation
 Write-DebugLog "Exported to: $outputCSV" "SUCCESS"
 
 # Send Email Report
@@ -577,7 +655,7 @@ Send-NewServerReport `
     -From $smtpFrom `
     -To $smtpTo `
     -Subject $smtpSubject `
-    -HoursBack $hoursBack `
+    -DaysBack $daysBack `
     -CsvPath $outputCSV
 
 # Cleanup
