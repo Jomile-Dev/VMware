@@ -1,0 +1,57 @@
+// Fetch Aria Operations resources with proper query
+    const ariaQuery = {
+      resourceKind: ["VirtualMachine"],
+      name: [`*${searchQuery}*`]
+    };
+
+    const ariaResources = await fetch(`https://${ariaHost}/suite-api/api/resources/query`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${btoa(`${ariaUsername}:${ariaPassword}`)}`,
+        'Accept': 'application/json',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(ariaQuery)
+    });
+
+    if (!ariaResources.ok) {
+      throw new Error(`Aria Operations error: ${ariaResources.status}`);
+    }
+
+    const ariaData = await ariaResources.json();
+    
+    // Get property values for matching VMs
+    const matchingVMs = await Promise.all(
+      (ariaData.resourceList || []).map(async (resource) => {
+        try {
+          const propsResponse = await fetch(
+            `https://${ariaHost}/suite-api/api/resources/${resource.identifier}/properties`,
+            {
+              headers: {
+                'Authorization': `Basic ${btoa(`${ariaUsername}:${ariaPassword}`)}`,
+                'Accept': 'application/json'
+              }
+            }
+          );
+          
+          if (propsResponse.ok) {
+            const propsData = await propsResponse.json();
+            const machineProperty = propsData.property?.find(
+              p => p.name === 'Cloud.vsphere.Machine'
+            );
+            
+            return {
+              ...resource,
+              machineName: machineProperty?.value || resource.resourceKey?.name
+            };
+          }
+        } catch (err) {
+          console.error('Error fetching properties:', err);
+        }
+        
+        return {
+          ...resource,
+          machineName: resource.resourceKey?.name
+        };
+      })
+    );
