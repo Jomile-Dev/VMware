@@ -133,16 +133,15 @@ try {
         foreach ($dep in $deployments) {
             $totalProcessed++
             
-            # Filter by catalog item name - check if it contains "Virtual Machine" or "Database"
-            Write-Log "[$totalProcessed] Checking deployment: $($dep.name)"
-            Write-Log "  Catalog Item Name: $($dep.catalogItemName)"
+            # Filter by deployment name - check if it contains "Virtual Machine" or "Database"
+            Write-Log "[$totalProcessed] Checking: $($dep.name)"
             
-            if ($dep.catalogItemName -notmatch "Virtual Machine" -and $dep.catalogItemName -notmatch "Database") {
-                Write-Log "[$totalProcessed] Skipping: Catalog item '$($dep.catalogItemName)' doesn't contain VM/Database" "WARN"
+            if ($dep.name -notmatch "Virtual Machine" -and $dep.name -notmatch "Database") {
+                Write-Log "[$totalProcessed] Skipping: $($dep.name) (doesn't contain VM/Database)" "WARN"
                 continue
             }
             
-            Write-Log "[$totalProcessed] >>> CATALOG ITEM MATCHES! Processing: $($dep.catalogItemName) <<<" "SUCCESS"
+            Write-Log "[$totalProcessed] >>> MATCHES! Processing: $($dep.name) <<<" "SUCCESS"
             
             # Check date but log it for debugging
             $deleteDate = $null
