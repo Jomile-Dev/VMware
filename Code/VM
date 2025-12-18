@@ -91,122 +91,190 @@ $vraHeaders = @{
     "Content-Type" = "application/json"
 }
 
-# Fetch deleted deployment requests
-Write-Log "`n===== Fetching DELETE_DEPLOYMENT Requests ====="
-$requestsUri = "https://$vraServer/request/api/requests"
+# Fetch deleted deployments using the catalog/consume API
+Write-Log "`n===== Fetching Deleted Deployments ====="
+$deploymentsUri = "https://$vraServer/catalog/api/items"
 $cutoffDate = (Get-Date).AddDays(-$daysBack)
-Write-Log "Looking for DELETE_DEPLOYMENT requests from: $cutoffDate"
-Write-Log "Request API URL: $requestsUri"
+Write-Log "Looking for deleted deployments from: $cutoffDate"
 
-$allDeleteRequests = @()
+# First, let's try the deployment API with deleted filter
+$deploymentApiUri = "https://$vraServer/deployment/api/deployments"
+Write-Log "Deployment API URL: $deploymentApiUri"
+
+$allDeletedDeployments = @()
 $page = 0
 $size = 200
 
+# Try multiple approaches to find the right one
+$apiAttempts = @(
+    @{
+        Name = "Deployment API with deleted=true parameter"
+        Uri = "$deploymentApiUri`?deleted=true&page=$page&size=$size&expand=resources"
+    },
+    @{
+        Name = "Deployment API with deleted filter"
+        Uri = "$deploymentApiUri`?`$filter=deleted eq true&page=$page&size=$size&expand=resources"
+    },
+    @{
+        Name = "Deployment API - fetch all and filter"
+        Uri = "$deploymentApiUri`?page=$page&size=$size&expand=resources"
+        FilterInCode = $true
+    }
+)
+
+$successfulApi = $null
+
+foreach ($attempt in $apiAttempts) {
+    Write-Log "`n--- Trying: $($attempt.Name) ---"
+    Write-Log "  URL: $($attempt.Uri)"
+    
+    try {
+        $response = Invoke-RestMethod -Uri $attempt.Uri -Method Get -Headers $vraHeaders -ErrorAction Stop
+        
+        if ($response.content) {
+            $deployments = $response.content
+        }
+        elseif ($response.value) {
+            $deployments = $response.value
+        }
+        else {
+            $deployments = $response
+        }
+        
+        Write-Log "  SUCCESS! Retrieved $($deployments.Count) deployments" "SUCCESS"
+        
+        # If we need to filter in code
+        if ($attempt.FilterInCode) {
+            $deletedCount = ($deployments | Where-Object { $_.status -eq "DELETED" }).Count
+            Write-Log "  Found $deletedCount deleted deployments in results"
+        }
+        else {
+            Write-Log "  These should all be deleted deployments"
+        }
+        
+        # Show sample deployment structure
+        if ($deployments.Count -gt 0) {
+            $sample = $deployments[0]
+            Write-Log "`n  Sample Deployment Properties:"
+            $sample | Get-Member -MemberType NoteProperty | ForEach-Object {
+                Write-Log "    - $($_.Name)"
+            }
+        }
+        
+        $successfulApi = $attempt
+        break
+    }
+    catch {
+        Write-Log "  FAILED: $($_.Exception.Message)" "ERROR"
+    }
+}
+
+if (-not $successfulApi) {
+    Write-Log "`nAll API attempts failed. Cannot proceed." "ERROR"
+    throw "Unable to fetch deployments from any API endpoint"
+}
+
+Write-Log "`n===== Using successful API: $($successfulApi.Name) =====" "SUCCESS"
+
 try {
+    $page = 0
     do {
-        # Use $filter for type eq 'DELETE_DEPLOYMENT'
-        $pagedUri = "$requestsUri`?`$filter=type eq 'DELETE_DEPLOYMENT'&`$skip=$($page * $size)&`$top=$size"
-        Write-Log "Fetching DELETE_DEPLOYMENT requests page $($page + 1)..."
-        Write-Log "  Full URL: $pagedUri"
+        if ($successfulApi.FilterInCode) {
+            $pagedUri = "$deploymentApiUri`?page=$page&size=$size&expand=resources"
+        }
+        else {
+            $baseUri = $successfulApi.Uri -replace "page=\d+", "page=$page"
+            $pagedUri = $baseUri
+        }
+        
+        Write-Log "Fetching page $($page + 1)..."
+        Write-Log "  URL: $pagedUri"
         
         $response = Invoke-RestMethod -Uri $pagedUri -Method Get -Headers $vraHeaders -ErrorAction Stop
         
         if ($response.content) {
-            $requests = $response.content
+            $deployments = $response.content
         }
         elseif ($response.value) {
-            $requests = $response.value
+            $deployments = $response.value
         }
         else {
-            $requests = $response
+            $deployments = $response
         }
         
-        Write-Log "  Retrieved $($requests.Count) DELETE_DEPLOYMENT requests on page $($page + 1)" "SUCCESS"
+        Write-Log "  Retrieved $($deployments.Count) deployments on page $($page + 1)" "SUCCESS"
         
-        if ($requests.Count -eq 0) {
-            Write-Log "  No requests found, stopping pagination"
+        if ($deployments.Count -eq 0) {
+            Write-Log "  No deployments found, stopping pagination"
             break
         }
         
-        # Process each request
-        foreach ($req in $requests) {
-            Write-Log "`n  Processing DELETE_DEPLOYMENT request:"
-            Write-Log "    Request ID: $($req.id)"
-            Write-Log "    Name: $($req.name)"
-            Write-Log "    Type: $($req.type)"
-            Write-Log "    Status: $($req.status)"
-            Write-Log "    Requested By: $($req.requestedBy)"
-            Write-Log "    Created At: $($req.createdAt)"
-            Write-Log "    Updated At: $($req.updatedAt)"
+        # Filter for deleted deployments if needed
+        if ($successfulApi.FilterInCode) {
+            $deployments = $deployments | Where-Object { $_.status -eq "DELETED" }
+            Write-Log "  After filtering: $($deployments.Count) deleted deployments"
+        }
+        
+        # Process each deleted deployment
+        foreach ($dep in $deployments) {
+            Write-Log "`n  Processing deployment:"
+            Write-Log "    Name: $($dep.name)"
+            Write-Log "    ID: $($dep.id)"
+            Write-Log "    Status: $($dep.status)"
+            Write-Log "    Last Updated: $($dep.lastUpdatedAt)"
+            Write-Log "    Created By: $($dep.createdBy)"
+            Write-Log "    Owned By: $($dep.ownedBy)"
             
             # Check if within time range
-            if ($req.createdAt) {
-                $createdAt = [DateTime]$req.createdAt
+            if ($dep.lastUpdatedAt) {
+                $lastUpdated = [DateTime]$dep.lastUpdatedAt
                 
-                if ($createdAt -ge $cutoffDate) {
+                if ($lastUpdated -ge $cutoffDate) {
                     Write-Log "    >> Within time range (last $daysBack days)" "SUCCESS"
                     
-                    # Show all properties
-                    Write-Log "    All Request Properties:"
-                    $req | Get-Member -MemberType NoteProperty | ForEach-Object {
-                        $propName = $_.Name
-                        $propValue = $req.$propName
-                        if ($propValue -is [string] -or $propValue -is [int] -or $propValue -is [bool]) {
-                            Write-Log "      - $propName = $propValue"
-                        }
-                        else {
-                            Write-Log "      - $propName = [Complex Object]"
-                        }
-                    }
-                    
-                    # Check for outputs (VM details might be here)
-                    if ($req.outputs) {
-                        Write-Log "    Outputs:"
-                        $req.outputs | Get-Member -MemberType NoteProperty | ForEach-Object {
-                            $propName = $_.Name
-                            $propValue = $req.outputs.$propName
-                            Write-Log "      - $propName = $propValue"
-                        }
-                    }
-                    
-                    # Check for details
-                    if ($req.details) {
-                        Write-Log "    Details:"
-                        $req.details | Get-Member -MemberType NoteProperty | ForEach-Object {
-                            $propName = $_.Name
-                            $propValue = $req.details.$propName
-                            Write-Log "      - $propName = $propValue"
-                        }
-                    }
-                    
-                    # Check for resources
-                    if ($req.resources) {
-                        Write-Log "    Resources: $($req.resources.Count)"
-                        foreach ($res in $req.resources) {
-                            Write-Log "      Resource:"
-                            $res | Get-Member -MemberType NoteProperty | ForEach-Object {
-                                $propName = $_.Name
-                                $propValue = $res.$propName
-                                Write-Log "        - $propName = $propValue"
+                    # Show resources
+                    if ($dep.resources) {
+                        Write-Log "    Resources: $($dep.resources.Count)"
+                        
+                        foreach ($res in $dep.resources) {
+                            if ($res.type -eq "Cloud.vSphere.Machine") {
+                                Write-Log "`n      Cloud.vSphere.Machine Resource:"
+                                Write-Log "        Name: $($res.name)"
+                                Write-Log "        ID: $($res.id)"
+                                
+                                if ($res.properties) {
+                                    Write-Log "        Properties:"
+                                    $res.properties | Get-Member -MemberType NoteProperty | ForEach-Object {
+                                        $propName = $_.Name
+                                        $propValue = $res.properties.$propName
+                                        Write-Log "          - $propName = $propValue"
+                                    }
+                                }
                             }
                         }
                     }
                     
-                    # Check for blueprint
-                    if ($req.blueprint) {
-                        Write-Log "    Blueprint: $($req.blueprint)"
+                    # Show inputs
+                    if ($dep.inputs) {
+                        Write-Log "    Inputs:"
+                        $dep.inputs | Get-Member -MemberType NoteProperty | ForEach-Object {
+                            $propName = $_.Name
+                            $propValue = $dep.inputs.$propName
+                            Write-Log "      - $propName = $propValue"
+                        }
                     }
                     
-                    # Check for catalog item
-                    if ($req.catalogItemId) {
-                        Write-Log "    Catalog Item ID: $($req.catalogItemId)"
+                    # Show custom properties
+                    if ($dep.customProperties) {
+                        Write-Log "    Custom Properties:"
+                        $dep.customProperties | Get-Member -MemberType NoteProperty | ForEach-Object {
+                            $propName = $_.Name
+                            $propValue = $dep.customProperties.$propName
+                            Write-Log "      - $propName = $propValue"
+                        }
                     }
                     
-                    if ($req.catalogItemName) {
-                        Write-Log "    Catalog Item Name: $($req.catalogItemName)"
-                    }
-                    
-                    $allDeleteRequests += $req
+                    $allDeletedDeployments += $dep
                 }
                 else {
                     Write-Log "    >> Too old - before cutoff date" "WARN"
@@ -215,36 +283,41 @@ try {
         }
         
         $page++
+        $hasMore = $false
         
-        # Check if more pages available
-        $hasMore = ($requests.Count -eq $size)
+        if ($response.totalPages) { 
+            $hasMore = ($page -lt $response.totalPages)
+        } 
+        elseif ($response.totalElements) { 
+            $hasMore = (($page * $size) -lt $response.totalElements)
+        } 
+        else { 
+            $hasMore = ($deployments.Count -eq $size)
+        }
         
         if ($hasMore) {
             Write-Log "  More pages available, continuing..."
-        }
-        else {
-            Write-Log "  No more pages to fetch"
         }
         
     } while ($hasMore)
     
     Write-Log "`n===== Summary =====" "SUCCESS"
-    Write-Log "Total DELETE_DEPLOYMENT requests found: $($allDeleteRequests.Count)" "SUCCESS"
+    Write-Log "Total deleted deployments found: $($allDeletedDeployments.Count)" "SUCCESS"
     
     # Export to JSON for detailed inspection
-    $allDeleteRequests | ConvertTo-Json -Depth 10 | Out-File -FilePath $outputJson -Encoding UTF8
+    $allDeletedDeployments | ConvertTo-Json -Depth 10 | Out-File -FilePath $outputJson -Encoding UTF8
     Write-Log "Detailed data exported to: $outputJson" "SUCCESS"
     
-    if ($allDeleteRequests.Count -eq 0) {
-        Write-Log "No DELETE_DEPLOYMENT requests found in the last $daysBack day(s)" "WARN"
+    if ($allDeletedDeployments.Count -eq 0) {
+        Write-Log "No deleted deployments found in the last $daysBack day(s)" "WARN"
         Write-Log "Try increasing `$daysBack or check if there are actually any deleted deployments" "WARN"
     }
 }
 catch {
-    Write-Log "Error fetching requests: $($_.Exception.Message)" "ERROR"
+    Write-Log "Error fetching deployments: $($_.Exception.Message)" "ERROR"
     Write-Log "Error details: $($_.Exception)" "ERROR"
 }
 
 Write-Log "`n===== Script Completed =====" "SUCCESS"
-Write-Log "DELETE requests JSON: $outputJson"
+Write-Log "Deleted deployments JSON: $outputJson"
 Write-Log "Log file: $outputLog"
