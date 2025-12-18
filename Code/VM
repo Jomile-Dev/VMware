@@ -2,7 +2,7 @@
 # PowerShell 5.1 Compatible
 # Tracks servers built in the last day and correlates with vRA deployments
 
-#region Configuration Variables
+# Configuration Variables
 $vcServers = @(
     "vcenter1.yourdomain.com",
     "vcenter2.yourdomain.com"
@@ -29,9 +29,8 @@ $daysBack = 1
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $outputLog = "C:\Logs\NewServers_$timestamp.log"
 $outputCSV = "C:\Logs\NewServers_$timestamp.csv"
-#endregion
 
-#region Helper Functions
+# Helper Functions
 function Write-DebugLog {
     param(
         [string]$Message,
@@ -68,9 +67,8 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
     }
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 }
-#endregion
 
-#region Main Script
+# Main Script
 Write-DebugLog "===== Script Started =====" "SUCCESS"
 Write-DebugLog "PowerShell Version: $($PSVersionTable.PSVersion)"
 Write-DebugLog "Output CSV: $outputCSV"
@@ -97,7 +95,7 @@ $username = $credential.UserName
 $password = $credential.GetNetworkCredential().Password
 Write-DebugLog "Credentials obtained for user: $username"
 
-#region Connect to vCenter
+# Connect to vCenter
 Write-DebugLog "`n===== Connecting to vCenter Servers =====" "INFO"
 try {
     # Try to import VMware module
@@ -126,7 +124,7 @@ $allVMs = @()
 
 foreach ($vcServer in $vcServers) {
     try {
-        Write-DebugLog "`n--- Connecting to vCenter: $vcServer ---" "INFO"
+        Write-DebugLog "`n--- Connecting to vCenter $vcServer ---" "INFO"
         $vcConnection = Connect-VIServer -Server $vcServer -Credential $credential -ErrorAction Stop
         $vcConnections += $vcConnection
         Write-DebugLog "Connected to $vcServer successfully" "SUCCESS"
@@ -135,7 +133,7 @@ foreach ($vcServer in $vcServers) {
         Write-DebugLog "Fetching all VMs from $vcServer..."
         
         $vms = Get-VM -Server $vcServer
-        Write-DebugLog "Total VMs in $vcServer: $($vms.Count)"
+        Write-DebugLog "Total VMs in $vcServer : $($vms.Count)"
         
         # Add vCenter identifier to each VM object
         foreach ($vm in $vms) {
@@ -145,7 +143,7 @@ foreach ($vcServer in $vcServers) {
         $allVMs += $vms
     }
     catch {
-        Write-DebugLog "Failed to connect to $vcServer: $($_.Exception.Message)" "ERROR"
+        Write-DebugLog "Failed to connect to $vcServer : $($_.Exception.Message)" "ERROR"
         Write-DebugLog "Continuing with remaining vCenter servers..." "WARN"
     }
 }
@@ -159,9 +157,8 @@ if ($allVMs.Count -eq 0) {
 }
 
 Write-DebugLog "`nTotal VMs across all vCenters: $($allVMs.Count)" "SUCCESS"
-#endregion
 
-#region Connect to Aria Operations
+# Connect to Aria Operations
 Write-DebugLog "`n===== Connecting to Aria Operations =====" "INFO"
 $ariaToken = $null
 $vmStatusMap = @{}
@@ -170,15 +167,8 @@ $allNewVMs = @()
 try {
     Write-DebugLog "Authenticating to Aria Operations: $ariaOpsServer"
     
-    # Extract username without domain if present
-    $usernameOnly = $username
-    if ($username -like "*@*") {
-        $usernameOnly = ($username -split '@')[0]
-        Write-DebugLog "Extracted username without domain: $usernameOnly"
-    }
-    
     # Build vROps username format: username@domain@AuthSource
-    $ariaUsername = "$usernameOnly@$ariaOpsDomain@$ariaOpsAuthSource"
+    $ariaUsername = "$username@$ariaOpsDomain@$ariaOpsAuthSource"
     Write-DebugLog "vROps authentication username: $ariaUsername"
     
     $ariaAuthUri = "https://$ariaOpsServer/suite-api/api/auth/token/acquire"
@@ -266,12 +256,46 @@ try {
                     } | Select-Object -First 1
                     
                     if ($creationTimeProp -and $creationTimeProp.value) {
-                        $creationTime = [long]$creationTimeProp.value
+                        # Debug: Log the type and value we received
+                        $rawValue = $creationTimeProp.value
+                        $valueType = $rawValue.GetType().FullName
+                        Write-DebugLog "  DEBUG - VM: $vmName | Raw creation value: $rawValue | Type: $valueType"
+                        
+                        # Try to convert to long
+                        $creationTime = $null
+                        try {
+                            $creationTime = [long]$rawValue
+                            Write-DebugLog "  DEBUG - Successfully converted to long: $creationTime"
+                        }
+                        catch {
+                            Write-DebugLog "  ERROR - Failed to convert to long: $($_.Exception.Message)" "ERROR"
+                            continue
+                        }
+                        
+                        # Debug: Log comparison values
+                        Write-DebugLog "  DEBUG - Comparing creation time $creationTime vs cutoff $cutoffEpoch"
+                        Write-DebugLog "  DEBUG - Is new? $($creationTime -gt $cutoffEpoch)"
                         
                         if ($creationTime -gt $cutoffEpoch) {
                             $foundNewVMs++
-                            $creationDate = [datetime]'1970-01-01'.AddMilliseconds($creationTime)
-                            Write-DebugLog "  FOUND NEW VM: $vmName | Created: $creationDate (epoch: $creationTime)"
+                            
+                            # Convert epoch milliseconds to DateTime
+                            try {
+                                $epochStart = [datetime]'1970-01-01'
+                                Write-DebugLog "  DEBUG - Epoch start: $epochStart (Type: $($epochStart.GetType().FullName))"
+                                Write-DebugLog "  DEBUG - Adding milliseconds: $creationTime"
+                                
+                                $creationDate = $epochStart.AddMilliseconds($creationTime)
+                                Write-DebugLog "  FOUND NEW VM: $vmName | Created: $creationDate (epoch: $creationTime)"
+                            }
+                            catch {
+                                Write-DebugLog "  ERROR - Failed to convert epoch to date: $($_.Exception.Message)" "ERROR"
+                                Write-DebugLog "  ERROR - Epoch value: $creationTime | Type: $($creationTime.GetType().FullName)" "ERROR"
+                                
+                                # Use current date as fallback
+                                $creationDate = Get-Date
+                                Write-DebugLog "  WARNING - Using current date as fallback: $creationDate" "WARN"
+                            }
                             
                             # Get health status
                             $healthState = $resource.resourceStatusStates | Where-Object { $_.resourceState -eq "HEALTH" } | Select-Object -First 1
@@ -304,6 +328,7 @@ try {
                 }
                 catch {
                     Write-DebugLog "    Error processing resource: $($_.Exception.Message)" "WARN"
+                    Write-DebugLog "    Error stack trace: $($_.ScriptStackTrace)" "WARN"
                 }
             }
         }
@@ -345,14 +370,13 @@ if ($allNewVMs.Count -eq 0) {
     }
     exit
 }
-#endregion
 
-#region Connect to vRA and Get Deployment Info
+# Connect to vRA and Get Deployment Info
 Write-DebugLog "`n===== Processing vRA Servers =====" "INFO"
 $deploymentData = @{}
 
 foreach ($vraServer in $vraServers) {
-    Write-DebugLog "`n--- Connecting to vRA: $vraServer ---" "INFO"
+    Write-DebugLog "`n--- Connecting to vRA $vraServer ---" "INFO"
     
     try {
         # Authenticate to vRA
@@ -539,7 +563,7 @@ foreach ($vraServer in $vraServers) {
         Write-DebugLog "Completed scanning $vraServer - Found $deploymentsFound new deployments" "SUCCESS"
     }
     catch {
-        Write-DebugLog "Error processing vRA server $vraServer: $($_.Exception.Message)" "ERROR"
+        Write-DebugLog "Error processing vRA server $vraServer : $($_.Exception.Message)" "ERROR"
         Write-DebugLog "Error details: $($_.Exception)" "ERROR"
     }
 }
@@ -553,9 +577,8 @@ foreach ($vm in $allNewVMs) {
         Write-DebugLog "VM '$($vm.Name)' not found in any vRA deployment" "WARN"
     }
 }
-#endregion
 
-#region Build Final Report
+# Build Final Report
 Write-DebugLog "`n===== Building Final Report =====" "INFO"
 $reportData = @()
 
@@ -592,15 +615,13 @@ foreach ($vm in $allNewVMs) {
 }
 
 Write-DebugLog "Report contains $($reportData.Count) records" "SUCCESS"
-#endregion
 
-#region Export to CSV
+# Export to CSV
 Write-DebugLog "`n===== Exporting Data =====" "INFO"
 $reportData | Select-Object Name, Status, CreatedDate, DeploymentName, CatalogItem, RequestedBy, Requestor, vRAServer, DeploymentStatus | Export-Csv -Path $outputCSV -NoTypeInformation
 Write-DebugLog "Exported to: $outputCSV" "SUCCESS"
-#endregion
 
-#region Send Email
+# Send Email
 Write-DebugLog "`n===== Sending Email Report =====" "INFO"
 
 # Build HTML table for email
@@ -663,9 +684,8 @@ $htmlTable
 Write-DebugLog "Sending email to: $($smtpTo -join ', ')"
 Send-MailMessage -To $smtpTo -From $smtpFrom -Subject $smtpSubject -Body $htmlBody -BodyAsHtml -SmtpServer $smtpServer -Port $smtpPort -UseSsl -Attachments $outputCSV
 Write-DebugLog "Email sent successfully!" "SUCCESS"
-#endregion
 
-#region Cleanup
+# Cleanup
 Write-DebugLog "`n===== Cleanup =====" "INFO"
 if ($vcConnections.Count -gt 0) {
     foreach ($conn in $vcConnections) {
@@ -676,9 +696,3 @@ if ($vcConnections.Count -gt 0) {
 
 Write-DebugLog "`n===== Script Completed Successfully =====" "SUCCESS"
 Write-DebugLog "Results saved to: $outputCSV"
-Write-DebugLog "Log saved to: $outputLog"
-Write-DebugLog "`n========================================`n"
-Write-Host "`nPress any key to exit..." -ForegroundColor Yellow
-$null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
-#endregion
-#endregion
