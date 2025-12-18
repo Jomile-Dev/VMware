@@ -1,0 +1,654 @@
+# New Server Tracker - vCenter + Aria Operations + Multi-vRA
+
+# PowerShell 5.1 Compatible
+
+# Tracks servers built in the last day and correlates with vRA deployments
+
+#region Configuration Variables
+$vcServers = @(
+“vcenter1.yourdomain.com”,
+“vcenter2.yourdomain.com”
+)
+$ariaOpsServer = “aria-ops.yourdomain.com”
+$vraServers = @(
+“vra1.yourdomain.com”,
+“vra2.yourdomain.com”
+)
+
+# SMTP Configuration
+
+$smtpServer = “smtp.yourdomain.com”
+$smtpPort = 587
+$smtpFrom = “vra-reports@yourdomain.com”
+$smtpTo = @(“admin@yourdomain.com”)
+$smtpSubject = “New Server Deployment Report - $(Get-Date -Format ‘yyyy-MM-dd’)”
+
+# Time range for new VMs (in days)
+
+$daysBack = 1
+
+# Output
+
+$timestamp = Get-Date -Format ‘yyyyMMdd_HHmmss’
+$outputLog = “C:\Logs\NewServers_$timestamp.log”
+$outputCSV = “C:\Logs\NewServers_$timestamp.csv”
+#endregion
+
+#region Helper Functions
+function Write-DebugLog {
+param(
+[string]$Message,
+[string]$Level = “INFO”
+)
+$timestamp = Get-Date -Format “yyyy-MM-dd HH:mm:ss”
+$logMessage = “[$timestamp] [$Level] $Message”
+
+```
+$color = "Cyan"
+switch ($Level) {
+    "ERROR" { $color = "Red" }
+    "WARN" { $color = "Yellow" }
+    "SUCCESS" { $color = "Green" }
+}
+
+Write-Host $logMessage -ForegroundColor $color
+Add-Content -Path $outputLog -Value $logMessage
+```
+
+}
+
+function Disable-SSLValidation {
+if (-not ([System.Management.Automation.PSTypeName]’TrustAllCertsPolicy’).Type) {
+Add-Type @”
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+public class TrustAllCertsPolicy : ICertificatePolicy {
+public bool CheckValidationResult(
+ServicePoint svcPoint, X509Certificate certificate,
+WebRequest request, int certificateProblem) {
+return true;
+}
+}
+“@
+[System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+}
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+}
+#endregion
+
+#region Main Script
+try {
+Write-DebugLog “===== Script Started =====” “SUCCESS”
+Write-DebugLog “PowerShell Version: $($PSVersionTable.PSVersion)”
+Write-DebugLog “Output CSV: $outputCSV”
+Write-DebugLog “Combined Log: $outputLog”
+
+```
+# Ensure log directory exists
+$logDir = Split-Path $outputCSV -Parent
+if (!(Test-Path $logDir)) {
+    New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+    Write-DebugLog "Created log directory: $logDir"
+}
+
+Disable-SSLValidation
+Write-DebugLog "SSL validation disabled"
+
+# Get credentials once for all connections
+Write-DebugLog "Requesting credentials..."
+$credential = Get-Credential -Message "Enter credentials for vCenter, Aria Operations, and vRA"
+if (-not $credential) {
+    Write-DebugLog "Credentials not provided. Exiting." "ERROR"
+    return
+}
+$username = $credential.UserName
+$password = $credential.GetNetworkCredential().Password
+Write-DebugLog "Credentials obtained for user: $username"
+
+#region Connect to vCenter
+Write-DebugLog "`n===== Connecting to vCenter Servers =====" "INFO"
+try {
+    # Try to import VMware module
+    $vmwareModule = Get-Module -Name VMware.VimAutomation.Core -ListAvailable | Select-Object -First 1
+    if ($vmwareModule) {
+        Import-Module VMware.VimAutomation.Core -ErrorAction Stop
+        Write-DebugLog "VMware PowerCLI module loaded (Version: $($vmwareModule.Version))"
+    }
+    else {
+        Write-DebugLog "CRITICAL: VMware PowerCLI not installed. Install with: Install-Module VMware.PowerCLI -Scope CurrentUser" "ERROR"
+        throw "VMware PowerCLI not found"
+    }
+}
+catch {
+    Write-DebugLog "Error loading VMware module: $($_.Exception.Message)" "ERROR"
+    throw
+}
+
+# Suppress certificate warnings for PowerCLI
+$null = Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session
+$null = Set-PowerCLIConfiguration -ParticipateInCeip $false -Confirm:$false -Scope Session
+
+# Connect to all vCenter servers
+$vcConnections = @()
+$allNewVMs = @()
+
+foreach ($vcServer in $vcServers) {
+    try {
+        Write-DebugLog "`n--- Connecting to vCenter: $vcServer ---" "INFO"
+        $vcConnection = Connect-VIServer -Server $vcServer -Credential $credential -ErrorAction Stop
+        $vcConnections += $vcConnection
+        Write-DebugLog "Connected to $vcServer successfully" "SUCCESS"
+        
+        # Get VMs created in the last X days from this vCenter
+        $cutoffDate = (Get-Date).AddDays(-$daysBack)
+        Write-DebugLog "Searching for VMs created after: $cutoffDate on $vcServer"
+        
+        $allVMs = Get-VM -Server $vcServer
+        Write-DebugLog "Total VMs in $vcServer`: $($allVMs.Count)"
+        
+        $newVMs = $allVMs | Where-Object { 
+            $_.CreateDate -gt $cutoffDate 
+        }
+        
+        Write-DebugLog "Found $($newVMs.Count) VMs created in the last $daysBack day(s) on $vcServer" "SUCCESS"
+        
+        # Add vCenter identifier to each VM object
+        foreach ($vm in $newVMs) {
+            # Add a note property to track which vCenter this came from
+            $vm | Add-Member -MemberType NoteProperty -Name "vCenterServer" -Value ($vcServer -split '\.')[0] -Force
+            Write-DebugLog "  - $($vm.Name) | PowerState: $($vm.PowerState) | Created: $($vm.CreateDate) | vCenter: $(($vcServer -split '\.')[0])"
+        }
+        
+        $allNewVMs += $newVMs
+    }
+    catch {
+        Write-DebugLog "Failed to connect to $vcServer`: $($_.Exception.Message)" "ERROR"
+        Write-DebugLog "Continuing with remaining vCenter servers..." "WARN"
+    }
+}
+
+if ($allNewVMs.Count -eq 0) {
+    Write-DebugLog "`nNo new VMs found across all vCenter servers. Exiting." "WARN"
+    foreach ($conn in $vcConnections) {
+        Disconnect-VIServer -Server $conn -Confirm:$false -ErrorAction SilentlyContinue
+    }
+    return
+}
+
+Write-DebugLog "`nTotal new VMs across all vCenters: $($allNewVMs.Count)" "SUCCESS"
+#endregion
+
+#region Connect to Aria Operations
+Write-DebugLog "`n===== Connecting to Aria Operations =====" "INFO"
+$ariaToken = $null
+$vmStatusMap = @{}
+
+try {
+    Write-DebugLog "Authenticating to Aria Operations: $ariaOpsServer"
+    $ariaAuthUri = "https://$ariaOpsServer/suite-api/api/auth/token/acquire"
+    $ariaAuthBody = @{
+        username = $username
+        password = $password
+    } | ConvertTo-Json
+    
+    $ariaAuthHeaders = @{
+        "Content-Type" = "application/json"
+        "Accept" = "application/json"
+    }
+    
+    $ariaAuthResponse = Invoke-RestMethod -Uri $ariaAuthUri -Method Post -Headers $ariaAuthHeaders -Body $ariaAuthBody -ErrorAction Stop
+    $ariaToken = $ariaAuthResponse.token
+    Write-DebugLog "Authenticated to Aria Operations successfully" "SUCCESS"
+    
+    $ariaHeaders = @{
+        "Authorization" = "vRealizeOpsToken $ariaToken"
+        "Content-Type" = "application/json"
+        "Accept" = "application/json"
+    }
+    
+    # Get VM status from Aria Operations for each new VM
+    Write-DebugLog "Querying VM status from Aria Operations..."
+    foreach ($vm in $allNewVMs) {
+        try {
+            $vmName = $vm.Name
+            Write-DebugLog "  Checking status for: $vmName"
+            
+            # Search for the VM resource in Aria Operations
+            $escapedVmName = [uri]::EscapeDataString($vmName)
+            $searchUri = "https://$ariaOpsServer/suite-api/api/resources?name=$escapedVmName&resourceKind=VirtualMachine"
+            $searchResponse = Invoke-RestMethod -Uri $searchUri -Method Get -Headers $ariaHeaders -ErrorAction Stop
+            
+            if ($searchResponse.resourceList -and $searchResponse.resourceList.Count -gt 0) {
+                $resource = $searchResponse.resourceList[0]
+                $resourceId = $resource.identifier
+                
+                # Get resource health/status
+                $statusUri = "https://$ariaOpsServer/suite-api/api/resources/$resourceId"
+                $statusResponse = Invoke-RestMethod -Uri $statusUri -Method Get -Headers $ariaHeaders -ErrorAction Stop
+                
+                $healthState = $statusResponse.resourceStatusStates | Where-Object { $_.resourceState -eq "HEALTH" } | Select-Object -First 1
+                $status = if ($healthState) { $healthState.status } else { "UNKNOWN" }
+                
+                # Map status to simple online/offline/decomm
+                $simpleStatus = "Unknown"
+                switch ($status) {
+                    "GREEN" { $simpleStatus = "Online" }
+                    "YELLOW" { $simpleStatus = "Online" }
+                    "ORANGE" { $simpleStatus = "Online" }
+                    "RED" { $simpleStatus = "Offline" }
+                    "GREY" { $simpleStatus = "Decomm/Offline" }
+                }
+                
+                $vmStatusMap[$vmName] = $simpleStatus
+                Write-DebugLog "    Status: $simpleStatus ($status)"
+            }
+            else {
+                Write-DebugLog "    VM not found in Aria Operations, using vCenter PowerState" "WARN"
+                if ($vm.PowerState -eq "PoweredOn") {
+                    $vmStatusMap[$vmName] = "Online"
+                } else {
+                    $vmStatusMap[$vmName] = "Offline"
+                }
+            }
+        }
+        catch {
+            Write-DebugLog "    Error checking Aria Ops status: $($_.Exception.Message)" "WARN"
+            if ($vm.PowerState -eq "PoweredOn") {
+                $vmStatusMap[$vmName] = "Online"
+            } else {
+                $vmStatusMap[$vmName] = "Offline"
+            }
+        }
+    }
+}
+catch {
+    Write-DebugLog "Failed to connect to Aria Operations: $($_.Exception.Message)" "WARN"
+    Write-DebugLog "Will use vCenter PowerState for VM status" "WARN"
+    
+    # Fallback to vCenter PowerState
+    foreach ($vm in $allNewVMs) {
+        if ($vm.PowerState -eq "PoweredOn") {
+            $vmStatusMap[$vm.Name] = "Online"
+        } else {
+            $vmStatusMap[$vm.Name] = "Offline"
+        }
+    }
+}
+#endregion
+
+#region Connect to vRA and Get Deployment Info
+Write-DebugLog "`n===== Processing vRA Servers =====" "INFO"
+$deploymentData = @{}
+
+foreach ($vraServer in $vraServers) {
+    Write-DebugLog "`n--- Connecting to vRA: $vraServer ---" "INFO"
+    
+    try {
+        # Authenticate to vRA
+        Write-DebugLog "Authenticating to $vraServer..."
+        $vraAuthUri = "https://$vraServer/csp/gateway/am/api/login"
+        $vraAuthBody = @{
+            username = $username
+            password = $password
+        } | ConvertTo-Json
+        
+        $vraAuthHeaders = @{
+            "Content-Type" = "application/json"
+            "Accept" = "application/json"
+        }
+        
+        $vraAuthResponse = Invoke-RestMethod -Uri $vraAuthUri -Method Post -Headers $vraAuthHeaders -Body $vraAuthBody -ErrorAction Stop
+        $vraToken = $vraAuthResponse.cspAuthToken
+        Write-DebugLog "Authenticated to $vraServer successfully" "SUCCESS"
+        
+        $vraHeaders = @{
+            "Authorization" = "Bearer $vraToken"
+            "Content-Type" = "application/json"
+        }
+        
+        # Fetch deployments
+        Write-DebugLog "Fetching deployments from $vraServer..."
+        $vraUri = "https://$vraServer/deployment/api/deployments"
+        $page = 0
+        $size = 1000
+        $deploymentsFound = 0
+        
+        do {
+            $pagedUri = "$vraUri`?page=$page&size=$size&expand=resources"
+            Write-DebugLog "  Fetching page $($page + 1) (size: $size)..."
+            
+            $vraResponse = Invoke-RestMethod -Uri $pagedUri -Method Get -Headers $vraHeaders -ErrorAction Stop
+            if ($vraResponse.content) {
+                $deployments = $vraResponse.content
+            } else {
+                $deployments = $vraResponse
+            }
+            
+            Write-DebugLog "  Retrieved $($deployments.Count) deployments on page $($page + 1)"
+            
+            # Filter for deployments with vSphere machines
+            $deploymentsWithVMs = @()
+            foreach ($dep in $deployments) {
+                if ($dep.resources) {
+                    $hasVSphereMachine = $false
+                    foreach ($res in $dep.resources) {
+                        if ($res.type -eq "Cloud.vSphere.Machine") {
+                            $hasVSphereMachine = $true
+                            break
+                        }
+                    }
+                    if ($hasVSphereMachine) {
+                        $deploymentsWithVMs += $dep
+                    }
+                }
+            }
+            
+            Write-DebugLog "  $($deploymentsWithVMs.Count) deployments have vSphere machines"
+            
+            foreach ($dep in $deploymentsWithVMs) {
+                $vSphereMachines = @()
+                foreach ($res in $dep.resources) {
+                    if ($res.type -eq "Cloud.vSphere.Machine") {
+                        $vSphereMachines += $res
+                    }
+                }
+                
+                foreach ($machine in $vSphereMachines) {
+                    # Get hostname from various possible properties
+                    # Check all Cloud.vSphere.Machine and Cloud.Machine properties
+                    $hostname = $null
+                    
+                    # Try common property names
+                    if ($machine.properties) {
+                        $props = $machine.properties
+                        
+                        # Priority order for finding hostname
+                        if ($props.hostname) { 
+                            $hostname = $props.hostname 
+                            Write-DebugLog "    Found hostname in properties.hostname: $hostname"
+                        } 
+                        elseif ($props.resourceName) {
+                            $hostname = $props.resourceName
+                            Write-DebugLog "    Found hostname in properties.resourceName: $hostname"
+                        }
+                        elseif ($props.name) {
+                            $hostname = $props.name
+                            Write-DebugLog "    Found hostname in properties.name: $hostname"
+                        }
+                        elseif ($props.address) {
+                            $hostname = $props.address
+                            Write-DebugLog "    Found hostname in properties.address: $hostname"
+                        }
+                        elseif ($props.hostName) {
+                            $hostname = $props.hostName
+                            Write-DebugLog "    Found hostname in properties.hostName: $hostname"
+                        }
+                    }
+                    
+                    # Fallback to machine name
+                    if (-not $hostname -and $machine.name) {
+                        $hostname = $machine.name
+                        Write-DebugLog "    Found hostname in machine.name: $hostname"
+                    }
+                    
+                    if ($hostname) {
+                        # Only store if not already found in a previous vRA
+                        if (-not $deploymentData.ContainsKey($hostname)) {
+                            $deploymentsFound++
+                            
+                            $description = "N/A"
+                            if ($dep.description) { $description = $dep.description }
+                            
+                            $requestedBy = "N/A"
+                            if ($dep.createdBy) { $requestedBy = $dep.createdBy }
+                            
+                            $requestor = $requestedBy
+                            if ($dep.ownedBy) { $requestor = $dep.ownedBy }
+                            
+                            # Extract first part of FQDN (e.g., "vra1" from "vra1.yourdomain.com")
+                            $vraServerShort = ($vraServer -split '\.')[0]
+                            
+                            # Get catalog item from customProperties.category
+                            $catalogItem = "N/A"
+                            if ($dep.customProperties -and $dep.customProperties.category) {
+                                $catalogItem = $dep.customProperties.category
+                                Write-DebugLog "    Found catalog item: $catalogItem"
+                            }
+                            
+                            $deploymentData[$hostname] = @{
+                                DeploymentName = $dep.name
+                                Description = $description
+                                RequestedBy = $requestedBy
+                                Requestor = $requestor
+                                vRAServer = $vraServerShort
+                                DeploymentID = $dep.id
+                                Status = $dep.status
+                                CatalogItem = $catalogItem
+                            }
+                            
+                            Write-DebugLog "    Stored deployment for $hostname from $vraServer"
+                        }
+                        else {
+                            Write-DebugLog "    Skipping $hostname - already found in another vRA" "WARN"
+                        }
+                    }
+                    else {
+                        Write-DebugLog "    Could not determine hostname for machine in deployment $($dep.name)" "WARN"
+                        Write-DebugLog "    Machine type: $($machine.type), Machine ID: $($machine.id)"
+                        
+                        # Log all available properties for debugging
+                        if ($machine.properties) {
+                            Write-DebugLog "    Available properties: $($machine.properties.Keys -join ', ')"
+                        }
+                    }
+                }
+            }
+            
+            $page++
+            $hasMore = $false
+            
+            if ($vraResponse.totalPages) { 
+                $hasMore = ($page -lt $vraResponse.totalPages)
+            } elseif ($vraResponse.totalElements) { 
+                $hasMore = (($page * $size) -lt $vraResponse.totalElements)
+            } else { 
+                $hasMore = ($deployments.Count -eq $size)
+            }
+            
+        } while ($hasMore)
+        
+        Write-DebugLog "Completed scanning $vraServer - Found $deploymentsFound new deployments" "SUCCESS"
+    }
+    catch {
+        Write-DebugLog "Error processing vRA server $vraServer`: $($_.Exception.Message)" "ERROR"
+        Write-DebugLog "Error details: $($_.Exception)" "ERROR"
+    }
+}
+
+Write-DebugLog "`nTotal unique deployments found across all vRA servers: $($deploymentData.Count)" "SUCCESS"
+
+# Log which VMs were not found in any vRA
+Write-DebugLog "`n--- VM to Deployment Matching ---" "INFO"
+foreach ($vm in $allNewVMs) {
+    if (-not $deploymentData.ContainsKey($vm.Name)) {
+        Write-DebugLog "VM '$($vm.Name)' not found in any vRA deployment" "WARN"
+    }
+}
+#endregion
+
+#region Build Final Report
+Write-DebugLog "`n===== Building Final Report =====" "INFO"
+$reportData = @()
+
+foreach ($vm in $allNewVMs) {
+    $vmName = $vm.Name
+    $vmStatus = $vmStatusMap[$vmName]
+    
+    # Try to find deployment info
+    $depInfo = $null
+    if ($deploymentData.ContainsKey($vmName)) {
+        $depInfo = $deploymentData[$vmName]
+    }
+    
+    if ($depInfo) {
+        Write-DebugLog "Matched VM '$vmName' to deployment: $($depInfo.DeploymentName)"
+    }
+    else {
+        Write-DebugLog "No deployment found for VM: $vmName" "WARN"
+    }
+    
+    $reportObject = New-Object PSObject -Property @{
+        Name = $vmName
+        Status = $vmStatus
+        CreatedDate = $vm.CreateDate
+        DeploymentName = if ($depInfo) { $depInfo.DeploymentName } else { "Not Found" }
+        CatalogItem = if ($depInfo) { $depInfo.CatalogItem } else { "N/A" }
+        RequestedBy = if ($depInfo) { $depInfo.RequestedBy } else { "N/A" }
+        Requestor = if ($depInfo) { $depInfo.Requestor } else { "N/A" }
+        vRAServer = if ($depInfo) { $depInfo.vRAServer } else { "N/A" }
+        DeploymentStatus = if ($depInfo) { $depInfo.Status } else { "N/A" }
+    }
+    
+    $reportData += $reportObject
+}
+
+Write-DebugLog "Report contains $($reportData.Count) records" "SUCCESS"
+#endregion
+
+#region Export to CSV
+Write-DebugLog "`n===== Exporting Data =====" "INFO"
+# Select properties in specific order for CSV
+$reportData | Select-Object Name, Status, CreatedDate, DeploymentName, CatalogItem, RequestedBy, Requestor, vRAServer, DeploymentStatus | Export-Csv -Path $outputCSV -NoTypeInformation
+Write-DebugLog "Exported to: $outputCSV" "SUCCESS"
+#endregion
+
+#region Send Email
+Write-DebugLog "`n===== Sending Email Report =====" "INFO"
+try {
+    Write-DebugLog "Requesting SMTP credentials..."
+    $smtpCredential = Get-Credential -Message "Enter SMTP credentials"
+    
+    if (-not $smtpCredential) {
+        Write-DebugLog "SMTP credentials not provided. Skipping email." "WARN"
+    }
+    else {
+        # Build HTML table for email
+        $htmlRows = ""
+        foreach ($record in $reportData) {
+            $htmlRows += "<tr>"
+            $htmlRows += "<td>$($record.Name)</td>"
+            $htmlRows += "<td>$($record.Status)</td>"
+            $htmlRows += "<td>$($record.CreatedDate)</td>"
+            $htmlRows += "<td>$($record.DeploymentName)</td>"
+            $htmlRows += "<td>$($record.CatalogItem)</td>"
+            $htmlRows += "<td>$($record.RequestedBy)</td>"
+            $htmlRows += "<td>$($record.Requestor)</td>"
+            $htmlRows += "<td>$($record.vRAServer)</td>"
+            $htmlRows += "</tr>"
+        }
+        
+        $htmlTable = @"
+```
+
+<table>
+<thead>
+<tr>
+<th>Name</th>
+<th>Status</th>
+<th>Created Date</th>
+<th>Deployment Name</th>
+<th>Catalog Item</th>
+<th>Requested By</th>
+<th>Requestor</th>
+<th>vRA Server</th>
+</tr>
+</thead>
+<tbody>
+$htmlRows
+</tbody>
+</table>
+"@
+
+```
+        $currentDate = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        $htmlBody = @"
+```
+
+<html>
+<head>
+<style>
+    body { font-family: Arial, sans-serif; }
+    table { border-collapse: collapse; width: 100%; }
+    th { background-color: #4CAF50; color: white; padding: 8px; text-align: left; }
+    td { border: 1px solid #ddd; padding: 8px; }
+    tr:nth-child(even) { background-color: #f2f2f2; }
+</style>
+</head>
+<body>
+<h2>New Server Deployment Report</h2>
+<p>Generated: $currentDate</p>
+<p>Total New Servers: $($reportData.Count)</p>
+$htmlTable
+<p><small>CSV attached for detailed analysis.</small></p>
+</body>
+</html>
+"@
+
+```
+        Write-DebugLog "Sending email to: $($smtpTo -join ', ')"
+        Send-MailMessage `
+            -From $smtpFrom `
+            -To $smtpTo `
+            -Subject $smtpSubject `
+            -Body $htmlBody `
+            -BodyAsHtml `
+            -SmtpServer $smtpServer `
+            -Port $smtpPort `
+            -UseSsl `
+            -Credential $smtpCredential `
+            -Attachments $outputCSV `
+            -ErrorAction Stop
+        
+        Write-DebugLog "Email sent successfully!" "SUCCESS"
+    }
+}
+catch {
+    Write-DebugLog "Failed to send email: $($_.Exception.Message)" "ERROR"
+    if ($_.Exception.InnerException) {
+        Write-DebugLog "Email error details: $($_.Exception.InnerException)" "ERROR"
+    }
+}
+#endregion
+
+#region Cleanup
+Write-DebugLog "`n===== Cleanup =====" "INFO"
+if ($vcConnections.Count -gt 0) {
+    foreach ($conn in $vcConnections) {
+        Disconnect-VIServer -Server $conn -Confirm:$false -ErrorAction SilentlyContinue
+        Write-DebugLog "Disconnected from $($conn.Name)"
+    }
+}
+
+Write-DebugLog "`n===== Script Completed Successfully =====" "SUCCESS"
+Write-DebugLog "Results saved to: $outputCSV"
+Write-DebugLog "Log saved to: $outputLog"
+Write-DebugLog "`n========================================`n"
+Write-Host "`nPress any key to exit..." -ForegroundColor Yellow
+$null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+#endregion
+```
+
+}
+finally {
+# Final cleanup
+if ($vcConnections -and $vcConnections.Count -gt 0) {
+try {
+foreach ($conn in $vcConnections) {
+Disconnect-VIServer -Server $conn -Confirm:$false -ErrorAction SilentlyContinue
+}
+} catch {
+# Suppress any cleanup errors
+}
+}
+}
+#endregion
