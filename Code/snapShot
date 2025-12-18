@@ -1,560 +1,595 @@
-#Requires -Modules VMware.VimAutomation.Core
+# New Server Tracker - Aria Operations + Multi-vRA + vCenter
+# PowerShell 5.1 Compatible
+# Tracks servers built in the last day from vCenter Events and correlates with vRA deployments
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
+# Configuration Variables
+$ariaOpsServer = "aria-ops.yourdomain.com"
+$ariaOpsDomain = "yourdomain.com"
+$ariaOpsAuthSource = "localos"
+$vraServers = @(
+    "vra1.yourdomain.com",
+    "vra2.yourdomain.com"
+)
 
+# vCenter Configuration
 $vCenters = @(
     "vcenter1.domain.com",
     "vcenter2.domain.com",
     "vcenter3.domain.com"
 )
 
-$vraServer = "vra.domain.com"
-
-# Email settings
-$smtpServer = "smtp.domain.com"
+# SMTP Configuration
+$smtpServer = "smtp.yourdomain.com"
 $smtpPort = 587
-$emailFrom = "snapshots@domain.com"
-$emailTo = @("admin@domain.com")
-$emailSubject = "vCenter Snapshot Report - $(Get-Date -Format 'yyyy-MM-dd')"
+$smtpFrom = "vra-reports@yourdomain.com"
+$smtpTo = @("admin@yourdomain.com")
+$smtpSubject = "New Server Deployment Report - $(Get-Date -Format 'yyyy-MM-dd')"
 
-# ============================================================================
-# FUNCTIONS
-# ============================================================================
+# Time range for new VMs (in hours - 24 hours = last day)
+$hoursBack = 24
 
-function Get-vRAAccessToken {
+# Output
+$timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$outputLog = "C:\Logs\NewServers_$timestamp.log"
+$outputCSV = "C:\Logs\NewServers_$timestamp.csv"
+
+# Helper Functions
+function Write-DebugLog {
     param(
-        [Parameter(Mandatory)]
-        [PSCredential]$Credential,
-        [Parameter(Mandatory)]
-        [string]$Server
+        [string]$Message,
+        [string]$Level = "INFO"
     )
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logMessage = "[$timestamp] [$Level] $Message"
     
-    $uri = "https://$Server/csp/gateway/am/api/login?access_token"
-    $body = @{
-        username = $Credential.UserName
-        password = $Credential.GetNetworkCredential().Password
-    } | ConvertTo-Json
+    $color = "Cyan"
+    switch ($Level) {
+        "ERROR" { $color = "Red" }
+        "WARN" { $color = "Yellow" }
+        "SUCCESS" { $color = "Green" }
+    }
     
-    try {
-        $response = Invoke-RestMethod -Uri $uri -Method Post -Body $body -ContentType "application/json" -ErrorAction Stop
-        return $response.refresh_token
-    }
-    catch {
-        Write-Warning "Failed to get vRA refresh token: $_"
-        return $null
-    }
+    Write-Host $logMessage -ForegroundColor $color
+    Add-Content -Path $outputLog -Value $logMessage
 }
 
-function Get-vRABearerToken {
-    param(
-        [Parameter(Mandatory)]
-        [string]$RefreshToken,
-        [Parameter(Mandatory)]
-        [string]$Server
-    )
-    
-    $uri = "https://$Server/iaas/api/login"
-    $body = @{ refreshToken = $RefreshToken } | ConvertTo-Json
-    
-    try {
-        $response = Invoke-RestMethod -Uri $uri -Method Post -Body $body -ContentType "application/json" -ErrorAction Stop
-        return $response.token
-    }
-    catch {
-        Write-Warning "Failed to get vRA bearer token: $_"
-        return $null
+function Disable-SSLValidation {
+    if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
+        Add-Type @"
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+public class TrustAllCertsPolicy : ICertificatePolicy {
+    public bool CheckValidationResult(
+        ServicePoint svcPoint, X509Certificate certificate,
+        WebRequest request, int certificateProblem) {
+        return true;
     }
 }
-
-function Get-vRACloudMachineByName {
-    param(
-        [Parameter(Mandatory)]
-        [string]$VMName,
-        [Parameter(Mandatory)]
-        [string]$Server,
-        [Parameter(Mandatory)]
-        [string]$AccessToken
-    )
-    
-    $headers = @{
-        "Authorization" = "Bearer $AccessToken"
-        "Content-Type"  = "application/json"
+"@
+        [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
     }
-    
-    $uri = "https://$Server/iaas/api/machines?`$filter=name eq '$VMName'"
-    
-    try {
-        $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers -ErrorAction Stop
-        return $response.content[0]
-    }
-    catch {
-        Write-Warning "Failed to get vRA machine for $VMName : $_"
-        return $null
-    }
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 }
 
-function Get-vRADeploymentEvents {
+function Send-NewServerReport {
     param(
-        [Parameter(Mandatory)]
-        [string]$DeploymentId,
-        [Parameter(Mandatory)]
-        [string]$Server,
-        [Parameter(Mandatory)]
-        [string]$AccessToken
-    )
-    
-    $headers = @{
-        "Authorization" = "Bearer $AccessToken"
-        "Content-Type"  = "application/json"
-    }
-    
-    $uri = "https://$Server/deployment/api/deployments/$DeploymentId/events"
-    
-    try {
-        $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers -ErrorAction Stop
-        return $response.content
-    }
-    catch {
-        Write-Warning "Failed to get deployment events for $DeploymentId : $_"
-        return $null
-    }
-}
-
-function Get-SnapshotUserFromvRA {
-    param(
-        [Parameter(Mandatory)]
-        [string]$VMName,
-        [Parameter(Mandatory)]
-        [string]$SnapshotCreated,
-        [Parameter(Mandatory)]
-        [string]$SnapshotName,
-        [string]$SnapshotDescription,
-        [Parameter(Mandatory)]
-        [string]$Server,
-        [Parameter(Mandatory)]
-        [string]$AccessToken
-    )
-    
-    # Get the VM from vRA
-    $machine = Get-vRACloudMachineByName -VMName $VMName -Server $Server -AccessToken $AccessToken
-    if (-not $machine -or -not $machine.deploymentId) {
-        return @{ User = "N/A"; Date = "N/A" }
-    }
-    
-    # Get deployment events
-    $events = Get-vRADeploymentEvents -DeploymentId $machine.deploymentId -Server $Server -AccessToken $AccessToken
-    if (-not $events) {
-        return @{ User = "N/A"; Date = "N/A" }
-    }
-    
-    # Find snapshot create events within 10 minutes of snapshot creation
-    $snapshotDate = [DateTime]::Parse($SnapshotCreated)
-    $matchingEvents = $events | Where-Object {
-        $_.actionId -eq "Cloud.vSphere.Machine.Snapshot.Create" -and
-        $_.updatedAt -and
-        [Math]::Abs(([DateTime]::Parse($_.updatedAt) - $snapshotDate).TotalMinutes) -lt 10
-    }
-    
-    if (-not $matchingEvents) {
-        return @{ User = "N/A"; Date = "N/A" }
-    }
-    
-    # If multiple matches found, try to match by snapshot name/description
-    if ($matchingEvents.Count -gt 1) {
-        # Try exact match
-        $bestMatch = $matchingEvents | Where-Object {
-            $_.inputs -and (
-                ($_.inputs.name -eq $SnapshotName) -or
-                ($SnapshotDescription -and $_.inputs.description -eq $SnapshotDescription)
-            )
-        } | Select-Object -First 1
+        [Parameter(Mandatory=$true)]
+        [Array]$ReportData,
         
-        # Try partial match if no exact match
-        if (-not $bestMatch) {
-            $bestMatch = $matchingEvents | Where-Object {
-                ($_.message -like "*$SnapshotName*") -or 
-                ($SnapshotDescription -and $_.message -like "*$SnapshotDescription*") -or
-                ($_.inputs -and (
-                    ($_.inputs.name -like "*$SnapshotName*") -or
-                    ($SnapshotDescription -and $_.inputs.description -like "*$SnapshotDescription*")
-                ))
-            } | Select-Object -First 1
+        [Parameter(Mandatory=$true)]
+        [string]$SmtpServer,
+        
+        [Parameter(Mandatory=$true)]
+        [int]$SmtpPort,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$From,
+        
+        [Parameter(Mandatory=$true)]
+        [Array]$To,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$Subject,
+        
+        [Parameter(Mandatory=$false)]
+        [int]$HoursBack = 24,
+        
+        [Parameter(Mandatory=$false)]
+        [string]$CsvPath
+    )
+    
+    Write-DebugLog "Building email report..."
+    
+    # Build HTML table for email
+    $htmlRows = ""
+    foreach ($record in $ReportData) {
+        # Color code rows based on source
+        $rowClass = ""
+        if ($record.Source -eq "vCenter Direct") {
+            $rowClass = " style='background-color: #fff3cd;'"
         }
         
-        # Use closest by time if still no match
-        if ($bestMatch) {
-            $matchingEvents = @($bestMatch)
-        }
-        else {
-            $matchingEvents = $matchingEvents | 
-                Sort-Object { [Math]::Abs(([DateTime]::Parse($_.updatedAt) - $snapshotDate).TotalSeconds) } | 
-                Select-Object -First 1
-        }
+        $htmlRows += "<tr$rowClass>"
+        $htmlRows += "<td>$($record.Name)</td>"
+        $htmlRows += "<td>$($record.Status)</td>"
+        $htmlRows += "<td>$($record.CreatedDate)</td>"
+        $htmlRows += "<td>$($record.Source)</td>"
+        $htmlRows += "<td>$($record.CreatedBy)</td>"
+        $htmlRows += "<td>$($record.DeploymentName)</td>"
+        $htmlRows += "<td>$($record.CatalogItem)</td>"
+        $htmlRows += "<td>$($record.vRAServer)</td>"
+        $htmlRows += "<td>$($record.vCenter)</td>"
+        $htmlRows += "</tr>"
     }
     
-    # Extract user from the event (check multiple possible fields)
-    $event = $matchingEvents[0]
+    $htmlTable = @"
+<table>
+<thead>
+<tr>
+<th>Name</th>
+<th>Status</th>
+<th>Created Date</th>
+<th>Source</th>
+<th>Created By</th>
+<th>Deployment Name</th>
+<th>Catalog Item</th>
+<th>vRA Server</th>
+<th>vCenter</th>
+</tr>
+</thead>
+<tbody>
+$htmlRows
+</tbody>
+</table>
+"@
     
-    # PowerShell 5.1 compatible null-coalescing
-    $actualUser = $null
-    if ($event.requestedBy) {
-        $actualUser = $event.requestedBy
-    }
-    elseif ($event.inputs -and $event.inputs.requestedBy) {
-        $actualUser = $event.inputs.requestedBy
-    }
-    elseif ($event.user) {
-        $actualUser = $event.user
-    }
-    elseif ($event.inputs -and $event.inputs.user) {
-        $actualUser = $event.inputs.user
-    }
+    $vraCount = ($ReportData | Where-Object { $_.Source -eq "vRA" }).Count
+    $vcenterCount = ($ReportData | Where-Object { $_.Source -eq "vCenter Direct" }).Count
     
-    if ($actualUser) {
-        return @{
-            User = $actualUser
-            Date = ([DateTime]::Parse($event.updatedAt)).ToString("yyyy-MM-dd")
-        }
-    }
+    $currentDate = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $htmlBody = @"
+<html>
+<head>
+<style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    h2 { color: #333; }
+    table { border-collapse: collapse; width: 100%; margin-top: 20px; }
+    th { background-color: #4CAF50; color: white; padding: 12px; text-align: left; font-weight: bold; }
+    td { border: 1px solid #ddd; padding: 10px; }
+    tr:nth-child(even) { background-color: #f2f2f2; }
+    tr:hover { background-color: #e8e8e8; }
+    .summary { background-color: #f9f9f9; padding: 15px; border-left: 4px solid #4CAF50; margin-bottom: 20px; }
+    .footer { margin-top: 20px; font-size: 12px; color: #666; }
+    .legend { margin-top: 10px; font-size: 14px; }
+    .legend-item { display: inline-block; margin-right: 20px; }
+    .legend-color { display: inline-block; width: 20px; height: 20px; margin-right: 5px; vertical-align: middle; border: 1px solid #ddd; }
+</style>
+</head>
+<body>
+<h2>New Server Deployment Report</h2>
+<div class="summary">
+    <p><strong>Generated:</strong> $currentDate</p>
+    <p><strong>Total New Servers:</strong> $($ReportData.Count)</p>
+    <p><strong>Built via vRA:</strong> $vraCount</p>
+    <p><strong>Built directly in vCenter:</strong> $vcenterCount</p>
+    <p><strong>Time Range:</strong> Last $HoursBack hours</p>
+</div>
+<div class="legend">
+    <div class="legend-item"><span class="legend-color" style="background-color: #fff3cd;"></span>Built directly in vCenter</div>
+    <div class="legend-item"><span class="legend-color" style="background-color: #f2f2f2;"></span>Built via vRA</div>
+</div>
+$htmlTable
+<div class="footer">
+    <p>CSV report also saved to: $CsvPath</p>
+</div>
+</body>
+</html>
+"@
     
-    return @{ User = "N/A"; Date = "N/A" }
+    Write-DebugLog "Sending email to: $($To -join ', ')"
+    Send-MailMessage -To $To -From $From -Subject $Subject -Body $htmlBody -BodyAsHtml -SmtpServer $SmtpServer -Port $SmtpPort -UseSsl
+    Write-DebugLog "Email sent successfully!" "SUCCESS"
 }
 
-function Get-AllSnapshots {
-    param(
-        [Parameter(Mandatory)]
-        [array]$vCenterServers,
-        [Parameter(Mandatory)]
-        [PSCredential]$Credential
-    )
+# Main Script
+Write-DebugLog "===== Script Started =====" "SUCCESS"
+Write-DebugLog "PowerShell Version: $($PSVersionTable.PSVersion)"
+Write-DebugLog "Output CSV: $outputCSV"
+Write-DebugLog "Combined Log: $outputLog"
+
+# Check for VMware PowerCLI
+Write-DebugLog "Checking for VMware PowerCLI module..."
+if (-not (Get-Module -ListAvailable -Name VMware.PowerCLI)) {
+    Write-DebugLog "VMware PowerCLI module not found. Please install it:" "ERROR"
+    Write-DebugLog "Install-Module -Name VMware.PowerCLI -Scope CurrentUser" "ERROR"
+    exit
+}
+Import-Module VMware.PowerCLI -ErrorAction SilentlyContinue
+Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session | Out-Null
+Write-DebugLog "VMware PowerCLI loaded successfully" "SUCCESS"
+
+# Ensure log directory exists
+$logDir = Split-Path $outputCSV -Parent
+if (!(Test-Path $logDir)) {
+    New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+    Write-DebugLog "Created log directory: $logDir"
+}
+
+Disable-SSLValidation
+Write-DebugLog "SSL validation disabled"
+
+# Get credentials once for all connections
+Write-DebugLog "Requesting credentials..."
+$credential = Get-Credential -Message "Enter credentials for vCenter, Aria Operations, and vRA"
+if (-not $credential) {
+    Write-DebugLog "Credentials not provided. Exiting." "ERROR"
+    exit
+}
+$username = $credential.UserName
+$password = $credential.GetNetworkCredential().Password
+Write-DebugLog "Credentials obtained for user: $username"
+
+# Calculate cutoff time
+$cutoffDate = (Get-Date).AddHours(-$hoursBack)
+Write-DebugLog "Searching for VMs created after: $cutoffDate (last $hoursBack hours)"
+
+# Connect to vCenters and Get New VMs from Events
+Write-DebugLog "`n===== Connecting to vCenter Servers =====" "INFO"
+$newVMsData = @()
+$allVCenterVMs = @{}
+
+foreach ($vCenter in $vCenters) {
+    Write-DebugLog "`n--- Connecting to vCenter: $vCenter ---" "INFO"
     
-    $allSnapshots = @()
-    
-    foreach ($vcServer in $vCenterServers) {
-        Write-Host "Processing $vcServer..." -ForegroundColor Cyan
+    try {
+        # Connect to vCenter
+        Write-DebugLog "Connecting to $vCenter..."
+        $vcConnection = Connect-VIServer -Server $vCenter -Credential $credential -ErrorAction Stop
+        Write-DebugLog "Connected to $vCenter successfully" "SUCCESS"
         
-        try {
-            # Connect to vCenter
-            Connect-VIServer -Server $vcServer -Credential $Credential -ErrorAction Stop | Out-Null
+        # Query for VM creation events in the last X hours
+        Write-DebugLog "Querying VM creation events from the last $hoursBack hours..."
+        
+        # Get VM creation events (VmCreatedEvent, VmBeingDeployedEvent, VmRegisteredEvent)
+        $events = Get-VIEvent -Server $vCenter -Start $cutoffDate -MaxSamples 50000 | Where-Object {
+            $_.GetType().Name -in @('VmCreatedEvent', 'VmBeingDeployedEvent', 'VmRegisteredEvent', 'VmDeployedEvent') -and
+            $_.Vm.Name -ne $null
+        }
+        
+        Write-DebugLog "Found $($events.Count) VM creation/deployment events"
+        
+        # Process each event
+        $vmsFoundInVC = 0
+        foreach ($event in $events) {
+            $vmName = $event.Vm.Name
             
-            # Get all VMs that have snapshots
-            $vms = Get-VM | Where-Object { $_.ExtensionData.Snapshot }
+            # Skip if we already processed this VM from another vCenter
+            if ($allVCenterVMs.ContainsKey($vmName)) {
+                continue
+            }
             
-            foreach ($vm in $vms) {
-                $snapshots = Get-Snapshot -VM $vm
+            # Get the VM object to check if it still exists and get current status
+            $vm = Get-VM -Name $vmName -Server $vCenter -ErrorAction SilentlyContinue
+            
+            if ($vm) {
+                $vmsFoundInVC++
                 
-                foreach ($snap in $snapshots) {
-                    # Calculate snapshot age
-                    $ageDays = [Math]::Round(((Get-Date) - $snap.Created).TotalDays, 0)
-                    
-                    # Try to get creator from vCenter events
-                    $vcCreator = "Unknown"
-                    try {
-                        $events = Get-VIEvent -Entity $vm -Types Info -Start $snap.Created.AddMinutes(-1) -Finish $snap.Created.AddMinutes(1) -ErrorAction SilentlyContinue |
-                            Where-Object { $_.FullFormattedMessage -match "snapshot" -or $_.GetType().Name -match "Snapshot" } |
-                            Sort-Object CreatedTime -Descending |
-                            Select-Object -First 1
-                        
-                        if ($events) {
-                            $vcCreator = $events.UserName
+                # Determine status
+                $status = "Unknown"
+                switch ($vm.PowerState) {
+                    "PoweredOn" { $status = "Online" }
+                    "PoweredOff" { $status = "Decomm/Offline" }
+                    "Suspended" { $status = "Decomm/Offline" }
+                    default { $status = "Unknown" }
+                }
+                
+                # Get creator from event
+                $createdBy = "N/A"
+                if ($event.UserName) {
+                    $createdBy = $event.UserName
+                } elseif ($event.UserName) {
+                    $createdBy = $event.UserName
+                }
+                
+                # Extract vCenter short name
+                $vCenterShort = ($vCenter -split '\.')[0]
+                
+                $vmObject = [PSCustomObject]@{
+                    Name = $vmName
+                    CreatedDate = $event.CreatedTime
+                    Status = $status
+                    CreatedByUser = $createdBy
+                    vCenter = $vCenterShort
+                    PowerState = $vm.PowerState
+                }
+                
+                $newVMsData += $vmObject
+                $allVCenterVMs[$vmName] = $vmObject
+                
+                Write-DebugLog "  Found VM: $vmName | Created: $($event.CreatedTime) | By: $createdBy | Status: $status"
+            }
+        }
+        
+        Write-DebugLog "Found $vmsFoundInVC new VMs in $vCenter" "SUCCESS"
+        
+        # Disconnect from vCenter
+        Disconnect-VIServer -Server $vCenter -Confirm:$false
+        Write-DebugLog "Disconnected from $vCenter"
+    }
+    catch {
+        Write-DebugLog "Error connecting to vCenter $vCenter : $($_.Exception.Message)" "ERROR"
+        Write-DebugLog "Error details: $($_.Exception)" "ERROR"
+    }
+}
+
+Write-DebugLog "`nTotal unique VMs found across all vCenters: $($newVMsData.Count)" "SUCCESS"
+
+# Exit early if no new VMs found
+if ($newVMsData.Count -eq 0) {
+    Write-DebugLog "`nNo new VMs found in the last $hoursBack hours. No email will be sent." "WARN"
+    Write-DebugLog "Script completed - nothing to report." "SUCCESS"
+    Write-Host "`nPress any key to exit..." -ForegroundColor Yellow
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    exit
+}
+
+# Connect to vRA and Get Deployment Info
+Write-DebugLog "`n===== Processing vRA Servers =====" "INFO"
+$deploymentData = @{}
+
+foreach ($vraServer in $vraServers) {
+    Write-DebugLog "`n--- Connecting to vRA $vraServer ---" "INFO"
+    
+    try {
+        # Authenticate to vRA
+        Write-DebugLog "Authenticating to $vraServer..."
+        $vraAuthUri = "https://$vraServer/csp/gateway/am/api/login"
+        $vraAuthBody = @{
+            username = $username
+            password = $password
+        } | ConvertTo-Json
+        
+        $vraAuthHeaders = @{
+            "Content-Type" = "application/json"
+            "Accept" = "application/json"
+        }
+        
+        $vraAuthResponse = Invoke-RestMethod -Uri $vraAuthUri -Method Post -Headers $vraAuthHeaders -Body $vraAuthBody -ErrorAction Stop
+        $vraToken = $vraAuthResponse.cspAuthToken
+        Write-DebugLog "Authenticated to $vraServer successfully" "SUCCESS"
+        
+        $vraHeaders = @{
+            "Authorization" = "Bearer $vraToken"
+            "Content-Type" = "application/json"
+        }
+        
+        # Fetch deployments
+        Write-DebugLog "Fetching deployments from $vraServer..."
+        $vraUri = "https://$vraServer/deployment/api/deployments"
+        $page = 0
+        $size = 1000
+        $deploymentsFound = 0
+        
+        do {
+            $pagedUri = "$vraUri`?page=$page&size=$size&expand=resources"
+            Write-DebugLog "  Fetching page $($page + 1) (size: $size)..."
+            
+            $vraResponse = Invoke-RestMethod -Uri $pagedUri -Method Get -Headers $vraHeaders -ErrorAction Stop
+            if ($vraResponse.content) {
+                $deployments = $vraResponse.content
+            } 
+            else {
+                $deployments = $vraResponse
+            }
+            
+            Write-DebugLog "  Retrieved $($deployments.Count) deployments on page $($page + 1)"
+            
+            # Filter for deployments with vSphere machines
+            $deploymentsWithVMs = @()
+            foreach ($dep in $deployments) {
+                if ($dep.resources) {
+                    $hasVSphereMachine = $false
+                    foreach ($res in $dep.resources) {
+                        if ($res.type -eq "Cloud.vSphere.Machine") {
+                            $hasVSphereMachine = $true
+                            break
                         }
                     }
-                    catch { }
-                    
-                    # Add snapshot to collection
-                    $allSnapshots += [PSCustomObject]@{
-                        vCenter      = $vcServer
-                        VMName       = $vm.Name
-                        SnapshotName = $snap.Name
-                        Description  = $snap.Description
-                        CreatedDate  = $snap.Created
-                        CreatedBy    = $vcCreator
-                        SizeGB       = [Math]::Round($snap.SizeGB, 2)
-                        AgeDays      = $ageDays
+                    if ($hasVSphereMachine) {
+                        $deploymentsWithVMs += $dep
                     }
                 }
             }
             
-            Disconnect-VIServer -Server $vcServer -Confirm:$false -ErrorAction SilentlyContinue
-            Write-Host "Completed $vcServer" -ForegroundColor Green
-        }
-        catch {
-            Write-Warning "Error processing $vcServer : $_"
-        }
-    }
-    
-    # Return snapshots sorted by age (oldest first)
-    return $allSnapshots | Sort-Object AgeDays -Descending
-}
-
-function Invoke-vRAEnrichment {
-    param(
-        [Parameter(Mandatory)]
-        [array]$Snapshots,
-        [Parameter(Mandatory)]
-        [string]$Server,
-        [Parameter(Mandatory)]
-        [string]$Token
-    )
-    
-    Write-Host "`nEnriching vRA-created snapshots..." -ForegroundColor Yellow
-    
-    $vraSnapshotCount = ($Snapshots | Where-Object { $_.CreatedBy -like "*vravc*" }).Count
-    $processedCount = 0
-    
-    foreach ($snap in $Snapshots) {
-        # Check if snapshot was created by vRA (contains "vravc" in username)
-        if ($snap.CreatedBy -like "*vravc*") {
-            $processedCount++
-            Write-Host "  Processing vRA snapshot $processedCount of $vraSnapshotCount..." -ForegroundColor Gray
+            Write-DebugLog "  $($deploymentsWithVMs.Count) deployments have vSphere machines"
             
-            # Get actual user from vRA API
-            $vraInfo = Get-SnapshotUserFromvRA `
-                -VMName $snap.VMName `
-                -SnapshotCreated $snap.CreatedDate `
-                -SnapshotName $snap.SnapshotName `
-                -SnapshotDescription $snap.Description `
-                -Server $Server `
-                -AccessToken $Token
-            
-            # Replace "vravc" account with actual user if found
-            if ($vraInfo.User -ne "N/A") {
-                $snap.CreatedBy = $vraInfo.User
+            foreach ($dep in $deploymentsWithVMs) {
+                $vSphereMachines = @()
+                foreach ($res in $dep.resources) {
+                    if ($res.type -eq "Cloud.vSphere.Machine") {
+                        $vSphereMachines += $res
+                    }
+                }
+                
+                foreach ($machine in $vSphereMachines) {
+                    # Get hostname from various possible properties
+                    $hostname = $null
+                    
+                    if ($machine.properties) {
+                        $props = $machine.properties
+                        
+                        # Priority order for finding hostname
+                        if ($props.hostname) { 
+                            $hostname = $props.hostname 
+                        } 
+                        elseif ($props.resourceName) {
+                            $hostname = $props.resourceName
+                        }
+                        elseif ($props.name) {
+                            $hostname = $props.name
+                        }
+                        elseif ($props.address) {
+                            $hostname = $props.address
+                        }
+                        elseif ($props.hostName) {
+                            $hostname = $props.hostName
+                        }
+                    }
+                    
+                    # Fallback to machine name
+                    if (-not $hostname -and $machine.name) {
+                        $hostname = $machine.name
+                    }
+                    
+                    if ($hostname) {
+                        # Only store if not already found in a previous vRA
+                        if (-not $deploymentData.ContainsKey($hostname)) {
+                            $deploymentsFound++
+                            
+                            $description = "N/A"
+                            if ($dep.description) {
+                                $description = $dep.description
+                            }
+                            
+                            $requestedBy = "N/A"
+                            if ($dep.createdBy) {
+                                $requestedBy = $dep.createdBy
+                            }
+                            
+                            $requestor = $requestedBy
+                            if ($dep.ownedBy) {
+                                $requestor = $dep.ownedBy
+                            }
+                            
+                            # Extract first part of FQDN
+                            $vraServerShort = ($vraServer -split '\.')[0]
+                            
+                            # Get catalog item
+                            $catalogItem = "N/A"
+                            if ($dep.customProperties -and $dep.customProperties.category) {
+                                $catalogItem = $dep.customProperties.category
+                            }
+                            
+                            $deploymentData[$hostname] = @{
+                                DeploymentName = $dep.name
+                                Description = $description
+                                RequestedBy = $requestedBy
+                                Requestor = $requestor
+                                vRAServer = $vraServerShort
+                                DeploymentID = $dep.id
+                                Status = $dep.Status
+                                CatalogItem = $catalogItem
+                            }
+                            
+                            Write-DebugLog "    Stored deployment for $hostname from $vraServer"
+                        }
+                    }
+                }
             }
             
-            # Add vRA metadata
-            $snap | Add-Member -NotePropertyName "vRAUser" -NotePropertyValue $vraInfo.User -Force
-            $snap | Add-Member -NotePropertyName "vRADate" -NotePropertyValue $vraInfo.Date -Force
-        }
-        else {
-            # Not a vRA snapshot, add empty vRA fields
-            $snap | Add-Member -NotePropertyName "vRAUser" -NotePropertyValue "N/A" -Force
-            $snap | Add-Member -NotePropertyName "vRADate" -NotePropertyValue "N/A" -Force
-        }
-    }
-    
-    Write-Host "Enrichment complete - Processed $processedCount vRA snapshots" -ForegroundColor Green
-    return $Snapshots
-}
-
-function Send-SnapshotReport {
-    param(
-        [Parameter(Mandatory)]
-        [array]$Snapshots,
-        [Parameter(Mandatory)]
-        [string]$SmtpServer,
-        [Parameter(Mandatory)]
-        [int]$SmtpPort,
-        [Parameter(Mandatory)]
-        [string]$From,
-        [Parameter(Mandatory)]
-        [array]$To,
-        [Parameter(Mandatory)]
-        [string]$Subject
-    )
-    
-    # Build HTML email with table
-    $html = @"
-<!DOCTYPE html>
-<html>
-<head>
-    <style>
-        body { font-family: Arial, sans-serif; }
-        table { border-collapse: collapse; width: 100%; margin-top: 20px; }
-        th { background-color: #3498db; color: white; padding: 12px; text-align: left; }
-        td { border: 1px solid #ddd; padding: 10px; }
-        tr:nth-child(even) { background-color: #f2f2f2; }
-        tr:hover { background-color: #e8f4f8; }
-        .summary { background-color: #ecf0f1; padding: 15px; border-radius: 5px; margin-bottom: 20px; }
-        .old { color: #e74c3c; font-weight: bold; }
-    </style>
-</head>
-<body>
-    <div class="summary">
-        <strong>Total Snapshots:</strong> $($Snapshots.Count)
-    </div>
-    <table>
-        <tr>
-            <th>VM Name</th>
-            <th>Snapshot Name</th>
-            <th>Description</th>
-            <th>Created Date</th>
-            <th>Created By</th>
-            <th>Size (GB)</th>
-            <th>Age (Days)</th>
-        </tr>
-"@
-    
-    # Add each snapshot as a table row
-    foreach ($snap in $Snapshots) {
-        $ageClass = if ($snap.AgeDays -gt 30) { " class='old'" } else { "" }
-        $createdBy = if ($snap.vRAUser -ne "N/A") { "$($snap.CreatedBy) (vRA)" } else { $snap.CreatedBy }
+            $page++
+            $hasMore = $false
+            
+            if ($vraResponse.totalPages) { 
+                $hasMore = ($page -lt $vraResponse.totalPages)
+            } 
+            elseif ($vraResponse.totalElements) { 
+                $hasMore = (($page * $size) -lt $vraResponse.totalElements)
+            } 
+            else { 
+                $hasMore = ($deployments.Count -eq $size)
+            }
+            
+        } while ($hasMore)
         
-        $html += @"
-        <tr>
-            <td>$($snap.VMName)</td>
-            <td>$($snap.SnapshotName)</td>
-            <td>$($snap.Description)</td>
-            <td>$($snap.CreatedDate.ToString('yyyy-MM-dd HH:mm'))</td>
-            <td>$createdBy</td>
-            <td>$($snap.SizeGB)</td>
-            <td$ageClass>$($snap.AgeDays)</td>
-        </tr>
-"@
-    }
-    
-    $html += @"
-    </table>
-</body>
-</html>
-"@
-    
-    # Send the email
-    try {
-        Send-MailMessage `
-            -To $To `
-            -From $From `
-            -Subject $Subject `
-            -Body $html `
-            -BodyAsHtml `
-            -SmtpServer $SmtpServer `
-            -Port $SmtpPort `
-            -UseSsl `
-            -ErrorAction Stop
-        
-        Write-Host "Email sent successfully to $($To -join ', ')" -ForegroundColor Green
+        Write-DebugLog "Completed scanning $vraServer - Found $deploymentsFound deployments" "SUCCESS"
     }
     catch {
-        Write-Warning "Failed to send email: $_"
+        Write-DebugLog "Error processing vRA server $vraServer : $($_.Exception.Message)" "ERROR"
+        Write-DebugLog "Error details: $($_.Exception)" "ERROR"
     }
 }
 
-# ============================================================================
-# MAIN EXECUTION
-# ============================================================================
+Write-DebugLog "`nTotal unique deployments found across all vRA servers: $($deploymentData.Count)" "SUCCESS"
 
-Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "vCenter Snapshot Report with vRA Integration" -ForegroundColor Cyan
-Write-Host "========================================`n" -ForegroundColor Cyan
+# Build Final Report
+Write-DebugLog "`n===== Building Final Report =====" "INFO"
+$reportData = @()
 
-# Get credentials for vCenter and vRA
-$credential = Get-Credential -Message "Enter credentials for vCenter and vRA"
-if (-not $credential) {
-    Write-Error "Credentials are required to continue."
-    exit 1
-}
-
-# Authenticate with vRA
-Write-Host "Authenticating with vRA..." -ForegroundColor Yellow
-$vraRefreshToken = Get-vRAAccessToken -Credential $credential -Server $vraServer
-
-if ($vraRefreshToken) {
-    $vraBearerToken = Get-vRABearerToken -RefreshToken $vraRefreshToken -Server $vraServer
+foreach ($vmData in $newVMsData) {
+    $vmName = $vmData.Name
     
-    if ($vraBearerToken) {
-        Write-Host "Successfully authenticated with vRA" -ForegroundColor Green
+    # Try to find deployment info
+    $depInfo = $null
+    if ($deploymentData.ContainsKey($vmName)) {
+        $depInfo = $deploymentData[$vmName]
+    }
+    
+    if ($depInfo) {
+        Write-DebugLog "Matched VM '$vmName' to deployment: $($depInfo.DeploymentName)"
+        
+        # VM found in vRA
+        $reportObject = New-Object PSObject -Property @{
+            Name = $vmName
+            Status = $vmData.Status
+            CreatedDate = $vmData.CreatedDate
+            DeploymentName = $depInfo.DeploymentName
+            CatalogItem = $depInfo.CatalogItem
+            RequestedBy = $depInfo.RequestedBy
+            Requestor = $depInfo.Requestor
+            vRAServer = $depInfo.vRAServer
+            DeploymentStatus = $depInfo.Status
+            CreatedBy = $depInfo.RequestedBy
+            Source = "vRA"
+            vCenter = $vmData.vCenter
+        }
     }
     else {
-        Write-Warning "Failed to get vRA bearer token. Continuing without vRA enrichment."
-        $vraBearerToken = $null
-    }
-}
-else {
-    Write-Warning "Failed to authenticate with vRA. Continuing without vRA enrichment."
-    $vraBearerToken = $null
-}
-
-# Collect snapshots from all vCenters
-Write-Host "`nCollecting snapshots from vCenters..." -ForegroundColor Yellow
-$allSnapshots = Get-AllSnapshots -vCenterServers $vCenters -Credential $credential
-
-if ($allSnapshots.Count -eq 0) {
-    Write-Host "No snapshots found." -ForegroundColor Yellow
-    
-    # Send email with no snapshots message
-    $html = @"
-<!DOCTYPE html>
-<html>
-<head>
-    <style>
-        body { font-family: Arial, sans-serif; }
-        .summary { background-color: #ecf0f1; padding: 15px; border-radius: 5px; margin-bottom: 20px; }
-    </style>
-</head>
-<body>
-    <div class="summary">
-        <strong>No snapshots found</strong>
-    </div>
-</body>
-</html>
-"@
-    
-    try {
-        Send-MailMessage `
-            -To $emailTo `
-            -From $emailFrom `
-            -Subject $emailSubject `
-            -Body $html `
-            -BodyAsHtml `
-            -SmtpServer $smtpServer `
-            -Port $smtpPort `
-            -UseSsl `
-            -ErrorAction Stop
+        Write-DebugLog "No deployment found for VM: $vmName - Built directly in vCenter" "WARN"
         
-        Write-Host "Email sent successfully" -ForegroundColor Green
-    }
-    catch {
-        Write-Warning "Failed to send email: $_"
+        # VM NOT found in vRA
+        $reportObject = New-Object PSObject -Property @{
+            Name = $vmName
+            Status = $vmData.Status
+            CreatedDate = $vmData.CreatedDate
+            DeploymentName = "N/A - Built in vCenter"
+            CatalogItem = "N/A"
+            RequestedBy = "N/A"
+            Requestor = "N/A"
+            vRAServer = "N/A"
+            DeploymentStatus = "N/A"
+            CreatedBy = $vmData.CreatedByUser
+            Source = "vCenter Direct"
+            vCenter = $vmData.vCenter
+        }
     }
     
-    exit 0
+    $reportData += $reportObject
 }
 
-Write-Host "`nTotal snapshots found: $($allSnapshots.Count)" -ForegroundColor Green
-
-# Enrich vRA snapshots with actual user information
-if ($vraBearerToken) {
-    $allSnapshots = Invoke-vRAEnrichment -Snapshots $allSnapshots -Server $vraServer -Token $vraBearerToken
-}
-else {
-    # Add empty vRA fields if authentication failed
-    $allSnapshots = $allSnapshots | ForEach-Object {
-        $_ | Add-Member -NotePropertyName "vRAUser" -NotePropertyValue "N/A" -Force
-        $_ | Add-Member -NotePropertyName "vRADate" -NotePropertyValue "N/A" -Force
-        $_
-    }
-}
-
-# Display summary to console
-$totalSize = [Math]::Round(($allSnapshots | Measure-Object -Property SizeGB -Sum).Sum, 2)
-$oldestSnapshot = [Math]::Round(($allSnapshots | Measure-Object -Property AgeDays -Maximum).Maximum, 0)
-
-Write-Host "`n========================================" -ForegroundColor Cyan
-Write-Host "SUMMARY" -ForegroundColor Cyan
-Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "Total Snapshots: $($allSnapshots.Count)"
-Write-Host "Total Size: $totalSize GB"
-Write-Host "Oldest Snapshot: $oldestSnapshot days"
-Write-Host ""
-
-# Display table in console
-$allSnapshots | Format-Table -Property vCenter, VMName, SnapshotName, CreatedDate, CreatedBy, SizeGB, AgeDays -AutoSize
+Write-DebugLog "Report contains $($reportData.Count) records" "SUCCESS"
 
 # Export to CSV
-$csvPath = ".\SnapshotReport_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
-$allSnapshots | Export-Csv -Path $csvPath -NoTypeInformation
-Write-Host "CSV exported to: $csvPath" -ForegroundColor Green
+Write-DebugLog "`n===== Exporting Data =====" "INFO"
+$reportData | Select-Object Name, Status, CreatedDate, Source, CreatedBy, DeploymentName, CatalogItem, RequestedBy, Requestor, vRAServer, DeploymentStatus, vCenter | Export-Csv -Path $outputCSV -NoTypeInformation
+Write-DebugLog "Exported to: $outputCSV" "SUCCESS"
 
-# Send HTML email report
-Write-Host "`nSending email report..." -ForegroundColor Yellow
-Send-SnapshotReport `
-    -Snapshots $allSnapshots `
+# Send Email Report
+Write-DebugLog "`n===== Sending Email Report =====" "INFO"
+Send-NewServerReport `
+    -ReportData $reportData `
     -SmtpServer $smtpServer `
     -SmtpPort $smtpPort `
-    -From $emailFrom `
-    -To $emailTo `
-    -Subject $emailSubject
+    -From $smtpFrom `
+    -To $smtpTo `
+    -Subject $smtpSubject `
+    -HoursBack $hoursBack `
+    -CsvPath $outputCSV
 
-Write-Host "`nScript completed successfully!" -ForegroundColor Green
+# Cleanup
+Write-DebugLog "`n===== Script Completed Successfully =====" "SUCCESS"
+Write-DebugLog "Results saved to: $outputCSV"
+Write-DebugLog "Log saved to: $outputLog"
+Write-DebugLog "`n========================================`n"
+Write-Host "`nPress any key to exit..." -ForegroundColor Yellow
+$null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
