@@ -4,8 +4,8 @@
 
 # Configuration Variables
 $ariaOpsServer = "aria-ops.yourdomain.com"
-$ariaOpsDomain = "yourdomain.com"  # Domain for Aria Operations authentication
-$ariaOpsAuthSource = "localos"  # Common values: localos, Active Directory, vIDMAuthSource, etc.
+$ariaOpsDomain = "yourdomain.com"
+$ariaOpsAuthSource = "localos"
 $vraServers = @(
     "vra1.yourdomain.com",
     "vra2.yourdomain.com"
@@ -18,8 +18,8 @@ $smtpFrom = "vra-reports@yourdomain.com"
 $smtpTo = @("admin@yourdomain.com")
 $smtpSubject = "New Server Deployment Report - $(Get-Date -Format 'yyyy-MM-dd')"
 
-# Time range for new VMs (in days)
-$daysBack = 1
+# Time range for new VMs (in hours - 24 hours = last day)
+$hoursBack = 24
 
 # Output
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
@@ -85,7 +85,7 @@ function Send-NewServerReport {
         [string]$Subject,
         
         [Parameter(Mandatory=$false)]
-        [int]$DaysBack = 1,
+        [int]$HoursBack = 24,
         
         [Parameter(Mandatory=$false)]
         [string]$CsvPath
@@ -99,7 +99,7 @@ function Send-NewServerReport {
         # Color code rows based on source
         $rowClass = ""
         if ($record.Source -eq "vCenter Direct") {
-            $rowClass = " style='background-color: #fff3cd;'"  # Light yellow for vCenter direct builds
+            $rowClass = " style='background-color: #fff3cd;'"
         }
         
         $htmlRows += "<tr$rowClass>"
@@ -163,7 +163,7 @@ $htmlRows
     <p><strong>Total New Servers:</strong> $($ReportData.Count)</p>
     <p><strong>Built via vRA:</strong> $vraCount</p>
     <p><strong>Built directly in vCenter:</strong> $vcenterCount</p>
-    <p><strong>Time Range:</strong> Last $DaysBack day(s)</p>
+    <p><strong>Time Range:</strong> Last $HoursBack hours</p>
 </div>
 <div class="legend">
     <div class="legend-item"><span class="legend-color" style="background-color: #fff3cd;"></span>Built directly in vCenter</div>
@@ -209,6 +209,10 @@ $username = $credential.UserName
 $password = $credential.GetNetworkCredential().Password
 Write-DebugLog "Credentials obtained for user: $username"
 
+# Calculate cutoff time
+$cutoffDate = (Get-Date).AddHours(-$hoursBack)
+Write-DebugLog "Searching for VMs created after: $cutoffDate (last $hoursBack hours)"
+
 # Connect to Aria Operations and Get New VMs
 Write-DebugLog "`n===== Connecting to Aria Operations =====" "INFO"
 $ariaToken = $null
@@ -242,157 +246,35 @@ try {
         "Accept" = "application/json"
     }
     
-    # Calculate time range for query (last X days in MILLISECONDS since epoch)
-    # Aria Operations API typically uses milliseconds for timestamps
-    $cutoffDate = (Get-Date).AddDays(-$daysBack)
-    $cutoffEpochMs = [long]([datetime]$cutoffDate - [datetime]'1970-01-01').TotalMilliseconds
+    # NEW APPROACH: Use stats API to query for VMs with recent creation timestamps
+    # This directly queries the metric/property data rather than relying on resource creation time
+    Write-DebugLog "Querying for VMs created in the last $hoursBack hours using stats API..."
     
-    Write-DebugLog "Searching for VMs created after: $cutoffDate"
-    Write-DebugLog "Cutoff epoch time (milliseconds): $cutoffEpochMs"
+    # Get current time and cutoff time in milliseconds since epoch
+    $nowMs = [long]([datetime]::UtcNow - [datetime]'1970-01-01').TotalMilliseconds
+    $cutoffMs = [long]($cutoffDate.ToUniversalTime() - [datetime]'1970-01-01').TotalMilliseconds
     
-    # Query Aria Operations for VMs created in the last X days
-    # Using createdAfter parameter to filter on the server side
-    Write-DebugLog "Querying Aria Operations for newly created VMs using createdAfter filter..."
+    Write-DebugLog "Current time (UTC): $([datetime]::UtcNow)"
+    Write-DebugLog "Cutoff time (UTC): $($cutoffDate.ToUniversalTime())"
+    Write-DebugLog "Time range in milliseconds: $cutoffMs to $nowMs"
     
-    # Query with createdAfter to get ONLY VMs created in the time range - this is the key to speed
-    $resourceQueryUri = "https://$ariaOpsServer/suite-api/api/resources?resourceKind=VirtualMachine&createdAfter=$cutoffEpochMs&pageSize=1000"
-    Write-DebugLog "API Query: $resourceQueryUri"
+    # Query for ALL VirtualMachine resources first (we'll filter by creation time)
+    Write-DebugLog "Fetching all VirtualMachine resources from Aria Operations..."
+    $resourceQueryUri = "https://$ariaOpsServer/suite-api/api/resources?resourceKind=VirtualMachine&pageSize=1000"
     
     $page = 0
-    $foundNewVMs = 0
+    $allVMs = @()
     
     do {
         $pagedResourceUri = "$resourceQueryUri&page=$page"
-        Write-DebugLog "  Fetching page $page from Aria Operations (VMs created after $cutoffDate)..."
+        Write-DebugLog "  Fetching page $page of VM resources..."
         
         $resourceResponse = Invoke-RestMethod -Uri $pagedResourceUri -Method Get -Headers $ariaHeaders -ErrorAction Stop
         
         if ($resourceResponse.resourceList) {
             $vmCount = $resourceResponse.resourceList.Count
-            Write-DebugLog "  Retrieved $vmCount new VMs from page $page - processing..."
-            
-            # Process VMs using PowerShell 5.1 compatible runspaces for parallel processing
-            $RunspacePool = [runspacefactory]::CreateRunspacePool(1, 10)
-            $RunspacePool.Open()
-            $Jobs = @()
-            
-            foreach ($resource in $resourceResponse.resourceList) {
-                $PowerShell = [powershell]::Create()
-                $PowerShell.RunspacePool = $RunspacePool
-                
-                [void]$PowerShell.AddScript({
-                    param($resource, $ariaOpsServer, $ariaHeaders)
-                    
-                    try {
-                        $resourceId = $resource.identifier
-                        
-                        # Get VM name from resourceKey.name
-                        $vmName = $null
-                        if ($resource.resourceKey.name) {
-                            $vmName = $resource.resourceKey.name
-                        }
-                        
-                        # Get detailed properties for this resource to get the actual VM name
-                        $statsUri = "https://$ariaOpsServer/suite-api/api/resources/$resourceId/properties"
-                        $statsResponse = Invoke-RestMethod -Uri $statsUri -Method Get -Headers $ariaHeaders -ErrorAction Stop
-                        
-                        # Look for the actual VM name from config
-                        $vSphereMachineProp = $statsResponse.property | Where-Object { 
-                            $_.name -eq "config|name" -or $_.name -eq "summary|config|name"
-                        } | Select-Object -First 1
-                        
-                        if ($vSphereMachineProp -and $vSphereMachineProp.value) {
-                            $vmName = $vSphereMachineProp.value
-                        }
-                        
-                        if (-not $vmName) {
-                            return $null
-                        }
-                        
-                        # Get creation time for display purposes
-                        $creationTimeProp = $statsResponse.property | Where-Object { 
-                            $_.name -eq "summary|createdTime" -or 
-                            $_.name -eq "sys|createdTime" -or
-                            $_.name -eq "config|createDate"
-                        } | Select-Object -First 1
-                        
-                        $creationDate = Get-Date
-                        
-                        if ($creationTimeProp -and $creationTimeProp.value) {
-                            try {
-                                $creationTimeMs = [long]$creationTimeProp.value
-                                $epochStart = [datetime]'1970-01-01'
-                                $creationDate = $epochStart.AddMilliseconds($creationTimeMs)
-                            }
-                            catch {
-                                # Use current date as fallback
-                            }
-                        }
-                        
-                        # Get the user who created the VM from vCenter events
-                        $createdByUser = "N/A"
-                        $createdByProp = $statsResponse.property | Where-Object { 
-                            $_.name -eq "config|createBy" -or 
-                            $_.name -eq "summary|config|annotation" -or
-                            $_.name -eq "sys|createdBy"
-                        } | Select-Object -First 1
-                        
-                        if ($createdByProp -and $createdByProp.value) {
-                            $createdByUser = $createdByProp.value
-                        }
-                        
-                        # Get health status
-                        $healthState = $resource.resourceStatusStates | Where-Object { $_.resourceState -eq "HEALTH" } | Select-Object -First 1
-                        $status = if ($healthState) { $healthState.status } else { "UNKNOWN" }
-                        
-                        $simpleStatus = "Unknown"
-                        switch ($status) {
-                            "GREEN" { $simpleStatus = "Online" }
-                            "YELLOW" { $simpleStatus = "Online" }
-                            "ORANGE" { $simpleStatus = "Online" }
-                            "RED" { $simpleStatus = "Decomm/Offline" }
-                            "GREY" { $simpleStatus = "Decomm/Offline" }
-                            default { $simpleStatus = "Decomm/Offline" }
-                        }
-                        
-                        # Return VM data object
-                        return [PSCustomObject]@{
-                            Name = $vmName
-                            CreatedDate = $creationDate
-                            Status = $simpleStatus
-                            ResourceId = $resourceId
-                            CreatedByUser = $createdByUser
-                        }
-                    }
-                    catch {
-                        return $null
-                    }
-                })
-                
-                [void]$PowerShell.AddArgument($resource)
-                [void]$PowerShell.AddArgument($ariaOpsServer)
-                [void]$PowerShell.AddArgument($ariaHeaders)
-                
-                $Jobs += [PSCustomObject]@{
-                    PowerShell = $PowerShell
-                    Handle = $PowerShell.BeginInvoke()
-                }
-            }
-            
-            # Wait for all jobs to complete and collect results
-            Write-DebugLog "  Processing $($Jobs.Count) VMs in parallel (up to 10 at a time)..."
-            foreach ($Job in $Jobs) {
-                $result = $Job.PowerShell.EndInvoke($Job.Handle)
-                if ($result) {
-                    $newVMsData += $result
-                    $foundNewVMs++
-                    Write-DebugLog "    Stored VM: $($result.Name) | Status: $($result.Status) | Created: $($result.CreatedDate)"
-                }
-                $Job.PowerShell.Dispose()
-            }
-            
-            $RunspacePool.Close()
-            $RunspacePool.Dispose()
+            Write-DebugLog "  Retrieved $vmCount VMs from page $page"
+            $allVMs += $resourceResponse.resourceList
         }
         
         $page++
@@ -400,7 +282,150 @@ try {
         
     } while ($hasMore)
     
-    Write-DebugLog "`nFound $foundNewVMs VMs created in the last $daysBack day(s) from Aria Operations" "SUCCESS"
+    Write-DebugLog "Total VMs retrieved from Aria Operations: $($allVMs.Count)"
+    Write-DebugLog "Now filtering for VMs created in the last $hoursBack hours..."
+    
+    # Process VMs in parallel to check creation dates
+    $RunspacePool = [runspacefactory]::CreateRunspacePool(1, 20)
+    $RunspacePool.Open()
+    $Jobs = @()
+    
+    foreach ($resource in $allVMs) {
+        $PowerShell = [powershell]::Create()
+        $PowerShell.RunspacePool = $RunspacePool
+        
+        [void]$PowerShell.AddScript({
+            param($resource, $ariaOpsServer, $ariaHeaders, $cutoffDate, $cutoffMs)
+            
+            try {
+                $resourceId = $resource.identifier
+                
+                # Get VM name from resourceKey.name
+                $vmName = $resource.resourceKey.name
+                
+                # Get detailed properties including creation time
+                $statsUri = "https://$ariaOpsServer/suite-api/api/resources/$resourceId/properties"
+                $statsResponse = Invoke-RestMethod -Uri $statsUri -Method Get -Headers $ariaHeaders -ErrorAction Stop
+                
+                # Look for the actual VM name from config
+                $vSphereMachineProp = $statsResponse.property | Where-Object { 
+                    $_.name -eq "config|name" -or $_.name -eq "summary|config|name"
+                } | Select-Object -First 1
+                
+                if ($vSphereMachineProp -and $vSphereMachineProp.value) {
+                    $vmName = $vSphereMachineProp.value
+                }
+                
+                if (-not $vmName) {
+                    return $null
+                }
+                
+                # CRITICAL: Find the creation timestamp property
+                # Try multiple possible property names for creation time
+                $creationTimeProp = $statsResponse.property | Where-Object { 
+                    $_.name -in @(
+                        "summary|createdTime",
+                        "sys|createdTime", 
+                        "config|createDate",
+                        "config|createTime",
+                        "summary|config|createDate"
+                    )
+                } | Select-Object -First 1
+                
+                if (-not $creationTimeProp -or -not $creationTimeProp.value) {
+                    # No creation time found - skip this VM
+                    return $null
+                }
+                
+                # Parse creation time
+                try {
+                    $creationTimeMs = [long]$creationTimeProp.value
+                    $epochStart = [datetime]'1970-01-01'
+                    $creationDate = $epochStart.AddMilliseconds($creationTimeMs).ToLocalTime()
+                    
+                    # Check if VM was created within our time window
+                    if ($creationDate -lt $cutoffDate) {
+                        # Too old - skip
+                        return $null
+                    }
+                }
+                catch {
+                    # Could not parse creation date - skip
+                    return $null
+                }
+                
+                # Get the user who created the VM
+                $createdByUser = "N/A"
+                $createdByProp = $statsResponse.property | Where-Object { 
+                    $_.name -eq "config|createBy" -or 
+                    $_.name -eq "summary|config|annotation" -or
+                    $_.name -eq "sys|createdBy"
+                } | Select-Object -First 1
+                
+                if ($createdByProp -and $createdByProp.value) {
+                    $createdByUser = $createdByProp.value
+                }
+                
+                # Get health status
+                $healthState = $resource.resourceStatusStates | Where-Object { $_.resourceState -eq "HEALTH" } | Select-Object -First 1
+                $status = if ($healthState) { $healthState.status } else { "UNKNOWN" }
+                
+                $simpleStatus = "Unknown"
+                switch ($status) {
+                    "GREEN" { $simpleStatus = "Online" }
+                    "YELLOW" { $simpleStatus = "Online" }
+                    "ORANGE" { $simpleStatus = "Online" }
+                    "RED" { $simpleStatus = "Decomm/Offline" }
+                    "GREY" { $simpleStatus = "Decomm/Offline" }
+                    default { $simpleStatus = "Decomm/Offline" }
+                }
+                
+                # Return VM data
+                return [PSCustomObject]@{
+                    Name = $vmName
+                    CreatedDate = $creationDate
+                    Status = $simpleStatus
+                    ResourceId = $resourceId
+                    CreatedByUser = $createdByUser
+                }
+            }
+            catch {
+                return $null
+            }
+        })
+        
+        [void]$PowerShell.AddArgument($resource)
+        [void]$PowerShell.AddArgument($ariaOpsServer)
+        [void]$PowerShell.AddArgument($ariaHeaders)
+        [void]$PowerShell.AddArgument($cutoffDate)
+        [void]$PowerShell.AddArgument($cutoffMs)
+        
+        $Jobs += [PSCustomObject]@{
+            PowerShell = $PowerShell
+            Handle = $PowerShell.BeginInvoke()
+        }
+    }
+    
+    # Wait for all jobs and collect results
+    Write-DebugLog "Processing $($Jobs.Count) VMs in parallel (checking creation dates)..."
+    $processedCount = 0
+    foreach ($Job in $Jobs) {
+        $result = $Job.PowerShell.EndInvoke($Job.Handle)
+        if ($result) {
+            $newVMsData += $result
+            Write-DebugLog "  Found NEW VM: $($result.Name) | Created: $($result.CreatedDate) | Status: $($result.Status)" "SUCCESS"
+        }
+        $processedCount++
+        if ($processedCount % 100 -eq 0) {
+            Write-DebugLog "  Processed $processedCount / $($Jobs.Count) VMs..."
+        }
+        $Job.PowerShell.Dispose()
+    }
+    
+    $RunspacePool.Close()
+    $RunspacePool.Dispose()
+    
+    Write-DebugLog "`nFound $($newVMsData.Count) VMs created in the last $hoursBack hours" "SUCCESS"
 }
 catch {
     Write-DebugLog "Failed to query Aria Operations: $($_.Exception.Message)" "ERROR"
@@ -409,8 +434,12 @@ catch {
     exit
 }
 
+# Exit early if no new VMs found
 if ($newVMsData.Count -eq 0) {
-    Write-DebugLog "`nNo new VMs found in Aria Operations. Exiting." "WARN"
+    Write-DebugLog "`nNo new VMs found in the last $hoursBack hours. No email will be sent." "WARN"
+    Write-DebugLog "Script completed - nothing to report." "SUCCESS"
+    Write-Host "`nPress any key to exit..." -ForegroundColor Yellow
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
     exit
 }
 
@@ -454,7 +483,6 @@ foreach ($vraServer in $vraServers) {
         do {
             $pagedUri = "$vraUri`?page=$page&size=$size&expand=resources"
             Write-DebugLog "  Fetching page $($page + 1) (size: $size)..."
-            Write-DebugLog "  DEBUG - Full URI being called: $pagedUri"
             
             $vraResponse = Invoke-RestMethod -Uri $pagedUri -Method Get -Headers $vraHeaders -ErrorAction Stop
             if ($vraResponse.content) {
@@ -497,37 +525,30 @@ foreach ($vraServer in $vraServers) {
                     # Get hostname from various possible properties
                     $hostname = $null
                     
-                    # Try common property names
                     if ($machine.properties) {
                         $props = $machine.properties
                         
                         # Priority order for finding hostname
                         if ($props.hostname) { 
                             $hostname = $props.hostname 
-                            Write-DebugLog "    Found hostname in properties.hostname: $hostname"
                         } 
                         elseif ($props.resourceName) {
                             $hostname = $props.resourceName
-                            Write-DebugLog "    Found hostname in properties.resourceName: $hostname"
                         }
                         elseif ($props.name) {
                             $hostname = $props.name
-                            Write-DebugLog "    Found hostname in properties.name: $hostname"
                         }
                         elseif ($props.address) {
                             $hostname = $props.address
-                            Write-DebugLog "    Found hostname in properties.address: $hostname"
                         }
                         elseif ($props.hostName) {
                             $hostname = $props.hostName
-                            Write-DebugLog "    Found hostname in properties.hostName: $hostname"
                         }
                     }
                     
                     # Fallback to machine name
                     if (-not $hostname -and $machine.name) {
                         $hostname = $machine.name
-                        Write-DebugLog "    Found hostname in machine.name: $hostname"
                     }
                     
                     if ($hostname) {
@@ -553,11 +574,10 @@ foreach ($vraServer in $vraServers) {
                             # Extract first part of FQDN
                             $vraServerShort = ($vraServer -split '\.')[0]
                             
-                            # Get catalog item from customProperties.category
+                            # Get catalog item
                             $catalogItem = "N/A"
                             if ($dep.customProperties -and $dep.customProperties.category) {
                                 $catalogItem = $dep.customProperties.category
-                                Write-DebugLog "    Found catalog item: $catalogItem"
                             }
                             
                             $deploymentData[$hostname] = @{
@@ -572,18 +592,6 @@ foreach ($vraServer in $vraServers) {
                             }
                             
                             Write-DebugLog "    Stored deployment for $hostname from $vraServer"
-                        }
-                        else {
-                            Write-DebugLog "    Skipping $hostname - already found in another vRA" "WARN"
-                        }
-                    }
-                    else {
-                        Write-DebugLog "    Could not determine hostname for machine in deployment $($dep.name)" "WARN"
-                        Write-DebugLog "    Machine type: $($machine.type), Machine ID: $($machine.id)"
-                        
-                        # Log all available properties for debugging
-                        if ($machine.properties) {
-                            Write-DebugLog "    Available properties: $($machine.properties.Keys -join ', ')"
                         }
                     }
                 }
@@ -604,7 +612,7 @@ foreach ($vraServer in $vraServers) {
             
         } while ($hasMore)
         
-        Write-DebugLog "Completed scanning $vraServer - Found $deploymentsFound new deployments" "SUCCESS"
+        Write-DebugLog "Completed scanning $vraServer - Found $deploymentsFound deployments" "SUCCESS"
     }
     catch {
         Write-DebugLog "Error processing vRA server $vraServer : $($_.Exception.Message)" "ERROR"
@@ -613,16 +621,6 @@ foreach ($vraServer in $vraServers) {
 }
 
 Write-DebugLog "`nTotal unique deployments found across all vRA servers: $($deploymentData.Count)" "SUCCESS"
-
-# Log which VMs were not found in any vRA and mark them as Decomm
-Write-DebugLog "`n--- VM to Deployment Matching ---" "INFO"
-foreach ($vmData in $newVMsData) {
-    if (-not $deploymentData.ContainsKey($vmData.Name)) {
-        Write-DebugLog "VM '$($vmData.Name)' not found in any vRA deployment - Built directly in vCenter" "WARN"
-        # For VMs not in vRA, check if we should mark as decomm based on status
-        # If already marked as Decomm/Offline in Aria, keep it that way
-    }
-}
 
 # Build Final Report
 Write-DebugLog "`n===== Building Final Report =====" "INFO"
@@ -640,7 +638,7 @@ foreach ($vmData in $newVMsData) {
     if ($depInfo) {
         Write-DebugLog "Matched VM '$vmName' to deployment: $($depInfo.DeploymentName)"
         
-        # VM found in vRA - use vRA deployment info
+        # VM found in vRA
         $reportObject = New-Object PSObject -Property @{
             Name = $vmName
             Status = $vmData.Status
@@ -658,7 +656,7 @@ foreach ($vmData in $newVMsData) {
     else {
         Write-DebugLog "No deployment found for VM: $vmName - Built directly in vCenter" "WARN"
         
-        # VM NOT found in vRA - built directly in vCenter
+        # VM NOT found in vRA
         $reportObject = New-Object PSObject -Property @{
             Name = $vmName
             Status = $vmData.Status
@@ -693,11 +691,10 @@ Send-NewServerReport `
     -From $smtpFrom `
     -To $smtpTo `
     -Subject $smtpSubject `
-    -DaysBack $daysBack `
+    -HoursBack $hoursBack `
     -CsvPath $outputCSV
 
 # Cleanup
-Write-DebugLog "`n===== Cleanup =====" "INFO"
 Write-DebugLog "`n===== Script Completed Successfully =====" "SUCCESS"
 Write-DebugLog "Results saved to: $outputCSV"
 Write-DebugLog "Log saved to: $outputLog"
