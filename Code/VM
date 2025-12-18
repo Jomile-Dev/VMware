@@ -323,8 +323,6 @@ catch {
 
 if ($newVMsData.Count -eq 0) {
     Write-DebugLog "`nNo new VMs found in Aria Operations. Exiting." "WARN"
-    Write-Host "`nPress any key to exit..." -ForegroundColor Yellow
-    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
     exit
 }
 
@@ -358,16 +356,17 @@ foreach ($vraServer in $vraServers) {
             "Content-Type" = "application/json"
         }
         
-        # Fetch deployments
-        Write-DebugLog "Fetching deployments from $vraServer..."
+        # Fetch active deployments
+        Write-DebugLog "Fetching active deployments from $vraServer..."
         $vraUri = "https://$vraServer/deployment/api/deployments"
         $page = 0
         $size = 1000
         $deploymentsFound = 0
+        $allDeployments = @()
         
         do {
             $pagedUri = "$vraUri`?page=$page&size=$size&expand=resources"
-            Write-DebugLog "  Fetching page $($page + 1) (size: $size)..."
+            Write-DebugLog "  Fetching active deployments page $($page + 1) (size: $size)..."
             
             $vraResponse = Invoke-RestMethod -Uri $pagedUri -Method Get -Headers $vraHeaders -ErrorAction Stop
             if ($vraResponse.content) {
@@ -377,7 +376,65 @@ foreach ($vraServer in $vraServers) {
                 $deployments = $vraResponse
             }
             
-            Write-DebugLog "  Retrieved $($deployments.Count) deployments on page $($page + 1)"
+            Write-DebugLog "  Retrieved $($deployments.Count) active deployments on page $($page + 1)"
+            $allDeployments += $deployments
+            
+            $page++
+            $hasMore = $false
+            
+            if ($vraResponse.totalPages) { 
+                $hasMore = ($page -lt $vraResponse.totalPages)
+            } 
+            elseif ($vraResponse.totalElements) { 
+                $hasMore = (($page * $size) -lt $vraResponse.totalElements)
+            } 
+            else { 
+                $hasMore = ($deployments.Count -eq $size)
+            }
+            
+        } while ($hasMore)
+        
+        Write-DebugLog "Total active deployments retrieved: $($allDeployments.Count)"
+        
+        # Fetch deleted deployments
+        Write-DebugLog "Fetching deleted deployments from $vraServer..."
+        $page = 0
+        
+        do {
+            $pagedUri = "$vraUri`?page=$page&size=$size&expand=resources&status=DELETED"
+            Write-DebugLog "  Fetching deleted deployments page $($page + 1) (size: $size)..."
+            
+            $vraResponse = Invoke-RestMethod -Uri $pagedUri -Method Get -Headers $vraHeaders -ErrorAction Stop
+            if ($vraResponse.content) {
+                $deployments = $vraResponse.content
+            } 
+            else {
+                $deployments = $vraResponse
+            }
+            
+            Write-DebugLog "  Retrieved $($deployments.Count) deleted deployments on page $($page + 1)"
+            $allDeployments += $deployments
+            
+            $page++
+            $hasMore = $false
+            
+            if ($vraResponse.totalPages) { 
+                $hasMore = ($page -lt $vraResponse.totalPages)
+            } 
+            elseif ($vraResponse.totalElements) { 
+                $hasMore = (($page * $size) -lt $vraResponse.totalElements)
+            } 
+            else { 
+                $hasMore = ($deployments.Count -eq $size)
+            }
+            
+        } while ($hasMore)
+        
+        Write-DebugLog "Total deployments (active + deleted): $($allDeployments.Count)"
+        
+        # Now process all deployments (active and deleted)
+        $deployments = $allDeployments
+        Write-DebugLog "Processing all $($deployments.Count) deployments..."
             
             # Filter for deployments with vSphere machines
             $deploymentsWithVMs = @()
@@ -396,7 +453,7 @@ foreach ($vraServer in $vraServers) {
                 }
             }
             
-            Write-DebugLog "  $($deploymentsWithVMs.Count) deployments have vSphere machines"
+            Write-DebugLog "  $($deploymentsWithVMs.Count) deployments have vSphere machines (active and deleted)"
             
             foreach ($dep in $deploymentsWithVMs) {
                 $vSphereMachines = @()
@@ -497,7 +554,7 @@ foreach ($vraServer in $vraServers) {
             
         } while ($hasMore)
         
-        Write-DebugLog "Completed scanning $vraServer - Found $deploymentsFound deployments" "SUCCESS"
+        Write-DebugLog "Completed scanning $vraServer - Found $deploymentsFound deployments (including deleted)" "SUCCESS"
     }
     catch {
         Write-DebugLog "Error processing vRA server $vraServer : $($_.Exception.Message)" "ERROR"
@@ -663,5 +720,3 @@ Write-DebugLog "`n===== Script Completed Successfully =====" "SUCCESS"
 Write-DebugLog "Results saved to: $outputCSV"
 Write-DebugLog "Log saved to: $outputLog"
 Write-DebugLog "`n========================================`n"
-Write-Host "`nPress any key to exit..." -ForegroundColor Yellow
-$null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
