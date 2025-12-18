@@ -433,126 +433,110 @@ foreach ($vraServer in $vraServers) {
         Write-DebugLog "Total deployments (active + deleted): $($allDeployments.Count)"
         
         # Now process all deployments (active and deleted)
-        $deployments = $allDeployments
-        Write-DebugLog "Processing all $($deployments.Count) deployments..."
-            
-            # Filter for deployments with vSphere machines
-            $deploymentsWithVMs = @()
-            foreach ($dep in $deployments) {
-                if ($dep.resources) {
-                    $hasVSphereMachine = $false
-                    foreach ($res in $dep.resources) {
-                        if ($res.type -eq "Cloud.vSphere.Machine") {
-                            $hasVSphereMachine = $true
-                            break
-                        }
+        Write-DebugLog "Processing all $($allDeployments.Count) deployments..."
+        
+        # Filter for deployments with vSphere machines
+        $deploymentsWithVMs = @()
+        foreach ($dep in $allDeployments) {
+            if ($dep.resources) {
+                $hasVSphereMachine = $false
+                foreach ($res in $dep.resources) {
+                    if ($res.type -eq "Cloud.vSphere.Machine") {
+                        $hasVSphereMachine = $true
+                        break
                     }
-                    if ($hasVSphereMachine) {
-                        $deploymentsWithVMs += $dep
-                    }
+                }
+                if ($hasVSphereMachine) {
+                    $deploymentsWithVMs += $dep
+                }
+            }
+        }
+        
+        Write-DebugLog "  $($deploymentsWithVMs.Count) deployments have vSphere machines (active and deleted)"
+        
+        foreach ($dep in $deploymentsWithVMs) {
+            $vSphereMachines = @()
+            foreach ($res in $dep.resources) {
+                if ($res.type -eq "Cloud.vSphere.Machine") {
+                    $vSphereMachines += $res
                 }
             }
             
-            Write-DebugLog "  $($deploymentsWithVMs.Count) deployments have vSphere machines (active and deleted)"
-            
-            foreach ($dep in $deploymentsWithVMs) {
-                $vSphereMachines = @()
-                foreach ($res in $dep.resources) {
-                    if ($res.type -eq "Cloud.vSphere.Machine") {
-                        $vSphereMachines += $res
+            foreach ($machine in $vSphereMachines) {
+                # Get hostname from various possible properties
+                $hostname = $null
+                
+                if ($machine.properties) {
+                    $props = $machine.properties
+                    
+                    # Priority order for finding hostname
+                    if ($props.hostname) { 
+                        $hostname = $props.hostname 
+                    } 
+                    elseif ($props.resourceName) {
+                        $hostname = $props.resourceName
+                    }
+                    elseif ($props.name) {
+                        $hostname = $props.name
+                    }
+                    elseif ($props.address) {
+                        $hostname = $props.address
+                    }
+                    elseif ($props.hostName) {
+                        $hostname = $props.hostName
                     }
                 }
                 
-                foreach ($machine in $vSphereMachines) {
-                    # Get hostname from various possible properties
-                    $hostname = $null
-                    
-                    if ($machine.properties) {
-                        $props = $machine.properties
+                # Fallback to machine name
+                if (-not $hostname -and $machine.name) {
+                    $hostname = $machine.name
+                }
+                
+                if ($hostname) {
+                    # Only store if not already found in a previous vRA
+                    if (-not $deploymentData.ContainsKey($hostname)) {
+                        $deploymentsFound++
                         
-                        # Priority order for finding hostname
-                        if ($props.hostname) { 
-                            $hostname = $props.hostname 
-                        } 
-                        elseif ($props.resourceName) {
-                            $hostname = $props.resourceName
+                        $description = "N/A"
+                        if ($dep.description) {
+                            $description = $dep.description
                         }
-                        elseif ($props.name) {
-                            $hostname = $props.name
+                        
+                        $requestedBy = "N/A"
+                        if ($dep.createdBy) {
+                            $requestedBy = $dep.createdBy
                         }
-                        elseif ($props.address) {
-                            $hostname = $props.address
+                        
+                        $requestor = $requestedBy
+                        if ($dep.ownedBy) {
+                            $requestor = $dep.ownedBy
                         }
-                        elseif ($props.hostName) {
-                            $hostname = $props.hostName
+                        
+                        # Extract first part of FQDN
+                        $vraServerShort = ($vraServer -split '\.')[0]
+                        
+                        # Get catalog item
+                        $catalogItem = "N/A"
+                        if ($dep.customProperties -and $dep.customProperties.category) {
+                            $catalogItem = $dep.customProperties.category
                         }
-                    }
-                    
-                    # Fallback to machine name
-                    if (-not $hostname -and $machine.name) {
-                        $hostname = $machine.name
-                    }
-                    
-                    if ($hostname) {
-                        # Only store if not already found in a previous vRA
-                        if (-not $deploymentData.ContainsKey($hostname)) {
-                            $deploymentsFound++
-                            
-                            $description = "N/A"
-                            if ($dep.description) {
-                                $description = $dep.description
-                            }
-                            
-                            $requestedBy = "N/A"
-                            if ($dep.createdBy) {
-                                $requestedBy = $dep.createdBy
-                            }
-                            
-                            $requestor = $requestedBy
-                            if ($dep.ownedBy) {
-                                $requestor = $dep.ownedBy
-                            }
-                            
-                            # Extract first part of FQDN
-                            $vraServerShort = ($vraServer -split '\.')[0]
-                            
-                            # Get catalog item
-                            $catalogItem = "N/A"
-                            if ($dep.customProperties -and $dep.customProperties.category) {
-                                $catalogItem = $dep.customProperties.category
-                            }
-                            
-                            $deploymentData[$hostname] = @{
-                                DeploymentName = $dep.name
-                                Description = $description
-                                RequestedBy = $requestedBy
-                                Requestor = $requestor
-                                vRAServer = $vraServerShort
-                                DeploymentID = $dep.id
-                                Status = $dep.status
-                                CatalogItem = $catalogItem
-                            }
-                            
-                            Write-DebugLog "    Stored deployment for $hostname from $vraServer"
+                        
+                        $deploymentData[$hostname] = @{
+                            DeploymentName = $dep.name
+                            Description = $description
+                            RequestedBy = $requestedBy
+                            Requestor = $requestor
+                            vRAServer = $vraServerShort
+                            DeploymentID = $dep.id
+                            Status = $dep.status
+                            CatalogItem = $catalogItem
                         }
+                        
+                        Write-DebugLog "    Stored deployment for $hostname from $vraServer"
                     }
                 }
             }
-            
-            $page++
-            $hasMore = $false
-            
-            if ($vraResponse.totalPages) { 
-                $hasMore = ($page -lt $vraResponse.totalPages)
-            } 
-            elseif ($vraResponse.totalElements) { 
-                $hasMore = (($page * $size) -lt $vraResponse.totalElements)
-            } 
-            else { 
-                $hasMore = ($deployments.Count -eq $size)
-            }
-            
-        } while ($hasMore)
+        }
         
         Write-DebugLog "Completed scanning $vraServer - Found $deploymentsFound deployments (including deleted)" "SUCCESS"
     }
