@@ -320,8 +320,9 @@ foreach ($vraServer in $vraServers) {
         $deploymentsFound = 0
         
         do {
-            $pagedUri = "$vraUri?page=$page&size=$size&expand=resources"
+            $pagedUri = "$vraUri`?page=$page&size=$size&expand=resources"
             Write-DebugLog "  Fetching page $($page + 1) (size: $size)..."
+            Write-DebugLog "  DEBUG - Full URI being called: $pagedUri"
             
             $vraResponse = Invoke-RestMethod -Uri $pagedUri -Method Get -Headers $vraHeaders -ErrorAction Stop
             if ($vraResponse.content) {
@@ -481,11 +482,13 @@ foreach ($vraServer in $vraServers) {
 
 Write-DebugLog "`nTotal unique deployments found across all vRA servers: $($deploymentData.Count)" "SUCCESS"
 
-# Log which VMs were not found in any vRA
+# Log which VMs were not found in any vRA and mark them as Decomm
 Write-DebugLog "`n--- VM to Deployment Matching ---" "INFO"
 foreach ($vmData in $newVMsData) {
     if (-not $deploymentData.ContainsKey($vmData.Name)) {
-        Write-DebugLog "VM '$($vmData.Name)' not found in any vRA deployment" "WARN"
+        Write-DebugLog "VM '$($vmData.Name)' not found in any vRA deployment - marking as Decomm" "WARN"
+        # If VM not found in vRA OR if it's grayed out in Aria, it's decommissioned
+        $vmData.Status = "Decomm/Offline"
     }
 }
 
