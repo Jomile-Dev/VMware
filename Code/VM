@@ -401,14 +401,13 @@ foreach ($vraServer in $vraServers) {
         
         Write-DebugLog "Total active deployments retrieved: $($allDeployments.Count)"
         
-        # Fetch deleted deployments
+        # Fetch deleted deployments with expand=resources
         Write-DebugLog "Fetching deleted deployments from $vraServer..."
         $page = 0
         
         do {
             $pagedUri = "$vraUri`?page=$page&size=$size&expand=resources&`$filter=status eq 'DELETED'"
             Write-DebugLog "  Fetching deleted deployments page $($page + 1) (size: $size)..."
-            Write-DebugLog "  API Call: $pagedUri"
             
             try {
                 $vraResponse = Invoke-RestMethod -Uri $pagedUri -Method Get -Headers $vraHeaders -ErrorAction Stop
@@ -527,10 +526,10 @@ foreach ($vraServer in $vraServers) {
                         # Extract first part of FQDN
                         $vraServerShort = ($vraServer -split '\.')[0]
                         
-                        # Get catalog item
+                        # Get catalog item from _catalogItemName
                         $catalogItem = "N/A"
-                        if ($dep.customProperties -and $dep.customProperties.category) {
-                            $catalogItem = $dep.customProperties.category
+                        if ($dep.customProperties -and $dep.customProperties._catalogItemName) {
+                            $catalogItem = $dep.customProperties._catalogItemName
                         }
                         
                         $deploymentData[$hostname] = @{
