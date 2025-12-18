@@ -391,16 +391,15 @@ foreach ($vraServer in $vraServers) {
         
         Write-DebugLog "Total active deployments retrieved: $($allDeployments.Count)"
         
-        # Fetch deleted deployments with expand=resources (recently deleted)
-        Write-DebugLog "Fetching recently deleted deployments from $vraServer..."
+        # Fetch all deployments (including deleted ones)
+        Write-DebugLog "Fetching all deployments (including deleted) from $vraServer..."
         $page = 0
         $deletedCount = 0
         
         do {
-            # Get all deleted deployments first, then filter by date
-            $pagedUri = "$vraUri`?page=$page&size=$size&expand=resources&`$filter=status eq 'DELETED'"
-            Write-DebugLog "  Fetching deleted deployments page $($page + 1) (size: $size)..."
-            Write-DebugLog "  API URL: $pagedUri" "INFO"
+            # Get ALL deployments without status filter
+            $pagedUri = "$vraUri`?page=$page&size=$size&expand=resources"
+            Write-DebugLog "  Fetching all deployments page $($page + 1) (size: $size)..."
             
             try {
                 $vraResponse = Invoke-RestMethod -Uri $pagedUri -Method Get -Headers $vraHeaders -ErrorAction Stop
@@ -411,37 +410,11 @@ foreach ($vraServer in $vraServers) {
                     $deployments = $vraResponse
                 }
                 
-                Write-DebugLog "  Retrieved $($deployments.Count) total deleted deployments on page $($page + 1)"
-                
-                # Filter for recently deleted (within daysBack)
-                $cutoffDate = (Get-Date).AddDays(-$daysBack)
-                Write-DebugLog "  Cutoff date for recently deleted: $cutoffDate"
-                
-                $recentlyDeleted = @()
-                foreach ($dep in $deployments) {
-                    if ($dep.lastUpdatedAt) {
-                        $lastUpdated = [DateTime]$dep.lastUpdatedAt
-                        Write-DebugLog "    Deployment: $($dep.name) | Status: $($dep.status) | LastUpdated: $lastUpdated" "INFO"
-                        
-                        if ($lastUpdated -ge $cutoffDate) {
-                            Write-DebugLog "      ✓ Including - Recently deleted (within $daysBack days)" "SUCCESS"
-                            $recentlyDeleted += $dep
-                        }
-                        else {
-                            Write-DebugLog "      ✗ Skipping - Deleted too long ago" "WARN"
-                        }
-                    }
-                    else {
-                        Write-DebugLog "    Deployment: $($dep.name) | Status: $($dep.status) | LastUpdated: N/A - Skipping" "WARN"
-                    }
-                }
-                
-                Write-DebugLog "  $($recentlyDeleted.Count) recently deleted deployments match time criteria"
-                $deletedCount += $recentlyDeleted.Count
-                $allDeployments += $recentlyDeleted
+                Write-DebugLog "  Retrieved $($deployments.Count) deployments on page $($page + 1)"
+                $allDeployments += $deployments
             }
             catch {
-                Write-DebugLog "  Could not fetch deleted deployments: $($_.Exception.Message)" "ERROR"
+                Write-DebugLog "  Could not fetch deployments: $($_.Exception.Message)" "ERROR"
                 Write-DebugLog "  Error details: $($_.Exception)" "ERROR"
                 break
             }
@@ -462,7 +435,6 @@ foreach ($vraServer in $vraServers) {
         } while ($hasMore)
         
         Write-DebugLog "Total recently deleted deployments included: $deletedCount" "SUCCESS"
-        Write-DebugLog "Total deployments (active + recently deleted): $($allDeployments.Count)"
         
         # Now process all deployments (active and deleted)
         Write-DebugLog "Processing all $($allDeployments.Count) deployments..."
