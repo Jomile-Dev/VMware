@@ -133,38 +133,30 @@ try {
         foreach ($dep in $deployments) {
             $totalProcessed++
             
-            # Filter by ItemName - check if it contains "Virtual Machine" or "Database"
+            # Filter by catalogItemName (the template name) - check if it contains "Virtual Machine" or "Database"
             Write-Log "[$totalProcessed] Checking deployment: $($dep.name)"
             
-            $itemName = $null
+            $catalogItemName = $dep.catalogItemName
             
-            # Get the ItemName field
-            if ($dep.itemName) {
-                $itemName = $dep.itemName
-            } elseif ($dep.name) {
-                # Sometimes 'name' is the item name
-                $itemName = $dep.name
-            }
-            
-            Write-Log "  ItemName: $itemName"
-            Write-Log "  Catalog Item Name: $($dep.catalogItemName)"
+            Write-Log "  Deployment Name: $($dep.name)"
+            Write-Log "  Catalog Item Name (Template): $catalogItemName"
             Write-Log "  Owner: $($dep.ownedBy)"
             Write-Log "  Requestor: $($dep.createdBy)"
             Write-Log "  Project: $($dep.projectId)"
             
-            # Skip if no ItemName found
-            if (-not $itemName) {
-                Write-Log "[$totalProcessed] Skipping: No ItemName found" "WARN"
+            # Skip if no catalog item name found
+            if (-not $catalogItemName) {
+                Write-Log "[$totalProcessed] Skipping: No Catalog Item Name found" "WARN"
                 continue
             }
             
-            # Filter by ItemName containing "Virtual Machine" or "Database"
-            if ($itemName -notmatch "Virtual Machine" -and $itemName -notmatch "Database") {
-                Write-Log "[$totalProcessed] Skipping: ItemName '$itemName' doesn't contain 'Virtual Machine' or 'Database'" "WARN"
+            # Filter by catalogItemName containing "Virtual Machine" or "Database"
+            if ($catalogItemName -notmatch "Virtual Machine" -and $catalogItemName -notmatch "Database") {
+                Write-Log "[$totalProcessed] Skipping: Catalog Item Name '$catalogItemName' doesn't contain 'Virtual Machine' or 'Database'" "WARN"
                 continue
             }
             
-            Write-Log "[$totalProcessed] >>> ItemName '$itemName' MATCHES! Processing... <<<" "SUCCESS"
+            Write-Log "[$totalProcessed] >>> Catalog Item Name '$catalogItemName' MATCHES! Processing... <<<" "SUCCESS"
             
             # Check date but log it for debugging
             $deleteDate = $null
@@ -284,6 +276,43 @@ try {
                     Write-Log "  $($_.Type): $($_.Value)"
                 }
                 
+                # NEW APPROACH: Search all requests and filter by deployment name or ID
+                Write-Log "`nNEW APPROACH: Searching all catalog requests for this deployment..."
+                try {
+                    $searchUri = "https://$vraServer/catalog/api/requests?`$top=1000"
+                    Write-Log "  Fetching all recent requests: $searchUri"
+                    $allRequestsResponse = Invoke-RestMethod -Uri $searchUri -Method Get -Headers $vraHeaders -ErrorAction Stop
+                    $allRequests = if ($allRequestsResponse.content) { $allRequestsResponse.content } else { $allRequestsResponse }
+                    
+                    Write-Log "  Retrieved $($allRequests.Count) total requests, filtering..."
+                    
+                    # Filter requests that match this deployment
+                    $matchingRequests = $allRequests | Where-Object {
+                        ($_.deploymentId -eq $dep.id) -or
+                        ($_.resourceId -eq $dep.id) -or
+                        ($_.catalogItemId -eq $dep.catalogItemId) -or
+                        ($_.requestedItemName -eq $dep.name) -or
+                        ($_.name -match [regex]::Escape($dep.name))
+                    }
+                    
+                    if ($matchingRequests -and $matchingRequests.Count -gt 0) {
+                        $requests = $matchingRequests
+                        $historyFetchSuccess = $true
+                        Write-Log "  >>> SUCCESS! Found $($requests.Count) matching requests by searching all requests <<<" "SUCCESS"
+                        foreach ($mr in $matchingRequests) {
+                            Write-Log "    - $($mr.name) (ID: $($mr.id), Status: $($mr.status))"
+                        }
+                    } else {
+                        Write-Log "  No matching requests found in catalog" "WARN"
+                    }
+                }
+                catch {
+                    Write-Log "  Search all requests failed: $($_.Exception.Message)" "WARN"
+                }
+            }
+            
+            # If still no success, try the individual ID approaches
+            if (-not $historyFetchSuccess) {
                 # Try each ID with different endpoints
                 foreach ($idInfo in $possibleIds) {
                     $currentId = $idInfo.Value
