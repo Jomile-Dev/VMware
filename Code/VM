@@ -558,6 +558,17 @@ foreach ($vraServer in $vraServers) {
 }
 
 Write-DebugLog "`nTotal unique deployments found across all vRA servers: $($deploymentData.Count)" "SUCCESS"
+Write-DebugLog "Total VMs from deleted deployments: $($deletedDeploymentData.Count)" "SUCCESS"
+
+# Merge deleted deployment data into main deployment data
+foreach ($vmName in $deletedDeploymentData.Keys) {
+    if (-not $deploymentData.ContainsKey($vmName)) {
+        $deploymentData[$vmName] = $deletedDeploymentData[$vmName]
+        Write-DebugLog "  Added deleted deployment data for $vmName to main dataset"
+    }
+}
+
+Write-DebugLog "Total unique deployments (active + deleted): $($deploymentData.Count)" "SUCCESS"
 
 # Connect to vCenter for VMs not found in vRA
 Write-DebugLog "`n===== Connecting to vCenter for Additional Info =====" "INFO"
