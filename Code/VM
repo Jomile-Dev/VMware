@@ -1,15 +1,15 @@
-# vRA Deleted Deployments - Detailed Events and History
-# This script fetches deleted deployments exactly like the vRA UI does
+# vRA Deleted Deployments - Extract Delete Event Details
+# This script fetches deployments from the deleted view and extracts delete event information
 
 # Configuration
 $vraServer = "vra1.yourdomain.com"
-$daysBack = 30  # Look back 30 days
+$daysBack = 1  # Past 1 day
 
 # Output
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $outputJson = "C:\Logs\DeletedDeployments_$timestamp.json"
 $outputLog = "C:\Logs\DeletedDeployments_$timestamp.log"
-$outputHtml = "C:\Logs\DeletedDeployments_$timestamp.html"
+$outputCsv = "C:\Logs\DeletedDeployments_$timestamp.csv"
 
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
@@ -45,7 +45,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 }
 
-Write-Log "===== vRA Deleted Deployments - Detailed Explorer =====" "SUCCESS"
+Write-Log "===== vRA Deleted Deployments - Delete Event Extractor =====" "SUCCESS"
 Disable-SSLValidation
 
 # Ensure log directory exists
@@ -93,287 +93,273 @@ $vraHeaders = @{
     "Accept" = "application/json"
 }
 
-$allDeletedDeployments = @()
+$cutoffDate = (Get-Date).AddDays(-$daysBack)
+Write-Log "Looking for deployments deleted after: $cutoffDate"
 
-# Fetch deleted deployments using the catalog API (like the UI does)
-Write-Log "`n===== Fetching Deleted Deployments (Catalog API) ====="
+$deletedDeploymentDetails = @()
+
+# Step 1: Fetch deleted deployments from the deployment API
+Write-Log "`n===== Fetching Deleted Deployments ====="
 
 try {
     $page = 0
-    $size = 100
+    $size = 200
+    $totalProcessed = 0
     
     do {
-        # This is the actual API the UI uses for deleted deployments
-        $uri = "https://$vraServer/catalog/api/items?deleted=true&page=$page&size=$size"
+        # Use deployment API to get deleted deployments
+        $uri = "https://$vraServer/deployment/api/deployments?`$filter=deleted eq true&page=$page&size=$size"
         Write-Log "Fetching page $($page + 1): $uri"
         
-        $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $vraHeaders -ErrorAction Stop
-        $items = if ($response.content) { $response.content } else { $response }
+        try {
+            $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $vraHeaders -ErrorAction Stop
+        }
+        catch {
+            # Try alternate format
+            Write-Log "Trying alternate URL format..." "WARN"
+            $uri = "https://$vraServer/deployment/api/deployments?deleted=true&page=$page&size=$size"
+            $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $vraHeaders -ErrorAction Stop
+        }
         
-        Write-Log "Retrieved $($items.Count) deleted items" "SUCCESS"
+        $deployments = if ($response.content) { $response.content } elseif ($response.value) { $response.value } else { $response }
         
-        foreach ($item in $items) {
+        Write-Log "Retrieved $($deployments.Count) deployments" "SUCCESS"
+        
+        if ($deployments.Count -eq 0) {
+            Write-Log "No deployments found on this page, stopping" "WARN"
+            break
+        }
+        
+        foreach ($dep in $deployments) {
+            $totalProcessed++
+            
+            # Filter by name
+            if ($dep.name -notmatch "Virtual Machine" -and $dep.name -notmatch "Database") {
+                Write-Log "[$totalProcessed] Skipping: $($dep.name) (not VM/Database)" "WARN"
+                continue
+            }
+            
+            # Filter by date
+            $deleteDate = $null
+            if ($dep.lastUpdatedAt) {
+                $deleteDate = [DateTime]$dep.lastUpdatedAt
+            }
+            elseif ($dep.deletedAt) {
+                $deleteDate = [DateTime]$dep.deletedAt
+            }
+            
+            if ($deleteDate -and $deleteDate -lt $cutoffDate) {
+                Write-Log "[$totalProcessed] Skipping: $($dep.name) (too old: $deleteDate)" "WARN"
+                continue
+            }
+            
             Write-Log "`n========================================" "SUCCESS"
-            Write-Log "DEPLOYMENT: $($item.name)" "SUCCESS"
+            Write-Log "[$totalProcessed] PROCESSING: $($dep.name)" "SUCCESS"
             Write-Log "========================================" "SUCCESS"
-            Write-Log "  ID: $($item.id)"
-            Write-Log "  Catalog Item: $($item.catalogItemName)"
-            Write-Log "  Status: $($item.status)"
-            Write-Log "  Deployment ID: $($item.deploymentId)"
-            Write-Log "  Created: $($item.createdAt)"
-            Write-Log "  Last Updated: $($item.lastUpdatedAt)"
-            Write-Log "  Requested By: $($item.requestedBy)"
+            Write-Log "Deployment ID: $($dep.id)"
+            Write-Log "Status: $($dep.status)"
+            Write-Log "Deleted At: $($dep.deletedAt)"
+            Write-Log "Last Updated: $($dep.lastUpdatedAt)"
+            Write-Log "Owner: $($dep.ownedBy)"
             
-            # Now fetch detailed deployment information
-            if ($item.deploymentId) {
-                Write-Log "`n  Fetching detailed deployment info..." "SUCCESS"
+            # Step 2: Get the request/action history for this deployment
+            Write-Log "`nFetching request history..." "SUCCESS"
+            
+            try {
+                $requestsUri = "https://$vraServer/deployment/api/deployments/$($dep.id)/requests"
+                $requestsResponse = Invoke-RestMethod -Uri $requestsUri -Method Get -Headers $vraHeaders -ErrorAction Stop
                 
-                try {
-                    $depUri = "https://$vraServer/deployment/api/deployments/$($item.deploymentId)"
-                    $deployment = Invoke-RestMethod -Uri $depUri -Method Get -Headers $vraHeaders -ErrorAction Stop
+                $requests = if ($requestsResponse.content) { $requestsResponse.content } elseif ($requestsResponse.value) { $requestsResponse.value } else { $requestsResponse }
+                
+                Write-Log "Found $($requests.Count) requests/actions in history"
+                
+                # Step 3: Find the DELETE action(s)
+                $deleteRequests = $requests | Where-Object { 
+                    $_.actionId -match "delete" -or 
+                    $_.actionId -match "DELETE" -or
+                    $_.name -match "delete" -or
+                    $_.name -match "DELETE" -or
+                    $_.actionId -eq "Deployment.Delete"
+                }
+                
+                if ($deleteRequests) {
+                    Write-Log ">>> FOUND $($deleteRequests.Count) DELETE ACTION(S) <<<" "SUCCESS"
                     
-                    Write-Log "  Project: $($deployment.projectId)"
-                    Write-Log "  Owned By: $($deployment.ownedBy)"
-                    Write-Log "  Deleted At: $($deployment.deletedAt)"
-                    
-                    # Get deployment resources
-                    if ($deployment.resources) {
-                        Write-Log "`n  === RESOURCES ($($deployment.resources.Count)) ===" "SUCCESS"
+                    foreach ($delReq in $deleteRequests) {
+                        Write-Log "`n  === DELETE EVENT DETAILS ===" "SUCCESS"
+                        Write-Log "  Request ID: $($delReq.id)"
+                        Write-Log "  Request Name: $($delReq.name)"
+                        Write-Log "  Action ID: $($delReq.actionId)"
+                        Write-Log "  Status: $($delReq.status)"
+                        Write-Log "  Created At: $($delReq.createdAt)"
+                        Write-Log "  Completed At: $($delReq.completedAt)"
+                        Write-Log "  Requested By: $($delReq.requestedBy)"
+                        Write-Log "  Approved By: $($delReq.approvedBy)"
                         
-                        foreach ($res in $deployment.resources) {
-                            Write-Log "`n    Resource: $($res.name)"
-                            Write-Log "      Type: $($res.type)"
-                            Write-Log "      ID: $($res.id)"
-                            Write-Log "      State: $($res.state)"
+                        # Step 4: Get detailed information about the delete request
+                        Write-Log "`n  Fetching detailed delete request info..."
+                        
+                        try {
+                            $deleteDetailUri = "https://$vraServer/deployment/api/deployments/$($dep.id)/requests/$($delReq.id)"
+                            $deleteDetail = Invoke-RestMethod -Uri $deleteDetailUri -Method Get -Headers $vraHeaders -ErrorAction Stop
                             
-                            if ($res.type -eq "Cloud.vSphere.Machine") {
-                                Write-Log "      >>> VM DETAILS <<<" "SUCCESS"
-                                if ($res.properties) {
-                                    Write-Log "      Properties:"
-                                    $res.properties.PSObject.Properties | ForEach-Object {
-                                        Write-Log "        $($_.Name): $($_.Value)"
-                                    }
+                            Write-Log "  === DETAILED DELETE REQUEST INFO ===" "SUCCESS"
+                            
+                            # Inputs
+                            if ($deleteDetail.inputs) {
+                                Write-Log "  INPUTS:"
+                                $deleteDetail.inputs.PSObject.Properties | ForEach-Object {
+                                    Write-Log "    $($_.Name): $($_.Value)"
                                 }
                             }
-                        }
-                    }
-                }
-                catch {
-                    Write-Log "  Could not fetch deployment details: $($_.Exception.Message)" "WARN"
-                }
-                
-                # Fetch REQUEST HISTORY / EVENTS for this deployment
-                Write-Log "`n  === FETCHING REQUEST HISTORY / EVENTS ===" "SUCCESS"
-                
-                try {
-                    $requestsUri = "https://$vraServer/deployment/api/deployments/$($item.deploymentId)/requests"
-                    $requests = Invoke-RestMethod -Uri $requestsUri -Method Get -Headers $vraHeaders -ErrorAction Stop
-                    
-                    $requestsList = if ($requests.content) { $requests.content } else { $requests }
-                    
-                    Write-Log "  Found $($requestsList.Count) requests/events" "SUCCESS"
-                    
-                    foreach ($req in $requestsList) {
-                        Write-Log "`n    >>> EVENT: $($req.name) <<<" "SUCCESS"
-                        Write-Log "      Request ID: $($req.id)"
-                        Write-Log "      Action: $($req.actionId)"
-                        Write-Log "      Status: $($req.status)"
-                        Write-Log "      Created: $($req.createdAt)"
-                        Write-Log "      Completed: $($req.completedAt)"
-                        Write-Log "      Requested By: $($req.requestedBy)"
-                        Write-Log "      Details: $($req.details)"
-                        
-                        # Get detailed event information
-                        if ($req.id) {
-                            try {
-                                $eventUri = "https://$vraServer/deployment/api/deployments/$($item.deploymentId)/requests/$($req.id)"
-                                $eventDetail = Invoke-RestMethod -Uri $eventUri -Method Get -Headers $vraHeaders -ErrorAction Stop
+                            
+                            # Outputs
+                            if ($deleteDetail.outputs) {
+                                Write-Log "  OUTPUTS:"
+                                $deleteDetail.outputs.PSObject.Properties | ForEach-Object {
+                                    Write-Log "    $($_.Name): $($_.Value)"
+                                }
+                            }
+                            
+                            # Details
+                            if ($deleteDetail.details) {
+                                Write-Log "  DETAILS: $($deleteDetail.details)"
+                            }
+                            
+                            # Resources affected
+                            if ($deleteDetail.resources) {
+                                Write-Log "  RESOURCES AFFECTED ($($deleteDetail.resources.Count)):"
+                                foreach ($res in $deleteDetail.resources) {
+                                    Write-Log "    - $($res.name) ($($res.type))"
+                                    Write-Log "      Resource ID: $($res.id)"
+                                    Write-Log "      State: $($res.state)"
+                                }
+                            }
+                            
+                            # Get resources from main deployment
+                            $vmResources = @()
+                            if ($dep.resources) {
+                                $vmResources = $dep.resources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" }
                                 
-                                if ($eventDetail.outputs) {
-                                    Write-Log "      Outputs:"
-                                    $eventDetail.outputs.PSObject.Properties | ForEach-Object {
-                                        Write-Log "        $($_.Name): $($_.Value)"
+                                if ($vmResources) {
+                                    Write-Log "`n  VM RESOURCES IN DEPLOYMENT ($($vmResources.Count)):"
+                                    foreach ($vm in $vmResources) {
+                                        Write-Log "    VM Name: $($vm.name)"
+                                        Write-Log "    VM ID: $($vm.id)"
+                                        Write-Log "    State: $($vm.state)"
+                                        
+                                        if ($vm.properties) {
+                                            Write-Log "    Properties:"
+                                            $vm.properties.PSObject.Properties | ForEach-Object {
+                                                Write-Log "      $($_.Name): $($_.Value)"
+                                            }
+                                        }
                                     }
                                 }
+                            }
+                            
+                            # Create comprehensive output object
+                            $deleteInfo = [PSCustomObject]@{
+                                DeploymentName = $dep.name
+                                DeploymentID = $dep.id
+                                DeletedAt = $dep.deletedAt
+                                LastUpdatedAt = $dep.lastUpdatedAt
+                                OwnedBy = $dep.ownedBy
+                                CreatedBy = $dep.createdBy
+                                ProjectId = $dep.projectId
                                 
-                                if ($eventDetail.inputs) {
-                                    Write-Log "      Inputs:"
-                                    $eventDetail.inputs.PSObject.Properties | ForEach-Object {
-                                        Write-Log "        $($_.Name): $($_.Value)"
-                                    }
-                                }
+                                # Delete Request Info
+                                DeleteRequestID = $delReq.id
+                                DeleteRequestName = $delReq.name
+                                DeleteActionID = $delReq.actionId
+                                DeleteStatus = $delReq.status
+                                DeleteCreatedAt = $delReq.createdAt
+                                DeleteCompletedAt = $delReq.completedAt
+                                DeleteRequestedBy = $delReq.requestedBy
+                                DeleteApprovedBy = $delReq.approvedBy
+                                
+                                # Detailed Info
+                                DeleteInputs = if ($deleteDetail.inputs) { $deleteDetail.inputs | ConvertTo-Json -Compress } else { $null }
+                                DeleteOutputs = if ($deleteDetail.outputs) { $deleteDetail.outputs | ConvertTo-Json -Compress } else { $null }
+                                DeleteDetails = $deleteDetail.details
+                                
+                                # Resources
+                                VMResources = if ($vmResources) { $vmResources | ConvertTo-Json -Compress -Depth 5 } else { $null }
+                                AffectedResources = if ($deleteDetail.resources) { $deleteDetail.resources | ConvertTo-Json -Compress -Depth 5 } else { $null }
+                                
+                                # Full objects for JSON
+                                FullDeployment = $dep
+                                FullDeleteRequest = $delReq
+                                FullDeleteDetail = $deleteDetail
                             }
-                            catch {
-                                Write-Log "      Could not fetch event details" "WARN"
-                            }
+                            
+                            $deletedDeploymentDetails += $deleteInfo
+                            
+                        }
+                        catch {
+                            Write-Log "  ERROR fetching delete request details: $($_.Exception.Message)" "ERROR"
                         }
                     }
                 }
-                catch {
-                    Write-Log "  Could not fetch request history: $($_.Exception.Message)" "WARN"
+                else {
+                    Write-Log "  No DELETE action found in history" "WARN"
                 }
                 
-                # Also try to get the original REQUEST details from catalog
-                Write-Log "`n  === FETCHING ORIGINAL CATALOG REQUEST ===" "SUCCESS"
-                
-                try {
-                    $catalogReqUri = "https://$vraServer/catalog/api/requests/$($item.id)"
-                    $catalogReq = Invoke-RestMethod -Uri $catalogReqUri -Method Get -Headers $vraHeaders -ErrorAction Stop
-                    
-                    Write-Log "  Request Type: $($catalogReq.requestType)"
-                    Write-Log "  Approval Status: $($catalogReq.approvalStatus)"
-                    
-                    if ($catalogReq.inputs) {
-                        Write-Log "  Original Request Inputs:"
-                        $catalogReq.inputs.PSObject.Properties | ForEach-Object {
-                            Write-Log "    $($_.Name): $($_.Value)"
-                        }
-                    }
-                    
-                    if ($catalogReq.outputs) {
-                        Write-Log "  Request Outputs:"
-                        $catalogReq.outputs.PSObject.Properties | ForEach-Object {
-                            Write-Log "    $($_.Name): $($_.Value)"
-                        }
-                    }
-                }
-                catch {
-                    Write-Log "  Could not fetch catalog request: $($_.Exception.Message)" "WARN"
-                }
             }
-            
-            # Build comprehensive object
-            $deletedInfo = [PSCustomObject]@{
-                ItemName = $item.name
-                ItemID = $item.id
-                DeploymentID = $item.deploymentId
-                CatalogItemName = $item.catalogItemName
-                Status = $item.status
-                CreatedAt = $item.createdAt
-                LastUpdatedAt = $item.lastUpdatedAt
-                DeletedAt = if ($deployment) { $deployment.deletedAt } else { $null }
-                RequestedBy = $item.requestedBy
-                OwnedBy = if ($deployment) { $deployment.ownedBy } else { $null }
-                ProjectId = if ($deployment) { $deployment.projectId } else { $null }
-                Resources = if ($deployment) { $deployment.resources } else { $null }
-                RequestHistory = if ($requestsList) { $requestsList } else { $null }
-                FullItem = $item
-                FullDeployment = $deployment
-                CatalogRequest = if ($catalogReq) { $catalogReq } else { $null }
+            catch {
+                Write-Log "ERROR fetching request history: $($_.Exception.Message)" "ERROR"
             }
-            
-            $allDeletedDeployments += $deletedInfo
         }
         
         $page++
-        $hasMore = ($items.Count -eq $size)
+        $hasMore = ($deployments.Count -eq $size)
         
     } while ($hasMore)
     
 }
 catch {
-    Write-Log "Error fetching deleted deployments: $($_.Exception.Message)" "ERROR"
+    Write-Log "ERROR in main loop: $($_.Exception.Message)" "ERROR"
     Write-Log "Stack Trace: $($_.Exception.StackTrace)" "ERROR"
 }
 
-# Summary
+# Summary and Export
 Write-Log "`n============================================" "SUCCESS"
 Write-Log "===== SUMMARY =====" "SUCCESS"
 Write-Log "============================================" "SUCCESS"
-Write-Log "Total deleted deployments found: $($allDeletedDeployments.Count)" "SUCCESS"
+Write-Log "Total deleted deployments processed: $totalProcessed"
+Write-Log "Deployments with delete events found: $($deletedDeploymentDetails.Count)" "SUCCESS"
 
-if ($allDeletedDeployments.Count -gt 0) {
+if ($deletedDeploymentDetails.Count -gt 0) {
     # Export full JSON
-    $allDeletedDeployments | ConvertTo-Json -Depth 20 | Out-File -FilePath $outputJson -Encoding UTF8
+    Write-Log "`nExporting detailed data..."
+    $deletedDeploymentDetails | ConvertTo-Json -Depth 20 | Out-File -FilePath $outputJson -Encoding UTF8
     Write-Log "Full JSON exported to: $outputJson" "SUCCESS"
     
-    # Create HTML report
-    $html = @"
-<!DOCTYPE html>
-<html>
-<head>
-    <title>vRA Deleted Deployments Report</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
-        h1 { color: #333; }
-        .deployment { background: white; padding: 20px; margin: 20px 0; border-radius: 5px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-        .deployment h2 { color: #d32f2f; margin-top: 0; }
-        .info { margin: 10px 0; }
-        .label { font-weight: bold; color: #666; }
-        .value { color: #333; }
-        .event { background: #f9f9f9; padding: 10px; margin: 10px 0; border-left: 4px solid #2196F3; }
-        .resource { background: #e8f5e9; padding: 10px; margin: 10px 0; border-left: 4px solid #4CAF50; }
-        pre { background: #f5f5f5; padding: 10px; overflow-x: auto; }
-    </style>
-</head>
-<body>
-    <h1>vRA Deleted Deployments Report</h1>
-    <p>Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</p>
-    <p>Total Deleted Deployments: $($allDeletedDeployments.Count)</p>
-"@
+    # Export CSV for easy viewing
+    $deletedDeploymentDetails | Select-Object DeploymentName, DeploymentID, DeletedAt, DeleteRequestedBy, 
+        DeleteStatus, DeleteCreatedAt, DeleteCompletedAt, OwnedBy | 
+        Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
+    Write-Log "CSV summary exported to: $outputCsv" "SUCCESS"
     
-    foreach ($dep in $allDeletedDeployments) {
-        $html += @"
-    <div class="deployment">
-        <h2>$($dep.ItemName)</h2>
-        <div class="info"><span class="label">Deployment ID:</span> <span class="value">$($dep.DeploymentID)</span></div>
-        <div class="info"><span class="label">Catalog Item:</span> <span class="value">$($dep.CatalogItemName)</span></div>
-        <div class="info"><span class="label">Status:</span> <span class="value">$($dep.Status)</span></div>
-        <div class="info"><span class="label">Requested By:</span> <span class="value">$($dep.RequestedBy)</span></div>
-        <div class="info"><span class="label">Created:</span> <span class="value">$($dep.CreatedAt)</span></div>
-        <div class="info"><span class="label">Deleted:</span> <span class="value">$($dep.DeletedAt)</span></div>
-        
-        <h3>Resources</h3>
-"@
-        
-        if ($dep.Resources) {
-            foreach ($res in $dep.Resources) {
-                $html += @"
-        <div class="resource">
-            <strong>$($res.name)</strong> ($($res.type))<br>
-            ID: $($res.id)<br>
-            State: $($res.state)
-        </div>
-"@
-            }
-        }
-        
-        $html += @"
-        <h3>Request History</h3>
-"@
-        
-        if ($dep.RequestHistory) {
-            foreach ($req in $dep.RequestHistory) {
-                $html += @"
-        <div class="event">
-            <strong>$($req.name)</strong><br>
-            Action: $($req.actionId)<br>
-            Status: $($req.status)<br>
-            Created: $($req.createdAt)
-        </div>
-"@
-            }
-        }
-        
-        $html += "</div>"
+    # Display summary table
+    Write-Log "`n=== DELETED DEPLOYMENTS SUMMARY ===" "SUCCESS"
+    $deletedDeploymentDetails | ForEach-Object {
+        Write-Log "`n$($_.DeploymentName)" "SUCCESS"
+        Write-Log "  Deleted: $($_.DeletedAt)"
+        Write-Log "  Deleted By: $($_.DeleteRequestedBy)"
+        Write-Log "  Delete Status: $($_.DeleteStatus)"
+        Write-Log "  Delete Completed: $($_.DeleteCompletedAt)"
     }
-    
-    $html += @"
-</body>
-</html>
-"@
-    
-    $html | Out-File -FilePath $outputHtml -Encoding UTF8
-    Write-Log "HTML report created: $outputHtml" "SUCCESS"
-    
-    # Open HTML report
-    Start-Process $outputHtml
 }
 else {
-    Write-Log "No deleted deployments found!" "WARN"
+    Write-Log "`nNO DELETED DEPLOYMENTS FOUND!" "WARN"
+    Write-Log "Possible reasons:" "WARN"
+    Write-Log "  1. No VM/Database deployments were deleted in the past $daysBack day(s)" "WARN"
+    Write-Log "  2. Increase `$daysBack variable" "WARN"
+    Write-Log "  3. Check permissions to view deleted deployments" "WARN"
 }
 
 Write-Log "`n===== Script Completed =====" "SUCCESS"
 Write-Log "JSON Output: $outputJson"
-Write-Log "HTML Report: $outputHtml"
+Write-Log "CSV Output: $outputCsv"
 Write-Log "Log file: $outputLog"
