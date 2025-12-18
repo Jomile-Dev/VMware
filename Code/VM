@@ -251,11 +251,15 @@ try {
     Write-DebugLog "Querying for VMs created in the last $hoursBack hours using stats API..."
     
     # Get current time and cutoff time in milliseconds since epoch
-    $nowMs = [long]([datetime]::UtcNow - [datetime]'1970-01-01').TotalMilliseconds
-    $cutoffMs = [long]($cutoffDate.ToUniversalTime() - [datetime]'1970-01-01').TotalMilliseconds
+    $nowUtc = [datetime]::UtcNow
+    $cutoffUtc = $cutoffDate.ToUniversalTime()
+    $nowMs = [long]($nowUtc - [datetime]'1970-01-01').TotalMilliseconds
+    $cutoffMs = [long]($cutoffUtc - [datetime]'1970-01-01').TotalMilliseconds
     
-    Write-DebugLog "Current time (UTC): $([datetime]::UtcNow)"
-    Write-DebugLog "Cutoff time (UTC): $($cutoffDate.ToUniversalTime())"
+    Write-DebugLog "Current time (Local): $(Get-Date)"
+    Write-DebugLog "Current time (UTC): $nowUtc"
+    Write-DebugLog "Cutoff time (Local): $cutoffDate"
+    Write-DebugLog "Cutoff time (UTC): $cutoffUtc"
     Write-DebugLog "Time range in milliseconds: $cutoffMs to $nowMs"
     
     # Query for ALL VirtualMachine resources first (we'll filter by creation time)
