@@ -1,12 +1,8 @@
-# New Server Tracker - vCenter + Aria Operations + Multi-vRA
+# New Server Tracker - Aria Operations + Multi-vRA
 # PowerShell 5.1 Compatible
-# Tracks servers built in the last day and correlates with vRA deployments
+# Tracks servers built in the last day from Aria Operations and correlates with vRA deployments
 
 # Configuration Variables
-$vcServers = @(
-    "vcenter1.yourdomain.com",
-    "vcenter2.yourdomain.com"
-)
 $ariaOpsServer = "aria-ops.yourdomain.com"
 $ariaOpsDomain = "yourdomain.com"  # Domain for Aria Operations authentication
 $ariaOpsAuthSource = "localos"  # Common values: localos, Active Directory, vIDMAuthSource, etc.
@@ -86,7 +82,7 @@ Write-DebugLog "SSL validation disabled"
 
 # Get credentials once for all connections
 Write-DebugLog "Requesting credentials..."
-$credential = Get-Credential -Message "Enter credentials for vCenter, Aria Operations, and vRA"
+$credential = Get-Credential -Message "Enter credentials for Aria Operations and vRA"
 if (-not $credential) {
     Write-DebugLog "Credentials not provided. Exiting." "ERROR"
     exit
@@ -95,74 +91,10 @@ $username = $credential.UserName
 $password = $credential.GetNetworkCredential().Password
 Write-DebugLog "Credentials obtained for user: $username"
 
-# Connect to vCenter
-Write-DebugLog "`n===== Connecting to vCenter Servers =====" "INFO"
-try {
-    # Try to import VMware module
-    $vmwareModule = Get-Module -Name VMware.VimAutomation.Core -ListAvailable | Select-Object -First 1
-    if ($vmwareModule) {
-        Import-Module VMware.VimAutomation.Core -ErrorAction Stop
-        Write-DebugLog "VMware PowerCLI module loaded (Version: $($vmwareModule.Version))"
-    }
-    else {
-        Write-DebugLog "CRITICAL: VMware PowerCLI not installed. Install with: Install-Module VMware.PowerCLI -Scope CurrentUser" "ERROR"
-        throw "VMware PowerCLI not found"
-    }
-}
-catch {
-    Write-DebugLog "Error loading VMware module: $($_.Exception.Message)" "ERROR"
-    exit
-}
-
-# Suppress certificate warnings for PowerCLI
-$null = Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session
-$null = Set-PowerCLIConfiguration -ParticipateInCeip $false -Confirm:$false -Scope Session
-
-# Connect to all vCenter servers
-$vcConnections = @()
-$allVMs = @()
-
-foreach ($vcServer in $vcServers) {
-    try {
-        Write-DebugLog "`n--- Connecting to vCenter $vcServer ---" "INFO"
-        $vcConnection = Connect-VIServer -Server $vcServer -Credential $credential -ErrorAction Stop
-        $vcConnections += $vcConnection
-        Write-DebugLog "Connected to $vcServer successfully" "SUCCESS"
-        
-        # Get all VMs from this vCenter (filtering will be done in Aria Operations)
-        Write-DebugLog "Fetching all VMs from $vcServer..."
-        
-        $vms = Get-VM -Server $vcServer
-        Write-DebugLog "Total VMs in $vcServer : $($vms.Count)"
-        
-        # Add vCenter identifier to each VM object
-        foreach ($vm in $vms) {
-            $vm | Add-Member -MemberType NoteProperty -Name "vCenterServer" -Value ($vcServer -split '\.')[0] -Force
-        }
-        
-        $allVMs += $vms
-    }
-    catch {
-        Write-DebugLog "Failed to connect to $vcServer : $($_.Exception.Message)" "ERROR"
-        Write-DebugLog "Continuing with remaining vCenter servers..." "WARN"
-    }
-}
-
-if ($allVMs.Count -eq 0) {
-    Write-DebugLog "`nNo VMs found across all vCenter servers. Exiting." "WARN"
-    foreach ($conn in $vcConnections) {
-        Disconnect-VIServer -Server $conn -Confirm:$false -ErrorAction SilentlyContinue
-    }
-    exit
-}
-
-Write-DebugLog "`nTotal VMs across all vCenters: $($allVMs.Count)" "SUCCESS"
-
-# Connect to Aria Operations
+# Connect to Aria Operations and Get New VMs
 Write-DebugLog "`n===== Connecting to Aria Operations =====" "INFO"
 $ariaToken = $null
-$vmStatusMap = @{}
-$allNewVMs = @()
+$newVMsData = @()
 
 try {
     Write-DebugLog "Authenticating to Aria Operations: $ariaOpsServer"
@@ -224,17 +156,17 @@ try {
                 try {
                     $resourceId = $resource.identifier
                     
-                    # Get VM name from resourceKey.name or properties
+                    # Get VM name from resourceKey.name
                     $vmName = $null
                     if ($resource.resourceKey.name) {
                         $vmName = $resource.resourceKey.name
                     }
                     
-                    # Get detailed stats for this resource including creation time
+                    # Get detailed properties for this resource
                     $statsUri = "https://$ariaOpsServer/suite-api/api/resources/$resourceId/properties"
                     $statsResponse = Invoke-RestMethod -Uri $statsUri -Method Get -Headers $ariaHeaders -ErrorAction Stop
                     
-                    # Look for Cloud.vSphere.Machine property to get the actual VM name
+                    # Look for the actual VM name from config
                     $vSphereMachineProp = $statsResponse.property | Where-Object { 
                         $_.name -eq "config|name" -or $_.name -eq "summary|config|name"
                     } | Select-Object -First 1
@@ -311,18 +243,16 @@ try {
                                 default { $simpleStatus = "Decomm/Offline" }
                             }
                             
-                            $vmStatusMap[$vmName] = $simpleStatus
+                            # Store VM data
+                            $vmData = @{
+                                Name = $vmName
+                                CreatedDate = $creationDate
+                                Status = $simpleStatus
+                                ResourceId = $resourceId
+                            }
                             
-                            # Find matching VM from vCenter list
-                            $matchingVM = $allVMs | Where-Object { $_.Name -eq $vmName } | Select-Object -First 1
-                            if ($matchingVM) {
-                                $matchingVM | Add-Member -MemberType NoteProperty -Name "AriaCreationDate" -Value $creationDate -Force
-                                $allNewVMs += $matchingVM
-                                Write-DebugLog "    Matched to vCenter VM: $vmName | Status: $simpleStatus"
-                            }
-                            else {
-                                Write-DebugLog "    WARNING: VM $vmName found in Aria Operations but not in vCenter list" "WARN"
-                            }
+                            $newVMsData += $vmData
+                            Write-DebugLog "    Stored VM: $vmName | Status: $simpleStatus | Created: $creationDate"
                         }
                     }
                 }
@@ -339,35 +269,16 @@ try {
     } while ($hasMore)
     
     Write-DebugLog "`nFound $foundNewVMs VMs created in the last $daysBack day(s) from Aria Operations" "SUCCESS"
-    
-    # For VMs not found in Aria Operations with creation time, use vCenter PowerState for status
-    foreach ($vm in $allNewVMs) {
-        if (-not $vmStatusMap.ContainsKey($vm.Name)) {
-            if ($vm.PowerState -eq "PoweredOn") {
-                $vmStatusMap[$vm.Name] = "Online"
-            } 
-            else {
-                $vmStatusMap[$vm.Name] = "Decomm/Offline"
-            }
-        }
-    }
 }
 catch {
     Write-DebugLog "Failed to query Aria Operations: $($_.Exception.Message)" "ERROR"
     Write-DebugLog "Error details: $($_.Exception)" "ERROR"
     Write-DebugLog "Cannot continue without Aria Operations data. Exiting." "ERROR"
-    
-    foreach ($conn in $vcConnections) {
-        Disconnect-VIServer -Server $conn -Confirm:$false -ErrorAction SilentlyContinue
-    }
     exit
 }
 
-if ($allNewVMs.Count -eq 0) {
+if ($newVMsData.Count -eq 0) {
     Write-DebugLog "`nNo new VMs found in Aria Operations. Exiting." "WARN"
-    foreach ($conn in $vcConnections) {
-        Disconnect-VIServer -Server $conn -Confirm:$false -ErrorAction SilentlyContinue
-    }
     exit
 }
 
@@ -572,9 +483,9 @@ Write-DebugLog "`nTotal unique deployments found across all vRA servers: $($depl
 
 # Log which VMs were not found in any vRA
 Write-DebugLog "`n--- VM to Deployment Matching ---" "INFO"
-foreach ($vm in $allNewVMs) {
-    if (-not $deploymentData.ContainsKey($vm.Name)) {
-        Write-DebugLog "VM '$($vm.Name)' not found in any vRA deployment" "WARN"
+foreach ($vmData in $newVMsData) {
+    if (-not $deploymentData.ContainsKey($vmData.Name)) {
+        Write-DebugLog "VM '$($vmData.Name)' not found in any vRA deployment" "WARN"
     }
 }
 
@@ -582,9 +493,8 @@ foreach ($vm in $allNewVMs) {
 Write-DebugLog "`n===== Building Final Report =====" "INFO"
 $reportData = @()
 
-foreach ($vm in $allNewVMs) {
-    $vmName = $vm.Name
-    $vmStatus = $vmStatusMap[$vmName]
+foreach ($vmData in $newVMsData) {
+    $vmName = $vmData.Name
     
     # Try to find deployment info
     $depInfo = $null
@@ -601,8 +511,8 @@ foreach ($vm in $allNewVMs) {
     
     $reportObject = New-Object PSObject -Property @{
         Name = $vmName
-        Status = $vmStatus
-        CreatedDate = if ($vm.AriaCreationDate) { $vm.AriaCreationDate } else { "Unknown" }
+        Status = $vmData.Status
+        CreatedDate = $vmData.CreatedDate
         DeploymentName = if ($depInfo) { $depInfo.DeploymentName } else { "Not Found" }
         CatalogItem = if ($depInfo) { $depInfo.CatalogItem } else { "N/A" }
         RequestedBy = if ($depInfo) { $depInfo.RequestedBy } else { "N/A" }
@@ -687,12 +597,9 @@ Write-DebugLog "Email sent successfully!" "SUCCESS"
 
 # Cleanup
 Write-DebugLog "`n===== Cleanup =====" "INFO"
-if ($vcConnections.Count -gt 0) {
-    foreach ($conn in $vcConnections) {
-        Disconnect-VIServer -Server $conn -Confirm:$false -ErrorAction SilentlyContinue
-        Write-DebugLog "Disconnected from $($conn.Name)"
-    }
-}
-
 Write-DebugLog "`n===== Script Completed Successfully =====" "SUCCESS"
 Write-DebugLog "Results saved to: $outputCSV"
+Write-DebugLog "Log saved to: $outputLog"
+Write-DebugLog "`n========================================`n"
+Write-Host "`nPress any key to exit..." -ForegroundColor Yellow
+$null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
