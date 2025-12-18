@@ -133,35 +133,40 @@ try {
         foreach ($dep in $deployments) {
             $totalProcessed++
             
-            # Filter by template NAME - check if it contains "Virtual Machine" or "Database"
+            # Filter by template NAME ONLY - check if it contains "Virtual Machine" or "Database"
             Write-Log "[$totalProcessed] Checking deployment: $($dep.name)"
             
             $templateName = $null
-            # Try to get the template name (not ID)
-            if ($dep.blueprintName) {
-                $templateName = $dep.blueprintName
-            } elseif ($dep.catalogItemName) {
+            
+            # ONLY use NAME fields, NOT ID fields
+            if ($dep.catalogItemName -and $dep.catalogItemName -notmatch "^[a-f0-9-]{36}$") {
+                # catalogItemName exists and doesn't look like a GUID
                 $templateName = $dep.catalogItemName
+            } elseif ($dep.blueprintName -and $dep.blueprintName -notmatch "^[a-f0-9-]{36}$") {
+                # blueprintName exists and doesn't look like a GUID
+                $templateName = $dep.blueprintName
             }
             
-            Write-Log "  Template Name: $templateName"
-            Write-Log "  Template ID: $($dep.blueprintId)"
+            Write-Log "  Catalog Item Name: $($dep.catalogItemName)"
+            Write-Log "  Blueprint Name: $($dep.blueprintName)"
+            Write-Log "  Using Template Name: $templateName"
             Write-Log "  Owner: $($dep.ownedBy)"
             Write-Log "  Requestor: $($dep.createdBy)"
             Write-Log "  Project: $($dep.projectId)"
             
-            # Only filter by NAME, not ID
+            # Skip if no valid template name found
             if (-not $templateName) {
-                Write-Log "[$totalProcessed] Skipping: No template name found" "WARN"
+                Write-Log "[$totalProcessed] Skipping: No valid template name found (only IDs available)" "WARN"
                 continue
             }
             
+            # Filter by template name
             if ($templateName -notmatch "Virtual Machine" -and $templateName -notmatch "Database") {
-                Write-Log "[$totalProcessed] Skipping: Template name '$templateName' doesn't match VM/Database filter" "WARN"
+                Write-Log "[$totalProcessed] Skipping: Template name '$templateName' doesn't contain 'Virtual Machine' or 'Database'" "WARN"
                 continue
             }
             
-            Write-Log "[$totalProcessed] >>> TEMPLATE NAME MATCHES! Processing: $templateName <<<" "SUCCESS"
+            Write-Log "[$totalProcessed] >>> TEMPLATE NAME '$templateName' MATCHES! Processing... <<<" "SUCCESS"
             
             # Check date but log it for debugging
             $deleteDate = $null
