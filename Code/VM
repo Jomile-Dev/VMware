@@ -547,25 +547,34 @@ $htmlBody = @"
 <html>
 <head>
 <style>
-    body { font-family: Arial, sans-serif; }
-    table { border-collapse: collapse; width: 100%; }
-    th { background-color: #4CAF50; color: white; padding: 8px; text-align: left; }
-    td { border: 1px solid #ddd; padding: 8px; }
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    h2 { color: #333; }
+    table { border-collapse: collapse; width: 100%; margin-top: 20px; }
+    th { background-color: #4CAF50; color: white; padding: 12px; text-align: left; font-weight: bold; }
+    td { border: 1px solid #ddd; padding: 10px; }
     tr:nth-child(even) { background-color: #f2f2f2; }
+    tr:hover { background-color: #e8e8e8; }
+    .summary { background-color: #f9f9f9; padding: 15px; border-left: 4px solid #4CAF50; margin-bottom: 20px; }
+    .footer { margin-top: 20px; font-size: 12px; color: #666; }
 </style>
 </head>
 <body>
 <h2>New Server Deployment Report</h2>
-<p>Generated: $currentDate</p>
-<p>Total New Servers: $($reportData.Count)</p>
+<div class="summary">
+    <p><strong>Generated:</strong> $currentDate</p>
+    <p><strong>Total New Servers:</strong> $($reportData.Count)</p>
+    <p><strong>Time Range:</strong> Last $daysBack day(s)</p>
+</div>
 $htmlTable
-<p><small>CSV attached for detailed analysis.</small></p>
+<div class="footer">
+    <p>CSV report also saved to: $outputCSV</p>
+</div>
 </body>
 </html>
 "@
 
 Write-DebugLog "Sending email to: $($smtpTo -join ', ')"
-Send-MailMessage -To $smtpTo -From $smtpFrom -Subject $smtpSubject -Body $htmlBody -BodyAsHtml -SmtpServer $smtpServer -Port $smtpPort -UseSsl -Attachments $outputCSV
+Send-MailMessage -To $smtpTo -From $smtpFrom -Subject $smtpSubject -Body $htmlBody -BodyAsHtml -SmtpServer $smtpServer -Port $smtpPort -UseSsl
 Write-DebugLog "Email sent successfully!" "SUCCESS"
 
 # Cleanup
