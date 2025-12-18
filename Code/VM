@@ -133,13 +133,17 @@ try {
         foreach ($dep in $deployments) {
             $totalProcessed++
             
-            # Filter by name
+            # Filter by name - but log what we're checking
+            Write-Log "[$totalProcessed] Checking: $($dep.name)"
+            
             if ($dep.name -notmatch "Virtual Machine" -and $dep.name -notmatch "Database") {
                 Write-Log "[$totalProcessed] Skipping: $($dep.name) (not VM/Database)" "WARN"
                 continue
             }
             
-            # Filter by date
+            Write-Log "[$totalProcessed] >>> MATCHES FILTER! Processing: $($dep.name) <<<" "SUCCESS"
+            
+            # Check date but log it for debugging
             $deleteDate = $null
             if ($dep.lastUpdatedAt) {
                 $deleteDate = [DateTime]$dep.lastUpdatedAt
@@ -148,10 +152,13 @@ try {
                 $deleteDate = [DateTime]$dep.deletedAt
             }
             
-            if ($deleteDate -and $deleteDate -lt $cutoffDate) {
-                Write-Log "[$totalProcessed] Skipping: $($dep.name) (too old: $deleteDate)" "WARN"
-                continue
-            }
+            Write-Log "[$totalProcessed] Date check: DeleteDate=$deleteDate, Cutoff=$cutoffDate"
+            
+            # TEMPORARILY DISABLED DATE FILTER - Process all to see what we get
+            # if ($deleteDate -and $deleteDate -lt $cutoffDate) {
+            #     Write-Log "[$totalProcessed] Skipping: $($dep.name) (too old: $deleteDate)" "WARN"
+            #     continue
+            # }
             
             Write-Log "`n========================================" "SUCCESS"
             Write-Log "[$totalProcessed] PROCESSING: $($dep.name)" "SUCCESS"
