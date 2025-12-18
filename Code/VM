@@ -217,9 +217,9 @@ try {
         
         # Process each deleted deployment
         foreach ($dep in $deployments) {
-            Write-Log "`n  Processing deployment:"
-            Write-Log "    Name: $($dep.name)"
-            Write-Log "    ID: $($dep.id)"
+            Write-Log "`n  ====== DELETED DEPLOYMENT ======"
+            Write-Log "    Deployment Name: $($dep.name)"
+            Write-Log "    Deployment ID: $($dep.id)"
             Write-Log "    Status: $($dep.status)"
             Write-Log "    Last Updated: $($dep.lastUpdatedAt)"
             Write-Log "    Created By: $($dep.createdBy)"
@@ -232,49 +232,81 @@ try {
                 if ($lastUpdated -ge $cutoffDate) {
                     Write-Log "    >> Within time range (last $daysBack days)" "SUCCESS"
                     
-                    # Show resources
+                    # Look for resources
                     if ($dep.resources) {
-                        Write-Log "    Resources: $($dep.resources.Count)"
+                        Write-Log "`n    === RESOURCES ($($dep.resources.Count)) ==="
                         
                         foreach ($res in $dep.resources) {
+                            Write-Log "`n      --- Resource ---"
+                            Write-Log "      Type: $($res.type)"
+                            Write-Log "      Name: $($res.name)"
+                            Write-Log "      ID: $($res.id)"
+                            
+                            # Focus on Cloud.vSphere.Machine
                             if ($res.type -eq "Cloud.vSphere.Machine") {
-                                Write-Log "`n      Cloud.vSphere.Machine Resource:"
-                                Write-Log "        Name: $($res.name)"
-                                Write-Log "        ID: $($res.id)"
+                                Write-Log "      >> This is a vSphere VM!" "SUCCESS"
                                 
+                                # Extract all properties
                                 if ($res.properties) {
-                                    Write-Log "        Properties:"
-                                    $res.properties | Get-Member -MemberType NoteProperty | ForEach-Object {
-                                        $propName = $_.Name
-                                        $propValue = $res.properties.$propName
-                                        Write-Log "          - $propName = $propValue"
+                                    Write-Log "      Properties:"
+                                    $res.properties.PSObject.Properties | ForEach-Object {
+                                        Write-Log "        - $($_.Name) = $($_.Value)"
                                     }
                                 }
+                                
+                                # Check for details
+                                if ($res.details) {
+                                    Write-Log "      DETAILS (SERVER NAME SHOULD BE HERE):" "SUCCESS"
+                                    
+                                    if ($res.details -is [string]) {
+                                        Write-Log "        Details (string): $($res.details)"
+                                    }
+                                    else {
+                                        $res.details.PSObject.Properties | ForEach-Object {
+                                            Write-Log "        - $($_.Name) = $($_.Value)"
+                                        }
+                                    }
+                                }
+                                
+                                # Create structured output
+                                $vmInfo = [PSCustomObject]@{
+                                    DeploymentName = $dep.name
+                                    DeploymentID = $dep.id
+                                    Timestamp = $dep.lastUpdatedAt
+                                    Status = $dep.status
+                                    ResourceType = $res.type
+                                    ResourceName = $res.name
+                                    ResourceID = $res.id
+                                    Details = $res.details
+                                    Properties = $res.properties
+                                    CreatedBy = $dep.createdBy
+                                    OwnedBy = $dep.ownedBy
+                                }
+                                
+                                Write-Log "`n      === EXTRACTED VM INFO ===" "SUCCESS"
+                                Write-Log "      Server Name from Details: $($res.details)" "SUCCESS"
+                                Write-Log "      Resource Name: $($res.name)"
+                                Write-Log "      Timestamp: $($dep.lastUpdatedAt)"
+                                
+                                $allDeletedDeployments += $vmInfo
                             }
                         }
                     }
+                    else {
+                        Write-Log "    >> No resources found in deployment" "WARN"
+                    }
                     
-                    # Show inputs
+                    # Also check inputs for catalog item
                     if ($dep.inputs) {
-                        Write-Log "    Inputs:"
-                        $dep.inputs | Get-Member -MemberType NoteProperty | ForEach-Object {
-                            $propName = $_.Name
-                            $propValue = $dep.inputs.$propName
-                            Write-Log "      - $propName = $propValue"
+                        Write-Log "`n    === INPUTS ==="
+                        $dep.inputs.PSObject.Properties | ForEach-Object {
+                            Write-Log "      - $($_.Name) = $($_.Value)"
+                            
+                            if ($_.Name -like "*catalog*") {
+                                Write-Log "        ^^ CATALOG ITEM FOUND ^^" "SUCCESS"
+                            }
                         }
                     }
-                    
-                    # Show custom properties
-                    if ($dep.customProperties) {
-                        Write-Log "    Custom Properties:"
-                        $dep.customProperties | Get-Member -MemberType NoteProperty | ForEach-Object {
-                            $propName = $_.Name
-                            $propValue = $dep.customProperties.$propName
-                            Write-Log "      - $propName = $propValue"
-                        }
-                    }
-                    
-                    $allDeletedDeployments += $dep
                 }
                 else {
                     Write-Log "    >> Too old - before cutoff date" "WARN"
