@@ -197,16 +197,10 @@ Write-DebugLog "PowerShell Version: $($PSVersionTable.PSVersion)"
 Write-DebugLog "Output CSV: $outputCSV"
 Write-DebugLog "Combined Log: $outputLog"
 
-# Check for VMware PowerCLI
-Write-DebugLog "Checking for VMware PowerCLI module..."
-if (-not (Get-Module -ListAvailable -Name VMware.PowerCLI)) {
-    Write-DebugLog "VMware PowerCLI module not found. Please install it:" "ERROR"
-    Write-DebugLog "Install-Module -Name VMware.PowerCLI -Scope CurrentUser" "ERROR"
-    exit
-}
+# Load VMware PowerCLI
 Import-Module VMware.PowerCLI -ErrorAction SilentlyContinue
 Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session | Out-Null
-Write-DebugLog "VMware PowerCLI loaded successfully" "SUCCESS"
+Write-DebugLog "VMware PowerCLI loaded" "SUCCESS"
 
 # Ensure log directory exists
 $logDir = Split-Path $outputCSV -Parent
