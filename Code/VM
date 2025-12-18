@@ -133,30 +133,58 @@ try {
         foreach ($dep in $deployments) {
             $totalProcessed++
             
-            # Filter by catalogItemName (the template name) - check if it contains "Virtual Machine" or "Database"
-            Write-Log "[$totalProcessed] Checking deployment: $($dep.name)"
+            # SHOW ALL DEPLOYMENT DATA for debugging
+            Write-Log "`n========================================" "SUCCESS"
+            Write-Log "[$totalProcessed] DEPLOYMENT DATA DUMP" "SUCCESS"
+            Write-Log "========================================" "SUCCESS"
             
-            $catalogItemName = $dep.catalogItemName
-            
-            Write-Log "  Deployment Name: $($dep.name)"
-            Write-Log "  Catalog Item Name (Template): $catalogItemName"
-            Write-Log "  Owner: $($dep.ownedBy)"
-            Write-Log "  Requestor: $($dep.createdBy)"
-            Write-Log "  Project: $($dep.projectId)"
-            
-            # Skip if no catalog item name found
-            if (-not $catalogItemName) {
-                Write-Log "[$totalProcessed] Skipping: No Catalog Item Name found" "WARN"
-                continue
+            Write-Log "`n>>> ALL PROPERTIES IN DEPLOYMENT OBJECT <<<"
+            $dep.PSObject.Properties | ForEach-Object {
+                $propName = $_.Name
+                $propValue = $_.Value
+                
+                if ($null -eq $propValue) {
+                    Write-Log "  $propName = [NULL]"
+                }
+                elseif ($propValue -is [string] -or $propValue -is [int] -or $propValue -is [bool] -or $propValue -is [datetime]) {
+                    Write-Log "  $propName = $propValue" "SUCCESS"
+                }
+                elseif ($propValue -is [array]) {
+                    Write-Log "  $propName = [ARRAY with $($propValue.Count) items]"
+                    if ($propValue.Count -gt 0 -and $propValue.Count -le 3) {
+                        for ($i = 0; $i -lt $propValue.Count; $i++) {
+                            Write-Log "    [$i] = $($propValue[$i])"
+                        }
+                    }
+                }
+                else {
+                    Write-Log "  $propName = [OBJECT - Type: $($propValue.GetType().Name)]"
+                    # Show nested properties if it's a simple object
+                    if ($propValue.PSObject.Properties.Count -le 10) {
+                        $propValue.PSObject.Properties | ForEach-Object {
+                            Write-Log "    $($_.Name) = $($_.Value)"
+                        }
+                    }
+                }
             }
             
-            # Filter by catalogItemName containing "Virtual Machine" or "Database"
-            if ($catalogItemName -notmatch "Virtual Machine" -and $catalogItemName -notmatch "Database") {
-                Write-Log "[$totalProcessed] Skipping: Catalog Item Name '$catalogItemName' doesn't contain 'Virtual Machine' or 'Database'" "WARN"
-                continue
+            Write-Log "`n>>> LOOKING FOR TEMPLATE/CATALOG/BLUEPRINT FIELDS <<<" "SUCCESS"
+            $dep.PSObject.Properties | Where-Object { 
+                $_.Name -match "catalog" -or 
+                $_.Name -match "Catalog" -or
+                $_.Name -match "blueprint" -or 
+                $_.Name -match "Blueprint" -or
+                $_.Name -match "template" -or
+                $_.Name -match "Template" -or
+                $_.Name -match "item" -or
+                $_.Name -match "Item"
+            } | ForEach-Object {
+                Write-Log "  FOUND: $($_.Name) = $($_.Value)" "SUCCESS"
             }
             
-            Write-Log "[$totalProcessed] >>> Catalog Item Name '$catalogItemName' MATCHES! Processing... <<<" "SUCCESS"
+            # Temporarily skip filtering so you can see ALL deployments
+            Write-Log "`n>>> TEMPORARILY SHOWING ALL DEPLOYMENTS - NO FILTERING <<<" "WARN"
+            Write-Log "Deployment Name: $($dep.name)"
             
             # Check date but log it for debugging
             $deleteDate = $null
