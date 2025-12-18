@@ -101,24 +101,40 @@ Write-Log "Request API URL: $requestsUri"
 $allDeleteRequests = @()
 $allRequests = @()
 $page = 0
-$size = 100
+$size = 200
 
 try {
     do {
-        $pagedUri = "$requestsUri`?page=$page&size=$size"
+        $pagedUri = "$requestsUri`?`$top=$size&`$skip=$($page * $size)"
         Write-Log "Fetching requests page $($page + 1)..."
         Write-Log "  Full URL: $pagedUri"
         
-        $response = Invoke-RestMethod -Uri $pagedUri -Method Get -Headers $vraHeaders -ErrorAction Stop
+        try {
+            $response = Invoke-RestMethod -Uri $pagedUri -Method Get -Headers $vraHeaders -ErrorAction Stop
+        }
+        catch {
+            Write-Log "  Error with `$top/`$skip parameters, trying page/size instead..." "WARN"
+            $pagedUri = "$requestsUri`?page=$page&size=$size"
+            Write-Log "  Trying URL: $pagedUri"
+            $response = Invoke-RestMethod -Uri $pagedUri -Method Get -Headers $vraHeaders -ErrorAction Stop
+        }
         
         if ($response.content) {
             $requests = $response.content
         } 
+        elseif ($response.results) {
+            $requests = $response.results
+        }
         else {
             $requests = $response
         }
         
         Write-Log "  Retrieved $($requests.Count) requests on page $($page + 1)" "SUCCESS"
+        
+        if ($requests.Count -eq 0) {
+            Write-Log "  No requests found, stopping pagination"
+            break
+        }
         
         # Store all requests for inspection
         $allRequests += $requests
