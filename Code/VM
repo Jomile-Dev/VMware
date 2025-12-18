@@ -269,25 +269,28 @@ try {
                 continue
             }
             
-            # Get power state from Aria Operations
-            $powerStateProp = $response.property | Where-Object { $_.name -eq "summary|runtime|powerState" } | Select-Object -First 1
+            # Get resource health/badge from Aria Operations
+            $healthProp = $response.property | Where-Object { $_.name -eq "badge|health" -or $_.name -eq "summary|health" } | Select-Object -First 1
+            $resourceStateProp = $response.property | Where-Object { $_.name -eq "summary|resourceState" } | Select-Object -First 1
             
-            $status = "Unknown"
+            $status = "Decomm/Offline"
             
-            # Check power state
-            if ($powerStateProp -and $powerStateProp.value) {
-                switch ($powerStateProp.value) {
-                    "Powered On" { $status = "Online" }
-                    "poweredOn" { $status = "Online" }
-                    "Powered Off" { $status = "Decomm/Offline" }
-                    "poweredOff" { $status = "Decomm/Offline" }
-                    "Suspended" { $status = "Decomm/Offline" }
-                    default { $status = "Decomm/Offline" }
+            # Check resource health badge - if grey or not available, it's decomm
+            if ($healthProp -and $healthProp.value) {
+                $healthValue = $healthProp.value.ToString().ToUpper()
+                if ($healthValue -in @("GREEN", "YELLOW", "ORANGE", "RED")) {
+                    $status = "Online"
+                }
+                else {
+                    # Grey or unknown = Decomm/Offline
+                    $status = "Decomm/Offline"
                 }
             }
-            else {
-                # If no power state found, default to Decomm/Offline
-                $status = "Decomm/Offline"
+            # Also check if resource state indicates it's not being monitored
+            elseif ($resourceStateProp -and $resourceStateProp.value) {
+                if ($resourceStateProp.value -eq "STARTED" -or $resourceStateProp.value -eq "MAINTAINED") {
+                    $status = "Online"
+                }
             }
             
             $vmObject = [PSCustomObject]@{
@@ -388,11 +391,13 @@ foreach ($vraServer in $vraServers) {
         
         Write-DebugLog "Total active deployments retrieved: $($allDeployments.Count)"
         
-        # Fetch deleted deployments with expand=resources
-        Write-DebugLog "Fetching deleted deployments from $vraServer..."
+        # Fetch deleted deployments with expand=resources (recently deleted)
+        Write-DebugLog "Fetching recently deleted deployments from $vraServer..."
         $page = 0
+        $deletedCount = 0
         
         do {
+            # Get all deleted deployments first, then filter by date
             $pagedUri = "$vraUri`?page=$page&size=$size&expand=resources&`$filter=status eq 'DELETED'"
             Write-DebugLog "  Fetching deleted deployments page $($page + 1) (size: $size)..."
             
@@ -405,8 +410,16 @@ foreach ($vraServer in $vraServers) {
                     $deployments = $vraResponse
                 }
                 
-                Write-DebugLog "  Retrieved $($deployments.Count) deleted deployments on page $($page + 1)"
-                $allDeployments += $deployments
+                # Filter for recently deleted (within daysBack)
+                $cutoffDate = (Get-Date).AddDays(-$daysBack)
+                $recentlyDeleted = $deployments | Where-Object { 
+                    $_.lastUpdatedAt -and 
+                    ([DateTime]$_.lastUpdatedAt) -ge $cutoffDate
+                }
+                
+                Write-DebugLog "  Retrieved $($deployments.Count) deleted deployments on page $($page + 1), $($recentlyDeleted.Count) recently deleted"
+                $deletedCount += $recentlyDeleted.Count
+                $allDeployments += $recentlyDeleted
             }
             catch {
                 Write-DebugLog "  Could not fetch deleted deployments (may not be supported): $($_.Exception.Message)" "WARN"
@@ -428,7 +441,8 @@ foreach ($vraServer in $vraServers) {
             
         } while ($hasMore)
         
-        Write-DebugLog "Total deployments (active + deleted): $($allDeployments.Count)"
+        Write-DebugLog "Total recently deleted deployments: $deletedCount"
+        Write-DebugLog "Total deployments (active + recently deleted): $($allDeployments.Count)"
         
         # Now process all deployments (active and deleted)
         Write-DebugLog "Processing all $($allDeployments.Count) deployments..."
