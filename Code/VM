@@ -175,20 +175,56 @@ try {
             $requests = $null
             $historyFetchSuccess = $false
             
-            # Try endpoint 1: Deployment API requests
+            # Try endpoint 1: Catalog API items endpoint (for deleted items)
             try {
-                $requestsUri = "https://$vraServer/deployment/api/deployments/$($dep.id)/requests"
+                $requestsUri = "https://$vraServer/catalog/api/items/$($dep.id)/requests"
                 Write-Log "Trying: $requestsUri"
                 $requestsResponse = Invoke-RestMethod -Uri $requestsUri -Method Get -Headers $vraHeaders -ErrorAction Stop
                 $requests = if ($requestsResponse.content) { $requestsResponse.content } elseif ($requestsResponse.value) { $requestsResponse.value } else { $requestsResponse }
                 $historyFetchSuccess = $true
-                Write-Log "SUCCESS with deployment API" "SUCCESS"
+                Write-Log "SUCCESS with catalog items API" "SUCCESS"
             }
             catch {
-                Write-Log "Deployment API failed: $($_.Exception.Message)" "WARN"
+                Write-Log "Catalog items API failed: $($_.Exception.Message)" "WARN"
             }
             
-            # Try endpoint 2: Catalog API consumer resources
+            # Try endpoint 2: Deployment API requests
+            if (-not $historyFetchSuccess) {
+                try {
+                    $requestsUri = "https://$vraServer/deployment/api/deployments/$($dep.id)/requests"
+                    Write-Log "Trying: $requestsUri"
+                    $requestsResponse = Invoke-RestMethod -Uri $requestsUri -Method Get -Headers $vraHeaders -ErrorAction Stop
+                    $requests = if ($requestsResponse.content) { $requestsResponse.content } elseif ($requestsResponse.value) { $requestsResponse.value } else { $requestsResponse }
+                    $historyFetchSuccess = $true
+                    Write-Log "SUCCESS with deployment API" "SUCCESS"
+                }
+                catch {
+                    Write-Log "Deployment API failed: $($_.Exception.Message)" "WARN"
+                }
+            }
+            
+            # Try endpoint 3: Get the deployment details first, then use catalog item ID
+            if (-not $historyFetchSuccess) {
+                try {
+                    Write-Log "Trying to get deployment details first..."
+                    $depDetailUri = "https://$vraServer/deployment/api/deployments/$($dep.id)"
+                    $depDetail = Invoke-RestMethod -Uri $depDetailUri -Method Get -Headers $vraHeaders -ErrorAction Stop
+                    
+                    if ($depDetail.catalogItemId) {
+                        $requestsUri = "https://$vraServer/catalog/api/items/$($depDetail.catalogItemId)/requests"
+                        Write-Log "Trying with catalog item ID: $requestsUri"
+                        $requestsResponse = Invoke-RestMethod -Uri $requestsUri -Method Get -Headers $vraHeaders -ErrorAction Stop
+                        $requests = if ($requestsResponse.content) { $requestsResponse.content } elseif ($requestsResponse.value) { $requestsResponse.value } else { $requestsResponse }
+                        $historyFetchSuccess = $true
+                        Write-Log "SUCCESS with catalog item ID" "SUCCESS"
+                    }
+                }
+                catch {
+                    Write-Log "Catalog item ID approach failed: $($_.Exception.Message)" "WARN"
+                }
+            }
+            
+            # Try endpoint 4: Catalog consumer resources
             if (-not $historyFetchSuccess) {
                 try {
                     $requestsUri = "https://$vraServer/catalog/api/consumer/resources/$($dep.id)/requests"
@@ -203,23 +239,49 @@ try {
                 }
             }
             
-            # Try endpoint 3: Get deployment actions
+            # Try endpoint 5: Get all catalog requests and filter by deployment ID
             if (-not $historyFetchSuccess) {
                 try {
-                    $requestsUri = "https://$vraServer/deployment/api/deployments/$($dep.id)/actions"
-                    Write-Log "Trying: $requestsUri"
-                    $requestsResponse = Invoke-RestMethod -Uri $requestsUri -Method Get -Headers $vraHeaders -ErrorAction Stop
+                    Write-Log "Trying to fetch all recent requests and filter..."
+                    $allRequestsUri = "https://$vraServer/catalog/api/requests?`$filter=deploymentId eq '$($dep.id)'"
+                    Write-Log "Trying: $allRequestsUri"
+                    $requestsResponse = Invoke-RestMethod -Uri $allRequestsUri -Method Get -Headers $vraHeaders -ErrorAction Stop
                     $requests = if ($requestsResponse.content) { $requestsResponse.content } elseif ($requestsResponse.value) { $requestsResponse.value } else { $requestsResponse }
-                    $historyFetchSuccess = $true
-                    Write-Log "SUCCESS with deployment actions API" "SUCCESS"
+                    if ($requests -and $requests.Count -gt 0) {
+                        $historyFetchSuccess = $true
+                        Write-Log "SUCCESS with filtered catalog requests" "SUCCESS"
+                    }
                 }
                 catch {
-                    Write-Log "Deployment actions API failed: $($_.Exception.Message)" "WARN"
+                    Write-Log "Filtered catalog requests failed: $($_.Exception.Message)" "WARN"
                 }
             }
             
             if (-not $historyFetchSuccess) {
                 Write-Log "ERROR: Could not fetch request history from any API endpoint" "ERROR"
+                Write-Log "Deployment ID attempted: $($dep.id)" "ERROR"
+                
+                # Still try to collect basic info even without history
+                $deleteInfo = [PSCustomObject]@{
+                    DeploymentName = $dep.name
+                    DeploymentID = $dep.id
+                    DeletedAt = $dep.deletedAt
+                    LastUpdatedAt = $dep.lastUpdatedAt
+                    OwnedBy = $dep.ownedBy
+                    CreatedBy = $dep.createdBy
+                    ProjectId = $dep.projectId
+                    Status = $dep.status
+                    CatalogItemName = $dep.catalogItemName
+                    
+                    # No history available
+                    DeleteRequestID = "N/A - Could not fetch history"
+                    ErrorMessage = "Could not retrieve request history from any API endpoint"
+                    
+                    # Full deployment object
+                    FullDeployment = $dep
+                }
+                
+                $deletedDeploymentDetails += $deleteInfo
                 continue
             }
             
