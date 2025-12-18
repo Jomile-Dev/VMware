@@ -5,6 +5,10 @@
 $vraServer = "vra1.yourdomain.com"
 $daysBack = 1  # Past 1 day
 
+# FILTER CONFIGURATION - Edit these to match your template names
+$filterTemplateNames = @("Virtual Machine", "Database")
+Write-Host ">>> FILTER: Looking for templates containing: $($filterTemplateNames -join ' OR ') <<<" -ForegroundColor Yellow
+
 # Output
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $outputJson = "C:\Logs\DeletedDeployments_$timestamp.json"
@@ -219,12 +223,21 @@ try {
             }
             
             # Filter by template name
-            if ($templateName -notmatch "Virtual Machine" -and $templateName -notmatch "Database") {
-                Write-Log "[$totalProcessed] Skipping: Template name '$templateName' doesn't contain 'Virtual Machine' or 'Database'" "WARN"
+            $matchesFilter = $false
+            foreach ($filterName in $filterTemplateNames) {
+                if ($templateName -match $filterName) {
+                    $matchesFilter = $true
+                    Write-Log "[$totalProcessed] >>> Template '$templateName' MATCHES filter '$filterName'! <<<" "SUCCESS"
+                    break
+                }
+            }
+            
+            if (-not $matchesFilter) {
+                Write-Log "[$totalProcessed] Skipping: Template name '$templateName' doesn't match any filter: $($filterTemplateNames -join ', ')" "WARN"
                 continue
             }
             
-            Write-Log "[$totalProcessed] >>> Template Name '$templateName' MATCHES! Processing... <<<" "SUCCESS"
+            Write-Log "[$totalProcessed] >>> Processing deployment with template: $templateName <<<" "SUCCESS"
             
             # Check date but log it for debugging
             $deleteDate = $null
@@ -344,34 +357,68 @@ try {
                     Write-Log "  $($_.Type): $($_.Value)"
                 }
                 
-                # NEW APPROACH: Search all requests and filter by deployment name or ID
-                Write-Log "`nNEW APPROACH: Searching all catalog requests for this deployment..."
+                # NEW APPROACH 1: Search all requests and filter by deployment
+                Write-Log "`n=== APPROACH 1: Searching ALL catalog requests ===" "SUCCESS"
                 try {
-                    $searchUri = "https://$vraServer/catalog/api/requests?`$top=1000"
-                    Write-Log "  Fetching all recent requests: $searchUri"
+                    # Try with higher limit and no filter first
+                    $searchUri = "https://$vraServer/catalog/api/requests?`$top=2000&`$orderby=lastUpdated desc"
+                    Write-Log "  URL: $searchUri"
                     $allRequestsResponse = Invoke-RestMethod -Uri $searchUri -Method Get -Headers $vraHeaders -ErrorAction Stop
-                    $allRequests = if ($allRequestsResponse.content) { $allRequestsResponse.content } else { $allRequestsResponse }
+                    $allRequests = if ($allRequestsResponse.content) { $allRequestsResponse.content } elseif ($allRequestsResponse.value) { $allRequestsResponse.value } else { $allRequestsResponse }
                     
-                    Write-Log "  Retrieved $($allRequests.Count) total requests, filtering..."
+                    Write-Log "  Retrieved $($allRequests.Count) total requests" "SUCCESS"
                     
-                    # Filter requests that match this deployment
+                    # Show some sample requests to see what fields are available
+                    if ($allRequests.Count -gt 0) {
+                        Write-Log "`n  Sample request structure (first request):"
+                        $allRequests[0].PSObject.Properties | ForEach-Object {
+                            if ($_.Value -is [string] -or $_.Value -is [int] -or $_.Value -is [bool]) {
+                                Write-Log "    $($_.Name) = $($_.Value)"
+                            } else {
+                                Write-Log "    $($_.Name) = [Complex: $($_.Value.GetType().Name)]"
+                            }
+                        }
+                    }
+                    
+                    Write-Log "`n  Filtering requests for deployment..."
+                    Write-Log "    Looking for matches with:"
+                    Write-Log "      Deployment ID: $($dep.id)"
+                    Write-Log "      Deployment Name: $($dep.name)"
+                    Write-Log "      Catalog Item ID: $($dep.catalogItemId)"
+                    
+                    # Filter requests that match this deployment - try multiple field combinations
                     $matchingRequests = $allRequests | Where-Object {
                         ($_.deploymentId -eq $dep.id) -or
                         ($_.resourceId -eq $dep.id) -or
                         ($_.catalogItemId -eq $dep.catalogItemId) -or
+                        ($_.requestedItemId -eq $dep.id) -or
                         ($_.requestedItemName -eq $dep.name) -or
-                        ($_.name -match [regex]::Escape($dep.name))
+                        ($_.name -match [regex]::Escape($dep.name)) -or
+                        ($_.id -eq $dep.id)
                     }
                     
                     if ($matchingRequests -and $matchingRequests.Count -gt 0) {
                         $requests = $matchingRequests
                         $historyFetchSuccess = $true
-                        Write-Log "  >>> SUCCESS! Found $($requests.Count) matching requests by searching all requests <<<" "SUCCESS"
+                        Write-Log "  >>> SUCCESS! Found $($requests.Count) matching requests <<<" "SUCCESS"
                         foreach ($mr in $matchingRequests) {
-                            Write-Log "    - $($mr.name) (ID: $($mr.id), Status: $($mr.status))"
+                            Write-Log "    Request: $($mr.name)"
+                            Write-Log "      ID: $($mr.id)"
+                            Write-Log "      Status: $($mr.status)"
+                            Write-Log "      Action: $($mr.actionId)"
+                            Write-Log "      Deployment ID: $($mr.deploymentId)"
                         }
                     } else {
-                        Write-Log "  No matching requests found in catalog" "WARN"
+                        Write-Log "  No matching requests found by filtering" "WARN"
+                        
+                        # Debug: Show what deploymentIds we see in the requests
+                        $uniqueDepIds = $allRequests | Select-Object -ExpandProperty deploymentId -ErrorAction SilentlyContinue | Select-Object -Unique -First 10
+                        if ($uniqueDepIds) {
+                            Write-Log "  Sample deployment IDs from requests (for comparison):"
+                            $uniqueDepIds | ForEach-Object {
+                                Write-Log "    $_"
+                            }
+                        }
                     }
                 }
                 catch {
@@ -379,8 +426,29 @@ try {
                 }
             }
             
+            # NEW APPROACH 2: Try getting deployment actions/operations
+            if (-not $historyFetchSuccess) {
+                Write-Log "`n=== APPROACH 2: Trying deployment operations API ===" "SUCCESS"
+                try {
+                    $opsUri = "https://$vraServer/deployment/api/deployments/$($dep.id)/operations"
+                    Write-Log "  URL: $opsUri"
+                    $opsResponse = Invoke-RestMethod -Uri $opsUri -Method Get -Headers $vraHeaders -ErrorAction Stop
+                    $operations = if ($opsResponse.content) { $opsResponse.content } else { $opsResponse }
+                    
+                    if ($operations -and $operations.Count -gt 0) {
+                        Write-Log "  >>> SUCCESS! Found $($operations.Count) operations <<<" "SUCCESS"
+                        $requests = $operations
+                        $historyFetchSuccess = $true
+                    }
+                }
+                catch {
+                    Write-Log "  Deployment operations failed: $($_.Exception.Message)" "WARN"
+                }
+            }
+            
             # If still no success, try the individual ID approaches
             if (-not $historyFetchSuccess) {
+                Write-Log "`n=== APPROACH 3: Trying individual ID endpoints ===" "SUCCESS"
                 # Try each ID with different endpoints
                 foreach ($idInfo in $possibleIds) {
                     $currentId = $idInfo.Value
