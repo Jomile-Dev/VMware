@@ -176,10 +176,10 @@ Write-DebugLog "PowerShell Version: $($PSVersionTable.PSVersion)"
 Write-DebugLog "Output CSV: $outputCSV"
 Write-DebugLog "Combined Log: $outputLog"
 
-# Load VMware PowerCLI
-Import-Module VMware.PowerCLI -ErrorAction SilentlyContinue
+# Load VMware VCF PowerCLI module
+Import-Module VMware.VCF.PowerCLI -ErrorAction SilentlyContinue
 Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session | Out-Null
-Write-DebugLog "VMware PowerCLI loaded" "SUCCESS"
+Write-DebugLog "VMware VCF PowerCLI module loaded" "SUCCESS"
 
 # Ensure log directory exists
 $logDir = Split-Path $outputCSV -Parent
@@ -589,7 +589,7 @@ if ($vmsNeedingVCenterLookup.Count -gt 0) {
         Write-DebugLog "`n--- Connecting to vCenter: $vCenter ---" "INFO"
         
         try {
-            # Connect to vCenter
+            # Connect to vCenter using VCF PowerCLI
             Write-DebugLog "Connecting to $vCenter..."
             $vcConnection = Connect-VIServer -Server $vCenter -Credential $credential -ErrorAction Stop
             Write-DebugLog "Connected to $vCenter successfully" "SUCCESS"
@@ -598,7 +598,7 @@ if ($vmsNeedingVCenterLookup.Count -gt 0) {
             $cutoffDate = (Get-Date).AddDays(-$daysBack)
             Write-DebugLog "Querying VM creation events from the last $daysBack day(s)..."
             
-            $events = Get-VIEvent -Server $vCenter -Start $cutoffDate -MaxSamples 50000 | Where-Object {
+            $events = Get-VIEvent -Server $vCenter -Start $cutoffDate -MaxSamples 50000 -ErrorAction Stop | Where-Object {
                 $_.GetType().Name -in @('VmCreatedEvent', 'VmBeingDeployedEvent', 'VmRegisteredEvent', 'VmDeployedEvent') -and
                 $_.Vm.Name -in $vmsNeedingVCenterLookup
             }
@@ -626,7 +626,7 @@ if ($vmsNeedingVCenterLookup.Count -gt 0) {
             }
             
             # Disconnect from vCenter
-            Disconnect-VIServer -Server $vCenter -Confirm:$false
+            Disconnect-VIServer -Server $vCenter -Confirm:$false -ErrorAction SilentlyContinue
             Write-DebugLog "Disconnected from $vCenter"
         }
         catch {
