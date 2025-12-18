@@ -133,20 +133,46 @@ try {
         foreach ($dep in $deployments) {
             $totalProcessed++
             
-            # Filter by resources - check if deployment has Cloud.vSphere.Machine
+            # Filter by catalog item template - check if it includes Virtual Machine or Database
             Write-Log "[$totalProcessed] Checking: $($dep.name)"
             
-            $hasVMResource = $false
-            if ($dep.resources) {
-                $hasVMResource = ($dep.resources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" }).Count -gt 0
+            $matchesFilter = $false
+            $filterReason = ""
+            
+            # Check catalog item name
+            if ($dep.catalogItemName) {
+                Write-Log "  Catalog Item: $($dep.catalogItemName)"
+                if ($dep.catalogItemName -match "Virtual Machine" -or $dep.catalogItemName -match "Database") {
+                    $matchesFilter = $true
+                    $filterReason = "Catalog Item matches: $($dep.catalogItemName)"
+                }
             }
             
-            if (-not $hasVMResource) {
-                Write-Log "[$totalProcessed] Skipping: $($dep.name) (no Cloud.vSphere.Machine resources)" "WARN"
+            # Also check blueprint name if available
+            if (-not $matchesFilter -and $dep.blueprintName) {
+                Write-Log "  Blueprint: $($dep.blueprintName)"
+                if ($dep.blueprintName -match "Virtual Machine" -or $dep.blueprintName -match "Database") {
+                    $matchesFilter = $true
+                    $filterReason = "Blueprint matches: $($dep.blueprintName)"
+                }
+            }
+            
+            # Also check blueprint ID if available
+            if (-not $matchesFilter -and $dep.blueprintId) {
+                Write-Log "  Blueprint ID: $($dep.blueprintId)"
+                if ($dep.blueprintId -match "Virtual Machine" -or $dep.blueprintId -match "Database") {
+                    $matchesFilter = $true
+                    $filterReason = "Blueprint ID matches: $($dep.blueprintId)"
+                }
+            }
+            
+            if (-not $matchesFilter) {
+                Write-Log "[$totalProcessed] Skipping: $($dep.name) (template doesn't match VM/Database)" "WARN"
+                Write-Log "  CatalogItem: $($dep.catalogItemName), Blueprint: $($dep.blueprintName)" "WARN"
                 continue
             }
             
-            Write-Log "[$totalProcessed] >>> HAS VM RESOURCES! Processing: $($dep.name) <<<" "SUCCESS"
+            Write-Log "[$totalProcessed] >>> MATCHES FILTER! $filterReason <<<" "SUCCESS"
             
             # Check date but log it for debugging
             $deleteDate = $null
