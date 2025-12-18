@@ -169,10 +169,39 @@ try {
             Write-Log "Last Updated: $($dep.lastUpdatedAt)"
             Write-Log "Owner: $($dep.ownedBy)"
             
-            # DEBUG: Show all available properties
-            Write-Log "`nDEBUG - Available deployment properties:"
-            $dep.PSObject.Properties | ForEach-Object {
-                Write-Log "  $($_.Name): $($_.Value)"
+            # Step 1.5: Get FULL deployment details to find more IDs
+            Write-Log "`nFetching FULL deployment details..."
+            $fullDeployment = $null
+            try {
+                $depDetailUri = "https://$vraServer/deployment/api/deployments/$($dep.id)"
+                Write-Log "  URL: $depDetailUri"
+                $fullDeployment = Invoke-RestMethod -Uri $depDetailUri -Method Get -Headers $vraHeaders -ErrorAction Stop
+                Write-Log "  SUCCESS getting full deployment" "SUCCESS"
+                
+                Write-Log "`nDEBUG - ALL deployment properties:"
+                $fullDeployment.PSObject.Properties | ForEach-Object {
+                    if ($_.Value -is [string] -or $_.Value -is [int] -or $_.Value -is [bool] -or $null -eq $_.Value) {
+                        Write-Log "  $($_.Name): $($_.Value)"
+                    } else {
+                        Write-Log "  $($_.Name): [Complex Object - Type: $($_.Value.GetType().Name)]"
+                    }
+                }
+                
+                # Look specifically for request-related fields
+                Write-Log "`nLooking for request-related fields:"
+                if ($fullDeployment.lastRequest) {
+                    Write-Log "  lastRequest found!" "SUCCESS"
+                    $fullDeployment.lastRequest.PSObject.Properties | ForEach-Object {
+                        Write-Log "    $($_.Name): $($_.Value)"
+                    }
+                }
+                if ($fullDeployment.requests) {
+                    Write-Log "  requests array found with $($fullDeployment.requests.Count) items!" "SUCCESS"
+                }
+            }
+            catch {
+                Write-Log "  Could not fetch full deployment: $($_.Exception.Message)" "WARN"
+                $fullDeployment = $dep
             }
             
             # Step 2: Get the request/action history - Try multiple IDs and endpoints
@@ -181,94 +210,108 @@ try {
             $requests = $null
             $historyFetchSuccess = $false
             
+            # Use fullDeployment if we got it, otherwise use dep
+            $deploymentToUse = if ($fullDeployment) { $fullDeployment } else { $dep }
+            
             # Collect all possible IDs we can use
             $possibleIds = @()
-            if ($dep.id) { $possibleIds += @{Type="Deployment ID"; Value=$dep.id} }
-            if ($dep.resourceId) { $possibleIds += @{Type="Resource ID"; Value=$dep.resourceId} }
-            if ($dep.catalogItemId) { $possibleIds += @{Type="Catalog Item ID"; Value=$dep.catalogItemId} }
-            if ($dep.requestId) { $possibleIds += @{Type="Request ID"; Value=$dep.requestId} }
-            
-            Write-Log "Available IDs to try:"
-            $possibleIds | ForEach-Object {
-                Write-Log "  $($_.Type): $($_.Value)"
+            if ($deploymentToUse.id) { $possibleIds += @{Type="Deployment ID"; Value=$deploymentToUse.id} }
+            if ($deploymentToUse.resourceId) { $possibleIds += @{Type="Resource ID"; Value=$deploymentToUse.resourceId} }
+            if ($deploymentToUse.catalogItemId) { $possibleIds += @{Type="Catalog Item ID"; Value=$deploymentToUse.catalogItemId} }
+            if ($deploymentToUse.requestId) { $possibleIds += @{Type="Request ID"; Value=$deploymentToUse.requestId} }
+            if ($deploymentToUse.lastRequest -and $deploymentToUse.lastRequest.id) { 
+                $possibleIds += @{Type="Last Request ID"; Value=$deploymentToUse.lastRequest.id} 
             }
             
-            # Try each ID with different endpoints
-            foreach ($idInfo in $possibleIds) {
-                $currentId = $idInfo.Value
-                $idType = $idInfo.Type
-                
-                if ($historyFetchSuccess) { break }
-                
-                Write-Log "`nTrying with $idType`: $currentId"
-                
-                # Endpoint 1: Catalog items
-                if (-not $historyFetchSuccess) {
-                    try {
-                        $requestsUri = "https://$vraServer/catalog/api/items/$currentId/requests"
-                        Write-Log "  Trying: $requestsUri"
-                        $requestsResponse = Invoke-RestMethod -Uri $requestsUri -Method Get -Headers $vraHeaders -ErrorAction Stop
-                        $requests = if ($requestsResponse.content) { $requestsResponse.content } elseif ($requestsResponse.value) { $requestsResponse.value } else { $requestsResponse }
-                        if ($requests) {
-                            $historyFetchSuccess = $true
-                            Write-Log "  SUCCESS with catalog items API using $idType" "SUCCESS"
-                        }
-                    }
-                    catch {
-                        Write-Log "  Failed: $($_.Exception.Message)" "WARN"
-                    }
-                }
-                
-                # Endpoint 2: Deployment requests
-                if (-not $historyFetchSuccess) {
-                    try {
-                        $requestsUri = "https://$vraServer/deployment/api/deployments/$currentId/requests"
-                        Write-Log "  Trying: $requestsUri"
-                        $requestsResponse = Invoke-RestMethod -Uri $requestsUri -Method Get -Headers $vraHeaders -ErrorAction Stop
-                        $requests = if ($requestsResponse.content) { $requestsResponse.content } elseif ($requestsResponse.value) { $requestsResponse.value } else { $requestsResponse }
-                        if ($requests) {
-                            $historyFetchSuccess = $true
-                            Write-Log "  SUCCESS with deployment API using $idType" "SUCCESS"
-                        }
-                    }
-                    catch {
-                        Write-Log "  Failed: $($_.Exception.Message)" "WARN"
-                    }
-                }
-                
-                # Endpoint 3: Consumer resources
-                if (-not $historyFetchSuccess) {
-                    try {
-                        $requestsUri = "https://$vraServer/catalog/api/consumer/resources/$currentId/requests"
-                        Write-Log "  Trying: $requestsUri"
-                        $requestsResponse = Invoke-RestMethod -Uri $requestsUri -Method Get -Headers $vraHeaders -ErrorAction Stop
-                        $requests = if ($requestsResponse.content) { $requestsResponse.content } elseif ($requestsResponse.value) { $requestsResponse.value } else { $requestsResponse }
-                        if ($requests) {
-                            $historyFetchSuccess = $true
-                            Write-Log "  SUCCESS with consumer resources API using $idType" "SUCCESS"
-                        }
-                    }
-                    catch {
-                        Write-Log "  Failed: $($_.Exception.Message)" "WARN"
-                    }
-                }
+            # Check if requests are already embedded in the deployment
+            if ($deploymentToUse.requests -and $deploymentToUse.requests.Count -gt 0) {
+                Write-Log ">>> REQUESTS FOUND EMBEDDED IN DEPLOYMENT! <<<" "SUCCESS"
+                $requests = $deploymentToUse.requests
+                $historyFetchSuccess = $true
             }
             
-            # Last resort: Try to get request by ID directly if we have a requestId
-            if (-not $historyFetchSuccess -and $dep.requestId) {
-                try {
-                    Write-Log "`nTrying direct request lookup with requestId: $($dep.requestId)"
-                    $requestUri = "https://$vraServer/catalog/api/requests/$($dep.requestId)"
-                    Write-Log "  Trying: $requestUri"
-                    $singleRequest = Invoke-RestMethod -Uri $requestUri -Method Get -Headers $vraHeaders -ErrorAction Stop
-                    if ($singleRequest) {
-                        $requests = @($singleRequest)
-                        $historyFetchSuccess = $true
-                        Write-Log "  SUCCESS with direct request lookup" "SUCCESS"
-                    }
+            if (-not $historyFetchSuccess) {
+                Write-Log "Available IDs to try:"
+                $possibleIds | ForEach-Object {
+                    Write-Log "  $($_.Type): $($_.Value)"
                 }
-                catch {
-                    Write-Log "  Failed: $($_.Exception.Message)" "WARN"
+                
+                # Try each ID with different endpoints
+                foreach ($idInfo in $possibleIds) {
+                    $currentId = $idInfo.Value
+                    $idType = $idInfo.Type
+                    
+                    if ($historyFetchSuccess) { break }
+                    
+                    Write-Log "`nTrying with $idType`: $currentId"
+                    
+                    # Endpoint 1: Catalog items
+                    if (-not $historyFetchSuccess) {
+                        try {
+                            $requestsUri = "https://$vraServer/catalog/api/items/$currentId/requests"
+                            Write-Log "  Trying: $requestsUri"
+                            $requestsResponse = Invoke-RestMethod -Uri $requestsUri -Method Get -Headers $vraHeaders -ErrorAction Stop
+                            $requests = if ($requestsResponse.content) { $requestsResponse.content } elseif ($requestsResponse.value) { $requestsResponse.value } else { $requestsResponse }
+                            if ($requests) {
+                                $historyFetchSuccess = $true
+                                Write-Log "  SUCCESS with catalog items API using $idType" "SUCCESS"
+                            }
+                        }
+                        catch {
+                            Write-Log "  Failed: $($_.Exception.Message)" "WARN"
+                        }
+                    }
+                    
+                    # Endpoint 2: Deployment requests
+                    if (-not $historyFetchSuccess) {
+                        try {
+                            $requestsUri = "https://$vraServer/deployment/api/deployments/$currentId/requests"
+                            Write-Log "  Trying: $requestsUri"
+                            $requestsResponse = Invoke-RestMethod -Uri $requestsUri -Method Get -Headers $vraHeaders -ErrorAction Stop
+                            $requests = if ($requestsResponse.content) { $requestsResponse.content } elseif ($requestsResponse.value) { $requestsResponse.value } else { $requestsResponse }
+                            if ($requests) {
+                                $historyFetchSuccess = $true
+                                Write-Log "  SUCCESS with deployment API using $idType" "SUCCESS"
+                            }
+                        }
+                        catch {
+                            Write-Log "  Failed: $($_.Exception.Message)" "WARN"
+                        }
+                    }
+                    
+                    # Endpoint 3: Consumer resources
+                    if (-not $historyFetchSuccess) {
+                        try {
+                            $requestsUri = "https://$vraServer/catalog/api/consumer/resources/$currentId/requests"
+                            Write-Log "  Trying: $requestsUri"
+                            $requestsResponse = Invoke-RestMethod -Uri $requestsUri -Method Get -Headers $vraHeaders -ErrorAction Stop
+                            $requests = if ($requestsResponse.content) { $requestsResponse.content } elseif ($requestsResponse.value) { $requestsResponse.value } else { $requestsResponse }
+                            if ($requests) {
+                                $historyFetchSuccess = $true
+                                Write-Log "  SUCCESS with consumer resources API using $idType" "SUCCESS"
+                            }
+                        }
+                        catch {
+                            Write-Log "  Failed: $($_.Exception.Message)" "WARN"
+                        }
+                    }
+                    
+                    # Endpoint 4: Direct request lookup
+                    if (-not $historyFetchSuccess -and $idType -match "Request") {
+                        try {
+                            $requestUri = "https://$vraServer/catalog/api/requests/$currentId"
+                            Write-Log "  Trying direct request: $requestUri"
+                            $singleRequest = Invoke-RestMethod -Uri $requestUri -Method Get -Headers $vraHeaders -ErrorAction Stop
+                            if ($singleRequest) {
+                                $requests = @($singleRequest)
+                                $historyFetchSuccess = $true
+                                Write-Log "  SUCCESS with direct request lookup using $idType" "SUCCESS"
+                            }
+                        }
+                        catch {
+                            Write-Log "  Failed: $($_.Exception.Message)" "WARN"
+                        }
+                    }
                 }
             }
             
