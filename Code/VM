@@ -168,23 +168,63 @@ try {
                 }
             }
             
-            Write-Log "`n>>> LOOKING FOR TEMPLATE/CATALOG/BLUEPRINT FIELDS <<<" "SUCCESS"
-            $dep.PSObject.Properties | Where-Object { 
-                $_.Name -match "catalog" -or 
-                $_.Name -match "Catalog" -or
-                $_.Name -match "blueprint" -or 
-                $_.Name -match "Blueprint" -or
-                $_.Name -match "template" -or
-                $_.Name -match "Template" -or
-                $_.Name -match "item" -or
-                $_.Name -match "Item"
-            } | ForEach-Object {
-                Write-Log "  FOUND: $($_.Name) = $($_.Value)" "SUCCESS"
+            # Convert Blueprint ID to Name
+            Write-Log "`n>>> CONVERTING IDs TO NAMES <<<" "SUCCESS"
+            $blueprintName = $null
+            $catalogItemName = $null
+            
+            if ($dep.blueprintId) {
+                Write-Log "Found Blueprint ID: $($dep.blueprintId)"
+                try {
+                    $bpUri = "https://$vraServer/blueprint/api/blueprints/$($dep.blueprintId)"
+                    Write-Log "  Fetching blueprint details: $bpUri"
+                    $blueprint = Invoke-RestMethod -Uri $bpUri -Method Get -Headers $vraHeaders -ErrorAction Stop
+                    $blueprintName = $blueprint.name
+                    Write-Log "  >>> Blueprint Name: $blueprintName <<<" "SUCCESS"
+                }
+                catch {
+                    Write-Log "  Could not fetch blueprint name: $($_.Exception.Message)" "WARN"
+                }
             }
             
-            # Temporarily skip filtering so you can see ALL deployments
-            Write-Log "`n>>> TEMPORARILY SHOWING ALL DEPLOYMENTS - NO FILTERING <<<" "WARN"
+            if ($dep.catalogItemId) {
+                Write-Log "Found Catalog Item ID: $($dep.catalogItemId)"
+                try {
+                    $catUri = "https://$vraServer/catalog/api/items/$($dep.catalogItemId)"
+                    Write-Log "  Fetching catalog item details: $catUri"
+                    $catalogItem = Invoke-RestMethod -Uri $catUri -Method Get -Headers $vraHeaders -ErrorAction Stop
+                    $catalogItemName = $catalogItem.name
+                    Write-Log "  >>> Catalog Item Name: $catalogItemName <<<" "SUCCESS"
+                }
+                catch {
+                    Write-Log "  Could not fetch catalog item name: $($_.Exception.Message)" "WARN"
+                }
+            }
+            
+            # Now filter by the resolved names
+            Write-Log "`n>>> FILTERING BY TEMPLATE NAME <<<" "SUCCESS"
             Write-Log "Deployment Name: $($dep.name)"
+            Write-Log "Blueprint Name: $blueprintName"
+            Write-Log "Catalog Item Name: $catalogItemName"
+            Write-Log "Owner: $($dep.ownedBy)"
+            Write-Log "Requestor: $($dep.createdBy)"
+            Write-Log "Project: $($dep.projectId)"
+            
+            # Use whichever name we successfully retrieved
+            $templateName = if ($blueprintName) { $blueprintName } elseif ($catalogItemName) { $catalogItemName } else { $null }
+            
+            if (-not $templateName) {
+                Write-Log "[$totalProcessed] Skipping: Could not resolve template name from IDs" "WARN"
+                continue
+            }
+            
+            # Filter by template name
+            if ($templateName -notmatch "Virtual Machine" -and $templateName -notmatch "Database") {
+                Write-Log "[$totalProcessed] Skipping: Template name '$templateName' doesn't contain 'Virtual Machine' or 'Database'" "WARN"
+                continue
+            }
+            
+            Write-Log "[$totalProcessed] >>> Template Name '$templateName' MATCHES! Processing... <<<" "SUCCESS"
             
             # Check date but log it for debugging
             $deleteDate = $null
