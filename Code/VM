@@ -133,29 +133,35 @@ try {
         foreach ($dep in $deployments) {
             $totalProcessed++
             
-            # Filter by template - check if it contains "Virtual Machine" or "Database"
+            # Filter by template NAME - check if it contains "Virtual Machine" or "Database"
             Write-Log "[$totalProcessed] Checking deployment: $($dep.name)"
             
             $templateName = $null
+            # Try to get the template name (not ID)
             if ($dep.blueprintName) {
                 $templateName = $dep.blueprintName
             } elseif ($dep.catalogItemName) {
                 $templateName = $dep.catalogItemName
-            } elseif ($dep.blueprintId) {
-                $templateName = $dep.blueprintId
             }
             
-            Write-Log "  Template: $templateName"
+            Write-Log "  Template Name: $templateName"
+            Write-Log "  Template ID: $($dep.blueprintId)"
             Write-Log "  Owner: $($dep.ownedBy)"
             Write-Log "  Requestor: $($dep.createdBy)"
             Write-Log "  Project: $($dep.projectId)"
             
-            if (-not $templateName -or ($templateName -notmatch "Virtual Machine" -and $templateName -notmatch "Database")) {
-                Write-Log "[$totalProcessed] Skipping: Template '$templateName' doesn't match VM/Database filter" "WARN"
+            # Only filter by NAME, not ID
+            if (-not $templateName) {
+                Write-Log "[$totalProcessed] Skipping: No template name found" "WARN"
                 continue
             }
             
-            Write-Log "[$totalProcessed] >>> TEMPLATE MATCHES! Processing: $templateName <<<" "SUCCESS"
+            if ($templateName -notmatch "Virtual Machine" -and $templateName -notmatch "Database") {
+                Write-Log "[$totalProcessed] Skipping: Template name '$templateName' doesn't match VM/Database filter" "WARN"
+                continue
+            }
+            
+            Write-Log "[$totalProcessed] >>> TEMPLATE NAME MATCHES! Processing: $templateName <<<" "SUCCESS"
             
             # Check date but log it for debugging
             $deleteDate = $null
