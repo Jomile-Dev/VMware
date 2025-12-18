@@ -124,21 +124,20 @@ try {
         "Accept" = "application/json"
     }
     
-    # Calculate time range for query (last X days in milliseconds)
+    # Calculate time range for query (last X days in SECONDS since epoch)
+    # Aria Operations API uses seconds, not milliseconds
     $cutoffDate = (Get-Date).AddDays(-$daysBack)
-    $cutoffEpoch = [long]([datetime]$cutoffDate - [datetime]'1970-01-01').TotalMilliseconds
-    $currentEpoch = [long]([datetime]::UtcNow - [datetime]'1970-01-01').TotalMilliseconds
+    $cutoffEpochSeconds = [long]([datetime]$cutoffDate - [datetime]'1970-01-01').TotalSeconds
     
     Write-DebugLog "Searching for VMs created after: $cutoffDate"
-    Write-DebugLog "Cutoff epoch time: $cutoffEpoch"
-    Write-DebugLog "Current epoch time: $currentEpoch"
+    Write-DebugLog "Cutoff epoch time (seconds): $cutoffEpochSeconds"
     
     # Query Aria Operations for VMs created in the last X days
-    Write-DebugLog "Querying Aria Operations for newly created VMs..."
+    # Using createdAfter parameter to filter on the server side - MUCH FASTER!
+    Write-DebugLog "Querying Aria Operations for newly created VMs using createdAfter filter..."
     
-    # Use the resources API with property filter for creation time
-    $resourceQueryUri = "https://$ariaOpsServer/suite-api/api/resources?resourceKind=VirtualMachine&pageSize=1000"
-    Write-DebugLog "Fetching all VirtualMachine resources from Aria Operations..."
+    $resourceQueryUri = "https://$ariaOpsServer/suite-api/api/resources?resourceKind=VirtualMachine&createdAfter=$cutoffEpochSeconds&pageSize=1000"
+    Write-DebugLog "API Query: $resourceQueryUri"
     
     $page = 0
     $foundNewVMs = 0
@@ -150,11 +149,12 @@ try {
         $resourceResponse = Invoke-RestMethod -Uri $pagedResourceUri -Method Get -Headers $ariaHeaders -ErrorAction Stop
         
         if ($resourceResponse.resourceList) {
-            Write-DebugLog "  Retrieved $($resourceResponse.resourceList.Count) VMs from page $page"
+            Write-DebugLog "  Retrieved $($resourceResponse.resourceList.Count) new VMs from page $page"
             
             foreach ($resource in $resourceResponse.resourceList) {
                 try {
                     $resourceId = $resource.identifier
+                    $foundNewVMs++
                     
                     # Get VM name from resourceKey.name
                     $vmName = $null
@@ -162,7 +162,7 @@ try {
                         $vmName = $resource.resourceKey.name
                     }
                     
-                    # Get detailed properties for this resource
+                    # Get detailed properties for this resource to get the actual VM name
                     $statsUri = "https://$ariaOpsServer/suite-api/api/resources/$resourceId/properties"
                     $statsResponse = Invoke-RestMethod -Uri $statsUri -Method Get -Headers $ariaHeaders -ErrorAction Stop
                     
@@ -180,81 +180,51 @@ try {
                         continue
                     }
                     
-                    # Look for creation time property
+                    # Get creation time for display purposes
                     $creationTimeProp = $statsResponse.property | Where-Object { 
                         $_.name -eq "summary|createdTime" -or 
                         $_.name -eq "sys|createdTime" -or
                         $_.name -eq "config|createDate"
                     } | Select-Object -First 1
                     
+                    $creationDate = Get-Date  # Default to now if we can't get creation date
+                    
                     if ($creationTimeProp -and $creationTimeProp.value) {
-                        # Debug: Log the type and value we received
-                        $rawValue = $creationTimeProp.value
-                        $valueType = $rawValue.GetType().FullName
-                        Write-DebugLog "  DEBUG - VM: $vmName | Raw creation value: $rawValue | Type: $valueType"
-                        
-                        # Try to convert to long
-                        $creationTime = $null
                         try {
-                            $creationTime = [long]$rawValue
-                            Write-DebugLog "  DEBUG - Successfully converted to long: $creationTime"
+                            $creationTimeMs = [long]$creationTimeProp.value
+                            $epochStart = [datetime]'1970-01-01'
+                            $creationDate = $epochStart.AddMilliseconds($creationTimeMs)
+                            Write-DebugLog "  FOUND NEW VM: $vmName | Created: $creationDate"
                         }
                         catch {
-                            Write-DebugLog "  ERROR - Failed to convert to long: $($_.Exception.Message)" "ERROR"
-                            continue
-                        }
-                        
-                        # Debug: Log comparison values
-                        Write-DebugLog "  DEBUG - Comparing creation time $creationTime vs cutoff $cutoffEpoch"
-                        Write-DebugLog "  DEBUG - Is new? $($creationTime -gt $cutoffEpoch)"
-                        
-                        if ($creationTime -gt $cutoffEpoch) {
-                            $foundNewVMs++
-                            
-                            # Convert epoch milliseconds to DateTime
-                            try {
-                                $epochStart = [datetime]'1970-01-01'
-                                Write-DebugLog "  DEBUG - Epoch start: $epochStart (Type: $($epochStart.GetType().FullName))"
-                                Write-DebugLog "  DEBUG - Adding milliseconds: $creationTime"
-                                
-                                $creationDate = $epochStart.AddMilliseconds($creationTime)
-                                Write-DebugLog "  FOUND NEW VM: $vmName | Created: $creationDate (epoch: $creationTime)"
-                            }
-                            catch {
-                                Write-DebugLog "  ERROR - Failed to convert epoch to date: $($_.Exception.Message)" "ERROR"
-                                Write-DebugLog "  ERROR - Epoch value: $creationTime | Type: $($creationTime.GetType().FullName)" "ERROR"
-                                
-                                # Use current date as fallback
-                                $creationDate = Get-Date
-                                Write-DebugLog "  WARNING - Using current date as fallback: $creationDate" "WARN"
-                            }
-                            
-                            # Get health status
-                            $healthState = $resource.resourceStatusStates | Where-Object { $_.resourceState -eq "HEALTH" } | Select-Object -First 1
-                            $status = if ($healthState) { $healthState.status } else { "UNKNOWN" }
-                            
-                            $simpleStatus = "Unknown"
-                            switch ($status) {
-                                "GREEN" { $simpleStatus = "Online" }
-                                "YELLOW" { $simpleStatus = "Online" }
-                                "ORANGE" { $simpleStatus = "Online" }
-                                "RED" { $simpleStatus = "Decomm/Offline" }
-                                "GREY" { $simpleStatus = "Decomm/Offline" }
-                                default { $simpleStatus = "Decomm/Offline" }
-                            }
-                            
-                            # Store VM data
-                            $vmData = @{
-                                Name = $vmName
-                                CreatedDate = $creationDate
-                                Status = $simpleStatus
-                                ResourceId = $resourceId
-                            }
-                            
-                            $newVMsData += $vmData
-                            Write-DebugLog "    Stored VM: $vmName | Status: $simpleStatus | Created: $creationDate"
+                            Write-DebugLog "  WARNING - Could not parse creation date for $vmName, using current time" "WARN"
                         }
                     }
+                    
+                    # Get health status
+                    $healthState = $resource.resourceStatusStates | Where-Object { $_.resourceState -eq "HEALTH" } | Select-Object -First 1
+                    $status = if ($healthState) { $healthState.status } else { "UNKNOWN" }
+                    
+                    $simpleStatus = "Unknown"
+                    switch ($status) {
+                        "GREEN" { $simpleStatus = "Online" }
+                        "YELLOW" { $simpleStatus = "Online" }
+                        "ORANGE" { $simpleStatus = "Online" }
+                        "RED" { $simpleStatus = "Decomm/Offline" }
+                        "GREY" { $simpleStatus = "Decomm/Offline" }
+                        default { $simpleStatus = "Decomm/Offline" }
+                    }
+                    
+                    # Store VM data
+                    $vmData = @{
+                        Name = $vmName
+                        CreatedDate = $creationDate
+                        Status = $simpleStatus
+                        ResourceId = $resourceId
+                    }
+                    
+                    $newVMsData += $vmData
+                    Write-DebugLog "    Stored VM: $vmName | Status: $simpleStatus | Created: $creationDate"
                 }
                 catch {
                     Write-DebugLog "    Error processing resource: $($_.Exception.Message)" "WARN"
