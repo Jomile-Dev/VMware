@@ -133,15 +133,29 @@ try {
         foreach ($dep in $deployments) {
             $totalProcessed++
             
-            # Filter by deployment name - check if it contains "Virtual Machine" or "Database"
-            Write-Log "[$totalProcessed] Checking: $($dep.name)"
+            # Filter by template - check if it contains "Virtual Machine" or "Database"
+            Write-Log "[$totalProcessed] Checking deployment: $($dep.name)"
             
-            if ($dep.name -notmatch "Virtual Machine" -and $dep.name -notmatch "Database") {
-                Write-Log "[$totalProcessed] Skipping: $($dep.name) (doesn't contain VM/Database)" "WARN"
+            $templateName = $null
+            if ($dep.blueprintName) {
+                $templateName = $dep.blueprintName
+            } elseif ($dep.catalogItemName) {
+                $templateName = $dep.catalogItemName
+            } elseif ($dep.blueprintId) {
+                $templateName = $dep.blueprintId
+            }
+            
+            Write-Log "  Template: $templateName"
+            Write-Log "  Owner: $($dep.ownedBy)"
+            Write-Log "  Requestor: $($dep.createdBy)"
+            Write-Log "  Project: $($dep.projectId)"
+            
+            if (-not $templateName -or ($templateName -notmatch "Virtual Machine" -and $templateName -notmatch "Database")) {
+                Write-Log "[$totalProcessed] Skipping: Template '$templateName' doesn't match VM/Database filter" "WARN"
                 continue
             }
             
-            Write-Log "[$totalProcessed] >>> MATCHES! Processing: $($dep.name) <<<" "SUCCESS"
+            Write-Log "[$totalProcessed] >>> TEMPLATE MATCHES! Processing: $templateName <<<" "SUCCESS"
             
             # Check date but log it for debugging
             $deleteDate = $null
@@ -192,11 +206,20 @@ try {
                 if ($fullDeployment.lastRequest) {
                     Write-Log "  lastRequest found!" "SUCCESS"
                     $fullDeployment.lastRequest.PSObject.Properties | ForEach-Object {
-                        Write-Log "    $($_.Name): $($_.Value)"
+                        Write-Log "    lastRequest.$($_.Name): $($_.Value)"
                     }
                 }
                 if ($fullDeployment.requests) {
                     Write-Log "  requests array found with $($fullDeployment.requests.Count) items!" "SUCCESS"
+                    foreach ($req in $fullDeployment.requests) {
+                        Write-Log "    Request: $($req.name) (ID: $($req.id))"
+                    }
+                }
+                
+                # Look for any field that might contain request IDs
+                Write-Log "`nSearching for any 'request' related fields:"
+                $fullDeployment.PSObject.Properties | Where-Object { $_.Name -match "request" -or $_.Name -match "Request" } | ForEach-Object {
+                    Write-Log "  FOUND: $($_.Name) = $($_.Value)" "SUCCESS"
                 }
             }
             catch {
@@ -213,14 +236,24 @@ try {
             # Use fullDeployment if we got it, otherwise use dep
             $deploymentToUse = if ($fullDeployment) { $fullDeployment } else { $dep }
             
-            # Collect all possible IDs we can use
+            # Collect all possible IDs we can use - including ALL request-related IDs
             $possibleIds = @()
             if ($deploymentToUse.id) { $possibleIds += @{Type="Deployment ID"; Value=$deploymentToUse.id} }
             if ($deploymentToUse.resourceId) { $possibleIds += @{Type="Resource ID"; Value=$deploymentToUse.resourceId} }
             if ($deploymentToUse.catalogItemId) { $possibleIds += @{Type="Catalog Item ID"; Value=$deploymentToUse.catalogItemId} }
             if ($deploymentToUse.requestId) { $possibleIds += @{Type="Request ID"; Value=$deploymentToUse.requestId} }
+            if ($deploymentToUse.catalogRequestId) { $possibleIds += @{Type="Catalog Request ID"; Value=$deploymentToUse.catalogRequestId} }
             if ($deploymentToUse.lastRequest -and $deploymentToUse.lastRequest.id) { 
                 $possibleIds += @{Type="Last Request ID"; Value=$deploymentToUse.lastRequest.id} 
+            }
+            
+            # Check ALL properties that contain "request" in the name
+            $deploymentToUse.PSObject.Properties | Where-Object { $_.Name -match "request" -and $_.Value } | ForEach-Object {
+                if ($_.Value -is [string] -and $_.Value -match "^[a-f0-9-]{36}$") {
+                    # Looks like a GUID/UUID
+                    $possibleIds += @{Type="$($_.Name)"; Value=$_.Value}
+                    Write-Log "  Found potential request ID in field: $($_.Name) = $($_.Value)" "SUCCESS"
+                }
             }
             
             # Check if requests are already embedded in the deployment
@@ -228,6 +261,12 @@ try {
                 Write-Log ">>> REQUESTS FOUND EMBEDDED IN DEPLOYMENT! <<<" "SUCCESS"
                 $requests = $deploymentToUse.requests
                 $historyFetchSuccess = $true
+                
+                # Show what we found
+                Write-Log "Found $($requests.Count) embedded requests:"
+                foreach ($embReq in $requests) {
+                    Write-Log "  - $($embReq.name) (ID: $($embReq.id), Action: $($embReq.actionId))"
+                }
             }
             
             if (-not $historyFetchSuccess) {
