@@ -1,14 +1,12 @@
-# vRA Deleted Deployments - Request-Centric Approach
-# In vRA 8.x, deleted deployments cannot be queried via deployment API
-# This script queries request-service API for DELETE_DEPLOYMENT requests
+# vRA Request-Service API Validation Script
+# First validates that request-service endpoint is accessible before proceeding
 
 # Configuration
 $vraServer = "vra1.yourdomain.com"
-$daysBack = 1  # Past 1 day
+$daysBack = 1
 
-# FILTER CONFIGURATION - Edit these to match your template names
+# FILTER CONFIGURATION
 $filterTemplateNames = @("Virtual Machine", "Database")
-Write-Host "`n>>> FILTER: Looking for delete requests with templates containing: $($filterTemplateNames -join ' OR ') <<<" -ForegroundColor Yellow
 
 # Output
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
@@ -50,9 +48,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 }
 
-Write-Log "===== vRA Deleted Deployments - Request-Service Approach =====" "SUCCESS"
-Write-Log "Note: In vRA 8.x, deleted deployments cannot be queried via deployment API" "WARN"
-Write-Log "Querying request-service API for DELETE_DEPLOYMENT requests instead" "SUCCESS"
+Write-Log "===== vRA Request-Service API Validation =====" "SUCCESS"
 Disable-SSLValidation
 
 # Ensure log directory exists
@@ -100,42 +96,67 @@ $vraHeaders = @{
     "Accept" = "application/json"
 }
 
+# ===== VALIDATION STEP =====
+Write-Log "`n===== VALIDATING REQUEST-SERVICE API ENDPOINT =====" "SUCCESS"
+
+$testEndpoint = "https://$vraServer/request-service/api/requests?`$top=5"
+Write-Log "Testing endpoint: $testEndpoint"
+
+try {
+    $testResponse = Invoke-RestMethod -Uri $testEndpoint -Method Get -Headers $vraHeaders -ErrorAction Stop
+    Write-Log "SUCCESS: request-service API is accessible!" "SUCCESS"
+    Write-Log "Response contains $($testResponse.content.Count) requests" "SUCCESS"
+    
+    # Show sample request structure
+    if ($testResponse.content -and $testResponse.content.Count -gt 0) {
+        Write-Log "`nSample request fields available:"
+        $testResponse.content[0].PSObject.Properties | ForEach-Object {
+            Write-Log "  - $($_.Name)"
+        }
+    }
+    
+    Write-Log "`nValidation passed - proceeding with main script..." "SUCCESS"
+}
+catch {
+    $statusCode = $_.Exception.Response.StatusCode.value__
+    Write-Log "FAILED: request-service API returned error" "ERROR"
+    Write-Log "Status Code: $statusCode" "ERROR"
+    Write-Log "Error Message: $($_.Exception.Message)" "ERROR"
+    
+    Write-Log "`n===== ENDPOINT NOT AVAILABLE =====" "ERROR"
+    Write-Log "The request-service API is not exposed/accessible in your vRA environment." "ERROR"
+    Write-Log "`nAlternative approaches to find deleted deployments:" "WARN"
+    Write-Log "  1. Check vRA audit logs/events API" "WARN"
+    Write-Log "  2. Use deployment API with includeDeleted parameter (if supported)" "WARN"
+    Write-Log "  3. Query vRO workflows that handle deletions" "WARN"
+    Write-Log "  4. Check vRA database directly (if you have access)" "WARN"
+    Write-Log "  5. Use vRealize Log Insight for deletion events" "WARN"
+    
+    Write-Log "`nWould you like me to create a script using an alternative API?" "WARN"
+    exit
+}
+
+# ===== MAIN SCRIPT LOGIC (only runs if validation passed) =====
+
 $cutoffDate = (Get-Date).AddDays(-$daysBack)
+Write-Log "`n===== Querying for DELETE Requests ====="
 Write-Log "Looking for delete requests from: $cutoffDate"
+Write-Log "Filter: Templates containing: $($filterTemplateNames -join ' OR ')" "WARN"
 
 $deletedDeploymentDetails = @()
 
-# MAIN APPROACH: Query request-service for DELETE requests
-Write-Log "`n===== Querying Request-Service for DELETE Requests ====="
-
 try {
-    # Fetch all recent requests from request-service
+    # Fetch all recent requests
     $reqSvcUri = "https://$vraServer/request-service/api/requests?`$top=5000&`$orderby=dateSubmitted desc"
     Write-Log "Fetching requests: $reqSvcUri"
     
     $reqSvcResponse = Invoke-RestMethod -Uri $reqSvcUri -Method Get -Headers $vraHeaders -ErrorAction Stop
     $allRequests = if ($reqSvcResponse.content) { $reqSvcResponse.content } else { $reqSvcResponse }
     
-    Write-Log "Retrieved $($allRequests.Count) total requests from request-service" "SUCCESS"
+    Write-Log "Retrieved $($allRequests.Count) total requests" "SUCCESS"
     
-    # Show sample request structure
-    if ($allRequests.Count -gt 0) {
-        Write-Log "`nSample request structure (first request):"
-        $sample = $allRequests[0]
-        $sample.PSObject.Properties | ForEach-Object {
-            if ($_.Value -is [string] -or $_.Value -is [int] -or $_.Value -is [bool] -or $null -eq $_.Value) {
-                Write-Log "  $($_.Name) = $($_.Value)"
-            } else {
-                Write-Log "  $($_.Name) = [Complex: $($_.Value.GetType().Name)]"
-            }
-        }
-    }
-    
-    # Filter for DELETE requests within time range
-    Write-Log "`n=== Filtering for DELETE requests ==="
-    
+    # Filter for DELETE requests
     $deleteRequests = $allRequests | Where-Object {
-        # Check if it's a delete operation
         $isDelete = (
             $_.requestType -eq "DELETE_DEPLOYMENT" -or
             $_.requestType -match "DELETE" -or
@@ -143,14 +164,13 @@ try {
             ($_.requestedItemName -and $_.requestedItemName -match "Delete")
         )
         
-        # Check if within time range
         $withinTimeRange = $true
         if ($_.dateSubmitted) {
             try {
                 $submitDate = [DateTime]$_.dateSubmitted
                 $withinTimeRange = ($submitDate -ge $cutoffDate)
             } catch {
-                $withinTimeRange = $true  # Include if can't parse date
+                $withinTimeRange = $true
             }
         }
         
@@ -160,7 +180,8 @@ try {
     Write-Log "Found $($deleteRequests.Count) DELETE requests in time range" "SUCCESS"
     
     if ($deleteRequests.Count -eq 0) {
-        Write-Log "No DELETE requests found. Showing all request types for debugging:" "WARN"
+        Write-Log "No DELETE requests found." "WARN"
+        Write-Log "Showing sample of available request types:" "WARN"
         $allRequests | Select-Object -First 10 | ForEach-Object {
             Write-Log "  $($_.requestType) - $($_.requestedItemName) (Date: $($_.dateSubmitted))"
         }
@@ -171,20 +192,7 @@ try {
     foreach ($delReq in $deleteRequests) {
         $processedCount++
         
-        Write-Log "`n========================================" "SUCCESS"
-        Write-Log "[$processedCount/$($deleteRequests.Count)] DELETE REQUEST" "SUCCESS"
-        Write-Log "========================================" "SUCCESS"
-        
-        Write-Log "Request Number: $($delReq.requestNumber)"
-        Write-Log "Request ID: $($delReq.id)"
-        Write-Log "Item Name: $($delReq.requestedItemName)"
-        Write-Log "Request Type: $($delReq.requestType)"
-        Write-Log "Phase: $($delReq.phase)"
-        Write-Log "State: $($delReq.state)"
-        Write-Log "Requested By: $($delReq.requestedBy)"
-        Write-Log "Requested For: $($delReq.requestedFor)"
-        Write-Log "Date Submitted: $($delReq.dateSubmitted)"
-        Write-Log "Date Completed: $($delReq.dateCompleted)"
+        Write-Log "`n[$processedCount/$($deleteRequests.Count)] Processing: $($delReq.requestedItemName)" "SUCCESS"
         
         # Get full request details
         $fullRequest = $null
@@ -193,81 +201,41 @@ try {
         
         try {
             $fullReqUri = "https://$vraServer/request-service/api/requests/$($delReq.id)"
-            Write-Log "`nFetching full request details: $fullReqUri"
             $fullRequest = Invoke-RestMethod -Uri $fullReqUri -Method Get -Headers $vraHeaders -ErrorAction Stop
-            
-            Write-Log ">>> FULL REQUEST RETRIEVED <<<" "SUCCESS"
             
             # Extract catalog item or blueprint information
             if ($fullRequest.requestData) {
-                Write-Log "`nRequest Data:"
                 $fullRequest.requestData.PSObject.Properties | ForEach-Object {
-                    Write-Log "  $($_.Name) = $($_.Value)"
-                    
-                    # Look for catalog item or blueprint references
                     if ($_.Name -match "catalogItem" -or $_.Name -match "blueprint") {
                         if ($_.Value -is [string]) {
-                            # Try to resolve the ID to a name
                             try {
                                 if ($_.Name -match "catalogItem") {
                                     $catItemUri = "https://$vraServer/catalog/api/items/$($_.Value)"
                                     $catItem = Invoke-RestMethod -Uri $catItemUri -Method Get -Headers $vraHeaders -ErrorAction Stop
                                     $catalogItemName = $catItem.name
-                                    Write-Log "  >>> Resolved Catalog Item Name: $catalogItemName <<<" "SUCCESS"
+                                    Write-Log "  Catalog Item: $catalogItemName"
                                 }
                                 elseif ($_.Name -match "blueprint") {
                                     $bpUri = "https://$vraServer/blueprint/api/blueprints/$($_.Value)"
                                     $bp = Invoke-RestMethod -Uri $bpUri -Method Get -Headers $vraHeaders -ErrorAction Stop
                                     $blueprintName = $bp.name
-                                    Write-Log "  >>> Resolved Blueprint Name: $blueprintName <<<" "SUCCESS"
+                                    Write-Log "  Blueprint: $blueprintName"
                                 }
                             }
                             catch {
-                                Write-Log "  Could not resolve ID to name: $($_.Exception.Message)" "WARN"
+                                Write-Log "  Could not resolve template name" "WARN"
                             }
                         }
                     }
                 }
             }
-            
-            if ($fullRequest.requestCompletion) {
-                Write-Log "`nRequest Completion:"
-                $fullRequest.requestCompletion.PSObject.Properties | ForEach-Object {
-                    Write-Log "  $($_.Name) = $($_.Value)"
-                }
-            }
-            
-            # Look for resource information
-            if ($fullRequest.resourceRef) {
-                Write-Log "`nResource Reference:"
-                $fullRequest.resourceRef.PSObject.Properties | ForEach-Object {
-                    Write-Log "  $($_.Name) = $($_.Value)"
-                }
-            }
-            
-            if ($fullRequest.requestedResourceRef) {
-                Write-Log "`nRequested Resource Reference:"
-                $fullRequest.requestedResourceRef.PSObject.Properties | ForEach-Object {
-                    Write-Log "  $($_.Name) = $($_.Value)"
-                }
-            }
         }
         catch {
-            Write-Log "Could not fetch full request details: $($_.Exception.Message)" "ERROR"
+            Write-Log "  Could not fetch full request details: $($_.Exception.Message)" "WARN"
         }
         
         # Determine template name for filtering
-        $templateName = $null
-        if ($catalogItemName) {
-            $templateName = $catalogItemName
-        } elseif ($blueprintName) {
-            $templateName = $blueprintName
-        } elseif ($delReq.requestedItemName) {
-            # Use the requested item name as fallback
-            $templateName = $delReq.requestedItemName
-        }
-        
-        Write-Log "`nTemplate Name for filtering: $templateName"
+        $templateName = $catalogItemName ?? $blueprintName ?? $delReq.requestedItemName
         
         # Apply filter
         $matchesFilter = $false
@@ -275,14 +243,14 @@ try {
             foreach ($filterName in $filterTemplateNames) {
                 if ($templateName -match $filterName) {
                     $matchesFilter = $true
-                    Write-Log ">>> MATCHES FILTER: '$filterName' <<<" "SUCCESS"
+                    Write-Log "  >>> MATCHES FILTER: '$filterName' <<<" "SUCCESS"
                     break
                 }
             }
         }
         
         if (-not $matchesFilter) {
-            Write-Log "Skipping: Template '$templateName' doesn't match filter: $($filterTemplateNames -join ', ')" "WARN"
+            Write-Log "  Skipping: Template '$templateName' doesn't match filter" "WARN"
             continue
         }
         
@@ -301,44 +269,37 @@ try {
             RequestedFor = $delReq.requestedFor
             DateSubmitted = $delReq.dateSubmitted
             DateCompleted = $delReq.dateCompleted
-            
-            # Full request objects
             BasicRequest = $delReq
             FullRequest = $fullRequest
         }
         
         $deletedDeploymentDetails += $deleteInfo
-        
-        Write-Log "`n>>> ADDED TO OUTPUT <<<" "SUCCESS"
+        Write-Log "  Added to output" "SUCCESS"
     }
     
 }
 catch {
     Write-Log "ERROR querying request-service: $($_.Exception.Message)" "ERROR"
-    Write-Log "Stack trace: $($_.Exception.StackTrace)" "ERROR"
 }
 
 # Summary and Export
-Write-Log "`n============================================" "SUCCESS"
-Write-Log "===== SUMMARY =====" "SUCCESS"
-Write-Log "============================================" "SUCCESS"
+Write-Log "`n===== SUMMARY =====" "SUCCESS"
 Write-Log "Total DELETE requests found: $($deleteRequests.Count)" 
 Write-Log "DELETE requests matching filter: $($deletedDeploymentDetails.Count)" "SUCCESS"
 
 if ($deletedDeploymentDetails.Count -gt 0) {
     # Export full JSON
-    Write-Log "`nExporting detailed data..."
     $deletedDeploymentDetails | ConvertTo-Json -Depth 20 | Out-File -FilePath $outputJson -Encoding UTF8
     Write-Log "Full JSON exported to: $outputJson" "SUCCESS"
     
-    # Export CSV for easy viewing
+    # Export CSV
     $deletedDeploymentDetails | Select-Object RequestNumber, ItemName, TemplateName, RequestedBy, 
         RequestedFor, DateSubmitted, DateCompleted, State | 
         Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
     Write-Log "CSV summary exported to: $outputCsv" "SUCCESS"
     
-    # Display summary table
-    Write-Log "`n=== DELETED DEPLOYMENTS SUMMARY ===" "SUCCESS"
+    # Display summary
+    Write-Log "`n=== DELETED DEPLOYMENTS ===" "SUCCESS"
     $deletedDeploymentDetails | ForEach-Object {
         Write-Log "`nRequest #$($_.RequestNumber): $($_.ItemName)" "SUCCESS"
         Write-Log "  Template: $($_.TemplateName)"
@@ -349,13 +310,8 @@ if ($deletedDeploymentDetails.Count -gt 0) {
 }
 else {
     Write-Log "`nNO MATCHING DELETE REQUESTS FOUND!" "WARN"
-    Write-Log "Possible reasons:" "WARN"
-    Write-Log "  1. No deployments with matching templates were deleted in the past $daysBack day(s)" "WARN"
-    Write-Log "  2. Adjust `$filterTemplateNames to match your actual template names" "WARN"
-    Write-Log "  3. Increase `$daysBack variable to look further back" "WARN"
+    Write-Log "Adjust `$filterTemplateNames or `$daysBack to broaden search" "WARN"
 }
 
 Write-Log "`n===== Script Completed =====" "SUCCESS"
-Write-Log "JSON Output: $outputJson"
-Write-Log "CSV Output: $outputCsv"
 Write-Log "Log file: $outputLog"
