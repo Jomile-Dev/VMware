@@ -235,7 +235,14 @@ try {
         }
         
         # Determine template name for filtering
-        $templateName = $catalogItemName ?? $blueprintName ?? $delReq.requestedItemName
+        $templateName = $null
+        if ($catalogItemName) {
+            $templateName = $catalogItemName
+        } elseif ($blueprintName) {
+            $templateName = $blueprintName
+        } elseif ($delReq.requestedItemName) {
+            $templateName = $delReq.requestedItemName
+        }
         
         # Apply filter
         $matchesFilter = $false
