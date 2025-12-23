@@ -517,50 +517,228 @@ try {
         }
     }
     
-    # Query Aria Operations for new VMs
-    $ariaInternalURL = "https://$ariaOpsServer/suite-api/api/resources?resourceKind=VirtualMachine"
-    Write-DebugLog "Querying for VMs: $ariaInternalURL" "DEBUG"
+    # Query Aria Operations for new VMs with comprehensive troubleshooting
+    Write-DebugLog "`n===== TROUBLESHOOTING: Querying Aria Operations for VMs =====" "INFO"
     
+    # Try multiple API endpoints and formats
+    $apiEndpoints = @(
+        @{
+            Name = "Resources API v1"
+            Url = "https://$ariaOpsServer/suite-api/api/resources?resourceKind=VirtualMachine&pageSize=10"
+        },
+        @{
+            Name = "Resources API v2 with adapterKind"
+            Url = "https://$ariaOpsServer/suite-api/api/resources?resourceKind=VirtualMachine&adapterKind=VMWARE&pageSize=10"
+        },
+        @{
+            Name = "Resources API with no filters"
+            Url = "https://$ariaOpsServer/suite-api/api/resources?pageSize=10"
+        },
+        @{
+            Name = "Adapter instances (to verify connectivity)"
+            Url = "https://$ariaOpsServer/suite-api/api/adapterkinds"
+        }
+    )
+    
+    $workingEndpoint = $null
     $response = $null
+    
+    foreach ($endpoint in $apiEndpoints) {
+        Write-DebugLog "`nTrying endpoint: $($endpoint.Name)" "INFO"
+        Write-DebugLog "URL: $($endpoint.Url)" "DEBUG"
+        
+        try {
+            # Use Invoke-WebRequest first to see raw response
+            Write-DebugLog "  Step 1: Testing with Invoke-WebRequest..." "DEBUG"
+            $webResponse = $null
+            
+            try {
+                $webResponse = Invoke-WebRequest -Uri $endpoint.Url -Headers $ariaHeaders -Method Get -ErrorAction Stop
+                Write-DebugLog "  ✓ HTTP Status: $($webResponse.StatusCode) $($webResponse.StatusDescription)" "SUCCESS"
+                Write-DebugLog "  ✓ Content Length: $($webResponse.Content.Length) bytes" "DEBUG"
+                Write-DebugLog "  ✓ Content Type: $($webResponse.Headers['Content-Type'])" "DEBUG"
+                
+                # Show first 500 characters of response
+                $contentPreview = $webResponse.Content.Substring(0, [Math]::Min(500, $webResponse.Content.Length))
+                Write-DebugLog "  Response Preview (first 500 chars):" "DEBUG"
+                Write-DebugLog "  $contentPreview" "DEBUG"
+            }
+            catch {
+                Write-DebugLog "  ✗ WebRequest failed: $($_.Exception.Message)" "ERROR"
+                
+                if ($_.Exception.Response) {
+                    Write-DebugLog "  ✗ Status Code: $($_.Exception.Response.StatusCode.value__)" "ERROR"
+                    Write-DebugLog "  ✗ Status Description: $($_.Exception.Response.StatusDescription)" "ERROR"
+                    
+                    # Try to read error response body
+                    try {
+                        $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+                        $errorBody = $reader.ReadToEnd()
+                        Write-DebugLog "  ✗ Error Response Body: $errorBody" "ERROR"
+                        $reader.Close()
+                    }
+                    catch {
+                        Write-DebugLog "  ✗ Could not read error response body" "ERROR"
+                    }
+                }
+                continue
+            }
+            
+            # Now try Invoke-RestMethod to parse JSON
+            Write-DebugLog "  Step 2: Parsing JSON with Invoke-RestMethod..." "DEBUG"
+            
+            try {
+                $response = Invoke-RestMethod -Uri $endpoint.Url -Headers $ariaHeaders -Method Get -ErrorAction Stop
+                
+                if ($response -eq $null) {
+                    Write-DebugLog "  ✗ Invoke-RestMethod returned null" "WARN"
+                    continue
+                }
+                
+                Write-DebugLog "  ✓ Successfully parsed JSON response" "SUCCESS"
+                Write-DebugLog "  ✓ Response Type: $($response.GetType().Name)" "DEBUG"
+                
+                # Check if response has properties
+                if ($response.PSObject -and $response.PSObject.Properties) {
+                    $propNames = $response.PSObject.Properties.Name
+                    Write-DebugLog "  ✓ Response Properties: $($propNames -join ', ')" "DEBUG"
+                    
+                    # Show sample data for each property
+                    foreach ($propName in $propNames) {
+                        $propValue = $response.$propName
+                        if ($propValue -ne $null) {
+                            if ($propValue -is [Array]) {
+                                Write-DebugLog "    - $propName : Array with $($propValue.Count) items" "DEBUG"
+                            }
+                            elseif ($propValue -is [string] -or $propValue -is [int]) {
+                                Write-DebugLog "    - $propName : $propValue" "DEBUG"
+                            }
+                            else {
+                                Write-DebugLog "    - $propName : $($propValue.GetType().Name)" "DEBUG"
+                            }
+                        }
+                        else {
+                            Write-DebugLog "    - $propName : (null)" "DEBUG"
+                        }
+                    }
+                }
+                elseif ($response -is [Array]) {
+                    Write-DebugLog "  ✓ Response is an Array with $($response.Count) items" "DEBUG"
+                }
+                else {
+                    Write-DebugLog "  ✗ Response has no PSObject.Properties" "WARN"
+                    Write-DebugLog "  Response ToString: $($response.ToString())" "DEBUG"
+                }
+                
+                # This endpoint works!
+                $workingEndpoint = $endpoint
+                Write-DebugLog "  ✓✓✓ SUCCESS! This endpoint works!" "SUCCESS"
+                break
+            }
+            catch {
+                Write-DebugLog "  ✗ Failed to parse JSON: $($_.Exception.Message)" "ERROR"
+                continue
+            }
+        }
+        catch {
+            Write-DebugLog "  ✗ Endpoint test failed: $($_.Exception.Message)" "ERROR"
+            continue
+        }
+    }
+    
+    # Check if we found a working endpoint
+    if (-not $workingEndpoint -or -not $response) {
+        Write-DebugLog "`n===== TROUBLESHOOTING SUMMARY =====" "ERROR"
+        Write-DebugLog "All API endpoints failed. Possible causes:" "ERROR"
+        Write-DebugLog "  1. User permissions insufficient - need at least 'Read Only' role in Aria Ops" "ERROR"
+        Write-DebugLog "  2. API version incompatibility - check Aria Operations version" "ERROR"
+        Write-DebugLog "  3. Network/firewall blocking API access" "ERROR"
+        Write-DebugLog "  4. Authentication token format incorrect for this Aria Ops version" "ERROR"
+        Write-DebugLog "`nDEBUG INFO:" "ERROR"
+        Write-DebugLog "  Aria Ops Server: $ariaOpsServer" "ERROR"
+        Write-DebugLog "  Username: $ariaUsername" "ERROR"
+        Write-DebugLog "  Auth Source: $ariaOpsAuthSource" "ERROR"
+        Write-DebugLog "  Token (first 20): $($ariaToken.Substring(0, [Math]::Min(20, $ariaToken.Length)))" "ERROR"
+        throw "Cannot query Aria Operations - all API endpoints failed"
+    }
+    
+    Write-DebugLog "`n✓ Using working endpoint: $($workingEndpoint.Name)" "SUCCESS"
+    
+    # Now get the full VM list using the working endpoint format
+    $ariaInternalURL = "https://$ariaOpsServer/suite-api/api/resources?resourceKind=VirtualMachine"
+    Write-DebugLog "`nFetching complete VM list from: $ariaInternalURL" "INFO"
+    
     try {
         $response = Invoke-RestMethod -Uri $ariaInternalURL -Headers $ariaHeaders -Method Get -ErrorAction Stop
     }
     catch {
-        Write-DebugLog "Failed to query VMs from Aria Operations" "ERROR"
+        Write-DebugLog "Failed to fetch full VM list" "ERROR"
         Write-DebugLog "Error: $($_.Exception.Message)" "ERROR"
-        if ($_.Exception.Response) {
-            Write-DebugLog "Status Code: $($_.Exception.Response.StatusCode.value__)" "ERROR"
-        }
-        throw "Cannot query Aria Operations for VMs"
+        throw "Cannot fetch VM list from Aria Operations"
     }
     
-    # Validate response
-    if (-not $response) {
-        Write-DebugLog "Received null response from Aria Operations" "ERROR"
-        throw "Null response from Aria Operations API"
-    }
-    
-    # Debug: Show response structure
-    Write-DebugLog "Response type: $($response.GetType().Name)" "DEBUG"
-    if ($response.PSObject.Properties) {
-        Write-DebugLog "Response properties: $($response.PSObject.Properties.Name -join ', ')" "DEBUG"
-    }
-    
-    # Handle response - could be direct array or nested in resourceList
+    # Parse response with detailed diagnostics
+    Write-DebugLog "`nParsing VM response..." "INFO"
     $allResources = $null
-    if ($response.resourceList) {
+    
+    if ($response -eq $null) {
+        Write-DebugLog "Response is null!" "ERROR"
+        throw "Null response from Aria Operations"
+    }
+    
+    # Determine response structure
+    if ($response.PSObject.Properties -and ($response.PSObject.Properties.Name -contains 'resourceList')) {
         $allResources = $response.resourceList
-        Write-DebugLog "Found resourceList with $($allResources.Count) items" "DEBUG"
+        Write-DebugLog "✓ Found 'resourceList' property" "SUCCESS"
+        
+        if ($allResources -ne $null) {
+            Write-DebugLog "✓ resourceList contains $($allResources.Count) items" "SUCCESS"
+        }
+        else {
+            Write-DebugLog "✗ resourceList is null" "WARN"
+            $allResources = @()
+        }
+    }
+    elseif ($response.PSObject.Properties -and ($response.PSObject.Properties.Name -contains 'resources')) {
+        $allResources = $response.resources
+        Write-DebugLog "✓ Found 'resources' property" "SUCCESS"
+        
+        if ($allResources -ne $null) {
+            Write-DebugLog "✓ resources contains $($allResources.Count) items" "SUCCESS"
+        }
+        else {
+            Write-DebugLog "✗ resources is null" "WARN"
+            $allResources = @()
+        }
     }
     elseif ($response -is [Array]) {
         $allResources = $response
-        Write-DebugLog "Response is direct array with $($allResources.Count) items" "DEBUG"
+        Write-DebugLog "✓ Response is direct array with $($allResources.Count) items" "SUCCESS"
     }
     else {
-        Write-DebugLog "Unexpected response structure!" "ERROR"
-        Write-DebugLog "Response type: $($response.GetType().Name)" "ERROR"
-        Write-DebugLog "Response content: $($response | ConvertTo-Json -Depth 2)" "ERROR"
-        throw "Cannot parse Aria Operations response"
+        Write-DebugLog "✗ Cannot determine response structure!" "ERROR"
+        Write-DebugLog "Response Type: $($response.GetType().Name)" "ERROR"
+        
+        if ($response.PSObject.Properties) {
+            Write-DebugLog "Available Properties: $($response.PSObject.Properties.Name -join ', ')" "ERROR"
+        }
+        
+        # Try to show full response as JSON
+        try {
+            $jsonResponse = $response | ConvertTo-Json -Depth 3
+            Write-DebugLog "Full Response (JSON):" "ERROR"
+            Write-DebugLog $jsonResponse "ERROR"
+        }
+        catch {
+            Write-DebugLog "Cannot convert response to JSON" "ERROR"
+        }
+        
+        throw "Cannot parse Aria Operations response structure"
+    }
+    
+    if ($allResources -eq $null) {
+        Write-DebugLog "No resources found in response" "WARN"
+        $allResources = @()
     }
     
     # Filter for VMs created in timeframe and get identifiers
