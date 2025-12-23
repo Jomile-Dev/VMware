@@ -1,21 +1,15 @@
-# vRA Merged History Extractor
-# Replicates the GUI View: Metadata + History + Logs + Resources
+# vRA Deep-Dive: Deployment Metadata + History + Granular Events
+# Purpose: Replicates the GUI "History" and "Request" logs for deleted items.
 
 # --- Configuration ---
 $vraServer = "vra1.yourdomain.com"
-$apiVersion = "2020-08-25" 
+$apiVersion = "2020-08-25"  # <--- CRITICAL: Versioning for deleted records
 $daysBack   = 30 
 $filterKeywords = @("Virtual Machine", "Database")
 
-# --- 1. Fix Null Path & Prep Output ---
-$logDir = "C:\Logs"
-if (!(Test-Path $logDir)) { 
-    New-Item -ItemType Directory -Path $logDir -Force | Out-Null 
-}
+# --- Output ---
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-$outputLog = "$logDir\vRA_Full_Deep_Dive_$timestamp.log"
-
-Write-Host "Logs will be saved to: $outputLog" -ForegroundColor Cyan
+$outputFile = "C:\Logs\vRA_Full_Deep_History_$timestamp.log"
 
 # --- Setup & Auth ---
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -32,64 +26,58 @@ $authBody = @{ username = $credential.UserName; password = $credential.GetNetwor
 $authRes = Invoke-RestMethod -Uri "https://$vraServer/csp/gateway/am/api/login" -Method Post -Headers @{"Content-Type"="application/json"} -Body $authBody
 $vraHeaders = @{ "Authorization" = "Bearer $($authRes.cspAuthToken)"; "Content-Type" = "application/json" }
 
-# --- 2. Get Deleted Deployments ---
-Write-Host "Fetching deleted deployment records..." -ForegroundColor Cyan
+# --- 1. Get Deleted Deployments ---
+Write-Host "Searching for deleted deployments..." -ForegroundColor Cyan
 $deployUri = "https://$vraServer/deployment/api/deployments?apiVersion=$apiVersion&deleted=true&`$top=200"
 $allDeps = (Invoke-RestMethod -Uri $deployUri -Method Get -Headers $vraHeaders).content
 
 $cutoffDate = (Get-Date).AddDays(-$daysBack)
 
 foreach ($dep in $allDeps) {
-    # Filters: Look for Deleted status + Keywords
+    # Filter for Deletes + Keywords
     if ($dep.status -notmatch "DELETE" -and $dep.status -ne "ARCHIVED") { continue }
     $nameMatch = $false
     foreach ($k in $filterKeywords) { if ($dep.name -match $k) { $nameMatch = $true } }
     if (-not $nameMatch) { continue }
 
-    # --- TOP LEVEL METADATA ---
-    $header = "`n[DEPLOYMENT] Name: $($dep.name) | Status: $($dep.status) | ID: $($dep.id)"
-    Write-Host $header -ForegroundColor White -Bold
-    $header | Add-Content $outputLog
+    Write-Host "`n====================================================" -ForegroundColor White
+    Write-Host "DEPLOYMENT: $($dep.name)" -ForegroundColor Green
+    Write-Host "ID: $($dep.id)" -ForegroundColor Gray
+    "--- DEPLOYMENT: $($dep.name) (ID: $($dep.id)) ---" | Add-Content $outputFile
 
-    # --- 3. RESOURCE SPECIFICS (IP/CPU/RAM) ---
+    # --- 2. Get the "Specifics" (Hardware/IP) ---
     try {
         $resUri = "https://$vraServer/deployment/api/deployments/$($dep.id)/resources?apiVersion=$apiVersion"
         $resources = (Invoke-RestMethod -Uri $resUri -Method Get -Headers $vraHeaders).content
-        if ($resources) {
-            foreach ($res in $resources) {
-                $specLine = "  [Resource] Name: $($res.name) | IP: $($res.properties.address) | CPU: $($res.properties.cpuCount)"
-                Write-Host $specLine -ForegroundColor Cyan
-                $specLine | Add-Content $outputLog
-            }
+        foreach ($res in $resources) {
+            $spec = "Resource: $($res.name) | IP: $($res.properties.address) | CPU: $($res.properties.cpuCount)"
+            Write-Host "  [Specs] $spec" -ForegroundColor Cyan
+            "  [Specs] $spec" | Add-Content $outputFile
         }
-    } catch { 
-        "  [Resource] Details purged from DB (Expected for older deletions)." | Add-Content $outputLog 
-    }
+    } catch { Write-Host "  [Specs] Resource data already purged from DB." -ForegroundColor Red }
 
-    # --- 4. REQUEST HISTORY (GUI History Tab) ---
+    # --- 3. Get REQUESTS (GUI History Tab) ---
     try {
         $reqUri = "https://$vraServer/deployment/api/deployments/$($dep.id)/requests?apiVersion=$apiVersion"
         $requests = (Invoke-RestMethod -Uri $reqUri -Method Get -Headers $vraHeaders).content
         
         foreach ($req in $requests) {
-            $reqLine = "  [Action] $($req.name) | User: $($req.requestedBy) | Time: $($req.completedAt)"
-            Write-Host $reqLine -ForegroundColor Yellow
-            $reqLine | Add-Content $outputLog
+            $reqHeader = "  [Action: $($req.name)] Status: $($req.status) | By: $($req.requestedBy)"
+            Write-Host $reqHeader -ForegroundColor Yellow
+            $reqHeader | Add-Content $outputFile
 
-            # --- 5. GRANULAR EVENTS (Technical Logs) ---
+            # --- 4. Get EVENTS (The detailed technical logs) ---
             try {
                 $eventUri = "https://$vraServer/deployment/api/requests/$($req.id)/events?apiVersion=$apiVersion"
                 $events = (Invoke-RestMethod -Uri $eventUri -Method Get -Headers $vraHeaders).content
-                if ($events) {
-                    foreach ($evt in $events) {
-                        $evtLine = "    > $($evt.timestamp): $($evt.message)"
-                        Write-Host $evtLine -ForegroundColor DarkGray
-                        $evtLine | Add-Content $outputLog
-                    }
+                foreach ($evt in $events) {
+                    $logLine = "    > $($evt.timestamp): $($evt.message)"
+                    Write-Host $logLine -ForegroundColor DarkGray
+                    $logLine | Add-Content $outputFile
                 }
-            } catch { "    > Event logs purged." | Add-Content $outputLog }
+            } catch { "    > Event logs purged." | Add-Content $outputFile }
         }
-    } catch { "  [History] Request history unavailable." | Add-Content $outputLog }
+    } catch { "  [History] Request history unavailable." | Add-Content $outputFile }
 }
 
-Write-Host "`nAnalysis complete. Full report at: $outputLog" -ForegroundColor Green
+Write-Host "`nFull log saved to: $outputFile" -ForegroundColor Green
