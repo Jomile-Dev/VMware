@@ -6,6 +6,7 @@ $vraServer = "vra1.yourdomain.com"
 $daysBack = 90  # How many days back to search for deleted deployments
 $pageSize = 200  # Items per page for deployments
 $eventsPageSize = 200  # Items per page for events (increased from 50)
+$filterResourceTypes = @("Cloud.vSphere.Machine")  # Filter events by resource type (empty array = no filter)
 
 # Output files
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
@@ -402,8 +403,25 @@ foreach ($deployment in $filteredDeployments) {
                 
                 Write-Log "    Total events for request: $($allEvents.Count)" "SUCCESS"
                 
+                # Filter events by resource type if specified
+                $filteredEvents = $allEvents
+                if ($filterResourceTypes.Count -gt 0) {
+                    $filteredEvents = $allEvents | Where-Object {
+                        $eventResourceType = $_.resourceType
+                        $match = $false
+                        foreach ($filter in $filterResourceTypes) {
+                            if ($eventResourceType -eq $filter -or $eventResourceType -like $filter) {
+                                $match = $true
+                                break
+                            }
+                        }
+                        $match
+                    }
+                    Write-Log "    Events after resource type filter ($($filterResourceTypes -join ', ')): $($filteredEvents.Count)" "SUCCESS"
+                }
+                
                 # Create detailed records for each event
-                foreach ($event in $allEvents) {
+                foreach ($event in $filteredEvents) {
                         # Extract details - could be string, object, or array
                         $detailsValue = $null
                         if ($event.details) {
@@ -455,6 +473,7 @@ foreach ($deployment in $filteredDeployments) {
                     BlueprintId = $deployment.blueprintId
                     RequestCount = $requests.Count
                     TotalEventCount = $allEvents.Count
+                    FilteredEventCount = $filteredEvents.Count
                 }
         }
         else {
@@ -495,6 +514,7 @@ Write-Log "`n============================================"
 Write-Log "FINAL SUMMARY"
 Write-Log "============================================"
 Write-Log "Date range: Last $daysBack days (since $cutoffDateStr)" "SUCCESS"
+Write-Log "Resource type filter: $(if ($filterResourceTypes.Count -gt 0) { $filterResourceTypes -join ', ' } else { 'None (all types)' })" "SUCCESS"
 Write-Log "Deleted deployments found: $($summaryResults.Count)" "SUCCESS"
 Write-Log "Total events captured: $($detailedResults.Count)" "SUCCESS"
 
