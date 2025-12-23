@@ -1,82 +1,343 @@
-# vRA "Last Resort" History Finder
-# Bypasses server-side filtering to avoid 400/404 errors.
+# vRA Deleted Deployments - Without Requests API
+# Uses deployment metadata when requests endpoint is unavailable
 
 # Configuration
 $vraServer = "vra1.yourdomain.com"
 $daysBack = 30
 $apiVersion = "2020-08-25"
-$filterKeywords = @("Virtual Machine", "Database")
+$filterTemplateNames = @("Virtual Machine", "Database")
 
 # Output
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-$outputCsv = "C:\Logs\vRA_Final_History_$timestamp.csv"
+$outputCsv = "C:\Logs\vRA_DeletionHistory_$timestamp.csv"
+$outputLog = "C:\Logs\vRA_DeletionHistory_$timestamp.log"
 
-# --- Setup & Auth ---
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+function Write-Log {
+    param([string]$Message, [string]$Level = "INFO")
+    $logTimestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logMessage = "[$logTimestamp] [$Level] $Message"
+    
+    $color = switch ($Level) {
+        "ERROR" { "Red" }
+        "WARN" { "Yellow" }
+        "SUCCESS" { "Green" }
+        default { "Cyan" }
+    }
+    
+    Write-Host $logMessage -ForegroundColor $color
+    Add-Content -Path $outputLog -Value $logMessage
+}
+
 function Disable-SSLValidation {
     if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
-        Add-Type "using System.Net; using System.Security.Cryptography.X509Certificates; public class TrustAllCertsPolicy : ICertificatePolicy { public bool CheckValidationResult(ServicePoint svcPoint, X509Certificate certificate, WebRequest request, int certificateProblem) { return true; } }"
-        [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+        Add-Type @"
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+public class TrustAllCertsPolicy : ICertificatePolicy {
+    public bool CheckValidationResult(
+        ServicePoint svcPoint, X509Certificate certificate,
+        WebRequest request, int certificateProblem) {
+        return true;
     }
 }
+"@
+        [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+    }
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+}
+
+Write-Log "===== vRA Deleted Deployments - Deployment Metadata Only =====" "SUCCESS"
 Disable-SSLValidation
 
-$credential = Get-Credential -Message "Enter vRA Credentials"
-$authBody = @{ username = $credential.UserName; password = $credential.GetNetworkCredential().Password } | ConvertTo-Json
-$authRes = Invoke-RestMethod -Uri "https://$vraServer/csp/gateway/am/api/login" -Method Post -Headers @{"Content-Type"="application/json"} -Body $authBody
-$vraHeaders = @{ "Authorization" = "Bearer $($authRes.cspAuthToken)"; "Content-Type" = "application/json" }
+# Ensure log directory exists
+$logDir = Split-Path $outputLog -Parent
+if (!(Test-Path $logDir)) {
+    New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+}
 
-# STEP 1: Get raw requests without ANY server-side filtering
-Write-Host "Downloading recent requests (Unfiltered)..." -ForegroundColor Cyan
-$requestUri = "https://$vraServer/deployment/api/requests?apiVersion=$apiVersion&`$top=1000"
-
-try {
-    $rawResponse = Invoke-RestMethod -Uri $requestUri -Method Get -Headers $vraHeaders
-    $allRequests = $rawResponse.content
-} catch {
-    Write-Host "Fatal Error: Even the basic request list failed. $($_.Exception.Message)" -ForegroundColor Red
+# Get credentials
+Write-Log "`nRequesting credentials..."
+$credential = Get-Credential -Message "Enter credentials for vRA"
+if (-not $credential) {
+    Write-Log "Credentials not provided. Exiting." "ERROR"
     exit
 }
 
-# STEP 2: Filter locally in PowerShell
-Write-Host "Filtering $($allRequests.Count) requests locally..." -ForegroundColor Yellow
+# Authenticate
+Write-Log "Authenticating to vRA: $vraServer"
+try {
+    $authBody = @{
+        username = $credential.UserName
+        password = $credential.GetNetworkCredential().Password
+    } | ConvertTo-Json
+    
+    $authRes = Invoke-RestMethod -Uri "https://$vraServer/csp/gateway/am/api/login" `
+        -Method Post -Headers @{"Content-Type"="application/json"} -Body $authBody -ErrorAction Stop
+    
+    $vraHeaders = @{
+        "Authorization" = "Bearer $($authRes.cspAuthToken)"
+        "Content-Type" = "application/json"
+        "Accept" = "application/json"
+    }
+    Write-Log "Authenticated successfully" "SUCCESS"
+}
+catch {
+    Write-Log "Authentication failed: $($_.Exception.Message)" "ERROR"
+    exit
+}
+
 $cutoffDate = (Get-Date).AddDays(-$daysBack)
 $finalResults = @()
 
-foreach ($req in $allRequests) {
-    # 1. Filter by Date
-    if ($req.completedAt) {
-        $compDate = [DateTime]$req.completedAt
-        if ($compDate -lt $cutoffDate) { continue }
-    }
+# ===== Test which endpoints are available =====
+Write-Log "`n===== Testing Available Endpoints =====" "SUCCESS"
 
-    # 2. Filter by Action (Only looking for Deletes)
-    if ($req.actionId -notmatch "delete" -and $req.name -notmatch "delete") { continue }
+$testEndpoints = @(
+    @{Name="Deployments Basic"; Uri="https://$vraServer/deployment/api/deployments?`$top=1"},
+    @{Name="Deployments with deleted=true"; Uri="https://$vraServer/deployment/api/deployments?deleted=true&`$top=1"},
+    @{Name="Deployments with expand"; Uri="https://$vraServer/deployment/api/deployments?`$expand=*&`$top=1"},
+    @{Name="Deployments with apiVersion"; Uri="https://$vraServer/deployment/api/deployments?apiVersion=$apiVersion&`$top=1"},
+    @{Name="Actions endpoint"; Uri="https://$vraServer/deployment/api/actions?`$top=1"}
+)
 
-    # 3. Filter by Template/Keyword
-    $isMatch = $false
-    foreach ($k in $filterKeywords) {
-        if ($req.deploymentName -match $k -or $req.name -match $k) { $isMatch = $true; break }
-    }
+$workingEndpoints = @()
 
-    if ($isMatch) {
-        Write-Host "Found: $($req.deploymentName) deleted by $($req.requestedBy)" -ForegroundColor Green
+foreach ($test in $testEndpoints) {
+    Write-Log "`nTesting: $($test.Name)"
+    try {
+        $response = Invoke-RestMethod -Uri $test.Uri -Method Get -Headers $vraHeaders -ErrorAction Stop
+        Write-Log "  SUCCESS - Endpoint works!" "SUCCESS"
+        $workingEndpoints += $test
         
-        $finalResults += [PSCustomObject]@{
-            Date           = $req.completedAt
-            DeploymentName = $req.deploymentName
-            DeletedBy      = $req.requestedBy
-            ActionName     = $req.name
-            Status         = $req.status
-            RequestID      = $req.id
+        # Show sample fields
+        $sample = if ($response.content) { $response.content[0] } else { $response[0] }
+        if ($sample) {
+            Write-Log "  Available fields:"
+            $sample.PSObject.Properties | ForEach-Object {
+                Write-Log "    - $($_.Name)"
+            }
         }
     }
+    catch {
+        Write-Log "  FAILED - $($_.Exception.Message)" "WARN"
+    }
 }
 
-# STEP 3: Export
-if ($finalResults.Count -gt 0) {
-    $finalResults | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
-    Write-Host "SUCCESS! $outputCsv created." -ForegroundColor Green
-} else {
-    Write-Host "No delete requests matched your keywords in the last $daysBack days." -ForegroundColor Gray
+if ($workingEndpoints.Count -eq 0) {
+    Write-Log "`nERROR: No working deployment endpoints found!" "ERROR"
+    exit
 }
+
+# ===== Get Deleted Deployments =====
+Write-Log "`n===== Fetching Deleted Deployments =====" "SUCCESS"
+
+$allDeletedDeployments = @()
+
+# Try different status values
+$statusFilters = @("DELETED", "DELETE_SUCCESSFUL", "ARCHIVED")
+
+foreach ($status in $statusFilters) {
+    Write-Log "`nTrying status: $status"
+    try {
+        $uri = "https://$vraServer/deployment/api/deployments?apiVersion=$apiVersion&`$filter=status eq '$status'&`$top=500"
+        Write-Log "  URI: $uri"
+        
+        $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $vraHeaders -ErrorAction Stop
+        $deps = if ($response.content) { $response.content } else { $response }
+        
+        if ($deps.Count -gt 0) {
+            Write-Log "  Found $($deps.Count) deployments with status '$status'" "SUCCESS"
+            $allDeletedDeployments += $deps
+        }
+    }
+    catch {
+        Write-Log "  Status filter '$status' failed: $($_.Exception.Message)" "WARN"
+    }
+}
+
+# Remove duplicates
+$allDeletedDeployments = $allDeletedDeployments | Sort-Object -Property id -Unique
+
+Write-Log "`nTotal unique deleted deployments: $($allDeletedDeployments.Count)" "SUCCESS"
+
+if ($allDeletedDeployments.Count -eq 0) {
+    Write-Log "No deleted deployments found. Trying to get ALL deployments to inspect..." "WARN"
+    
+    try {
+        $uri = "https://$vraServer/deployment/api/deployments?apiVersion=$apiVersion&`$top=100&`$orderby=lastUpdatedAt desc"
+        $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $vraHeaders -ErrorAction Stop
+        $allDeps = if ($response.content) { $response.content } else { $response }
+        
+        Write-Log "Retrieved $($allDeps.Count) deployments. Showing status distribution:" "SUCCESS"
+        $statusGroups = $allDeps | Group-Object -Property status
+        foreach ($group in $statusGroups) {
+            Write-Log "  Status '$($group.Name)': $($group.Count) deployments"
+        }
+    }
+    catch {
+        Write-Log "Could not retrieve deployments: $($_.Exception.Message)" "ERROR"
+    }
+    
+    Write-Log "`nNo deleted deployments found. Exiting." "WARN"
+    exit
+}
+
+# ===== Process Each Deleted Deployment =====
+Write-Log "`n===== Processing Deleted Deployments =====" "SUCCESS"
+
+foreach ($dep in $allDeletedDeployments) {
+    # Check if within time range
+    $withinTimeRange = $true
+    if ($dep.lastUpdatedAt) {
+        try {
+            $updateDate = [DateTime]$dep.lastUpdatedAt
+            $withinTimeRange = ($updateDate -ge $cutoffDate)
+        } catch {}
+    }
+    
+    if (-not $withinTimeRange) {
+        continue
+    }
+    
+    Write-Log "`n========================================" "SUCCESS"
+    Write-Log "Processing: $($dep.name)" "SUCCESS"
+    Write-Log "========================================" "SUCCESS"
+    Write-Log "Deployment ID: $($dep.id)"
+    Write-Log "Status: $($dep.status)"
+    Write-Log "Last Updated: $($dep.lastUpdatedAt)"
+    Write-Log "Last Updated By: $($dep.lastUpdatedBy)"
+    Write-Log "Owner: $($dep.ownedBy)"
+    
+    # Get template name
+    $templateName = "Unknown"
+    if ($dep.catalogItemId) {
+        Write-Log "Catalog Item ID: $($dep.catalogItemId)"
+        try {
+            $catUri = "https://$vraServer/catalog/api/items/$($dep.catalogItemId)?apiVersion=$apiVersion"
+            $cat = Invoke-RestMethod -Uri $catUri -Method Get -Headers $vraHeaders -ErrorAction Stop
+            $templateName = $cat.name
+            Write-Log "Template Name: $templateName" "SUCCESS"
+        } catch {
+            Write-Log "Could not resolve catalog item name" "WARN"
+        }
+    }
+    
+    if ($dep.blueprintId) {
+        Write-Log "Blueprint ID: $($dep.blueprintId)"
+        try {
+            $bpUri = "https://$vraServer/blueprint/api/blueprints/$($dep.blueprintId)?apiVersion=$apiVersion"
+            $bp = Invoke-RestMethod -Uri $bpUri -Method Get -Headers $vraHeaders -ErrorAction Stop
+            $templateName = $bp.name
+            Write-Log "Blueprint Name: $templateName" "SUCCESS"
+        } catch {
+            Write-Log "Could not resolve blueprint name" "WARN"
+        }
+    }
+    
+    # Apply template filter
+    $isMatch = $false
+    foreach ($f in $filterTemplateNames) {
+        if ($templateName -match $f) {
+            $isMatch = $true
+            Write-Log ">>> MATCHES FILTER: '$f' <<<" "SUCCESS"
+            break
+        }
+    }
+    
+    if (-not $isMatch) {
+        Write-Log "Skipping - template '$templateName' doesn't match filter" "WARN"
+        continue
+    }
+    
+    # Try alternative endpoints for history
+    Write-Log "`nTrying alternative history endpoints..."
+    
+    # Try /actions endpoint
+    $actionFound = $false
+    try {
+        $actionsUri = "https://$vraServer/deployment/api/deployments/$($dep.id)/actions?apiVersion=$apiVersion"
+        Write-Log "  Trying: $actionsUri"
+        $actionsResponse = Invoke-RestMethod -Uri $actionsUri -Method Get -Headers $vraHeaders -ErrorAction Stop
+        $actions = if ($actionsResponse.content) { $actionsResponse.content } else { $actionsResponse }
+        Write-Log "  Retrieved $($actions.Count) actions" "SUCCESS"
+        $actionFound = $true
+    }
+    catch {
+        Write-Log "  Actions endpoint not available: $($_.Exception.Message)" "WARN"
+    }
+    
+    # Try /operations endpoint
+    $operationFound = $false
+    try {
+        $opsUri = "https://$vraServer/deployment/api/deployments/$($dep.id)/operations?apiVersion=$apiVersion"
+        Write-Log "  Trying: $opsUri"
+        $opsResponse = Invoke-RestMethod -Uri $opsUri -Method Get -Headers $vraHeaders -ErrorAction Stop
+        $operations = if ($opsResponse.content) { $opsResponse.content } else { $opsResponse }
+        Write-Log "  Retrieved $($operations.Count) operations" "SUCCESS"
+        $operationFound = $true
+    }
+    catch {
+        Write-Log "  Operations endpoint not available: $($_.Exception.Message)" "WARN"
+    }
+    
+    # Create result from deployment metadata only
+    $finalResults += [PSCustomObject]@{
+        DeploymentName = $dep.name
+        DeploymentId = $dep.id
+        Template = $templateName
+        Status = $dep.status
+        DeletedBy = $dep.lastUpdatedBy
+        DeleteTime = $dep.lastUpdatedAt
+        Owner = $dep.ownedBy
+        CreatedAt = $dep.createdAt
+        CreatedBy = $dep.createdBy
+        ProjectId = $dep.projectId
+        OrgId = $dep.orgId
+        CatalogItemId = $dep.catalogItemId
+        BlueprintId = $dep.blueprintId
+    }
+    
+    Write-Log ">>> ADDED TO OUTPUT <<<" "SUCCESS"
+}
+
+# ===== Summary and Export =====
+Write-Log "`n============================================" "SUCCESS"
+Write-Log "===== SUMMARY =====" "SUCCESS"
+Write-Log "============================================" "SUCCESS"
+
+if ($finalResults.Count -gt 0) {
+    Write-Log "Total deleted deployments found: $($finalResults.Count)" "SUCCESS"
+    
+    # Export to CSV
+    $finalResults | Select-Object DeploymentName, Template, Status, DeletedBy, DeleteTime, Owner, CreatedBy, CreatedAt, DeploymentId |
+        Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
+    
+    Write-Log "Exported to: $outputCsv" "SUCCESS"
+    
+    # Display summary
+    Write-Log "`n=== DELETED DEPLOYMENTS ===" "SUCCESS"
+    foreach ($result in $finalResults) {
+        Write-Log "`n$($result.DeploymentName)" "SUCCESS"
+        Write-Log "  Template: $($result.Template)"
+        Write-Log "  Status: $($result.Status)"
+        Write-Log "  Last Updated By: $($result.DeletedBy)"
+        Write-Log "  Last Updated: $($result.DeleteTime)"
+        Write-Log "  Original Owner: $($result.Owner)"
+        Write-Log "  Created By: $($result.CreatedBy) at $($result.CreatedAt)"
+    }
+    
+    Write-Log "`n=== IMPORTANT NOTE ===" "WARN"
+    Write-Log "The /requests endpoint is not available in your vRA environment." "WARN"
+    Write-Log "Results show deployment metadata only (lastUpdatedBy/lastUpdatedAt)." "WARN"
+    Write-Log "This may not be the exact user who clicked 'Delete' in the GUI." "WARN"
+    Write-Log "`nFor complete deletion history, you may need:" "WARN"
+    Write-Log "  - vRealize Log Insight access" "WARN"
+    Write-Log "  - Direct database query access" "WARN"
+    Write-Log "  - vRealize Orchestrator workflow logs" "WARN"
+}
+else {
+    Write-Log "NO MATCHING DELETED DEPLOYMENTS FOUND!" "WARN"
+}
+
+Write-Log "`n===== Script Completed =====" "SUCCESS"
+Write-Log "Log file: $outputLog"
