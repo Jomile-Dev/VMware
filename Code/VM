@@ -1,92 +1,82 @@
-# vRA Global Request History Finder (404 Bypass Version)
-# Purpose: Scans the global request service to find deletion history 
-# without relying on potentially broken Deployment links.
+# vRA "Last Resort" History Finder
+# Bypasses server-side filtering to avoid 400/404 errors.
 
 # Configuration
 $vraServer = "vra1.yourdomain.com"
 $daysBack = 30
 $apiVersion = "2020-08-25"
-$filterTemplateNames = @("Virtual Machine", "Database") # Partial matches allowed
+$filterKeywords = @("Virtual Machine", "Database")
 
 # Output
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-$outputCsv = "C:\Logs\vRA_DeletionHistory_Global_$timestamp.csv"
+$outputCsv = "C:\Logs\vRA_Final_History_$timestamp.csv"
 
+# --- Setup & Auth ---
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 function Disable-SSLValidation {
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
         Add-Type "using System.Net; using System.Security.Cryptography.X509Certificates; public class TrustAllCertsPolicy : ICertificatePolicy { public bool CheckValidationResult(ServicePoint svcPoint, X509Certificate certificate, WebRequest request, int certificateProblem) { return true; } }"
         [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
     }
 }
-
 Disable-SSLValidation
+
 $credential = Get-Credential -Message "Enter vRA Credentials"
 $authBody = @{ username = $credential.UserName; password = $credential.GetNetworkCredential().Password } | ConvertTo-Json
 $authRes = Invoke-RestMethod -Uri "https://$vraServer/csp/gateway/am/api/login" -Method Post -Headers @{"Content-Type"="application/json"} -Body $authBody
 $vraHeaders = @{ "Authorization" = "Bearer $($authRes.cspAuthToken)"; "Content-Type" = "application/json" }
 
-# STEP 1: Query Global Requests
-# Instead of looking for Deployments, we look for 'Delete' Actions that finished recently
-Write-Host "Searching Global Requests for Deletion actions..." -ForegroundColor Cyan
-
-$cutoffDate = (Get-Date).AddDays(-$daysBack).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
-
-# This URI queries the Request service directly, looking for Delete actions completed after the cutoff
-$requestUri = "https://$vraServer/deployment/api/requests?apiVersion=$apiVersion&`$filter=status eq 'SUCCESSFUL' and completedAt ge '$cutoffDate'&`$top=1000"
+# STEP 1: Get raw requests without ANY server-side filtering
+Write-Host "Downloading recent requests (Unfiltered)..." -ForegroundColor Cyan
+$requestUri = "https://$vraServer/deployment/api/requests?apiVersion=$apiVersion&`$top=1000"
 
 try {
-    $allRequests = (Invoke-RestMethod -Uri $requestUri -Method Get -Headers $vraHeaders).content
+    $rawResponse = Invoke-RestMethod -Uri $requestUri -Method Get -Headers $vraHeaders
+    $allRequests = $rawResponse.content
 } catch {
-    Write-Host "Global Request Query Failed: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "Fatal Error: Even the basic request list failed. $($_.Exception.Message)" -ForegroundColor Red
     exit
 }
 
+# STEP 2: Filter locally in PowerShell
+Write-Host "Filtering $($allRequests.Count) requests locally..." -ForegroundColor Yellow
+$cutoffDate = (Get-Date).AddDays(-$daysBack)
 $finalResults = @()
 
-# STEP 2: Filter and Match
 foreach ($req in $allRequests) {
-    # We only care about Deletions
-    if ($req.actionId -notmatch "delete") { continue }
+    # 1. Filter by Date
+    if ($req.completedAt) {
+        $compDate = [DateTime]$req.completedAt
+        if ($compDate -lt $cutoffDate) { continue }
+    }
 
-    # Apply Template/Name Filter
+    # 2. Filter by Action (Only looking for Deletes)
+    if ($req.actionId -notmatch "delete" -and $req.name -notmatch "delete") { continue }
+
+    # 3. Filter by Template/Keyword
     $isMatch = $false
-    foreach ($f in $filterTemplateNames) {
-        # Checking deploymentName and the request name for our keywords (VM/Database)
-        if ($req.deploymentName -match $f -or $req.name -match $f) { $isMatch = $true; break }
+    foreach ($k in $filterKeywords) {
+        if ($req.deploymentName -match $k -or $req.name -match $k) { $isMatch = $true; break }
     }
 
     if ($isMatch) {
-        Write-Host "Match Found: $($req.deploymentName)" -ForegroundColor Green
+        Write-Host "Found: $($req.deploymentName) deleted by $($req.requestedBy)" -ForegroundColor Green
         
-        # STEP 3: Get Resource Details (Optional sub-drill)
-        $resourceNames = "N/A"
-        try {
-            $resUri = "https://$vraServer/deployment/api/requests/$($req.id)/resources?apiVersion=$apiVersion"
-            $resData = (Invoke-RestMethod -Uri $resUri -Method Get -Headers $vraHeaders).content
-            if ($resData) {
-                $resourceNames = ($resData | Select-Object -ExpandProperty name) -join ", "
-            }
-        } catch { 
-            # If this also 404s, we still have the Request data, so we just move on
-        }
-
         $finalResults += [PSCustomObject]@{
-            DeletionTimestamp = $req.completedAt
-            DeploymentName    = $req.deploymentName
-            DeletedByUser     = $req.requestedBy
-            RequestAction     = $req.name
-            ResourcesAffected = $resourceNames
-            Status            = $req.status
-            RequestID         = $req.id
+            Date           = $req.completedAt
+            DeploymentName = $req.deploymentName
+            DeletedBy      = $req.requestedBy
+            ActionName     = $req.name
+            Status         = $req.status
+            RequestID      = $req.id
         }
     }
 }
 
-# Export
+# STEP 3: Export
 if ($finalResults.Count -gt 0) {
     $finalResults | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
-    Write-Host "SUCCESS: $($finalResults.Count) history records exported to $outputCsv" -ForegroundColor Green
+    Write-Host "SUCCESS! $outputCsv created." -ForegroundColor Green
 } else {
-    Write-Host "No delete requests found in the last $daysBack days matching your filters." -ForegroundColor Yellow
+    Write-Host "No delete requests matched your keywords in the last $daysBack days." -ForegroundColor Gray
 }
