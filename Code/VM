@@ -1,9 +1,10 @@
-# vRA Deleted Deployments - Using Deployment API Only
-# Working with APIs that are actually accessible
+# vRA Deleted Deployments - Using Deployment Events API
+# Retrieves deleted deployments and their detailed event logs
 
 # Configuration
 $vraServer = "vra1.yourdomain.com"
-$daysBack = 7  # Look back 7 days
+$daysBack = 7
+$apiVersion = "2020-08-25"  # API version for compatibility with archived records
 
 # FILTER CONFIGURATION
 $filterTemplateNames = @("Virtual Machine", "Database")
@@ -48,8 +49,9 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 }
 
-Write-Log "===== vRA Deleted Deployments - Deployment API Approach =====" "SUCCESS"
+Write-Log "===== vRA Deleted Deployments with Events API =====" "SUCCESS"
 Write-Log "Looking for deployments deleted in the past $daysBack days" "INFO"
+Write-Log "Using API Version: $apiVersion" "INFO"
 Disable-SSLValidation
 
 # Ensure log directory exists
@@ -100,244 +102,256 @@ $vraHeaders = @{
 $cutoffDate = (Get-Date).AddDays(-$daysBack)
 $deletedDeploymentDetails = @()
 
-# ===== Try different query parameters to find deleted deployments =====
-Write-Log "`n===== Testing Deployment API Queries =====" "SUCCESS"
+# ===== STEP 1: Get all deployments with deleted status =====
+Write-Log "`n===== STEP 1: Querying Deployments API =====" "SUCCESS"
 
-$queryVariations = @(
-    @{
-        Name = "Basic Query"
-        Uri = "https://$vraServer/deployment/api/deployments?`$top=5"
-    },
-    @{
-        Name = "With Expand"
-        Uri = "https://$vraServer/deployment/api/deployments?`$top=5&`$expand=*"
-    },
-    @{
-        Name = "Filter by Status DELETED"
-        Uri = "https://$vraServer/deployment/api/deployments?`$filter=status eq 'DELETED'"
-    },
-    @{
-        Name = "Filter by Status DELETE_SUCCESSFUL"
-        Uri = "https://$vraServer/deployment/api/deployments?`$filter=status eq 'DELETE_SUCCESSFUL'"
-    },
-    @{
-        Name = "Filter by Status ARCHIVED"
-        Uri = "https://$vraServer/deployment/api/deployments?`$filter=status eq 'ARCHIVED'"
-    },
-    @{
-        Name = "Include Deleted Parameter"
-        Uri = "https://$vraServer/deployment/api/deployments?includeDeleted=true&`$top=5"
-    },
-    @{
-        Name = "Show Deleted Parameter"
-        Uri = "https://$vraServer/deployment/api/deployments?showDeleted=true&`$top=5"
-    },
-    @{
-        Name = "Deleted Parameter"
-        Uri = "https://$vraServer/deployment/api/deployments?deleted=true&`$top=5"
-    }
-)
+$deletedStatuses = @("DELETED", "DELETE_SUCCESSFUL", "ARCHIVED")
+$allDeletedDeployments = @()
 
-$workingQuery = $null
-
-foreach ($query in $queryVariations) {
-    Write-Log "`nTesting: $($query.Name)"
-    Write-Log "  URI: $($query.Uri)"
+foreach ($status in $deletedStatuses) {
+    Write-Log "`nTrying status filter: $status"
     
     try {
-        $response = Invoke-RestMethod -Uri $query.Uri -Method Get -Headers $vraHeaders -ErrorAction Stop
+        $deployUri = "https://$vraServer/deployment/api/deployments?apiVersion=$apiVersion&`$filter=status eq '$status'&`$top=1000"
+        Write-Log "  URI: $deployUri"
+        
+        $response = Invoke-RestMethod -Uri $deployUri -Method Get -Headers $vraHeaders -ErrorAction Stop
         $deployments = if ($response.content) { $response.content } else { $response }
         
-        Write-Log "  SUCCESS - Retrieved $($deployments.Count) deployments" "SUCCESS"
+        Write-Log "  Found $($deployments.Count) deployments with status '$status'" "SUCCESS"
         
         if ($deployments.Count -gt 0) {
-            Write-Log "`n  Sample deployment structure:"
-            $sample = $deployments[0]
-            $sample.PSObject.Properties | ForEach-Object {
-                if ($_.Value -is [string] -or $_.Value -is [int] -or $_.Value -is [bool] -or $null -eq $_.Value) {
-                    Write-Log "    $($_.Name) = $($_.Value)"
-                }
-            }
-            
-            # Check if this query returns deleted deployments
-            $hasDeletedStatus = $deployments | Where-Object { 
-                $_.status -match "DELETE" -or $_.status -eq "ARCHIVED" 
-            }
-            
-            if ($hasDeletedStatus) {
-                Write-Log "  >>> This query returns DELETED deployments! <<<" "SUCCESS"
-                $workingQuery = $query
+            $allDeletedDeployments += $deployments
+        }
+    }
+    catch {
+        Write-Log "  Failed to query status '$status': $($_.Exception.Message)" "WARN"
+    }
+}
+
+# Remove duplicates by ID
+$allDeletedDeployments = $allDeletedDeployments | Sort-Object -Property id -Unique
+
+Write-Log "`nTotal unique deleted deployments found: $($allDeletedDeployments.Count)" "SUCCESS"
+
+if ($allDeletedDeployments.Count -eq 0) {
+    Write-Log "No deleted deployments found. Exiting." "WARN"
+    exit
+}
+
+# ===== STEP 2: Get events and requests for each deleted deployment =====
+Write-Log "`n===== STEP 2: Retrieving Events for Each Deleted Deployment =====" "SUCCESS"
+
+$processedCount = 0
+
+foreach ($deployment in $allDeletedDeployments) {
+    $processedCount++
+    
+    # Check if within time range
+    $withinTimeRange = $true
+    if ($deployment.lastUpdatedAt) {
+        try {
+            $updateDate = [DateTime]$deployment.lastUpdatedAt
+            $withinTimeRange = ($updateDate -ge $cutoffDate)
+        } catch {}
+    }
+    
+    if (-not $withinTimeRange) {
+        Write-Log "`n[$processedCount/$($allDeletedDeployments.Count)] Skipping '$($deployment.name)' - outside time range" "WARN"
+        continue
+    }
+    
+    Write-Log "`n========================================" "SUCCESS"
+    Write-Log "[$processedCount/$($allDeletedDeployments.Count)] Processing Deployment" "SUCCESS"
+    Write-Log "========================================" "SUCCESS"
+    Write-Log "Name: $($deployment.name)"
+    Write-Log "ID: $($deployment.id)"
+    Write-Log "Status: $($deployment.status)"
+    Write-Log "Owner: $($deployment.ownedBy)"
+    Write-Log "Last Updated: $($deployment.lastUpdatedAt)"
+    
+    # Get template name
+    $templateName = $null
+    
+    if ($deployment.blueprintId) {
+        Write-Log "Blueprint ID: $($deployment.blueprintId)"
+        try {
+            $bpUri = "https://$vraServer/blueprint/api/blueprints/$($deployment.blueprintId)?apiVersion=$apiVersion"
+            $bp = Invoke-RestMethod -Uri $bpUri -Method Get -Headers $vraHeaders -ErrorAction Stop
+            $templateName = $bp.name
+            Write-Log "Blueprint Name: $templateName" "SUCCESS"
+        } catch {
+            Write-Log "Could not resolve blueprint name: $($_.Exception.Message)" "WARN"
+        }
+    }
+    
+    if ($deployment.catalogItemId) {
+        Write-Log "Catalog Item ID: $($deployment.catalogItemId)"
+        try {
+            $catUri = "https://$vraServer/catalog/api/items/$($deployment.catalogItemId)?apiVersion=$apiVersion"
+            $cat = Invoke-RestMethod -Uri $catUri -Method Get -Headers $vraHeaders -ErrorAction Stop
+            $templateName = $cat.name
+            Write-Log "Catalog Item Name: $templateName" "SUCCESS"
+        } catch {
+            Write-Log "Could not resolve catalog item name: $($_.Exception.Message)" "WARN"
+        }
+    }
+    
+    # Apply template filter
+    $matchesFilter = $false
+    if ($templateName) {
+        foreach ($filterName in $filterTemplateNames) {
+            if ($templateName -match $filterName) {
+                $matchesFilter = $true
+                Write-Log ">>> MATCHES FILTER: '$filterName' <<<" "SUCCESS"
                 break
             }
         }
+    } else {
+        Write-Log "Template name unknown - including anyway" "WARN"
+        $matchesFilter = $true
     }
-    catch {
-        $statusCode = $_.Exception.Response.StatusCode.value__
-        Write-Log "  FAILED - Status: $statusCode - $($_.Exception.Message)" "WARN"
+    
+    if (-not $matchesFilter) {
+        Write-Log "Skipping: Template '$templateName' doesn't match filter" "WARN"
+        continue
     }
-}
-
-# If we found a working query, use it to get all deleted deployments
-if ($workingQuery) {
-    Write-Log "`n===== Using Working Query: $($workingQuery.Name) =====" "SUCCESS"
     
-    # Modify URI to get more results
-    $finalUri = $workingQuery.Uri -replace '\$top=\d+', '$top=1000'
-    Write-Log "Final query: $finalUri"
-    
+    # Get deployment events
+    $deploymentEvents = $null
+    Write-Log "`nFetching deployment events..."
     try {
-        $response = Invoke-RestMethod -Uri $finalUri -Method Get -Headers $vraHeaders -ErrorAction Stop
-        $allDeployments = if ($response.content) { $response.content } else { $response }
+        $eventsUri = "https://$vraServer/deployment/api/deployments/$($deployment.id)/events?apiVersion=$apiVersion"
+        Write-Log "  URI: $eventsUri"
         
-        Write-Log "Retrieved $($allDeployments.Count) total deployments" "SUCCESS"
+        $eventsResponse = Invoke-RestMethod -Uri $eventsUri -Method Get -Headers $vraHeaders -ErrorAction Stop
+        $deploymentEvents = if ($eventsResponse.content) { $eventsResponse.content } else { $eventsResponse }
         
-        # Filter for deleted deployments within time range
-        $deletedDeployments = $allDeployments | Where-Object {
-            $isDeleted = (
-                $_.status -match "DELETE" -or 
-                $_.status -eq "ARCHIVED" -or
-                $_.status -eq "DESTROY"
-            )
-            
-            $withinTimeRange = $true
-            if ($_.lastUpdatedAt) {
-                try {
-                    $updateDate = [DateTime]$_.lastUpdatedAt
-                    $withinTimeRange = ($updateDate -ge $cutoffDate)
-                } catch {}
-            }
-            
-            $isDeleted -and $withinTimeRange
+        Write-Log "  Retrieved $($deploymentEvents.Count) events" "SUCCESS"
+        
+        # Find delete events
+        $deleteEvents = $deploymentEvents | Where-Object { 
+            $_.eventType -match "DELETE" -or $_.message -match "delete"
         }
         
-        Write-Log "Found $($deletedDeployments.Count) deleted deployments in time range" "SUCCESS"
-        
-        foreach ($dep in $deletedDeployments) {
-            Write-Log "`n========================================" "SUCCESS"
-            Write-Log "Deleted Deployment Found" "SUCCESS"
-            Write-Log "========================================" "SUCCESS"
-            Write-Log "Name: $($dep.name)"
-            Write-Log "ID: $($dep.id)"
-            Write-Log "Status: $($dep.status)"
-            Write-Log "Owner: $($dep.ownedBy)"
-            Write-Log "Last Updated: $($dep.lastUpdatedAt)"
-            Write-Log "Last Updated By: $($dep.lastUpdatedBy)"
-            
-            # Try to get blueprint/catalog item name
-            $templateName = $null
-            if ($dep.blueprintId) {
-                Write-Log "Blueprint ID: $($dep.blueprintId)"
-                try {
-                    $bpUri = "https://$vraServer/blueprint/api/blueprints/$($dep.blueprintId)"
-                    $bp = Invoke-RestMethod -Uri $bpUri -Method Get -Headers $vraHeaders -ErrorAction Stop
-                    $templateName = $bp.name
-                    Write-Log "Blueprint Name: $templateName" "SUCCESS"
-                } catch {
-                    Write-Log "Could not resolve blueprint name" "WARN"
-                }
+        if ($deleteEvents) {
+            Write-Log "`n  DELETE EVENTS FOUND:" "SUCCESS"
+            foreach ($evt in $deleteEvents) {
+                Write-Log "    Event Type: $($evt.eventType)"
+                Write-Log "    Message: $($evt.message)"
+                Write-Log "    Timestamp: $($evt.timestamp)"
+                Write-Log "    User: $($evt.user)"
             }
-            
-            if ($dep.catalogItemId) {
-                Write-Log "Catalog Item ID: $($dep.catalogItemId)"
-                try {
-                    $catUri = "https://$vraServer/catalog/api/items/$($dep.catalogItemId)"
-                    $cat = Invoke-RestMethod -Uri $catUri -Method Get -Headers $vraHeaders -ErrorAction Stop
-                    $templateName = $cat.name
-                    Write-Log "Catalog Item Name: $templateName" "SUCCESS"
-                } catch {
-                    Write-Log "Could not resolve catalog item name" "WARN"
-                }
-            }
-            
-            # Apply template filter
-            $matchesFilter = $false
-            if ($templateName) {
-                foreach ($filterName in $filterTemplateNames) {
-                    if ($templateName -match $filterName) {
-                        $matchesFilter = $true
-                        Write-Log ">>> MATCHES FILTER: '$filterName' <<<" "SUCCESS"
-                        break
-                    }
-                }
-            } else {
-                # If we can't determine template name, include it anyway
-                Write-Log "Template name unknown - including in results" "WARN"
-                $matchesFilter = $true
-            }
-            
-            if (-not $matchesFilter) {
-                Write-Log "Skipping: Template '$templateName' doesn't match filter" "WARN"
-                continue
-            }
-            
-            $deleteInfo = [PSCustomObject]@{
-                DeploymentId = $dep.id
-                DeploymentName = $dep.name
-                Status = $dep.status
-                TemplateName = $templateName
-                BlueprintId = $dep.blueprintId
-                CatalogItemId = $dep.catalogItemId
-                Owner = $dep.ownedBy
-                ProjectId = $dep.projectId
-                OrgId = $dep.orgId
-                LastUpdatedAt = $dep.lastUpdatedAt
-                LastUpdatedBy = $dep.lastUpdatedBy
-                CreatedAt = $dep.createdAt
-                CreatedBy = $dep.createdBy
-                FullDeployment = $dep
-            }
-            
-            $deletedDeploymentDetails += $deleteInfo
         }
     }
     catch {
-        Write-Log "Error querying deployments: $($_.Exception.Message)" "ERROR"
+        Write-Log "  Could not fetch events: $($_.Exception.Message)" "WARN"
     }
-}
-else {
-    Write-Log "`n===== NO WORKING QUERY FOUND =====" "ERROR"
-    Write-Log "None of the tested query variations returned deleted deployments." "ERROR"
-    Write-Log "`nThis means:" "WARN"
-    Write-Log "  1. vRA may not expose deleted deployments via the API" "WARN"
-    Write-Log "  2. Deleted deployments may be permanently removed from the database" "WARN"
-    Write-Log "  3. Your vRA version may not support querying deleted deployments" "WARN"
-    Write-Log "`nAlternative approaches:" "WARN"
-    Write-Log "  - Check vRealize Log Insight for deletion logs" "WARN"
-    Write-Log "  - Query the vRA Postgres database directly (requires DB access)" "WARN"
-    Write-Log "  - Use vRealize Orchestrator to track deletions prospectively" "WARN"
-    Write-Log "  - Enable external logging/monitoring before deletions occur" "WARN"
+    
+    # Get deployment requests
+    $deploymentRequests = $null
+    Write-Log "`nFetching deployment requests..."
+    try {
+        $requestsUri = "https://$vraServer/deployment/api/deployments/$($deployment.id)/requests?apiVersion=$apiVersion"
+        Write-Log "  URI: $requestsUri"
+        
+        $requestsResponse = Invoke-RestMethod -Uri $requestsUri -Method Get -Headers $vraHeaders -ErrorAction Stop
+        $deploymentRequests = if ($requestsResponse.content) { $requestsResponse.content } else { $requestsResponse }
+        
+        Write-Log "  Retrieved $($deploymentRequests.Count) requests" "SUCCESS"
+        
+        # Find delete requests
+        $deleteRequests = $deploymentRequests | Where-Object { 
+            $_.actionId -match "DELETE" -or $_.name -match "delete"
+        }
+        
+        if ($deleteRequests) {
+            Write-Log "`n  DELETE REQUESTS FOUND:" "SUCCESS"
+            foreach ($req in $deleteRequests) {
+                Write-Log "    Action ID: $($req.actionId)"
+                Write-Log "    Name: $($req.name)"
+                Write-Log "    Status: $($req.status)"
+                Write-Log "    Requested By: $($req.requestedBy)"
+                Write-Log "    Requested At: $($req.requestedAt)"
+                Write-Log "    Completed At: $($req.completedAt)"
+            }
+        }
+    }
+    catch {
+        Write-Log "  Could not fetch requests: $($_.Exception.Message)" "WARN"
+    }
+    
+    # Create detailed output object
+    $deleteInfo = [PSCustomObject]@{
+        DeploymentId = $deployment.id
+        DeploymentName = $deployment.name
+        Status = $deployment.status
+        TemplateName = $templateName
+        BlueprintId = $deployment.blueprintId
+        CatalogItemId = $deployment.catalogItemId
+        Owner = $deployment.ownedBy
+        ProjectId = $deployment.projectId
+        OrgId = $deployment.orgId
+        LastUpdatedAt = $deployment.lastUpdatedAt
+        LastUpdatedBy = $deployment.lastUpdatedBy
+        CreatedAt = $deployment.createdAt
+        CreatedBy = $deployment.createdBy
+        Events = $deploymentEvents
+        Requests = $deploymentRequests
+        DeleteEvents = $deleteEvents
+        DeleteRequests = $deleteRequests
+        FullDeployment = $deployment
+    }
+    
+    $deletedDeploymentDetails += $deleteInfo
+    Write-Log "`n>>> ADDED TO OUTPUT <<<" "SUCCESS"
 }
 
 # ===== Summary and Export =====
 Write-Log "`n============================================" "SUCCESS"
 Write-Log "===== SUMMARY =====" "SUCCESS"
 Write-Log "============================================" "SUCCESS"
-Write-Log "Total deleted deployments found: $($deletedDeploymentDetails.Count)" "SUCCESS"
+Write-Log "Total deleted deployments processed: $processedCount"
+Write-Log "Deleted deployments matching filter: $($deletedDeploymentDetails.Count)" "SUCCESS"
 
 if ($deletedDeploymentDetails.Count -gt 0) {
     # Export full JSON
     $deletedDeploymentDetails | ConvertTo-Json -Depth 20 | Out-File -FilePath $outputJson -Encoding UTF8
     Write-Log "Full JSON exported to: $outputJson" "SUCCESS"
     
-    # Export CSV
-    $deletedDeploymentDetails | Select-Object DeploymentName, TemplateName, Status, Owner, 
-        LastUpdatedBy, LastUpdatedAt, CreatedAt |
-        Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
+    # Export CSV summary
+    $csvData = $deletedDeploymentDetails | Select-Object DeploymentName, TemplateName, Status, Owner, 
+        LastUpdatedBy, LastUpdatedAt, CreatedAt, 
+        @{Name='EventCount';Expression={if($_.Events){$_.Events.Count}else{0}}},
+        @{Name='RequestCount';Expression={if($_.Requests){$_.Requests.Count}else{0}}},
+        @{Name='DeleteEventCount';Expression={if($_.DeleteEvents){$_.DeleteEvents.Count}else{0}}},
+        @{Name='DeleteRequestCount';Expression={if($_.DeleteRequests){$_.DeleteRequests.Count}else{0}}}
+    
+    $csvData | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
     Write-Log "CSV summary exported to: $outputCsv" "SUCCESS"
     
     # Display summary table
-    Write-Log "`n=== DELETED DEPLOYMENTS ===" "SUCCESS"
-    $deletedDeploymentDetails | ForEach-Object {
-        Write-Log "`n$($_.DeploymentName)" "SUCCESS"
-        Write-Log "  Template: $($_.TemplateName)"
-        Write-Log "  Status: $($_.Status)"
-        Write-Log "  Owner: $($_.Owner)"
-        Write-Log "  Deleted: $($_.LastUpdatedAt) by $($_.LastUpdatedBy)"
+    Write-Log "`n=== DELETED DEPLOYMENTS WITH EVENTS ===" "SUCCESS"
+    foreach ($item in $deletedDeploymentDetails) {
+        Write-Log "`n$($item.DeploymentName)" "SUCCESS"
+        Write-Log "  Template: $($item.TemplateName)"
+        Write-Log "  Status: $($item.Status)"
+        Write-Log "  Owner: $($item.Owner)"
+        Write-Log "  Deleted: $($item.LastUpdatedAt) by $($item.LastUpdatedBy)"
+        Write-Log "  Events Retrieved: $($item.Events.Count)"
+        Write-Log "  Requests Retrieved: $($item.Requests.Count)"
+        
+        if ($item.DeleteRequests) {
+            $deleteReq = $item.DeleteRequests | Select-Object -First 1
+            Write-Log "  Delete Initiated By: $($deleteReq.requestedBy) at $($deleteReq.requestedAt)" "SUCCESS"
+        }
     }
 }
 else {
-    Write-Log "`nNO DELETED DEPLOYMENTS FOUND!" "WARN"
+    Write-Log "`nNO MATCHING DELETED DEPLOYMENTS FOUND!" "WARN"
 }
 
 Write-Log "`n===== Script Completed =====" "SUCCESS"
+Write-Log "JSON Output: $outputJson"
+Write-Log "CSV Output: $outputCsv"
 Write-Log "Log file: $outputLog"
