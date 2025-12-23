@@ -217,9 +217,10 @@ foreach ($deployment in $allDeletedDeployments) {
         continue
     }
     
-    # Get deployment events
+    # Get deployment events (History tab data)
     $deploymentEvents = $null
-    Write-Log "`nFetching deployment events..."
+    $parsedHistoryEvents = @()
+    Write-Log "`nFetching deployment events (History tab)..."
     try {
         $eventsUri = "https://$vraServer/deployment/api/deployments/$($deployment.id)/events?apiVersion=$apiVersion"
         Write-Log "  URI: $eventsUri"
@@ -227,22 +228,45 @@ foreach ($deployment in $allDeletedDeployments) {
         $eventsResponse = Invoke-RestMethod -Uri $eventsUri -Method Get -Headers $vraHeaders -ErrorAction Stop
         $deploymentEvents = if ($eventsResponse.content) { $eventsResponse.content } else { $eventsResponse }
         
-        Write-Log "  Retrieved $($deploymentEvents.Count) events" "SUCCESS"
+        Write-Log "  Retrieved $($deploymentEvents.Count) events from History" "SUCCESS"
+        
+        # Parse each event for timestamp, status, resource type, resource name, details
+        if ($deploymentEvents.Count -gt 0) {
+            Write-Log "`n  PARSING EVENT HISTORY:" "SUCCESS"
+            
+            foreach ($evt in $deploymentEvents) {
+                # Extract key fields
+                $historyEvent = [PSCustomObject]@{
+                    Timestamp = $evt.timestamp
+                    Status = $evt.eventType
+                    ResourceType = $evt.resourceType
+                    ResourceName = $evt.resourceName
+                    Details = $evt.message
+                    User = $evt.user
+                    EventId = $evt.id
+                }
+                
+                $parsedHistoryEvents += $historyEvent
+                
+                # Log if it's a delete-related event
+                if ($evt.eventType -match "DELETE" -or $evt.message -match "delete") {
+                    Write-Log "    [DELETE EVENT]" "SUCCESS"
+                    Write-Log "      Timestamp: $($evt.timestamp)"
+                    Write-Log "      Status: $($evt.eventType)"
+                    Write-Log "      Resource Type: $($evt.resourceType)"
+                    Write-Log "      Resource Name: $($evt.resourceName)"
+                    Write-Log "      Details: $($evt.message)"
+                    Write-Log "      User: $($evt.user)"
+                }
+            }
+        }
         
         # Find delete events
         $deleteEvents = $deploymentEvents | Where-Object { 
             $_.eventType -match "DELETE" -or $_.message -match "delete"
         }
         
-        if ($deleteEvents) {
-            Write-Log "`n  DELETE EVENTS FOUND:" "SUCCESS"
-            foreach ($evt in $deleteEvents) {
-                Write-Log "    Event Type: $($evt.eventType)"
-                Write-Log "    Message: $($evt.message)"
-                Write-Log "    Timestamp: $($evt.timestamp)"
-                Write-Log "    User: $($evt.user)"
-            }
-        }
+        Write-Log "  Found $($deleteEvents.Count) DELETE-related events" "SUCCESS"
     }
     catch {
         Write-Log "  Could not fetch events: $($_.Exception.Message)" "WARN"
@@ -250,6 +274,7 @@ foreach ($deployment in $allDeletedDeployments) {
     
     # Get deployment requests
     $deploymentRequests = $null
+    $parsedRequestResources = @()
     Write-Log "`nFetching deployment requests..."
     try {
         $requestsUri = "https://$vraServer/deployment/api/deployments/$($deployment.id)/requests?apiVersion=$apiVersion"
@@ -274,6 +299,41 @@ foreach ($deployment in $allDeletedDeployments) {
                 Write-Log "    Requested By: $($req.requestedBy)"
                 Write-Log "    Requested At: $($req.requestedAt)"
                 Write-Log "    Completed At: $($req.completedAt)"
+                
+                # NEW: Get granular Request Resources (this is the History tab data!)
+                Write-Log "`n    Fetching Request Resources (History details)..."
+                try {
+                    $resourceUri = "https://$vraServer/deployment/api/requests/$($req.id)/resources?apiVersion=$apiVersion"
+                    Write-Log "      URI: $resourceUri"
+                    
+                    $resourceResponse = Invoke-RestMethod -Uri $resourceUri -Method Get -Headers $vraHeaders -ErrorAction Stop
+                    $resourceDetails = if ($resourceResponse.content) { $resourceResponse.content } else { $resourceResponse }
+                    
+                    Write-Log "      Retrieved $($resourceDetails.Count) resource entries" "SUCCESS"
+                    
+                    # Parse each resource - these map to History tab columns
+                    foreach ($res in $resourceDetails) {
+                        $historyEntry = [PSCustomObject]@{
+                            Timestamp = $req.completedAt
+                            Status = $res.status
+                            ResourceType = $res.type
+                            ResourceName = $res.name
+                            Details = if ($res.provisioningStatus) { $res.provisioningStatus } else { $res.status }
+                            RequestId = $req.id
+                            RequestedBy = $req.requestedBy
+                            ActionId = $req.actionId
+                        }
+                        
+                        $parsedRequestResources += $historyEntry
+                        
+                        Write-Log "      Resource: $($res.name) [$($res.type)] - Status: $($res.status)" "SUCCESS"
+                        if ($res.provisioningStatus) {
+                            Write-Log "        Provisioning Status: $($res.provisioningStatus)"
+                        }
+                    }
+                } catch {
+                    Write-Log "      Could not fetch granular resource details for Request $($req.id): $($_.Exception.Message)" "WARN"
+                }
             }
         }
     }
@@ -296,8 +356,13 @@ foreach ($deployment in $allDeletedDeployments) {
         LastUpdatedBy = $deployment.lastUpdatedBy
         CreatedAt = $deployment.createdAt
         CreatedBy = $deployment.createdBy
-        Events = $deploymentEvents
-        Requests = $deploymentRequests
+        
+        # Parsed History Events (Timestamp, Status, ResourceType, ResourceName, Details)
+        HistoryEvents = $parsedHistoryEvents
+        
+        # Full raw data
+        RawEvents = $deploymentEvents
+        RawRequests = $deploymentRequests
         DeleteEvents = $deleteEvents
         DeleteRequests = $deleteRequests
         FullDeployment = $deployment
@@ -319,31 +384,66 @@ if ($deletedDeploymentDetails.Count -gt 0) {
     $deletedDeploymentDetails | ConvertTo-Json -Depth 20 | Out-File -FilePath $outputJson -Encoding UTF8
     Write-Log "Full JSON exported to: $outputJson" "SUCCESS"
     
-    # Export CSV summary
-    $csvData = $deletedDeploymentDetails | Select-Object DeploymentName, TemplateName, Status, Owner, 
-        LastUpdatedBy, LastUpdatedAt, CreatedAt, 
-        @{Name='EventCount';Expression={if($_.Events){$_.Events.Count}else{0}}},
-        @{Name='RequestCount';Expression={if($_.Requests){$_.Requests.Count}else{0}}},
-        @{Name='DeleteEventCount';Expression={if($_.DeleteEvents){$_.DeleteEvents.Count}else{0}}},
-        @{Name='DeleteRequestCount';Expression={if($_.DeleteRequests){$_.DeleteRequests.Count}else{0}}}
+    # Export CSV summary with History events
+    $csvData = @()
+    foreach ($item in $deletedDeploymentDetails) {
+        if ($item.HistoryEvents -and $item.HistoryEvents.Count -gt 0) {
+            # Create a row for each history event
+            foreach ($histEvent in $item.HistoryEvents) {
+                $csvData += [PSCustomObject]@{
+                    DeploymentName = $item.DeploymentName
+                    TemplateName = $item.TemplateName
+                    DeploymentOwner = $item.Owner
+                    EventTimestamp = $histEvent.Timestamp
+                    EventStatus = $histEvent.Status
+                    ResourceType = $histEvent.ResourceType
+                    ResourceName = $histEvent.ResourceName
+                    EventDetails = $histEvent.Details
+                    EventUser = $histEvent.User
+                }
+            }
+        } else {
+            # If no events, create single row with deployment info
+            $csvData += [PSCustomObject]@{
+                DeploymentName = $item.DeploymentName
+                TemplateName = $item.TemplateName
+                DeploymentOwner = $item.Owner
+                EventTimestamp = $item.LastUpdatedAt
+                EventStatus = $item.Status
+                ResourceType = "N/A"
+                ResourceName = "N/A"
+                EventDetails = "No event history available"
+                EventUser = $item.LastUpdatedBy
+            }
+        }
+    }
     
     $csvData | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
     Write-Log "CSV summary exported to: $outputCsv" "SUCCESS"
     
     # Display summary table
-    Write-Log "`n=== DELETED DEPLOYMENTS WITH EVENTS ===" "SUCCESS"
+    Write-Log "`n=== DELETED DEPLOYMENTS WITH HISTORY EVENTS ===" "SUCCESS"
     foreach ($item in $deletedDeploymentDetails) {
         Write-Log "`n$($item.DeploymentName)" "SUCCESS"
         Write-Log "  Template: $($item.TemplateName)"
         Write-Log "  Status: $($item.Status)"
         Write-Log "  Owner: $($item.Owner)"
         Write-Log "  Deleted: $($item.LastUpdatedAt) by $($item.LastUpdatedBy)"
-        Write-Log "  Events Retrieved: $($item.Events.Count)"
-        Write-Log "  Requests Retrieved: $($item.Requests.Count)"
+        Write-Log "  History Events Retrieved: $($item.HistoryEvents.Count)" "SUCCESS"
+        
+        if ($item.HistoryEvents -and $item.HistoryEvents.Count -gt 0) {
+            Write-Log "`n  Event History (Timestamp | Status | ResourceType | ResourceName):"
+            foreach ($histEvt in $item.HistoryEvents) {
+                Write-Log "    $($histEvt.Timestamp) | $($histEvt.Status) | $($histEvt.ResourceType) | $($histEvt.ResourceName)"
+                if ($histEvt.Details) {
+                    Write-Log "      Details: $($histEvt.Details)"
+                }
+            }
+        }
         
         if ($item.DeleteRequests) {
             $deleteReq = $item.DeleteRequests | Select-Object -First 1
-            Write-Log "  Delete Initiated By: $($deleteReq.requestedBy) at $($deleteReq.requestedAt)" "SUCCESS"
+            Write-Log "`n  Delete Initiated By: $($deleteReq.requestedBy) at $($deleteReq.requestedAt)" "SUCCESS"
         }
     }
 }
