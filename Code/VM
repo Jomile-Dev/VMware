@@ -3,6 +3,9 @@
 
 # Configuration
 $vraServer = "vra1.yourdomain.com"
+$daysBack = 90  # How many days back to search for deleted deployments
+$pageSize = 200  # Items per page for deployments
+$eventsPageSize = 200  # Items per page for events (increased from 50)
 
 # Output files
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
@@ -191,6 +194,12 @@ catch {
 Write-Log "`n============================================"
 Write-Log "STEP 2: FETCHING DELETED DEPLOYMENTS"
 Write-Log "============================================"
+Write-Log "Searching for deployments deleted in the last $daysBack days" "SUCCESS"
+
+# Calculate cutoff date
+$cutoffDate = (Get-Date).AddDays(-$daysBack)
+$cutoffDateStr = $cutoffDate.ToString("yyyy-MM-dd")
+Write-Log "Cutoff date: $cutoffDateStr" "DEBUG"
 
 $allDeletedDeployments = @()
 $page = 0
@@ -288,8 +297,22 @@ if ($allDeletedDeployments.Count -gt 0) {
 
 Write-Log "`nTotal deleted deployments retrieved: $($allDeletedDeployments.Count)" "SUCCESS"
 
-if ($allDeletedDeployments.Count -eq 0) {
-    Write-Log "`n✗ No deleted deployments found!" "WARN"
+# Filter by date
+Write-Log "Filtering deployments by date (last $daysBack days)..." "DEBUG"
+$filteredDeployments = $allDeletedDeployments | Where-Object {
+    try {
+        $updateDate = [DateTime]$_.lastUpdatedAt
+        $updateDate -ge $cutoffDate
+    }
+    catch {
+        $true  # Include if can't parse date
+    }
+}
+
+Write-Log "Deployments after date filter: $($filteredDeployments.Count)" "SUCCESS"
+
+if ($filteredDeployments.Count -eq 0) {
+    Write-Log "`n✗ No deleted deployments found in the last $daysBack days!" "WARN"
     Write-Log "This could mean:" "WARN"
     Write-Log "  - No deployments have been deleted" "WARN"
     Write-Log "  - Deleted deployments are purged immediately" "WARN"
@@ -306,7 +329,7 @@ Write-Log "============================================"
 $summaryResults = @()
 $detailedResults = @()
 
-foreach ($deployment in $allDeletedDeployments) {
+foreach ($deployment in $filteredDeployments) {
     Write-Log "`nProcessing: $($deployment.name)" "SUCCESS"
     Write-Log "  Deployment ID: $($deployment.id)" "DEBUG"
     Write-Log "  Status: $($deployment.status)" "DEBUG"
@@ -328,19 +351,59 @@ foreach ($deployment in $allDeletedDeployments) {
             foreach ($request in $requests) {
                 Write-Log "    Request ID: $($request.id) - Action: $($request.actionId)" "DEBUG"
                 
-                # THIS IS THE EXACT URL FROM YOUR NETWORK CONSOLE
-                $eventsUri = "https://$vraServer/deployment/api/deployments/$($deployment.id)/requests/$($request.id)/events?page=0&size=50&deleted=true&apiVersion=2020-08-25"
-                Write-Log "    Fetching events..." "DEBUG"
-                Write-Log "    URL: $eventsUri" "DEBUG"
+                # Fetch ALL events with pagination
+                $allEvents = @()
+                $eventPage = 0
+                $totalEventPages = 0
                 
-                $eventsResult = Test-ApiEndpoint -Uri $eventsUri -Headers $headers -Description "Request Events"
-                
-                if ($eventsResult) {
-                    $events = if ($eventsResult.content) { $eventsResult.content } else { $eventsResult }
-                    Write-Log "    Found $($events.Count) events" "SUCCESS"
+                do {
+                    # THIS IS THE EXACT URL FROM YOUR NETWORK CONSOLE with pagination
+                    $eventsUri = "https://$vraServer/deployment/api/deployments/$($deployment.id)/requests/$($request.id)/events?page=$eventPage&size=$eventsPageSize&deleted=true&apiVersion=2020-08-25"
+                    Write-Log "    Fetching events page $eventPage..." "DEBUG"
+                    Write-Log "    URL: $eventsUri" "DEBUG"
                     
-                    # Create detailed records for each event
-                    foreach ($event in $events) {
+                    $eventsResult = Test-ApiEndpoint -Uri $eventsUri -Headers $headers -Description "Request Events Page $eventPage"
+                    
+                    if ($eventsResult) {
+                        $events = if ($eventsResult.content) { $eventsResult.content } else { $eventsResult }
+                        
+                        if ($events -and $events.Count -gt 0) {
+                            $allEvents += $events
+                            Write-Log "    Retrieved $($events.Count) events (Total: $($allEvents.Count))" "SUCCESS"
+                            
+                            # Check if there are more pages
+                            if ($eventsResult.totalElements) {
+                                $totalEventPages = [Math]::Ceiling($eventsResult.totalElements / $eventsPageSize)
+                                Write-Log "    Total events available: $($eventsResult.totalElements) (Pages: $totalEventPages)" "DEBUG"
+                            }
+                            
+                            $eventPage++
+                            
+                            # Stop if we got fewer items than page size (last page)
+                            if ($events.Count -lt $eventsPageSize) {
+                                break
+                            }
+                        }
+                        else {
+                            break
+                        }
+                    }
+                    else {
+                        break
+                    }
+                    
+                    # Safety limit per request
+                    if ($allEvents.Count -ge 1000) {
+                        Write-Log "    Reached safety limit of 1000 events for this request" "WARN"
+                        break
+                    }
+                    
+                } while ($true)
+                
+                Write-Log "    Total events for request: $($allEvents.Count)" "SUCCESS"
+                
+                # Create detailed records for each event
+                foreach ($event in $allEvents) {
                         $detailedResults += [PSCustomObject]@{
                             DeploymentName = $deployment.name
                             DeploymentId = $deployment.id
@@ -356,26 +419,30 @@ foreach ($deployment in $allDeletedDeployments) {
                             ResourceName = $event.resourceName
                             Message = $event.message
                             EventId = $event.id
+                            # Additional event properties
+                            EventLogLevel = $event.logLevel
+                            EventSource = $event.source
+                            EventCode = $event.code
                         }
                     }
                 }
-            }
-            
-            # Create summary record
-            $summaryResults += [PSCustomObject]@{
-                DeploymentName = $deployment.name
-                DeploymentId = $deployment.id
-                Status = $deployment.status
-                Owner = $deployment.ownedBy
-                CreatedBy = $deployment.createdBy
-                CreatedAt = $deployment.createdAt
-                LastUpdatedBy = $deployment.lastUpdatedBy
-                LastUpdatedAt = $deployment.lastUpdatedAt
-                ProjectId = $deployment.projectId
-                ProjectName = $deployment.projectName
-                BlueprintId = $deployment.blueprintId
-                RequestCount = $requests.Count
-            }
+                
+                # Create summary record
+                $summaryResults += [PSCustomObject]@{
+                    DeploymentName = $deployment.name
+                    DeploymentId = $deployment.id
+                    Status = $deployment.status
+                    Owner = $deployment.ownedBy
+                    CreatedBy = $deployment.createdBy
+                    CreatedAt = $deployment.createdAt
+                    LastUpdatedBy = $deployment.lastUpdatedBy
+                    LastUpdatedAt = $deployment.lastUpdatedAt
+                    ProjectId = $deployment.projectId
+                    ProjectName = $deployment.projectName
+                    BlueprintId = $deployment.blueprintId
+                    RequestCount = $requests.Count
+                    TotalEventCount = $allEvents.Count
+                }
         }
         else {
             Write-Log "  Could not fetch requests for this deployment" "WARN"
@@ -414,6 +481,7 @@ Write-Log "✓ Raw JSON: $outputJson" "SUCCESS"
 Write-Log "`n============================================"
 Write-Log "FINAL SUMMARY"
 Write-Log "============================================"
+Write-Log "Date range: Last $daysBack days (since $cutoffDateStr)" "SUCCESS"
 Write-Log "Deleted deployments found: $($summaryResults.Count)" "SUCCESS"
 Write-Log "Total events captured: $($detailedResults.Count)" "SUCCESS"
 
