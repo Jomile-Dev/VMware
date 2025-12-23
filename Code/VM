@@ -565,17 +565,46 @@ try {
             }
             
             if (-not $vmName) {
+                Write-DebugLog "  Skipping VM $identifier - no name found" "WARN"
                 continue
             }
             
-            # Get health status
+            # Get health status - with null checks
+            $status = "Decomm/Offline"  # Default status
+            
+            # Try to get health badge
             $healthProp = $response.property | Where-Object { $_.name -eq "badge|health" -or $_.name -eq "summary|health" } | Select-Object -First 1
-            $status = "Decomm/Offline"
             
             if ($healthProp -and $healthProp.value) {
-                $healthValue = $healthProp.value.ToString().ToUpper()
-                if ($healthValue -in @("GREEN", "YELLOW", "ORANGE", "RED")) {
-                    $status = "Online"
+                try {
+                    $healthValue = $healthProp.value.ToString().ToUpper()
+                    if ($healthValue -in @("GREEN", "YELLOW", "ORANGE", "RED")) {
+                        $status = "Online"
+                    }
+                    Write-DebugLog "  VM: $vmName | Health: $healthValue | Status: $status" "DEBUG"
+                }
+                catch {
+                    Write-DebugLog "  VM: $vmName | Could not parse health value" "WARN"
+                }
+            }
+            else {
+                # Try resource state as fallback
+                $resourceStateProp = $response.property | Where-Object { $_.name -eq "summary|resourceState" } | Select-Object -First 1
+                
+                if ($resourceStateProp -and $resourceStateProp.value) {
+                    try {
+                        $resourceState = $resourceStateProp.value.ToString().ToUpper()
+                        if ($resourceState -in @("STARTED", "MAINTAINED")) {
+                            $status = "Online"
+                        }
+                        Write-DebugLog "  VM: $vmName | Resource State: $resourceState | Status: $status" "DEBUG"
+                    }
+                    catch {
+                        Write-DebugLog "  VM: $vmName | Could not parse resource state" "WARN"
+                    }
+                }
+                else {
+                    Write-DebugLog "  VM: $vmName | No health or state data - defaulting to: $status" "WARN"
                 }
             }
             
@@ -585,10 +614,10 @@ try {
                 ResourceId = $identifier
             }
             
-            Write-DebugLog "  Found VM: $vmName | Status: $status"
+            Write-DebugLog "  Added VM: $vmName | Status: $status"
         }
         catch {
-            Write-DebugLog "  Error getting properties for VM $identifier" "WARN"
+            Write-DebugLog "  Error getting properties for VM $identifier : $($_.Exception.Message)" "WARN"
         }
     }
     
