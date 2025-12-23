@@ -1,378 +1,92 @@
-# vRA Deleted Deployments - Multi-Approach History Finder
-# Tries multiple methods to find deleted deployments and their history
+# vRA Global Request History Finder (404 Bypass Version)
+# Purpose: Scans the global request service to find deletion history 
+# without relying on potentially broken Deployment links.
 
 # Configuration
 $vraServer = "vra1.yourdomain.com"
 $daysBack = 30
 $apiVersion = "2020-08-25"
-$filterTemplateNames = @("Virtual Machine", "Database")
+$filterTemplateNames = @("Virtual Machine", "Database") # Partial matches allowed
 
 # Output
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-$outputCsv = "C:\Logs\vRA_DeletionHistory_$timestamp.csv"
-$outputLog = "C:\Logs\vRA_DeletionHistory_$timestamp.log"
-
-function Write-Log {
-    param([string]$Message, [string]$Level = "INFO")
-    $logTimestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $logMessage = "[$logTimestamp] [$Level] $Message"
-    
-    $color = switch ($Level) {
-        "ERROR" { "Red" }
-        "WARN" { "Yellow" }
-        "SUCCESS" { "Green" }
-        default { "Cyan" }
-    }
-    
-    Write-Host $logMessage -ForegroundColor $color
-    Add-Content -Path $outputLog -Value $logMessage
-}
+$outputCsv = "C:\Logs\vRA_DeletionHistory_Global_$timestamp.csv"
 
 function Disable-SSLValidation {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
-        Add-Type @"
-using System.Net;
-using System.Security.Cryptography.X509Certificates;
-public class TrustAllCertsPolicy : ICertificatePolicy {
-    public bool CheckValidationResult(
-        ServicePoint svcPoint, X509Certificate certificate,
-        WebRequest request, int certificateProblem) {
-        return true;
-    }
-}
-"@
+        Add-Type "using System.Net; using System.Security.Cryptography.X509Certificates; public class TrustAllCertsPolicy : ICertificatePolicy { public bool CheckValidationResult(ServicePoint svcPoint, X509Certificate certificate, WebRequest request, int certificateProblem) { return true; } }"
         [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
     }
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 }
 
-Write-Log "===== vRA Deleted Deployments History Finder =====" "SUCCESS"
 Disable-SSLValidation
+$credential = Get-Credential -Message "Enter vRA Credentials"
+$authBody = @{ username = $credential.UserName; password = $credential.GetNetworkCredential().Password } | ConvertTo-Json
+$authRes = Invoke-RestMethod -Uri "https://$vraServer/csp/gateway/am/api/login" -Method Post -Headers @{"Content-Type"="application/json"} -Body $authBody
+$vraHeaders = @{ "Authorization" = "Bearer $($authRes.cspAuthToken)"; "Content-Type" = "application/json" }
 
-# Ensure log directory exists
-$logDir = Split-Path $outputLog -Parent
-if (!(Test-Path $logDir)) {
-    New-Item -ItemType Directory -Path $logDir -Force | Out-Null
-}
+# STEP 1: Query Global Requests
+# Instead of looking for Deployments, we look for 'Delete' Actions that finished recently
+Write-Host "Searching Global Requests for Deletion actions..." -ForegroundColor Cyan
 
-# Get credentials
-Write-Log "`nRequesting credentials..."
-$credential = Get-Credential -Message "Enter credentials for vRA"
-if (-not $credential) {
-    Write-Log "Credentials not provided. Exiting." "ERROR"
-    exit
-}
+$cutoffDate = (Get-Date).AddDays(-$daysBack).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
 
-# Authenticate
-Write-Log "Authenticating to vRA: $vraServer"
+# This URI queries the Request service directly, looking for Delete actions completed after the cutoff
+$requestUri = "https://$vraServer/deployment/api/requests?apiVersion=$apiVersion&`$filter=status eq 'SUCCESSFUL' and completedAt ge '$cutoffDate'&`$top=1000"
+
 try {
-    $authBody = @{
-        username = $credential.UserName
-        password = $credential.GetNetworkCredential().Password
-    } | ConvertTo-Json
-    
-    $authRes = Invoke-RestMethod -Uri "https://$vraServer/csp/gateway/am/api/login" `
-        -Method Post -Headers @{"Content-Type"="application/json"} -Body $authBody -ErrorAction Stop
-    
-    $vraHeaders = @{
-        "Authorization" = "Bearer $($authRes.cspAuthToken)"
-        "Content-Type" = "application/json"
-        "Accept" = "application/json"
-    }
-    Write-Log "Authenticated successfully" "SUCCESS"
-}
-catch {
-    Write-Log "Authentication failed: $($_.Exception.Message)" "ERROR"
+    $allRequests = (Invoke-RestMethod -Uri $requestUri -Method Get -Headers $vraHeaders).content
+} catch {
+    Write-Host "Global Request Query Failed: $($_.Exception.Message)" -ForegroundColor Red
     exit
 }
 
-$cutoffDate = (Get-Date).AddDays(-$daysBack)
 $finalResults = @()
 
-# ===== APPROACH 1: Try deleted=true parameter =====
-Write-Log "`n===== APPROACH 1: Trying deleted=true parameter =====" "SUCCESS"
-try {
-    $uri = "https://$vraServer/deployment/api/deployments?apiVersion=$apiVersion&deleted=true&`$top=500"
-    Write-Log "URI: $uri"
-    
-    $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $vraHeaders -ErrorAction Stop
-    $deletedDeps = if ($response.content) { $response.content } else { $response }
-    
-    Write-Log "Found $($deletedDeps.Count) deployments with deleted=true" "SUCCESS"
-    
-    if ($deletedDeps.Count -gt 0) {
-        Write-Log "deleted=true parameter WORKS!" "SUCCESS"
-        # Process these deployments
-        foreach ($dep in $deletedDeps) {
-            Write-Log "`nProcessing: $($dep.name) (ID: $($dep.id))"
-            
-            # Get template name
-            $templateName = "Unknown"
-            if ($dep.catalogItemId) {
-                try {
-                    $catUri = "https://$vraServer/catalog/api/items/$($dep.catalogItemId)?apiVersion=$apiVersion"
-                    $cat = Invoke-RestMethod -Uri $catUri -Method Get -Headers $vraHeaders -ErrorAction Stop
-                    $templateName = $cat.name
-                } catch {}
-            }
-            
-            # Apply filter
-            $isMatch = $false
-            foreach ($f in $filterTemplateNames) {
-                if ($templateName -match $f) { $isMatch = $true; break }
-            }
-            if (-not $isMatch) {
-                Write-Log "  Skipping - template '$templateName' doesn't match filter" "WARN"
-                continue
-            }
-            
-            # Get request history
-            try {
-                $reqUri = "https://$vraServer/deployment/api/deployments/$($dep.id)/requests?apiVersion=$apiVersion"
-                Write-Log "  Getting requests: $reqUri"
-                
-                $reqResponse = Invoke-RestMethod -Uri $reqUri -Method Get -Headers $vraHeaders -ErrorAction Stop
-                $allReqs = if ($reqResponse.content) { $reqResponse.content } else { $reqResponse }
-                
-                Write-Log "  Retrieved $($allReqs.Count) requests"
-                
-                # Find delete request
-                $delReq = $allReqs | Where-Object {
-                    $_.actionId -match "DELETE" -or $_.name -match "Delete"
-                } | Sort-Object completedAt -Descending | Select-Object -First 1
-                
-                if ($delReq) {
-                    Write-Log "  Found Delete Request by $($delReq.requestedBy) at $($delReq.completedAt)" "SUCCESS"
-                    
-                    $finalResults += [PSCustomObject]@{
-                        DeploymentName = $dep.name
-                        Template = $templateName
-                        Status = $delReq.status
-                        DeletedBy = $delReq.requestedBy
-                        DeleteTime = $delReq.completedAt
-                        Action = $delReq.name
-                        DeploymentId = $dep.id
-                        RequestID = $delReq.id
-                        Approach = "deleted=true"
-                    }
-                } else {
-                    Write-Log "  No Delete Request found in history" "WARN"
-                }
-            }
-            catch {
-                Write-Log "  Could not get requests: $($_.Exception.Message)" "ERROR"
-            }
-        }
-    }
-}
-catch {
-    Write-Log "Approach 1 failed: $($_.Exception.Message)" "WARN"
-}
+# STEP 2: Filter and Match
+foreach ($req in $allRequests) {
+    # We only care about Deletions
+    if ($req.actionId -notmatch "delete") { continue }
 
-# ===== APPROACH 2: Filter by DELETE status =====
-if ($finalResults.Count -eq 0) {
-    Write-Log "`n===== APPROACH 2: Trying status filters =====" "SUCCESS"
-    
-    $statusFilters = @("DELETED", "DELETE_SUCCESSFUL", "ARCHIVED")
-    
-    foreach ($status in $statusFilters) {
-        Write-Log "`nTrying status: $status"
+    # Apply Template/Name Filter
+    $isMatch = $false
+    foreach ($f in $filterTemplateNames) {
+        # Checking deploymentName and the request name for our keywords (VM/Database)
+        if ($req.deploymentName -match $f -or $req.name -match $f) { $isMatch = $true; break }
+    }
+
+    if ($isMatch) {
+        Write-Host "Match Found: $($req.deploymentName)" -ForegroundColor Green
+        
+        # STEP 3: Get Resource Details (Optional sub-drill)
+        $resourceNames = "N/A"
         try {
-            $uri = "https://$vraServer/deployment/api/deployments?apiVersion=$apiVersion&`$filter=status eq '$status'&`$top=500"
-            Write-Log "URI: $uri"
-            
-            $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $vraHeaders -ErrorAction Stop
-            $deps = if ($response.content) { $response.content } else { $response }
-            
-            Write-Log "Found $($deps.Count) deployments with status '$status'" "SUCCESS"
-            
-            foreach ($dep in $deps) {
-                # Check if within time range
-                if ($dep.lastUpdatedAt) {
-                    try {
-                        $updateDate = [DateTime]$dep.lastUpdatedAt
-                        if ($updateDate -lt $cutoffDate) { continue }
-                    } catch {}
-                }
-                
-                Write-Log "`nProcessing: $($dep.name)"
-                
-                # Get template name
-                $templateName = "Unknown"
-                if ($dep.catalogItemId) {
-                    try {
-                        $cat = Invoke-RestMethod -Uri "https://$vraServer/catalog/api/items/$($dep.catalogItemId)?apiVersion=$apiVersion" -Headers $vraHeaders -ErrorAction Stop
-                        $templateName = $cat.name
-                    } catch {}
-                }
-                
-                # Apply filter
-                $isMatch = $false
-                foreach ($f in $filterTemplateNames) {
-                    if ($templateName -match $f) { $isMatch = $true; break }
-                }
-                if (-not $isMatch) { continue }
-                
-                # Get request history
-                try {
-                    $reqUri = "https://$vraServer/deployment/api/deployments/$($dep.id)/requests?apiVersion=$apiVersion"
-                    $reqResponse = Invoke-RestMethod -Uri $reqUri -Method Get -Headers $vraHeaders -ErrorAction Stop
-                    $allReqs = if ($reqResponse.content) { $reqResponse.content } else { $reqResponse }
-                    
-                    $delReq = $allReqs | Where-Object {
-                        $_.actionId -match "DELETE" -or $_.name -match "Delete"
-                    } | Sort-Object completedAt -Descending | Select-Object -First 1
-                    
-                    if ($delReq) {
-                        Write-Log "  Delete Request: $($delReq.requestedBy) at $($delReq.completedAt)" "SUCCESS"
-                        
-                        $finalResults += [PSCustomObject]@{
-                            DeploymentName = $dep.name
-                            Template = $templateName
-                            Status = $delReq.status
-                            DeletedBy = $delReq.requestedBy
-                            DeleteTime = $delReq.completedAt
-                            Action = $delReq.name
-                            DeploymentId = $dep.id
-                            RequestID = $delReq.id
-                            Approach = "status=$status"
-                        }
-                    }
-                }
-                catch {
-                    Write-Log "  Could not get requests: $($_.Exception.Message)" "WARN"
-                }
+            $resUri = "https://$vraServer/deployment/api/requests/$($req.id)/resources?apiVersion=$apiVersion"
+            $resData = (Invoke-RestMethod -Uri $resUri -Method Get -Headers $vraHeaders).content
+            if ($resData) {
+                $resourceNames = ($resData | Select-Object -ExpandProperty name) -join ", "
             }
+        } catch { 
+            # If this also 404s, we still have the Request data, so we just move on
         }
-        catch {
-            Write-Log "Status filter '$status' failed: $($_.Exception.Message)" "WARN"
+
+        $finalResults += [PSCustomObject]@{
+            DeletionTimestamp = $req.completedAt
+            DeploymentName    = $req.deploymentName
+            DeletedByUser     = $req.requestedBy
+            RequestAction     = $req.name
+            ResourcesAffected = $resourceNames
+            Status            = $req.status
+            RequestID         = $req.id
         }
     }
 }
 
-# ===== APPROACH 3: Get ALL deployments and filter by lastUpdatedAt =====
-if ($finalResults.Count -eq 0) {
-    Write-Log "`n===== APPROACH 3: Getting all recent deployments =====" "SUCCESS"
-    
-    try {
-        $uri = "https://$vraServer/deployment/api/deployments?apiVersion=$apiVersion&`$top=1000&`$orderby=lastUpdatedAt desc"
-        Write-Log "URI: $uri"
-        
-        $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $vraHeaders -ErrorAction Stop
-        $allDeps = if ($response.content) { $response.content } else { $response }
-        
-        Write-Log "Retrieved $($allDeps.Count) total deployments" "SUCCESS"
-        
-        # Look for deployments with DELETE status or recent updates
-        $recentDeps = $allDeps | Where-Object {
-            if ($_.lastUpdatedAt) {
-                try {
-                    $updateDate = [DateTime]$_.lastUpdatedAt
-                    if ($updateDate -ge $cutoffDate) {
-                        if ($_.status -match "DELETE" -or $_.status -eq "ARCHIVED") {
-                            return $true
-                        }
-                    }
-                } catch {}
-            }
-            return $false
-        }
-        
-        Write-Log "Found $($recentDeps.Count) recently updated deployments with DELETE status"
-        
-        foreach ($dep in $recentDeps) {
-            Write-Log "`nProcessing: $($dep.name)"
-            
-            # Get template name
-            $templateName = "Unknown"
-            if ($dep.catalogItemId) {
-                try {
-                    $cat = Invoke-RestMethod -Uri "https://$vraServer/catalog/api/items/$($dep.catalogItemId)?apiVersion=$apiVersion" -Headers $vraHeaders -ErrorAction Stop
-                    $templateName = $cat.name
-                } catch {}
-            }
-            
-            # Apply filter
-            $isMatch = $false
-            foreach ($f in $filterTemplateNames) {
-                if ($templateName -match $f) { $isMatch = $true; break }
-            }
-            if (-not $isMatch) { continue }
-            
-            # Get request history
-            try {
-                $reqUri = "https://$vraServer/deployment/api/deployments/$($dep.id)/requests?apiVersion=$apiVersion"
-                $reqResponse = Invoke-RestMethod -Uri $reqUri -Method Get -Headers $vraHeaders -ErrorAction Stop
-                $allReqs = if ($reqResponse.content) { $reqResponse.content } else { $reqResponse }
-                
-                $delReq = $allReqs | Where-Object {
-                    $_.actionId -match "DELETE" -or $_.name -match "Delete"
-                } | Sort-Object completedAt -Descending | Select-Object -First 1
-                
-                if ($delReq) {
-                    Write-Log "  Delete Request: $($delReq.requestedBy) at $($delReq.completedAt)" "SUCCESS"
-                    
-                    $finalResults += [PSCustomObject]@{
-                        DeploymentName = $dep.name
-                        Template = $templateName
-                        Status = $delReq.status
-                        DeletedBy = $delReq.requestedBy
-                        DeleteTime = $delReq.completedAt
-                        Action = $delReq.name
-                        DeploymentId = $dep.id
-                        RequestID = $delReq.id
-                        Approach = "recent+filtered"
-                    }
-                }
-            }
-            catch {
-                Write-Log "  Could not get requests: $($_.Exception.Message)" "WARN"
-            }
-        }
-    }
-    catch {
-        Write-Log "Approach 3 failed: $($_.Exception.Message)" "ERROR"
-    }
-}
-
-# ===== Summary and Export =====
-Write-Log "`n============================================" "SUCCESS"
-Write-Log "===== SUMMARY =====" "SUCCESS"
-Write-Log "============================================" "SUCCESS"
-
+# Export
 if ($finalResults.Count -gt 0) {
-    Write-Log "Total deleted deployments found: $($finalResults.Count)" "SUCCESS"
-    
-    # Remove duplicates by DeploymentId
-    $uniqueResults = $finalResults | Sort-Object DeploymentId -Unique
-    Write-Log "Unique deployments: $($uniqueResults.Count)" "SUCCESS"
-    
-    # Export to CSV
-    $uniqueResults | Select-Object DeploymentName, Template, Status, DeletedBy, DeleteTime, Action, DeploymentId, RequestID, Approach |
-        Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
-    
-    Write-Log "Exported to: $outputCsv" "SUCCESS"
-    
-    # Display summary
-    Write-Log "`n=== DELETED DEPLOYMENTS ===" "SUCCESS"
-    foreach ($result in $uniqueResults) {
-        Write-Log "`n$($result.DeploymentName)" "SUCCESS"
-        Write-Log "  Template: $($result.Template)"
-        Write-Log "  Deleted By: $($result.DeletedBy)"
-        Write-Log "  Delete Time: $($result.DeleteTime)"
-        Write-Log "  Status: $($result.Status)"
-        Write-Log "  Method: $($result.Approach)"
-    }
+    $finalResults | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
+    Write-Host "SUCCESS: $($finalResults.Count) history records exported to $outputCsv" -ForegroundColor Green
+} else {
+    Write-Host "No delete requests found in the last $daysBack days matching your filters." -ForegroundColor Yellow
 }
-else {
-    Write-Log "NO DELETED DEPLOYMENTS FOUND!" "WARN"
-    Write-Log "`nTroubleshooting steps:" "WARN"
-    Write-Log "  1. Verify deployments were actually deleted in the past $daysBack days" "WARN"
-    Write-Log "  2. Check if your user has permissions to view deleted deployments" "WARN"
-    Write-Log "  3. Try increasing `$daysBack to look further back" "WARN"
-    Write-Log "  4. Verify template filter names match your actual catalog items" "WARN"
-    Write-Log "  5. Check vRA logs or database directly if API access is limited" "WARN"
-}
-
-Write-Log "`n===== Script Completed =====" "SUCCESS"
-Write-Log "Log file: $outputLog"
