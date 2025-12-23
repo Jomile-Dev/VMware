@@ -1,43 +1,83 @@
-# vRA Deep Event & History Extractor
-# This script pulls the granular "Timeline" you see in the GUI
+# vRA Deep-Dive: Deployment Metadata + History + Granular Events
+# Purpose: Replicates the GUI "History" and "Request" logs for deleted items.
 
+# --- Configuration ---
 $vraServer = "vra1.yourdomain.com"
-$apiVersion = "2020-08-25"
-$targetDeploymentName = "Your-VM-Name" # Leave empty to scan all deleted items
+$apiVersion = "2020-08-25"  # <--- CRITICAL: Versioning for deleted records
+$daysBack   = 30 
+$filterKeywords = @("Virtual Machine", "Database")
+
+# --- Output ---
+$timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$outputFile = "C:\Logs\vRA_Full_Deep_History_$timestamp.log"
 
 # --- Setup & Auth ---
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-Disable-SSLValidation # (Function assumed from previous scripts)
+function Disable-SSLValidation {
+    if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
+        Add-Type "using System.Net; using System.Security.Cryptography.X509Certificates; public class TrustAllCertsPolicy : ICertificatePolicy { public bool CheckValidationResult(ServicePoint svcPoint, X509Certificate certificate, WebRequest request, int certificateProblem) { return true; } }"
+        [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+    }
+}
+Disable-SSLValidation
+
+$credential = Get-Credential -Message "vRA Admin Credentials"
+$authBody = @{ username = $credential.UserName; password = $credential.GetNetworkCredential().Password } | ConvertTo-Json
 $authRes = Invoke-RestMethod -Uri "https://$vraServer/csp/gateway/am/api/login" -Method Post -Headers @{"Content-Type"="application/json"} -Body $authBody
 $vraHeaders = @{ "Authorization" = "Bearer $($authRes.cspAuthToken)"; "Content-Type" = "application/json" }
 
-# 1. Get the Deleted Deployment ID
-$depUri = "https://$vraServer/deployment/api/deployments?apiVersion=$apiVersion&deleted=true&`$filter=name eq '$targetDeploymentName'"
-$dep = (Invoke-RestMethod -Uri $depUri -Method Get -Headers $vraHeaders).content[0]
+# --- 1. Get Deleted Deployments ---
+Write-Host "Searching for deleted deployments..." -ForegroundColor Cyan
+$deployUri = "https://$vraServer/deployment/api/deployments?apiVersion=$apiVersion&deleted=true&`$top=200"
+$allDeps = (Invoke-RestMethod -Uri $deployUri -Method Get -Headers $vraHeaders).content
 
-if (-not $dep) { Write-Error "Deployment not found"; return }
+$cutoffDate = (Get-Date).AddDays(-$daysBack)
 
-Write-Host "--- HISTORY FOR: $($dep.name) ---" -ForegroundColor Cyan
+foreach ($dep in $allDeps) {
+    # Filter for Deletes + Keywords
+    if ($dep.status -notmatch "DELETE" -and $dep.status -ne "ARCHIVED") { continue }
+    $nameMatch = $false
+    foreach ($k in $filterKeywords) { if ($dep.name -match $k) { $nameMatch = $true } }
+    if (-not $nameMatch) { continue }
 
-# 2. Get REQUESTS (The "History" tab in GUI)
-# This shows: Who started it, what the inputs were, and the exact status of each step
-$reqUri = "https://$vraServer/deployment/api/deployments/$($dep.id)/requests?apiVersion=$apiVersion"
-$requests = (Invoke-RestMethod -Uri $reqUri -Method Get -Headers $vraHeaders).content
+    Write-Host "`n====================================================" -ForegroundColor White
+    Write-Host "DEPLOYMENT: $($dep.name)" -ForegroundColor Green
+    Write-Host "ID: $($dep.id)" -ForegroundColor Gray
+    "--- DEPLOYMENT: $($dep.name) (ID: $($dep.id)) ---" | Add-Content $outputFile
 
-foreach ($req in $requests) {
-    Write-Host "`n[Action: $($req.name)]" -ForegroundColor Yellow
-    Write-Host "  Requested By: $($req.requestedBy)"
-    Write-Host "  Status:       $($req.status)"
-    Write-Host "  Started:      $($req.createdAt)"
-    
-    # 3. Get EVENTS for this specific Request (The "Log" entries)
-    # This is the "terminal output" style info you see in the GUI
-    $eventUri = "https://$vraServer/deployment/api/requests/$($req.id)/events?apiVersion=$apiVersion"
-    $events = (Invoke-RestMethod -Uri $eventUri -Method Get -Headers $vraHeaders).content
-    
-    foreach ($evt in $events) {
-        $timestamp = $evt.timestamp
-        $message   = $evt.message
-        Write-Host "    > $timestamp : $message" -ForegroundColor Gray
-    }
+    # --- 2. Get the "Specifics" (Hardware/IP) ---
+    try {
+        $resUri = "https://$vraServer/deployment/api/deployments/$($dep.id)/resources?apiVersion=$apiVersion"
+        $resources = (Invoke-RestMethod -Uri $resUri -Method Get -Headers $vraHeaders).content
+        foreach ($res in $resources) {
+            $spec = "Resource: $($res.name) | IP: $($res.properties.address) | CPU: $($res.properties.cpuCount)"
+            Write-Host "  [Specs] $spec" -ForegroundColor Cyan
+            "  [Specs] $spec" | Add-Content $outputFile
+        }
+    } catch { Write-Host "  [Specs] Resource data already purged from DB." -ForegroundColor Red }
+
+    # --- 3. Get REQUESTS (GUI History Tab) ---
+    try {
+        $reqUri = "https://$vraServer/deployment/api/deployments/$($dep.id)/requests?apiVersion=$apiVersion"
+        $requests = (Invoke-RestMethod -Uri $reqUri -Method Get -Headers $vraHeaders).content
+        
+        foreach ($req in $requests) {
+            $reqHeader = "  [Action: $($req.name)] Status: $($req.status) | By: $($req.requestedBy)"
+            Write-Host $reqHeader -ForegroundColor Yellow
+            $reqHeader | Add-Content $outputFile
+
+            # --- 4. Get EVENTS (The detailed technical logs) ---
+            try {
+                $eventUri = "https://$vraServer/deployment/api/requests/$($req.id)/events?apiVersion=$apiVersion"
+                $events = (Invoke-RestMethod -Uri $eventUri -Method Get -Headers $vraHeaders).content
+                foreach ($evt in $events) {
+                    $logLine = "    > $($evt.timestamp): $($evt.message)"
+                    Write-Host $logLine -ForegroundColor DarkGray
+                    $logLine | Add-Content $outputFile
+                }
+            } catch { "    > Event logs purged." | Add-Content $outputFile }
+        }
+    } catch { "  [History] Request history unavailable." | Add-Content $outputFile }
 }
+
+Write-Host "`nFull log saved to: $outputFile" -ForegroundColor Green
