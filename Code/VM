@@ -1,93 +1,43 @@
-# vRA Deep-Dive: Specs, IPs, and Hardware for Deleted VMs/DBs
-# Targets: Virtual Machines and Databases specifically.
+# vRA Deep Event & History Extractor
+# This script pulls the granular "Timeline" you see in the GUI
 
-# --- Configuration ---
 $vraServer = "vra1.yourdomain.com"
 $apiVersion = "2020-08-25"
-$daysBack   = 30 
-$filterKeywords = @("Virtual Machine", "Database", "VM", "SQL", "Instance")
-
-# --- Output ---
-$timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-$outputCsv = "C:\Logs\vRA_Detailed_Specs_$timestamp.csv"
+$targetDeploymentName = "Your-VM-Name" # Leave empty to scan all deleted items
 
 # --- Setup & Auth ---
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-function Disable-SSLValidation {
-    if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
-        Add-Type "using System.Net; using System.Security.Cryptography.X509Certificates; public class TrustAllCertsPolicy : ICertificatePolicy { public bool CheckValidationResult(ServicePoint svcPoint, X509Certificate certificate, WebRequest request, int certificateProblem) { return true; } }"
-        [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
-    }
-}
-Disable-SSLValidation
-
-$credential = Get-Credential -Message "vRA Admin Credentials"
-$authBody = @{ username = $credential.UserName; password = $credential.GetNetworkCredential().Password } | ConvertTo-Json
+Disable-SSLValidation # (Function assumed from previous scripts)
 $authRes = Invoke-RestMethod -Uri "https://$vraServer/csp/gateway/am/api/login" -Method Post -Headers @{"Content-Type"="application/json"} -Body $authBody
 $vraHeaders = @{ "Authorization" = "Bearer $($authRes.cspAuthToken)"; "Content-Type" = "application/json" }
 
-# --- Processing ---
-Write-Host "Fetching Deployment Records..." -ForegroundColor Cyan
-$deployUri = "https://$vraServer/deployment/api/deployments?apiVersion=$apiVersion&deleted=true&`$top=1000"
-$allDeps = (Invoke-RestMethod -Uri $deployUri -Method Get -Headers $vraHeaders).content
+# 1. Get the Deleted Deployment ID
+$depUri = "https://$vraServer/deployment/api/deployments?apiVersion=$apiVersion&deleted=true&`$filter=name eq '$targetDeploymentName'"
+$dep = (Invoke-RestMethod -Uri $depUri -Method Get -Headers $vraHeaders).content[0]
 
-$cutoffDate = (Get-Date).AddDays(-$daysBack)
-$detailedResults = @()
+if (-not $dep) { Write-Error "Deployment not found"; return }
 
-foreach ($dep in $allDeps) {
-    # Filter for Deleted + Filter for Keywords (VM / Database)
-    if ($dep.status -notmatch "DELETE" -and $dep.status -ne "ARCHIVED") { continue }
+Write-Host "--- HISTORY FOR: $($dep.name) ---" -ForegroundColor Cyan
+
+# 2. Get REQUESTS (The "History" tab in GUI)
+# This shows: Who started it, what the inputs were, and the exact status of each step
+$reqUri = "https://$vraServer/deployment/api/deployments/$($dep.id)/requests?apiVersion=$apiVersion"
+$requests = (Invoke-RestMethod -Uri $reqUri -Method Get -Headers $vraHeaders).content
+
+foreach ($req in $requests) {
+    Write-Host "`n[Action: $($req.name)]" -ForegroundColor Yellow
+    Write-Host "  Requested By: $($req.requestedBy)"
+    Write-Host "  Status:       $($req.status)"
+    Write-Host "  Started:      $($req.createdAt)"
     
-    $nameMatch = $false
-    foreach ($k in $filterKeywords) { if ($dep.name -match $k) { $nameMatch = $true } }
-    if (-not $nameMatch) { continue }
-
-    Write-Host "Deep Scanning: $($dep.name)" -ForegroundColor Yellow
-
-    # STEP: Query the Resources endpoint for this specific deployment
-    # This is where the "Specifics" (CPU, RAM, IP) live.
-    $resourceSpecs = "N/A"
-    $ipAddresses = "N/A"
-    $hostName = "N/A"
+    # 3. Get EVENTS for this specific Request (The "Log" entries)
+    # This is the "terminal output" style info you see in the GUI
+    $eventUri = "https://$vraServer/deployment/api/requests/$($req.id)/events?apiVersion=$apiVersion"
+    $events = (Invoke-RestMethod -Uri $eventUri -Method Get -Headers $vraHeaders).content
     
-    try {
-        $resUri = "https://$vraServer/deployment/api/deployments/$($dep.id)/resources?apiVersion=$apiVersion"
-        $resources = (Invoke-RestMethod -Uri $resUri -Method Get -Headers $vraHeaders).content
-        
-        if ($resources) {
-            foreach ($res in $resources) {
-                # Look for properties inside the Virtual Machine or Database resource type
-                if ($res.type -match "Machine" -or $res.type -match "Database") {
-                    $props = $res.properties
-                    $cpu = if ($props.cpuCount) { $props.cpuCount } else { $props.vcpu }
-                    $ram = if ($props.totalMemoryMB) { $props.totalMemoryMB } else { $props.memoryInMB }
-                    
-                    $resourceSpecs = "CPU: $cpu, RAM: $ram MB"
-                    $ipAddresses = ($props.address) -join ", "
-                    $hostName = $props.resourceName
-                }
-            }
-        }
-    } catch {
-        # If resources are already purged, we stick with the metadata we have
-    }
-
-    $detailedResults += [PSCustomObject]@{
-        DeploymentName = $dep.name
-        DeletedBy      = $dep.lastUpdatedBy
-        DeletedAt      = $dep.lastUpdatedAt
-        ProjectID      = $dep.projectId
-        Owner          = $dep.ownedBy
-        # --- THE SPECIFICS ---
-        InternalName   = $hostName
-        IP_Addresses   = $ipAddresses
-        HardwareSpecs  = $resourceSpecs
-        ResourceType   = $dep.catalogItemId # Shows the template used
-        DeploymentID   = $dep.id
+    foreach ($evt in $events) {
+        $timestamp = $evt.timestamp
+        $message   = $evt.message
+        Write-Host "    > $timestamp : $message" -ForegroundColor Gray
     }
 }
-
-# --- Export ---
-$detailedResults | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
-Write-Host "Deep Scan Complete. Results: $outputCsv" -ForegroundColor Green
-$detailedResults | Select-Object DeploymentName, HardwareSpecs, IP_Addresses, DeletedBy -First 10 | Format-Table
