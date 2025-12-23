@@ -1,457 +1,139 @@
-# vRA Deleted Deployments - Using Deployment Events API
-# Retrieves deleted deployments and their detailed event logs
+# vRA Deleted Deployments - History & Resource Detail Extractor (FIXED)
+# Purpose: Retrieves deleted deployments and drills into History tab data.
 
 # Configuration
 $vraServer = "vra1.yourdomain.com"
 $daysBack = 7
-$apiVersion = "2020-08-25"  # API version for compatibility with archived records
+$apiVersion = "2020-08-25" 
 
-# FILTER CONFIGURATION
+# Filter: Only process deployments from these templates
 $filterTemplateNames = @("Virtual Machine", "Database")
 
-# Output
+# Output Paths
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-$outputJson = "C:\Logs\DeletedDeployments_$timestamp.json"
-$outputLog = "C:\Logs\DeletedDeployments_$timestamp.log"
-$outputCsv = "C:\Logs\DeletedDeployments_$timestamp.csv"
+$outputJson = "C:\Logs\vRA_FullHistory_$timestamp.json"
+$outputCsv  = "C:\Logs\vRA_FullHistory_$timestamp.csv"
+$outputLog  = "C:\Logs\vRA_FullHistory_$timestamp.log"
+
+# --- Functions ---
 
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $logMessage = "[$timestamp] [$Level] $Message"
-    
-    $color = switch ($Level) {
-        "ERROR" { "Red" }
-        "WARN" { "Yellow" }
-        "SUCCESS" { "Green" }
-        default { "Cyan" }
-    }
-    
+    $logTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logMessage = "[$logTime] [$Level] $Message"
+    $color = switch ($Level) { "ERROR" {"Red"} "WARN" {"Yellow"} "SUCCESS" {"Green"} default {"Cyan"} }
     Write-Host $logMessage -ForegroundColor $color
+    if (!(Test-Path (Split-Path $outputLog))) { New-Item -ItemType Directory -Path (Split-Path $outputLog) -Force }
     Add-Content -Path $outputLog -Value $logMessage
 }
 
 function Disable-SSLValidation {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
-        Add-Type @"
-using System.Net;
-using System.Security.Cryptography.X509Certificates;
-public class TrustAllCertsPolicy : ICertificatePolicy {
-    public bool CheckValidationResult(
-        ServicePoint svcPoint, X509Certificate certificate,
-        WebRequest request, int certificateProblem) {
-        return true;
-    }
-}
-"@
+        Add-Type "using System.Net; using System.Security.Cryptography.X509Certificates; public class TrustAllCertsPolicy : ICertificatePolicy { public bool CheckValidationResult(ServicePoint svcPoint, X509Certificate certificate, WebRequest request, int certificateProblem) { return true; } }"
         [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
     }
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 }
 
-Write-Log "===== vRA Deleted Deployments with Events API =====" "SUCCESS"
-Write-Log "Looking for deployments deleted in the past $daysBack days" "INFO"
-Write-Log "Using API Version: $apiVersion" "INFO"
+# --- Execution ---
+
+Write-Log "Starting Fixed vRA History Extraction..." "SUCCESS"
 Disable-SSLValidation
 
-# Ensure log directory exists
-$logDir = Split-Path $outputJson -Parent
-if (!(Test-Path $logDir)) {
-    New-Item -ItemType Directory -Path $logDir -Force | Out-Null
-}
-
-# Get credentials
-Write-Log "`nRequesting credentials..."
-$credential = Get-Credential -Message "Enter credentials for vRA"
-if (-not $credential) {
-    Write-Log "Credentials not provided. Exiting." "ERROR"
-    exit
-}
-$username = $credential.UserName
-$password = $credential.GetNetworkCredential().Password
-
-# Authenticate to vRA
-Write-Log "Authenticating to vRA: $vraServer"
+# Authentication
+$credential = Get-Credential -Message "Enter vRA Credentials"
+$vraAuthBody = @{ username = $credential.UserName; password = $credential.GetNetworkCredential().Password } | ConvertTo-Json
 try {
-    $vraAuthUri = "https://$vraServer/csp/gateway/am/api/login"
-    $vraAuthBody = @{
-        username = $username
-        password = $password
-    } | ConvertTo-Json
-    
-    $vraAuthHeaders = @{
-        "Content-Type" = "application/json"
-        "Accept" = "application/json"
-    }
-    
-    $vraAuthResponse = Invoke-RestMethod -Uri $vraAuthUri -Method Post -Headers $vraAuthHeaders -Body $vraAuthBody -ErrorAction Stop
-    $vraToken = $vraAuthResponse.cspAuthToken
-    Write-Log "Authenticated to vRA successfully" "SUCCESS"
-}
-catch {
-    Write-Log "Failed to authenticate to vRA: $($_.Exception.Message)" "ERROR"
-    exit
-}
-
-$vraHeaders = @{
-    "Authorization" = "Bearer $vraToken"
-    "Content-Type" = "application/json"
-    "Accept" = "application/json"
+    $authResponse = Invoke-RestMethod -Uri "https://$vraServer/csp/gateway/am/api/login" -Method Post -Headers @{"Content-Type"="application/json"} -Body $vraAuthBody
+    $vraHeaders = @{ "Authorization" = "Bearer $($authResponse.cspAuthToken)"; "Content-Type" = "application/json" }
+    Write-Log "Authenticated successfully." "SUCCESS"
+} catch {
+    Write-Log "Auth Failed: $($_.Exception.Message)" "ERROR"; exit
 }
 
 $cutoffDate = (Get-Date).AddDays(-$daysBack)
-$deletedDeploymentDetails = @()
+$historyData = @()
 
-# ===== STEP 1: Get all deployments with deleted status =====
-Write-Log "`n===== STEP 1: Querying Deployments API =====" "SUCCESS"
+# STEP 1: Get Deleted Deployments (Using the 'deleted' flag which is more reliable than status filters)
+Write-Log "Querying for deleted deployments..."
+try {
+    # We use 'deleted=true' and 'deleted eq true' variations to ensure we catch them
+    $uri = "https://$vraServer/deployment/api/deployments?apiVersion=$apiVersion&deleted=true&`$top=1000"
+    $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $vraHeaders
+    $uniqueDeployments = if ($response.content) { $response.content } else { $response }
+    Write-Log "Successfully retrieved $($uniqueDeployments.Count) deleted deployment records." "SUCCESS"
+} catch {
+    Write-Log "Primary query failed: $($_.Exception.Message). Trying status filter fallback..." "WARN"
+    # Fallback to status filter if the boolean flag isn't supported on your version
+    $uri = "https://$vraServer/deployment/api/deployments?apiVersion=$apiVersion&`$filter=(status eq 'DELETED' or status eq 'DELETE_SUCCESSFUL')&`$top=1000"
+    $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $vraHeaders
+    $uniqueDeployments = if ($response.content) { $response.content } else { $response }
+}
 
-$deletedStatuses = @("DELETED", "DELETE_SUCCESSFUL", "ARCHIVED")
-$allDeletedDeployments = @()
+if ($uniqueDeployments.Count -eq 0) {
+    Write-Log "No deleted deployments found in the system." "ERROR"; exit
+}
 
-foreach ($status in $deletedStatuses) {
-    Write-Log "`nTrying status filter: $status"
-    
+# STEP 2: Process History for each Deployment
+foreach ($dep in $uniqueDeployments) {
+    # Time Filter
+    if ($dep.lastUpdatedAt) {
+        $lastUpdate = [DateTime]$dep.lastUpdatedAt
+        if ($lastUpdate -lt $cutoffDate) { continue }
+    }
+
+    # Template Filter
+    $templateName = "Unknown"
     try {
-        $deployUri = "https://$vraServer/deployment/api/deployments?apiVersion=$apiVersion&`$filter=status eq '$status'&`$top=1000"
-        Write-Log "  URI: $deployUri"
-        
-        $response = Invoke-RestMethod -Uri $deployUri -Method Get -Headers $vraHeaders -ErrorAction Stop
-        $deployments = if ($response.content) { $response.content } else { $response }
-        
-        Write-Log "  Found $($deployments.Count) deployments with status '$status'" "SUCCESS"
-        
-        if ($deployments.Count -gt 0) {
-            $allDeletedDeployments += $deployments
+        if ($dep.blueprintId) {
+            $templateName = (Invoke-RestMethod -Uri "https://$vraServer/blueprint/api/blueprints/$($dep.blueprintId)?apiVersion=$apiVersion" -Headers $vraHeaders).name
+        } elseif ($dep.catalogItemId) {
+            $templateName = (Invoke-RestMethod -Uri "https://$vraServer/catalog/api/items/$($dep.catalogItemId)?apiVersion=$apiVersion" -Headers $vraHeaders).name
         }
-    }
-    catch {
-        Write-Log "  Failed to query status '$status': $($_.Exception.Message)" "WARN"
-    }
-}
+    } catch { $templateName = "Archived Template" }
 
-# Remove duplicates by ID
-$allDeletedDeployments = $allDeletedDeployments | Sort-Object -Property id -Unique
+    $match = $false
+    foreach($f in $filterTemplateNames) { if ($templateName -match $f) { $match = $true } }
+    if (-not $match) { continue }
 
-Write-Log "`nTotal unique deleted deployments found: $($allDeletedDeployments.Count)" "SUCCESS"
+    Write-Log "Processing: $($dep.name) (Template: $templateName)" "INFO"
 
-if ($allDeletedDeployments.Count -eq 0) {
-    Write-Log "No deleted deployments found. Exiting." "WARN"
-    exit
-}
-
-# ===== STEP 2: Get events and requests for each deleted deployment =====
-Write-Log "`n===== STEP 2: Retrieving Events for Each Deleted Deployment =====" "SUCCESS"
-
-$processedCount = 0
-
-foreach ($deployment in $allDeletedDeployments) {
-    $processedCount++
-    
-    # Check if within time range
-    $withinTimeRange = $true
-    if ($deployment.lastUpdatedAt) {
-        try {
-            $updateDate = [DateTime]$deployment.lastUpdatedAt
-            $withinTimeRange = ($updateDate -ge $cutoffDate)
-        } catch {}
-    }
-    
-    if (-not $withinTimeRange) {
-        Write-Log "`n[$processedCount/$($allDeletedDeployments.Count)] Skipping '$($deployment.name)' - outside time range" "WARN"
-        continue
-    }
-    
-    Write-Log "`n========================================" "SUCCESS"
-    Write-Log "[$processedCount/$($allDeletedDeployments.Count)] Processing Deployment" "SUCCESS"
-    Write-Log "========================================" "SUCCESS"
-    Write-Log "Name: $($deployment.name)"
-    Write-Log "ID: $($deployment.id)"
-    Write-Log "Status: $($deployment.status)"
-    Write-Log "Owner: $($deployment.ownedBy)"
-    Write-Log "Last Updated: $($deployment.lastUpdatedAt)"
-    
-    # Get template name
-    $templateName = $null
-    
-    if ($deployment.blueprintId) {
-        Write-Log "Blueprint ID: $($deployment.blueprintId)"
-        try {
-            $bpUri = "https://$vraServer/blueprint/api/blueprints/$($deployment.blueprintId)?apiVersion=$apiVersion"
-            $bp = Invoke-RestMethod -Uri $bpUri -Method Get -Headers $vraHeaders -ErrorAction Stop
-            $templateName = $bp.name
-            Write-Log "Blueprint Name: $templateName" "SUCCESS"
-        } catch {
-            Write-Log "Could not resolve blueprint name: $($_.Exception.Message)" "WARN"
-        }
-    }
-    
-    if ($deployment.catalogItemId) {
-        Write-Log "Catalog Item ID: $($deployment.catalogItemId)"
-        try {
-            $catUri = "https://$vraServer/catalog/api/items/$($deployment.catalogItemId)?apiVersion=$apiVersion"
-            $cat = Invoke-RestMethod -Uri $catUri -Method Get -Headers $vraHeaders -ErrorAction Stop
-            $templateName = $cat.name
-            Write-Log "Catalog Item Name: $templateName" "SUCCESS"
-        } catch {
-            Write-Log "Could not resolve catalog item name: $($_.Exception.Message)" "WARN"
-        }
-    }
-    
-    # Apply template filter
-    $matchesFilter = $false
-    if ($templateName) {
-        foreach ($filterName in $filterTemplateNames) {
-            if ($templateName -match $filterName) {
-                $matchesFilter = $true
-                Write-Log ">>> MATCHES FILTER: '$filterName' <<<" "SUCCESS"
-                break
-            }
-        }
-    } else {
-        Write-Log "Template name unknown - including anyway" "WARN"
-        $matchesFilter = $true
-    }
-    
-    if (-not $matchesFilter) {
-        Write-Log "Skipping: Template '$templateName' doesn't match filter" "WARN"
-        continue
-    }
-    
-    # Get deployment events (History tab data)
-    $deploymentEvents = $null
-    $parsedHistoryEvents = @()
-    Write-Log "`nFetching deployment events (History tab)..."
+    # STEP 3: Get Requests and Resources (The 'History' Data)
     try {
-        $eventsUri = "https://$vraServer/deployment/api/deployments/$($deployment.id)/events?apiVersion=$apiVersion"
-        Write-Log "  URI: $eventsUri"
-        
-        $eventsResponse = Invoke-RestMethod -Uri $eventsUri -Method Get -Headers $vraHeaders -ErrorAction Stop
-        $deploymentEvents = if ($eventsResponse.content) { $eventsResponse.content } else { $eventsResponse }
-        
-        Write-Log "  Retrieved $($deploymentEvents.Count) events from History" "SUCCESS"
-        
-        # Parse each event for timestamp, status, resource type, resource name, details
-        if ($deploymentEvents.Count -gt 0) {
-            Write-Log "`n  PARSING EVENT HISTORY:" "SUCCESS"
-            
-            foreach ($evt in $deploymentEvents) {
-                # Extract key fields
-                $historyEvent = [PSCustomObject]@{
-                    Timestamp = $evt.timestamp
-                    Status = $evt.eventType
-                    ResourceType = $evt.resourceType
-                    ResourceName = $evt.resourceName
-                    Details = $evt.message
-                    User = $evt.user
-                    EventId = $evt.id
-                }
-                
-                $parsedHistoryEvents += $historyEvent
-                
-                # Log if it's a delete-related event
-                if ($evt.eventType -match "DELETE" -or $evt.message -match "delete") {
-                    Write-Log "    [DELETE EVENT]" "SUCCESS"
-                    Write-Log "      Timestamp: $($evt.timestamp)"
-                    Write-Log "      Status: $($evt.eventType)"
-                    Write-Log "      Resource Type: $($evt.resourceType)"
-                    Write-Log "      Resource Name: $($evt.resourceName)"
-                    Write-Log "      Details: $($evt.message)"
-                    Write-Log "      User: $($evt.user)"
+        # Get the specific Delete Request
+        $reqUri = "https://$vraServer/deployment/api/deployments/$($dep.id)/requests?apiVersion=$apiVersion"
+        $requests = (Invoke-RestMethod -Uri $reqUri -Method Get -Headers $vraHeaders).content
+        $deleteReq = $requests | Where-Object { $_.actionId -match "DELETE" -or $_.name -match "Delete" } | Select-Object -First 1
+
+        if ($deleteReq) {
+            # Get the granular Resource Deletion details
+            $resUri = "https://$vraServer/deployment/api/requests/$($deleteReq.id)/resources?apiVersion=$apiVersion"
+            $resources = (Invoke-RestMethod -Uri $resUri -Method Get -Headers $vraHeaders).content
+
+            foreach ($res in $resources) {
+                $historyData += [PSCustomObject]@{
+                    Timestamp      = $deleteReq.completedAt
+                    DeploymentName = $dep.name
+                    ResourceName   = $res.name
+                    ResourceType   = $res.type
+                    Status         = $res.status
+                    User           = $deleteReq.requestedBy
+                    Template       = $templateName
+                    Details        = if ($res.provisioningStatus) { $res.provisioningStatus } else { "Deletion Successful" }
                 }
             }
         }
-        
-        # Find delete events
-        $deleteEvents = $deploymentEvents | Where-Object { 
-            $_.eventType -match "DELETE" -or $_.message -match "delete"
-        }
-        
-        Write-Log "  Found $($deleteEvents.Count) DELETE-related events" "SUCCESS"
+    } catch {
+        Write-Log "Details for $($dep.id) could not be retrieved (likely fully purged from DB)." "WARN"
     }
-    catch {
-        Write-Log "  Could not fetch events: $($_.Exception.Message)" "WARN"
-    }
-    
-    # Get deployment requests
-    $deploymentRequests = $null
-    $parsedRequestResources = @()
-    Write-Log "`nFetching deployment requests..."
-    try {
-        $requestsUri = "https://$vraServer/deployment/api/deployments/$($deployment.id)/requests?apiVersion=$apiVersion"
-        Write-Log "  URI: $requestsUri"
-        
-        $requestsResponse = Invoke-RestMethod -Uri $requestsUri -Method Get -Headers $vraHeaders -ErrorAction Stop
-        $deploymentRequests = if ($requestsResponse.content) { $requestsResponse.content } else { $requestsResponse }
-        
-        Write-Log "  Retrieved $($deploymentRequests.Count) requests" "SUCCESS"
-        
-        # Find delete requests
-        $deleteRequests = $deploymentRequests | Where-Object { 
-            $_.actionId -match "DELETE" -or $_.name -match "delete"
-        }
-        
-        if ($deleteRequests) {
-            Write-Log "`n  DELETE REQUESTS FOUND:" "SUCCESS"
-            foreach ($req in $deleteRequests) {
-                Write-Log "    Action ID: $($req.actionId)"
-                Write-Log "    Name: $($req.name)"
-                Write-Log "    Status: $($req.status)"
-                Write-Log "    Requested By: $($req.requestedBy)"
-                Write-Log "    Requested At: $($req.requestedAt)"
-                Write-Log "    Completed At: $($req.completedAt)"
-                
-                # NEW: Get granular Request Resources (this is the History tab data!)
-                Write-Log "`n    Fetching Request Resources (History details)..."
-                try {
-                    $resourceUri = "https://$vraServer/deployment/api/requests/$($req.id)/resources?apiVersion=$apiVersion"
-                    Write-Log "      URI: $resourceUri"
-                    
-                    $resourceResponse = Invoke-RestMethod -Uri $resourceUri -Method Get -Headers $vraHeaders -ErrorAction Stop
-                    $resourceDetails = if ($resourceResponse.content) { $resourceResponse.content } else { $resourceResponse }
-                    
-                    Write-Log "      Retrieved $($resourceDetails.Count) resource entries" "SUCCESS"
-                    
-                    # Parse each resource - these map to History tab columns
-                    foreach ($res in $resourceDetails) {
-                        $historyEntry = [PSCustomObject]@{
-                            Timestamp = $req.completedAt
-                            Status = $res.status
-                            ResourceType = $res.type
-                            ResourceName = $res.name
-                            Details = if ($res.provisioningStatus) { $res.provisioningStatus } else { $res.status }
-                            RequestId = $req.id
-                            RequestedBy = $req.requestedBy
-                            ActionId = $req.actionId
-                        }
-                        
-                        $parsedRequestResources += $historyEntry
-                        
-                        Write-Log "      Resource: $($res.name) [$($res.type)] - Status: $($res.status)" "SUCCESS"
-                        if ($res.provisioningStatus) {
-                            Write-Log "        Provisioning Status: $($res.provisioningStatus)"
-                        }
-                    }
-                } catch {
-                    Write-Log "      Could not fetch granular resource details for Request $($req.id): $($_.Exception.Message)" "WARN"
-                }
-            }
-        }
-    }
-    catch {
-        Write-Log "  Could not fetch requests: $($_.Exception.Message)" "WARN"
-    }
-    
-    # Create detailed output object
-    $deleteInfo = [PSCustomObject]@{
-        DeploymentId = $deployment.id
-        DeploymentName = $deployment.name
-        Status = $deployment.status
-        TemplateName = $templateName
-        BlueprintId = $deployment.blueprintId
-        CatalogItemId = $deployment.catalogItemId
-        Owner = $deployment.ownedBy
-        ProjectId = $deployment.projectId
-        OrgId = $deployment.orgId
-        LastUpdatedAt = $deployment.lastUpdatedAt
-        LastUpdatedBy = $deployment.lastUpdatedBy
-        CreatedAt = $deployment.createdAt
-        CreatedBy = $deployment.createdBy
-        
-        # Parsed History Events (Timestamp, Status, ResourceType, ResourceName, Details)
-        HistoryEvents = $parsedHistoryEvents
-        
-        # Full raw data
-        RawEvents = $deploymentEvents
-        RawRequests = $deploymentRequests
-        DeleteEvents = $deleteEvents
-        DeleteRequests = $deleteRequests
-        FullDeployment = $deployment
-    }
-    
-    $deletedDeploymentDetails += $deleteInfo
-    Write-Log "`n>>> ADDED TO OUTPUT <<<" "SUCCESS"
 }
 
-# ===== Summary and Export =====
-Write-Log "`n============================================" "SUCCESS"
-Write-Log "===== SUMMARY =====" "SUCCESS"
-Write-Log "============================================" "SUCCESS"
-Write-Log "Total deleted deployments processed: $processedCount"
-Write-Log "Deleted deployments matching filter: $($deletedDeploymentDetails.Count)" "SUCCESS"
-
-if ($deletedDeploymentDetails.Count -gt 0) {
-    # Export full JSON
-    $deletedDeploymentDetails | ConvertTo-Json -Depth 20 | Out-File -FilePath $outputJson -Encoding UTF8
-    Write-Log "Full JSON exported to: $outputJson" "SUCCESS"
-    
-    # Export CSV summary with History events
-    $csvData = @()
-    foreach ($item in $deletedDeploymentDetails) {
-        if ($item.HistoryEvents -and $item.HistoryEvents.Count -gt 0) {
-            # Create a row for each history event
-            foreach ($histEvent in $item.HistoryEvents) {
-                $csvData += [PSCustomObject]@{
-                    DeploymentName = $item.DeploymentName
-                    TemplateName = $item.TemplateName
-                    DeploymentOwner = $item.Owner
-                    EventTimestamp = $histEvent.Timestamp
-                    EventStatus = $histEvent.Status
-                    ResourceType = $histEvent.ResourceType
-                    ResourceName = $histEvent.ResourceName
-                    EventDetails = $histEvent.Details
-                    EventUser = $histEvent.User
-                }
-            }
-        } else {
-            # If no events, create single row with deployment info
-            $csvData += [PSCustomObject]@{
-                DeploymentName = $item.DeploymentName
-                TemplateName = $item.TemplateName
-                DeploymentOwner = $item.Owner
-                EventTimestamp = $item.LastUpdatedAt
-                EventStatus = $item.Status
-                ResourceType = "N/A"
-                ResourceName = "N/A"
-                EventDetails = "No event history available"
-                EventUser = $item.LastUpdatedBy
-            }
-        }
-    }
-    
-    $csvData | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
-    Write-Log "CSV summary exported to: $outputCsv" "SUCCESS"
-    
-    # Display summary table
-    Write-Log "`n=== DELETED DEPLOYMENTS WITH HISTORY EVENTS ===" "SUCCESS"
-    foreach ($item in $deletedDeploymentDetails) {
-        Write-Log "`n$($item.DeploymentName)" "SUCCESS"
-        Write-Log "  Template: $($item.TemplateName)"
-        Write-Log "  Status: $($item.Status)"
-        Write-Log "  Owner: $($item.Owner)"
-        Write-Log "  Deleted: $($item.LastUpdatedAt) by $($item.LastUpdatedBy)"
-        Write-Log "  History Events Retrieved: $($item.HistoryEvents.Count)" "SUCCESS"
-        
-        if ($item.HistoryEvents -and $item.HistoryEvents.Count -gt 0) {
-            Write-Log "`n  Event History (Timestamp | Status | ResourceType | ResourceName):"
-            foreach ($histEvt in $item.HistoryEvents) {
-                Write-Log "    $($histEvt.Timestamp) | $($histEvt.Status) | $($histEvt.ResourceType) | $($histEvt.ResourceName)"
-                if ($histEvt.Details) {
-                    Write-Log "      Details: $($histEvt.Details)"
-                }
-            }
-        }
-        
-        if ($item.DeleteRequests) {
-            $deleteReq = $item.DeleteRequests | Select-Object -First 1
-            Write-Log "`n  Delete Initiated By: $($deleteReq.requestedBy) at $($deleteReq.requestedAt)" "SUCCESS"
-        }
-    }
+# Export Results
+if ($historyData.Count -gt 0) {
+    $historyData | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
+    $historyData | ConvertTo-Json -Depth 10 | Out-File -FilePath $outputJson
+    Write-Log "Exported $($historyData.Count) history records." "SUCCESS"
+    Write-Log "CSV: $outputCsv"
+} else {
+    Write-Log "No matching history events found for the filtered templates." "WARN"
 }
-else {
-    Write-Log "`nNO MATCHING DELETED DEPLOYMENTS FOUND!" "WARN"
-}
-
-Write-Log "`n===== Script Completed =====" "SUCCESS"
-Write-Log "JSON Output: $outputJson"
-Write-Log "CSV Output: $outputCsv"
-Write-Log "Log file: $outputLog"
