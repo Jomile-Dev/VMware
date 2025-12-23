@@ -517,218 +517,444 @@ try {
         }
     }
     
-    # Query Aria Operations for new VMs with MAXIMUM error handling
-    Write-DebugLog "`n===== Querying Aria Operations for VMs =====" "INFO"
+    # Query Aria Operations for new VMs with EXTREME debugging
+    Write-DebugLog "`n===== QUERYING ARIA OPERATIONS - MAXIMUM DEBUG MODE =====" "INFO"
+    Write-DebugLog "Current timestamp: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')" "DEBUG"
     
-    $ariaInternalURL = "https://$ariaOpsServer/suite-api/api/resources?resourceKind=VirtualMachine"
-    Write-DebugLog "Target URL: $ariaInternalURL" "DEBUG"
-    Write-DebugLog "Authorization Header: $($ariaHeaders['Authorization'].Substring(0, 30))..." "DEBUG"
+    # Verify all variables exist before starting
+    Write-DebugLog "`n[PRE-CHECK] Verifying all required variables exist..." "INFO"
+    Write-DebugLog "  ariaOpsServer exists: $($null -ne $ariaOpsServer) | Value: $ariaOpsServer" "DEBUG"
+    Write-DebugLog "  ariaToken exists: $($null -ne $ariaToken) | Length: $($ariaToken.Length)" "DEBUG"
+    Write-DebugLog "  ariaToken first 30 chars: $($ariaToken.Substring(0, [Math]::Min(30, $ariaToken.Length)))" "DEBUG"
+    Write-DebugLog "  ariaHeaders exists: $($null -ne $ariaHeaders)" "DEBUG"
     
-    # Initialize response variables
-    $response = $null
-    $allResources = @()
-    
-    # Step 1: Try to get raw web response first
-    Write-DebugLog "`nStep 1: Getting raw HTTP response..." "INFO"
-    try {
-        $webResponse = Invoke-WebRequest -Uri $ariaInternalURL -Headers $ariaHeaders -Method Get -UseBasicParsing -ErrorAction Stop
-        
-        Write-DebugLog "✓ HTTP Status Code: $($webResponse.StatusCode)" "SUCCESS"
-        Write-DebugLog "✓ Content Type: $($webResponse.Headers.'Content-Type')" "DEBUG"
-        Write-DebugLog "✓ Content Length: $($webResponse.Content.Length) bytes" "DEBUG"
-        
-        if ($webResponse.Content.Length -eq 0) {
-            Write-DebugLog "✗ WARNING: Response content is empty (0 bytes)" "WARN"
-            Write-DebugLog "This usually means:" "WARN"
-            Write-DebugLog "  - No VMs exist in Aria Operations" "WARN"
-            Write-DebugLog "  - User doesn't have permission to see VMs" "WARN"
-            Write-DebugLog "  - Wrong resourceKind specified" "WARN"
-        }
-        else {
-            # Show preview of response
-            $preview = $webResponse.Content.Substring(0, [Math]::Min(1000, $webResponse.Content.Length))
-            Write-DebugLog "Response preview (first 1000 chars):" "DEBUG"
-            Write-DebugLog $preview "DEBUG"
-        }
-    }
-    catch {
-        Write-DebugLog "✗ HTTP Request failed!" "ERROR"
-        Write-DebugLog "Error Message: $($_.Exception.Message)" "ERROR"
-        
-        if ($_.Exception.Response) {
-            $statusCode = [int]$_.Exception.Response.StatusCode
-            Write-DebugLog "HTTP Status Code: $statusCode" "ERROR"
-            
-            switch ($statusCode) {
-                401 { Write-DebugLog "401 Unauthorized - Token may be invalid or expired" "ERROR" }
-                403 { Write-DebugLog "403 Forbidden - User lacks permissions to access this resource" "ERROR" }
-                404 { Write-DebugLog "404 Not Found - API endpoint may not exist in this Aria Ops version" "ERROR" }
-                500 { Write-DebugLog "500 Internal Server Error - Aria Operations API error" "ERROR" }
-                default { Write-DebugLog "Unexpected HTTP error code" "ERROR" }
-            }
-            
-            # Try to get error response body
-            try {
-                $errorStream = $_.Exception.Response.GetResponseStream()
-                $reader = New-Object System.IO.StreamReader($errorStream)
-                $errorBody = $reader.ReadToEnd()
-                $reader.Close()
-                Write-DebugLog "Error Response Body:" "ERROR"
-                Write-DebugLog $errorBody "ERROR"
-            }
-            catch {
-                Write-DebugLog "Could not read error response body" "ERROR"
-            }
-        }
-        
-        throw "HTTP request to Aria Operations failed: $($_.Exception.Message)"
-    }
-    
-    # Step 2: Parse JSON response
-    Write-DebugLog "`nStep 2: Parsing JSON response..." "INFO"
-    try {
-        $response = Invoke-RestMethod -Uri $ariaInternalURL -Headers $ariaHeaders -Method Get -ErrorAction Stop
-        
-        if ($null -eq $response) {
-            Write-DebugLog "✗ Invoke-RestMethod returned NULL" "ERROR"
-            Write-DebugLog "This is unusual - HTTP request succeeded but JSON parsing returned null" "ERROR"
-            throw "Null response from Invoke-RestMethod"
-        }
-        
-        Write-DebugLog "✓ JSON parsed successfully" "SUCCESS"
-        Write-DebugLog "Response object type: $($response.GetType().FullName)" "DEBUG"
-        
-    }
-    catch {
-        Write-DebugLog "✗ JSON parsing failed!" "ERROR"
-        Write-DebugLog "Error: $($_.Exception.Message)" "ERROR"
-        throw "Cannot parse JSON response from Aria Operations"
-    }
-    
-    # Step 3: Analyze response structure
-    Write-DebugLog "`nStep 3: Analyzing response structure..." "INFO"
-    
-    # Safety check - ensure response is not null before accessing properties
-    if ($null -eq $response) {
-        Write-DebugLog "✗ Response is NULL - cannot proceed" "ERROR"
-        throw "Response object is null"
-    }
-    
-    # Check what type of object we have
-    $responseType = $response.GetType().Name
-    Write-DebugLog "Response Type: $responseType" "DEBUG"
-    
-    # Check if it's an array
-    if ($response -is [Array]) {
-        Write-DebugLog "✓ Response is an ARRAY" "SUCCESS"
-        Write-DebugLog "Array length: $($response.Count)" "DEBUG"
-        $allResources = $response
-    }
-    # Check if it has PSObject properties (custom object)
-    elseif ($null -ne $response.PSObject -and $null -ne $response.PSObject.Properties) {
-        Write-DebugLog "✓ Response is a PSCustomObject" "SUCCESS"
-        
-        # Get all property names
-        $propertyNames = @()
-        foreach ($prop in $response.PSObject.Properties) {
-            $propertyNames += $prop.Name
-        }
-        
-        Write-DebugLog "Available properties: $($propertyNames -join ', ')" "DEBUG"
-        
-        # Try different common property names
-        $foundData = $false
-        
-        # Try 'resourceList'
-        if ($propertyNames -contains 'resourceList') {
-            Write-DebugLog "✓ Found 'resourceList' property" "SUCCESS"
-            $allResources = $response.resourceList
-            
-            if ($null -eq $allResources) {
-                Write-DebugLog "  WARNING: resourceList exists but is NULL" "WARN"
-                $allResources = @()
-            }
-            elseif ($allResources -is [Array]) {
-                Write-DebugLog "  resourceList contains $($allResources.Count) items" "DEBUG"
+    if ($null -ne $ariaHeaders) {
+        Write-DebugLog "  ariaHeaders type: $($ariaHeaders.GetType().Name)" "DEBUG"
+        Write-DebugLog "  ariaHeaders keys: $($ariaHeaders.Keys -join ', ')" "DEBUG"
+        foreach ($key in $ariaHeaders.Keys) {
+            $value = $ariaHeaders[$key]
+            if ($key -eq "Authorization") {
+                Write-DebugLog "    $key = $($value.Substring(0, [Math]::Min(50, $value.Length)))..." "DEBUG"
             }
             else {
-                Write-DebugLog "  resourceList is not an array: $($allResources.GetType().Name)" "WARN"
-                $allResources = @($allResources)
+                Write-DebugLog "    $key = $value" "DEBUG"
             }
-            $foundData = $true
-        }
-        
-        # Try 'resources'
-        if (-not $foundData -and $propertyNames -contains 'resources') {
-            Write-DebugLog "✓ Found 'resources' property" "SUCCESS"
-            $allResources = $response.resources
-            
-            if ($null -eq $allResources) {
-                Write-DebugLog "  WARNING: resources exists but is NULL" "WARN"
-                $allResources = @()
-            }
-            elseif ($allResources -is [Array]) {
-                Write-DebugLog "  resources contains $($allResources.Count) items" "DEBUG"
-            }
-            else {
-                Write-DebugLog "  resources is not an array: $($allResources.GetType().Name)" "WARN"
-                $allResources = @($allResources)
-            }
-            $foundData = $true
-        }
-        
-        # Try 'content' (common in paginated responses)
-        if (-not $foundData -and $propertyNames -contains 'content') {
-            Write-DebugLog "✓ Found 'content' property" "SUCCESS"
-            $allResources = $response.content
-            
-            if ($null -eq $allResources) {
-                Write-DebugLog "  WARNING: content exists but is NULL" "WARN"
-                $allResources = @()
-            }
-            elseif ($allResources -is [Array]) {
-                Write-DebugLog "  content contains $($allResources.Count) items" "DEBUG"
-            }
-            else {
-                Write-DebugLog "  content is not an array: $($allResources.GetType().Name)" "WARN"
-                $allResources = @($allResources)
-            }
-            $foundData = $true
-        }
-        
-        if (-not $foundData) {
-            Write-DebugLog "✗ Could not find resource data in any expected property!" "ERROR"
-            Write-DebugLog "Dumping full response structure..." "ERROR"
-            
-            try {
-                $jsonDump = $response | ConvertTo-Json -Depth 5
-                Write-DebugLog "Full JSON Response:" "ERROR"
-                Write-DebugLog $jsonDump "ERROR"
-            }
-            catch {
-                Write-DebugLog "Cannot convert response to JSON for debugging" "ERROR"
-            }
-            
-            throw "Cannot find VM resource data in response"
         }
     }
     else {
-        Write-DebugLog "✗ Response is neither Array nor PSCustomObject!" "ERROR"
-        Write-DebugLog "Response type: $responseType" "ERROR"
-        Write-DebugLog "Response value: $($response.ToString())" "ERROR"
-        throw "Unexpected response type from Aria Operations"
+        Write-DebugLog "  ERROR: ariaHeaders is NULL!" "ERROR"
+        throw "ariaHeaders variable is null"
+    }
+    
+    # Build URL
+    $ariaInternalURL = "https://$ariaOpsServer/suite-api/api/resources?resourceKind=VirtualMachine"
+    Write-DebugLog "`n[URL] Target URL built: $ariaInternalURL" "INFO"
+    Write-DebugLog "  URL Length: $($ariaInternalURL.Length)" "DEBUG"
+    
+    # Initialize ALL response variables with explicit null
+    Write-DebugLog "`n[INIT] Initializing response variables..." "DEBUG"
+    $webResponse = $null
+    $response = $null
+    $allResources = $null
+    Write-DebugLog "  webResponse initialized to null: $($null -eq $webResponse)" "DEBUG"
+    Write-DebugLog "  response initialized to null: $($null -eq $response)" "DEBUG"
+    Write-DebugLog "  allResources initialized to null: $($null -eq $allResources)" "DEBUG"
+    
+    # ========== STEP 1: RAW HTTP REQUEST ==========
+    Write-DebugLog "`n========== STEP 1: RAW HTTP REQUEST ==========" "INFO"
+    Write-DebugLog "Attempting Invoke-WebRequest..." "INFO"
+    Write-DebugLog "  Method: GET" "DEBUG"
+    Write-DebugLog "  URI: $ariaInternalURL" "DEBUG"
+    Write-DebugLog "  UseBasicParsing: True" "DEBUG"
+    
+    try {
+        Write-DebugLog "  [1.1] Calling Invoke-WebRequest..." "DEBUG"
+        
+        $webResponse = Invoke-WebRequest -Uri $ariaInternalURL -Headers $ariaHeaders -Method Get -UseBasicParsing -ErrorAction Stop
+        
+        Write-DebugLog "  [1.2] Invoke-WebRequest completed without exception" "SUCCESS"
+        Write-DebugLog "  [1.3] Checking if webResponse is null..." "DEBUG"
+        
+        if ($null -eq $webResponse) {
+            Write-DebugLog "  [1.3] CRITICAL: webResponse is NULL after Invoke-WebRequest!" "ERROR"
+            throw "Invoke-WebRequest returned null"
+        }
+        
+        Write-DebugLog "  [1.3] webResponse is NOT null" "SUCCESS"
+        Write-DebugLog "  [1.4] webResponse type: $($webResponse.GetType().FullName)" "DEBUG"
+        
+        Write-DebugLog "  [1.5] Checking webResponse.StatusCode..." "DEBUG"
+        if ($null -ne $webResponse.StatusCode) {
+            Write-DebugLog "  ✓ HTTP Status Code: $($webResponse.StatusCode)" "SUCCESS"
+        }
+        else {
+            Write-DebugLog "  ✗ StatusCode is null" "WARN"
+        }
+        
+        Write-DebugLog "  [1.6] Checking webResponse.Headers..." "DEBUG"
+        if ($null -ne $webResponse.Headers) {
+            Write-DebugLog "  ✓ Headers exist" "DEBUG"
+            if ($webResponse.Headers['Content-Type']) {
+                Write-DebugLog "    Content-Type: $($webResponse.Headers['Content-Type'])" "DEBUG"
+            }
+            if ($webResponse.Headers['Content-Length']) {
+                Write-DebugLog "    Content-Length: $($webResponse.Headers['Content-Length'])" "DEBUG"
+            }
+        }
+        else {
+            Write-DebugLog "  ✗ Headers is null" "WARN"
+        }
+        
+        Write-DebugLog "  [1.7] Checking webResponse.Content..." "DEBUG"
+        if ($null -eq $webResponse.Content) {
+            Write-DebugLog "  ✗ CRITICAL: Content is NULL!" "ERROR"
+            throw "WebResponse Content is null"
+        }
+        
+        Write-DebugLog "  ✓ Content exists" "SUCCESS"
+        Write-DebugLog "  Content type: $($webResponse.Content.GetType().Name)" "DEBUG"
+        Write-DebugLog "  Content length: $($webResponse.Content.Length) bytes" "DEBUG"
+        
+        if ($webResponse.Content.Length -eq 0) {
+            Write-DebugLog "  ✗ WARNING: Content length is ZERO!" "WARN"
+            Write-DebugLog "  This means the API returned an empty response" "WARN"
+            Write-DebugLog "  Possible causes:" "WARN"
+            Write-DebugLog "    - No VMs exist in Aria Operations" "WARN"
+            Write-DebugLog "    - User lacks permission to view VMs" "WARN"
+            Write-DebugLog "    - resourceKind=VirtualMachine doesn't match your environment" "WARN"
+        }
+        else {
+            Write-DebugLog "  ✓ Content has data" "SUCCESS"
+            
+            # Show content preview
+            $previewLength = [Math]::Min(2000, $webResponse.Content.Length)
+            $preview = $webResponse.Content.Substring(0, $previewLength)
+            Write-DebugLog "  [1.8] Content preview (first $previewLength chars):" "DEBUG"
+            Write-DebugLog "================================================================" "DEBUG"
+            Write-DebugLog $preview "DEBUG"
+            Write-DebugLog "================================================================" "DEBUG"
+            
+            if ($webResponse.Content.Length -gt 2000) {
+                Write-DebugLog "  (Content continues for $($webResponse.Content.Length - 2000) more bytes...)" "DEBUG"
+            }
+        }
+        
+        Write-DebugLog "  [1.9] Step 1 completed successfully" "SUCCESS"
+        
+    }
+    catch {
+        Write-DebugLog "  [1.ERROR] Invoke-WebRequest FAILED!" "ERROR"
+        Write-DebugLog "  Exception Type: $($_.Exception.GetType().FullName)" "ERROR"
+        Write-DebugLog "  Exception Message: $($_.Exception.Message)" "ERROR"
+        
+        if ($null -ne $_.Exception.InnerException) {
+            Write-DebugLog "  Inner Exception: $($_.Exception.InnerException.Message)" "ERROR"
+        }
+        
+        if ($null -ne $_.Exception.Response) {
+            Write-DebugLog "  Response object exists, checking status..." "ERROR"
+            
+            try {
+                $statusCode = [int]$_.Exception.Response.StatusCode
+                $statusDesc = $_.Exception.Response.StatusDescription
+                Write-DebugLog "  HTTP Status: $statusCode $statusDesc" "ERROR"
+                
+                switch ($statusCode) {
+                    401 { 
+                        Write-DebugLog "  >>> 401 UNAUTHORIZED <<<" "ERROR"
+                        Write-DebugLog "  Token is invalid, expired, or authentication failed" "ERROR"
+                        Write-DebugLog "  Check: Token format, expiration, user credentials" "ERROR"
+                    }
+                    403 { 
+                        Write-DebugLog "  >>> 403 FORBIDDEN <<<" "ERROR"
+                        Write-DebugLog "  User authenticated but lacks permissions" "ERROR"
+                        Write-DebugLog "  Check: User needs 'Read Only' or higher role in Aria Ops" "ERROR"
+                    }
+                    404 { 
+                        Write-DebugLog "  >>> 404 NOT FOUND <<<" "ERROR"
+                        Write-DebugLog "  API endpoint doesn't exist" "ERROR"
+                        Write-DebugLog "  Check: Aria Ops version, API path correctness" "ERROR"
+                    }
+                    500 { 
+                        Write-DebugLog "  >>> 500 INTERNAL SERVER ERROR <<<" "ERROR"
+                        Write-DebugLog "  Aria Operations had an internal error" "ERROR"
+                        Write-DebugLog "  Check: Aria Ops logs, system health" "ERROR"
+                    }
+                    default { 
+                        Write-DebugLog "  >>> HTTP ERROR $statusCode <<<" "ERROR"
+                    }
+                }
+                
+                # Try to read error response body
+                Write-DebugLog "  Attempting to read error response body..." "ERROR"
+                try {
+                    $errorStream = $_.Exception.Response.GetResponseStream()
+                    $reader = New-Object System.IO.StreamReader($errorStream)
+                    $errorBody = $reader.ReadToEnd()
+                    $reader.Close()
+                    
+                    if ($errorBody.Length -gt 0) {
+                        Write-DebugLog "  Error Response Body:" "ERROR"
+                        Write-DebugLog "================================================================" "ERROR"
+                        Write-DebugLog $errorBody "ERROR"
+                        Write-DebugLog "================================================================" "ERROR"
+                    }
+                    else {
+                        Write-DebugLog "  Error response body is empty" "ERROR"
+                    }
+                }
+                catch {
+                    Write-DebugLog "  Could not read error response: $($_.Exception.Message)" "ERROR"
+                }
+            }
+            catch {
+                Write-DebugLog "  Could not extract status code: $($_.Exception.Message)" "ERROR"
+            }
+        }
+        else {
+            Write-DebugLog "  No Response object in exception (network error?)" "ERROR"
+        }
+        
+        Write-DebugLog "  Stack Trace:" "ERROR"
+        Write-DebugLog $_.ScriptStackTrace "ERROR"
+        
+        throw "HTTP request failed at Step 1: $($_.Exception.Message)"
+    }
+    
+    # ========== STEP 2: PARSE JSON ==========
+    Write-DebugLog "`n========== STEP 2: PARSE JSON ==========" "INFO"
+    Write-DebugLog "Attempting to parse JSON with Invoke-RestMethod..." "INFO"
+    
+    try {
+        Write-DebugLog "  [2.1] Calling Invoke-RestMethod..." "DEBUG"
+        Write-DebugLog "    URI: $ariaInternalURL" "DEBUG"
+        Write-DebugLog "    Method: GET" "DEBUG"
+        
+        $response = Invoke-RestMethod -Uri $ariaInternalURL -Headers $ariaHeaders -Method Get -ErrorAction Stop
+        
+        Write-DebugLog "  [2.2] Invoke-RestMethod completed" "SUCCESS"
+        Write-DebugLog "  [2.3] Checking if response is null..." "DEBUG"
+        
+        if ($null -eq $response) {
+            Write-DebugLog "  [2.3] CRITICAL ERROR: response is NULL!" "ERROR"
+            Write-DebugLog "  This is very unusual - HTTP succeeded but JSON parsing returned null" "ERROR"
+            Write-DebugLog "  The server may have returned empty JSON or invalid format" "ERROR"
+            throw "Invoke-RestMethod returned null response"
+        }
+        
+        Write-DebugLog "  [2.3] ✓ response is NOT null" "SUCCESS"
+        Write-DebugLog "  [2.4] response type: $($response.GetType().FullName)" "DEBUG"
+        Write-DebugLog "  [2.5] response base type: $($response.GetType().BaseType.FullName)" "DEBUG"
+        
+        Write-DebugLog "  [2.6] Checking if response is an Array..." "DEBUG"
+        if ($response -is [Array]) {
+            Write-DebugLog "  [2.6] ✓ YES - Response IS an Array" "SUCCESS"
+            Write-DebugLog "    Array length: $($response.Count)" "DEBUG"
+            Write-DebugLog "    Array element type: $($response[0].GetType().Name)" "DEBUG"
+        }
+        else {
+            Write-DebugLog "  [2.6] NO - Response is NOT an Array" "DEBUG"
+        }
+        
+        Write-DebugLog "  [2.7] Checking response.PSObject..." "DEBUG"
+        if ($null -eq $response.PSObject) {
+            Write-DebugLog "  [2.7] response.PSObject is NULL" "WARN"
+        }
+        else {
+            Write-DebugLog "  [2.7] ✓ response.PSObject exists" "SUCCESS"
+            Write-DebugLog "  [2.8] Checking response.PSObject.Properties..." "DEBUG"
+            
+            if ($null -eq $response.PSObject.Properties) {
+                Write-DebugLog "  [2.8] response.PSObject.Properties is NULL" "WARN"
+            }
+            else {
+                Write-DebugLog "  [2.8] ✓ response.PSObject.Properties exists" "SUCCESS"
+                
+                # Get property names safely
+                $propertyNames = @()
+                Write-DebugLog "  [2.9] Enumerating properties..." "DEBUG"
+                
+                try {
+                    foreach ($prop in $response.PSObject.Properties) {
+                        if ($null -ne $prop -and $null -ne $prop.Name) {
+                            $propertyNames += $prop.Name
+                            Write-DebugLog "    Found property: $($prop.Name) | Type: $($prop.TypeNameOfValue)" "DEBUG"
+                        }
+                    }
+                }
+                catch {
+                    Write-DebugLog "  Error enumerating properties: $($_.Exception.Message)" "ERROR"
+                }
+                
+                Write-DebugLog "  [2.10] Total properties found: $($propertyNames.Count)" "DEBUG"
+                Write-DebugLog "  Property names: $($propertyNames -join ', ')" "SUCCESS"
+            }
+        }
+        
+        Write-DebugLog "  [2.11] Step 2 completed successfully" "SUCCESS"
+        
+    }
+    catch {
+        Write-DebugLog "  [2.ERROR] JSON Parsing FAILED!" "ERROR"
+        Write-DebugLog "  Exception: $($_.Exception.Message)" "ERROR"
+        Write-DebugLog "  Exception Type: $($_.Exception.GetType().FullName)" "ERROR"
+        
+        if ($null -ne $_.Exception.InnerException) {
+            Write-DebugLog "  Inner Exception: $($_.Exception.InnerException.Message)" "ERROR"
+        }
+        
+        Write-DebugLog "  Stack Trace:" "ERROR"
+        Write-DebugLog $_.ScriptStackTrace "ERROR"
+        
+        throw "JSON parsing failed at Step 2: $($_.Exception.Message)"
+    }
+    
+    # ========== STEP 3: EXTRACT RESOURCE DATA ==========
+    Write-DebugLog "`n========== STEP 3: EXTRACT RESOURCE DATA ==========" "INFO"
+    
+    Write-DebugLog "  [3.1] Final null check on response..." "DEBUG"
+    if ($null -eq $response) {
+        Write-DebugLog "  [3.1] FATAL: response became null!" "ERROR"
+        throw "Response is null at Step 3"
+    }
+    Write-DebugLog "  [3.1] ✓ response is still not null" "SUCCESS"
+    
+    Write-DebugLog "  [3.2] Determining response structure..." "INFO"
+    $allResources = @()
+    $dataFound = $false
+    
+    # Check if it's an array
+    Write-DebugLog "  [3.3] Testing if response is Array..." "DEBUG"
+    if ($response -is [Array]) {
+        Write-DebugLog "  [3.3] ✓ Response IS an Array" "SUCCESS"
+        $allResources = $response
+        $dataFound = $true
+        Write-DebugLog "    Array count: $($allResources.Count)" "DEBUG"
+    }
+    else {
+        Write-DebugLog "  [3.3] Response is NOT an Array, checking properties..." "DEBUG"
+        
+        # Try to access PSObject safely
+        Write-DebugLog "  [3.4] Safely accessing PSObject.Properties..." "DEBUG"
+        $propertyNames = @()
+        
+        try {
+            if ($null -ne $response.PSObject -and $null -ne $response.PSObject.Properties) {
+                foreach ($prop in $response.PSObject.Properties) {
+                    if ($null -ne $prop.Name) {
+                        $propertyNames += $prop.Name
+                    }
+                }
+                Write-DebugLog "  [3.4] ✓ Found $($propertyNames.Count) properties" "SUCCESS"
+            }
+            else {
+                Write-DebugLog "  [3.4] PSObject or Properties is null" "WARN"
+            }
+        }
+        catch {
+            Write-DebugLog "  [3.4] ERROR accessing properties: $($_.Exception.Message)" "ERROR"
+        }
+        
+        if ($propertyNames.Count -gt 0) {
+            Write-DebugLog "  [3.5] Available properties: $($propertyNames -join ', ')" "DEBUG"
+            
+            # Try each possible property name
+            $propertyChecks = @('resourceList', 'resources', 'content', 'data', 'items', 'results')
+            
+            foreach ($propName in $propertyChecks) {
+                Write-DebugLog "  [3.6] Checking for property '$propName'..." "DEBUG"
+                
+                if ($propertyNames -contains $propName) {
+                    Write-DebugLog "  [3.6] ✓ Property '$propName' EXISTS" "SUCCESS"
+                    
+                    try {
+                        Write-DebugLog "    [3.7] Attempting to access response.$propName..." "DEBUG"
+                        $propValue = $response.$propName
+                        
+                        if ($null -eq $propValue) {
+                            Write-DebugLog "    [3.7] Property '$propName' is NULL" "WARN"
+                        }
+                        else {
+                            Write-DebugLog "    [3.7] ✓ Property '$propName' has value" "SUCCESS"
+                            Write-DebugLog "      Type: $($propValue.GetType().Name)" "DEBUG"
+                            
+                            if ($propValue -is [Array]) {
+                                Write-DebugLog "      Is Array: YES" "DEBUG"
+                                Write-DebugLog "      Count: $($propValue.Count)" "DEBUG"
+                                $allResources = $propValue
+                                $dataFound = $true
+                                Write-DebugLog "    [3.8] ✓✓✓ FOUND DATA in '$propName'" "SUCCESS"
+                                break
+                            }
+                            else {
+                                Write-DebugLog "      Is Array: NO, converting to array" "DEBUG"
+                                $allResources = @($propValue)
+                                $dataFound = $true
+                                Write-DebugLog "    [3.8] ✓ FOUND DATA in '$propName' (converted to array)" "SUCCESS"
+                                break
+                            }
+                        }
+                    }
+                    catch {
+                        Write-DebugLog "    [3.7] ERROR accessing '$propName': $($_.Exception.Message)" "ERROR"
+                    }
+                }
+                else {
+                    Write-DebugLog "  [3.6] Property '$propName' does not exist" "DEBUG"
+                }
+            }
+        }
+        else {
+            Write-DebugLog "  [3.5] No properties found in response!" "ERROR"
+        }
     }
     
     # Final validation
+    Write-DebugLog "  [3.9] Final validation..." "INFO"
+    Write-DebugLog "    dataFound: $dataFound" "DEBUG"
+    Write-DebugLog "    allResources is null: $($null -eq $allResources)" "DEBUG"
+    
+    if ($null -ne $allResources) {
+        Write-DebugLog "    allResources type: $($allResources.GetType().Name)" "DEBUG"
+        if ($allResources -is [Array]) {
+            Write-DebugLog "    allResources count: $($allResources.Count)" "DEBUG"
+        }
+    }
+    
+    if (-not $dataFound) {
+        Write-DebugLog "  [3.9] ✗✗✗ FAILED TO FIND RESOURCE DATA!" "ERROR"
+        Write-DebugLog "  Could not locate VM data in any expected property" "ERROR"
+        Write-DebugLog "  Dumping full response for analysis..." "ERROR"
+        
+        try {
+            $fullJson = $response | ConvertTo-Json -Depth 10 -Compress
+            Write-DebugLog "================================================================" "ERROR"
+            Write-DebugLog "FULL RESPONSE JSON:" "ERROR"
+            Write-DebugLog $fullJson "ERROR"
+            Write-DebugLog "================================================================" "ERROR"
+        }
+        catch {
+            Write-DebugLog "  Cannot convert to JSON: $($_.Exception.Message)" "ERROR"
+            Write-DebugLog "  Response ToString(): $($response.ToString())" "ERROR"
+        }
+        
+        throw "Cannot locate resource data in Aria Operations response"
+    }
+    
     if ($null -eq $allResources) {
-        Write-DebugLog "✗ allResources is still NULL after parsing!" "ERROR"
+        Write-DebugLog "  [3.9] allResources is NULL, initializing to empty array" "WARN"
         $allResources = @()
     }
     
     if ($allResources -isnot [Array]) {
-        Write-DebugLog "WARNING: allResources is not an array, converting..." "WARN"
+        Write-DebugLog "  [3.10] allResources is not array, converting..." "WARN"
         $allResources = @($allResources)
     }
+    
+    Write-DebugLog "  [3.11] ✓✓✓ Step 3 completed successfully" "SUCCESS"
+    Write-DebugLog "  Final allResources count: $($allResources.Count)" "SUCCESS"
+            }
+
     
     # Filter for VMs created in timeframe and get identifiers
     $vmIdentifiers = $allResources | Where-Object { 
