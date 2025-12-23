@@ -1,10 +1,9 @@
-# vRA Deleted Deployments - All Deployments Analysis
-# Gets ALL deployments and analyzes their structure to find deleted ones
+# vRA Deleted Deployments - Fixed Version
+# Now correctly handles deployments deleted recently but created long ago
 
 # Configuration
 $vraServer = "vra1.yourdomain.com"
 $daysBack = 30
-$apiVersion = "2020-08-25"
 $filterTemplateNames = @("Virtual Machine", "Database")
 
 # Output
@@ -91,16 +90,19 @@ $cutoffDate = (Get-Date).AddDays(-$daysBack)
 
 # ===== Get ALL Deployments =====
 Write-Log "`n===== Fetching ALL Deployments =====" "SUCCESS"
+Write-Log "NOTE: Fetching ALL deployments - this may take a while..."
 
 $allDeployments = @()
 $pageSize = 200
 $skip = 0
 $totalFetched = 0
+$maxDeployments = 5000  # Safety limit
 
 try {
-    # Fetch deployments in pages
+    # Fetch deployments in pages - REMOVED early cutoff logic
     do {
-        $uri = "https://$vraServer/deployment/api/deployments?apiVersion=$apiVersion&`$top=$pageSize&`$skip=$skip&`$orderby=lastUpdatedAt desc"
+        # Removed apiVersion parameter - you can add it back if needed
+        $uri = "https://$vraServer/deployment/api/deployments?`$top=$pageSize&`$skip=$skip&`$orderby=lastUpdatedAt desc"
         Write-Log "Fetching deployments (skip=$skip, top=$pageSize)..."
         
         $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $vraHeaders -ErrorAction Stop
@@ -111,25 +113,14 @@ try {
             $totalFetched = $allDeployments.Count
             Write-Log "  Retrieved $($deployments.Count) deployments (Total: $totalFetched)" "SUCCESS"
             $skip += $pageSize
-            
-            # Check if we should continue (if last updated is before our cutoff)
-            $lastDeployment = $deployments[-1]
-            if ($lastDeployment.lastUpdatedAt) {
-                try {
-                    $lastUpdateDate = [DateTime]$lastDeployment.lastUpdatedAt
-                    if ($lastUpdateDate -lt $cutoffDate) {
-                        Write-Log "  Reached deployments older than cutoff date. Stopping." "SUCCESS"
-                        break
-                    }
-                } catch {}
-            }
         } else {
+            Write-Log "  No more deployments to fetch" "SUCCESS"
             break
         }
         
         # Safety limit
-        if ($totalFetched -ge 2000) {
-            Write-Log "  Reached safety limit of 2000 deployments" "WARN"
+        if ($totalFetched -ge $maxDeployments) {
+            Write-Log "  Reached safety limit of $maxDeployments deployments" "WARN"
             break
         }
         
@@ -165,12 +156,12 @@ if ($allDeployments.Count -gt 0) {
     
     # Look for any field that might indicate deletion
     Write-Log "`nSearching for deletion indicators..."
-    $possibleDeleteFields = @("deleted", "isDeleted", "deletedAt", "deletedBy", "destroyDate", "terminated")
+    $possibleDeleteFields = @("deleted", "isDeleted", "deletedAt", "deletedBy", "destroyDate", "terminated", "destroyedAt")
     
     foreach ($field in $possibleDeleteFields) {
         $hasField = $sample.PSObject.Properties | Where-Object { $_.Name -eq $field }
         if ($hasField) {
-            Write-Log "  Found field: $field" "SUCCESS"
+            Write-Log "  Found field: $field = $($sample.$field)" "SUCCESS"
         }
     }
 }
@@ -188,8 +179,10 @@ foreach ($dep in $allDeployments) {
     if ($dep.status) {
         foreach ($keyword in $statusKeywords) {
             if ($dep.status -match $keyword) {
-                $deletedDeployments += $dep
-                Write-Log "  Found: $($dep.name) - Status: $($dep.status)" "SUCCESS"
+                if ($deletedDeployments.id -notcontains $dep.id) {
+                    $deletedDeployments += $dep
+                    Write-Log "  Found: $($dep.name) - Status: $($dep.status)" "SUCCESS"
+                }
                 break
             }
         }
@@ -248,62 +241,89 @@ if ($deletedDeployments.Count -eq 0) {
 }
 
 # ===== Process Deleted Deployments =====
-Write-Log "`n===== Processing Deleted Deployments =====" "SUCCESS"
+Write-Log "`n===== Processing Deleted Deployments (Filtering by Date) =====" "SUCCESS"
 
 $finalResults = @()
 
 foreach ($dep in $deletedDeployments) {
-    # Check if within time range
-    $withinTimeRange = $true
-    if ($dep.lastUpdatedAt) {
-        try {
-            $updateDate = [DateTime]$dep.lastUpdatedAt
-            $withinTimeRange = ($updateDate -ge $cutoffDate)
-        } catch {}
-    }
-    
-    if (-not $withinTimeRange) {
-        continue
-    }
-    
     Write-Log "`nProcessing: $($dep.name)"
     Write-Log "  Status: $($dep.status)"
     Write-Log "  Last Updated: $($dep.lastUpdatedAt) by $($dep.lastUpdatedBy)"
+    
+    # FIXED: Check DELETION date, not general lastUpdatedAt
+    $deletionDate = $null
+    $withinTimeRange = $false
+    
+    # Try to find deletion timestamp
+    if ($dep.deletedAt) {
+        $deletionDate = $dep.deletedAt
+    } elseif ($dep.destroyedAt) {
+        $deletionDate = $dep.destroyedAt
+    } elseif ($dep.terminatedAt) {
+        $deletionDate = $dep.terminatedAt
+    } elseif ($dep.lastUpdatedAt -and $dep.status -match "delete|destroy|terminate") {
+        # If no explicit deletion timestamp, use lastUpdatedAt if status suggests deletion
+        $deletionDate = $dep.lastUpdatedAt
+    }
+    
+    if ($deletionDate) {
+        try {
+            $delDate = [DateTime]$deletionDate
+            $withinTimeRange = ($delDate -ge $cutoffDate)
+            Write-Log "  Deletion Date: $deletionDate (Within range: $withinTimeRange)"
+        } catch {
+            Write-Log "  Could not parse deletion date: $deletionDate" "WARN"
+        }
+    } else {
+        Write-Log "  No deletion timestamp found - including anyway" "WARN"
+        $withinTimeRange = $true  # Include if we can't determine date
+    }
+    
+    if (-not $withinTimeRange) {
+        Write-Log "  Skipping - deletion outside date range" "WARN"
+        continue
+    }
     
     # Get template name
     $templateName = "Unknown"
     
     if ($dep.catalogItemId) {
         try {
-            $catUri = "https://$vraServer/catalog/api/items/$($dep.catalogItemId)?apiVersion=$apiVersion"
+            $catUri = "https://$vraServer/catalog/api/items/$($dep.catalogItemId)"
             $cat = Invoke-RestMethod -Uri $catUri -Method Get -Headers $vraHeaders -ErrorAction Stop
             $templateName = $cat.name
             Write-Log "  Template: $templateName"
-        } catch {}
+        } catch {
+            Write-Log "  Could not fetch catalog item" "WARN"
+        }
     }
     
     if ($dep.blueprintId -and $templateName -eq "Unknown") {
         try {
-            $bpUri = "https://$vraServer/blueprint/api/blueprints/$($dep.blueprintId)?apiVersion=$apiVersion"
+            $bpUri = "https://$vraServer/blueprint/api/blueprints/$($dep.blueprintId)"
             $bp = Invoke-RestMethod -Uri $bpUri -Method Get -Headers $vraHeaders -ErrorAction Stop
             $templateName = $bp.name
             Write-Log "  Template: $templateName"
-        } catch {}
-    }
-    
-    # Apply template filter
-    $isMatch = $false
-    foreach ($f in $filterTemplateNames) {
-        if ($templateName -match $f) {
-            $isMatch = $true
-            Write-Log "  >>> MATCHES FILTER <<<" "SUCCESS"
-            break
+        } catch {
+            Write-Log "  Could not fetch blueprint" "WARN"
         }
     }
     
-    if (-not $isMatch) {
-        Write-Log "  Skipping - doesn't match filter" "WARN"
-        continue
+    # Apply template filter
+    if ($filterTemplateNames.Count -gt 0) {
+        $isMatch = $false
+        foreach ($f in $filterTemplateNames) {
+            if ($templateName -match $f) {
+                $isMatch = $true
+                Write-Log "  >>> MATCHES FILTER: $f <<<" "SUCCESS"
+                break
+            }
+        }
+        
+        if (-not $isMatch) {
+            Write-Log "  Skipping - doesn't match template filter" "WARN"
+            continue
+        }
     }
     
     # Determine deletion info
@@ -315,6 +335,8 @@ foreach ($dep in $deletedDeployments) {
     }
     if ($dep.deletedAt) {
         $deletedAt = $dep.deletedAt
+    } elseif ($dep.destroyedAt) {
+        $deletedAt = $dep.destroyedAt
     }
     
     $finalResults += [PSCustomObject]@{
@@ -357,6 +379,7 @@ if ($finalResults.Count -gt 0) {
         Write-Log "  Status: $($result.Status)"
         Write-Log "  Deleted By: $($result.DeletedBy)"
         Write-Log "  Deleted At: $($result.DeletedAt)"
+        Write-Log "  Created At: $($result.CreatedAt)"
         Write-Log "  Original Owner: $($result.Owner)"
     }
 }
