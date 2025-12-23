@@ -1,16 +1,17 @@
-# vRA Deep-Dive Deleted Deployment Extractor
-# This script pulls all available metadata for deleted items and resolves IDs to names.
+# vRA Deep-Dive: Specs, IPs, and Hardware for Deleted VMs/DBs
+# Targets: Virtual Machines and Databases specifically.
 
 # --- Configuration ---
 $vraServer = "vra1.yourdomain.com"
 $apiVersion = "2020-08-25"
-$daysBack   = 90 
+$daysBack   = 30 
+$filterKeywords = @("Virtual Machine", "Database", "VM", "SQL", "Instance")
 
-# --- Output Paths ---
+# --- Output ---
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-$outputCsv = "C:\Logs\vRA_Full_Deleted_Details_$timestamp.csv"
+$outputCsv = "C:\Logs\vRA_Detailed_Specs_$timestamp.csv"
 
-# --- 1. Setup & Authentication ---
+# --- Setup & Auth ---
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 function Disable-SSLValidation {
     if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
@@ -25,80 +26,68 @@ $authBody = @{ username = $credential.UserName; password = $credential.GetNetwor
 $authRes = Invoke-RestMethod -Uri "https://$vraServer/csp/gateway/am/api/login" -Method Post -Headers @{"Content-Type"="application/json"} -Body $authBody
 $vraHeaders = @{ "Authorization" = "Bearer $($authRes.cspAuthToken)"; "Content-Type" = "application/json" }
 
-# --- 2. Data Retrieval ---
-Write-Host "Fetching all deployment records (including deleted)..." -ForegroundColor Cyan
-$deployUri = "https://$vraServer/deployment/api/deployments?apiVersion=$apiVersion&deleted=true&`$top=2000"
-
-try {
-    $allDeps = (Invoke-RestMethod -Uri $deployUri -Method Get -Headers $vraHeaders).content
-} catch {
-    Write-Host "Failed to reach vRA: $($_.Exception.Message)" -ForegroundColor Red; exit
-}
+# --- Processing ---
+Write-Host "Fetching Deployment Records..." -ForegroundColor Cyan
+$deployUri = "https://$vraServer/deployment/api/deployments?apiVersion=$apiVersion&deleted=true&`$top=1000"
+$allDeps = (Invoke-RestMethod -Uri $deployUri -Method Get -Headers $vraHeaders).content
 
 $cutoffDate = (Get-Date).AddDays(-$daysBack)
-$results = @()
+$detailedResults = @()
 
-# Helpers for ID Resolution (Caching names to speed up the script)
-$projectCache = @{}
-$catalogCache = @{}
-
-# --- 3. Processing and Information Extraction ---
 foreach ($dep in $allDeps) {
-    # Only look at Deleted/Archived items within our time window
+    # Filter for Deleted + Filter for Keywords (VM / Database)
     if ($dep.status -notmatch "DELETE" -and $dep.status -ne "ARCHIVED") { continue }
-    if ($dep.lastUpdatedAt) {
-        if ([DateTime]$dep.lastUpdatedAt -lt $cutoffDate) { continue }
-    }
-
-    Write-Host "Extracting info for: $($dep.name)" -ForegroundColor Yellow
-
-    # Resolve Project Name
-    if ($dep.projectId -and -not $projectCache.ContainsKey($dep.projectId)) {
-        try {
-            $proj = Invoke-RestMethod -Uri "https://$vraServer/iaas/api/projects/$($dep.projectId)?apiVersion=$apiVersion" -Headers $vraHeaders
-            $projectCache[$dep.projectId] = $proj.name
-        } catch { $projectCache[$dep.projectId] = "Unknown Project (Deleted)" }
-    }
-
-    # Resolve Template (Catalog Item) Name
-    if ($dep.catalogItemId -and -not $catalogCache.ContainsKey($dep.catalogItemId)) {
-        try {
-            $cat = Invoke-RestMethod -Uri "https://$vraServer/catalog/api/items/$($dep.catalogItemId)?apiVersion=$apiVersion" -Headers $vraHeaders
-            $catalogCache[$dep.catalogItemId] = $cat.name
-        } catch { $catalogCache[$dep.catalogItemId] = "Unknown Template" }
-    }
-
-    # Capture EVERY piece of info vRA still holds
-    $results += [PSCustomObject]@{
-        DeploymentName    = $dep.name
-        Status            = $dep.status
-        DeletedBy         = $dep.lastUpdatedBy    # Who triggered the final state
-        DeletedAt         = $dep.lastUpdatedAt    # When it happened
-        ProjectName       = $projectCache[$dep.projectId]
-        TemplateName      = $catalogCache[$dep.catalogItemId]
-        OwnedBy           = $dep.ownedBy
-        CreatedBy         = $dep.createdBy
-        CreatedAt         = $dep.createdAt
-        DeploymentID      = $dep.id
-        OrgID             = $dep.orgId
-        ProjectID         = $dep.projectId
-        BlueprintID       = $dep.blueprintId
-        CatalogItemID     = $dep.catalogItemId
-        # Some versions store extra metadata in 'expense' or 'inputs'
-        TotalCostToDate   = if ($dep.expense) { $dep.expense.totalCost } else { "N/A" }
-        Description       = $dep.description
-    }
-}
-
-# --- 4. Export ---
-if ($results.Count -gt 0) {
-    $results | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
-    Write-Host "`nSUCCESS!" -ForegroundColor Green
-    Write-Host "Extracted information for $($results.Count) deleted deployments."
-    Write-Host "File saved to: $outputCsv"
     
-    # Show summary of the "Inside" info
-    $results | Select-Object DeploymentName, ProjectName, DeletedBy, Status -First 10 | Format-Table -AutoSize
-} else {
-    Write-Host "No deleted deployment info found for the last $daysBack days." -ForegroundColor Gray
+    $nameMatch = $false
+    foreach ($k in $filterKeywords) { if ($dep.name -match $k) { $nameMatch = $true } }
+    if (-not $nameMatch) { continue }
+
+    Write-Host "Deep Scanning: $($dep.name)" -ForegroundColor Yellow
+
+    # STEP: Query the Resources endpoint for this specific deployment
+    # This is where the "Specifics" (CPU, RAM, IP) live.
+    $resourceSpecs = "N/A"
+    $ipAddresses = "N/A"
+    $hostName = "N/A"
+    
+    try {
+        $resUri = "https://$vraServer/deployment/api/deployments/$($dep.id)/resources?apiVersion=$apiVersion"
+        $resources = (Invoke-RestMethod -Uri $resUri -Method Get -Headers $vraHeaders).content
+        
+        if ($resources) {
+            foreach ($res in $resources) {
+                # Look for properties inside the Virtual Machine or Database resource type
+                if ($res.type -match "Machine" -or $res.type -match "Database") {
+                    $props = $res.properties
+                    $cpu = if ($props.cpuCount) { $props.cpuCount } else { $props.vcpu }
+                    $ram = if ($props.totalMemoryMB) { $props.totalMemoryMB } else { $props.memoryInMB }
+                    
+                    $resourceSpecs = "CPU: $cpu, RAM: $ram MB"
+                    $ipAddresses = ($props.address) -join ", "
+                    $hostName = $props.resourceName
+                }
+            }
+        }
+    } catch {
+        # If resources are already purged, we stick with the metadata we have
+    }
+
+    $detailedResults += [PSCustomObject]@{
+        DeploymentName = $dep.name
+        DeletedBy      = $dep.lastUpdatedBy
+        DeletedAt      = $dep.lastUpdatedAt
+        ProjectID      = $dep.projectId
+        Owner          = $dep.ownedBy
+        # --- THE SPECIFICS ---
+        InternalName   = $hostName
+        IP_Addresses   = $ipAddresses
+        HardwareSpecs  = $resourceSpecs
+        ResourceType   = $dep.catalogItemId # Shows the template used
+        DeploymentID   = $dep.id
+    }
 }
+
+# --- Export ---
+$detailedResults | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
+Write-Host "Deep Scan Complete. Results: $outputCsv" -ForegroundColor Green
+$detailedResults | Select-Object DeploymentName, HardwareSpecs, IP_Addresses, DeletedBy -First 10 | Format-Table
