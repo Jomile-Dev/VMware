@@ -520,10 +520,35 @@ try {
     # Query Aria Operations for new VMs
     $ariaInternalURL = "https://$ariaOpsServer/suite-api/api/resources?resourceKind=VirtualMachine"
     Write-DebugLog "Querying for VMs: $ariaInternalURL" "DEBUG"
-    $response = Invoke-RestMethod -Uri $ariaInternalURL -Headers $ariaHeaders -Method Get
-    $vmIdentifiers = $response.resourceList | Where-Object { $_.creationTime -ge $yesterday } | Select-Object -ExpandProperty identifier
     
-    Write-DebugLog "Found $($vmIdentifiers.Count) VMs created in the last $daysBack day(s)"
+    $response = Invoke-RestMethod -Uri $ariaInternalURL -Headers $ariaHeaders -Method Get
+    
+    # Debug: Show response structure
+    Write-DebugLog "Response properties: $($response.PSObject.Properties.Name -join ', ')" "DEBUG"
+    
+    # Handle response - could be direct array or nested in resourceList
+    $allResources = $null
+    if ($response.resourceList) {
+        $allResources = $response.resourceList
+        Write-DebugLog "Found resourceList with $($allResources.Count) items" "DEBUG"
+    }
+    elseif ($response -is [Array]) {
+        $allResources = $response
+        Write-DebugLog "Response is direct array with $($allResources.Count) items" "DEBUG"
+    }
+    else {
+        Write-DebugLog "Unexpected response structure!" "ERROR"
+        Write-DebugLog "Response type: $($response.GetType().Name)" "ERROR"
+        throw "Cannot parse Aria Operations response"
+    }
+    
+    # Filter for VMs created in timeframe and get identifiers
+    $vmIdentifiers = $allResources | Where-Object { 
+        $_.creationTime -ge $yesterday 
+    } | Select-Object -ExpandProperty identifier
+    
+    Write-DebugLog "Total VMs in Aria Ops: $($allResources.Count)" "DEBUG"
+    Write-DebugLog "VMs created in the last $daysBack day(s): $($vmIdentifiers.Count)" "SUCCESS"
     
     # Get properties for each VM
     foreach ($identifier in $vmIdentifiers) {
