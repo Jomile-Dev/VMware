@@ -1,87 +1,63 @@
-# vRA Deleted Deployments - GUI History Matcher
-# Purpose: Replicates the GUI view of "Who deleted this and when"
+# vRA Global Request History Extractor
+# Purpose: Bypasses deployment-level API blocks by querying the Global Request Service
 
 # Configuration
 $vraServer = "vra1.yourdomain.com"
-$daysBack = 30 # Increased lookback to be safe
+$daysBack = 14
 $apiVersion = "2020-08-25" 
-
 $filterTemplateNames = @("Virtual Machine", "Database")
 
 # Output
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-$outputCsv  = "C:\Logs\vRA_DeletionHistory_$timestamp.csv"
-$outputLog  = "C:\Logs\vRA_DeletionHistory_$timestamp.log"
+$outputCsv  = "C:\Logs\vRA_GlobalDeleteHistory_$timestamp.csv"
 
-function Write-Log {
-    param([string]$Message, [string]$Level = "INFO")
-    $logMessage = "[$(Get-Date -Format 'HH:mm:ss')] [$Level] $Message"
-    $color = switch ($Level) { "ERROR" {"Red"} "WARN" {"Yellow"} "SUCCESS" {"Green"} default {"Cyan"} }
-    Write-Host $logMessage -ForegroundColor $color
-    Add-Content -Path $outputLog -Value $logMessage
-}
-
-# --- Auth & Init ---
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-# (SSL Bypass logic assumed or handled)
+# --- Authentication (Standard) ---
+Disable-SSLValidation
 $credential = Get-Credential
 $authBody = @{ username = $credential.UserName; password = $credential.GetNetworkCredential().Password } | ConvertTo-Json
 $authRes = Invoke-RestMethod -Uri "https://$vraServer/csp/gateway/am/api/login" -Method Post -Headers @{"Content-Type"="application/json"} -Body $authBody
 $vraHeaders = @{ "Authorization" = "Bearer $($authRes.cspAuthToken)"; "Content-Type" = "application/json" }
 
-$cutoffDate = (Get-Date).AddDays(-$daysBack)
-$finalResults = @()
+# STEP 1: Query the GLOBAL Request endpoint
+# This looks at EVERY request in the system, filtered by 'Delete' actions
+Write-Host "Querying Global Request Service for Delete actions..." -ForegroundColor Cyan
 
-# STEP 1: Get Deleted Deployments
-Write-Log "Fetching Deleted Deployments..."
-$uri = "https://$vraServer/deployment/api/deployments?apiVersion=$apiVersion&deleted=true&`$top=200"
-$deployments = (Invoke-RestMethod -Uri $uri -Method Get -Headers $vraHeaders).content
+$cutoffDate = (Get-Date).AddDays(-$daysBack).ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+$requestUri = "https://$vraServer/deployment/api/requests?apiVersion=$apiVersion&`$filter=(actionId eq 'Deployment.Delete' or actionId eq 'Cloud.AWS.EC2.Instance.Delete') and completedAt ge '$cutoffDate'&`$top=1000"
 
-Write-Log "Found $($deployments.Count) deleted deployments. Checking history..." "SUCCESS"
-
-foreach ($dep in $deployments) {
-    # Filter by Template Name
-    $templateName = "Unknown"
-    if ($dep.catalogItemId) {
-        try { $templateName = (Invoke-RestMethod -Uri "https://$vraServer/catalog/api/items/$($dep.catalogItemId)?apiVersion=$apiVersion" -Headers $vraHeaders).name } catch {}
-    }
-    
-    $isMatch = $false
-    foreach($f in $filterTemplateNames) { if ($templateName -match $f) { $isMatch = $true } }
-    if (-not $isMatch) { continue }
-
-    Write-Log "Checking History for: $($dep.name)"
-    
-    try {
-        # STEP 2: Get Requests for this deployment
-        # This is where the GUI "History" tab gets its data
-        $reqUri = "https://$vraServer/deployment/api/deployments/$($dep.id)/requests?apiVersion=$apiVersion"
-        $allReqs = (Invoke-RestMethod -Uri $reqUri -Method Get -Headers $vraHeaders).content
-        
-        # Filter for the DELETE action
-        $delReq = $allReqs | Where-Object { $_.actionId -match "delete" -or $_.name -match "Delete" } | Select-Object -First 1
-
-        if ($delReq) {
-            # Map the exact fields you see in the GUI
-            $finalResults += [PSCustomObject]@{
-                DeploymentName = $dep.name
-                Template       = $templateName
-                Status         = $delReq.status         # Usually 'SUCCESSFUL'
-                DeletedBy      = $delReq.requestedBy    # The "Who"
-                DeleteTime     = $delReq.completedAt    # The "When"
-                Action         = $delReq.name           # e.g. "Delete Deployment"
-                DeploymentId   = $dep.id
-                RequestID      = $delReq.id
-            }
-            Write-Log "Found Delete Request by $($delReq.requestedBy)" "SUCCESS"
-        } else {
-            Write-Log "Deployment $($dep.name) found, but no Delete Request record exists." "WARN"
-        }
-    } catch {
-        Write-Log "Could not access request history for $($dep.name)." "ERROR"
-    }
+try {
+    $allRequests = (Invoke-RestMethod -Uri $requestUri -Method Get -Headers $vraHeaders).content
+} catch {
+    Write-Host "Failed to query global requests: $($_.Exception.Message)" -ForegroundColor Red
+    exit
 }
 
-# Export
-$finalResults | Export-Csv -Path $outputCsv -NoTypeInformation
-Write-Log "Exported $($finalResults.Count) records to $outputCsv" "SUCCESS"
+$finalResults = @()
+
+# STEP 2: Match Requests to your Filters
+foreach ($req in $allRequests) {
+    Write-Host "Processing Request: $($req.name) for Deployment: $($req.deploymentName)" -ForegroundColor Yellow
+    
+    # Check if the deployment name or template matches your filter
+    # Note: Global requests usually contain the 'deploymentName' inside the object
+    $match = $false
+    foreach($f in $filterTemplateNames) {
+        if ($req.deploymentName -match $f -or $req.name -match $f) { $match = $true }
+    }
+
+    if ($match) {
+        # STEP 3: Drill into the Resources for this specific Request (The "History" Details)
+        $resDetails = "No granular details"
+        try {
+            $resUri = "https://$vraServer/deployment/api/requests/$($req.id)/resources?apiVersion=$apiVersion"
+            $resources = (Invoke-RestMethod -Uri $resUri -Method Get -Headers $vraHeaders).content
+            if ($resources) {
+                $resDetails = $resources | ForEach-Object { "$($_.name) [$($_.type)]: $($_.status)" } | Out-String
+            }
+        } catch { }
+
+        $finalResults += [PSCustomObject]@{
+            Timestamp      = $req.completedAt
+            DeploymentName = $req.deploymentName
+            Action         = $req.name
+            Status         = $req.status
