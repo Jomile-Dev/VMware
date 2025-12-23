@@ -1,75 +1,109 @@
-# vRA 8.18 API Diagnostic & Troubleshooting Tool
-# Purpose: Isolate exactly which part of the query causes the 400/404 Error.
+# vRA 8.18 Fixed History Tool
+# Uses the specific URL structure you found: /deployments/{id}/requests/{id}/events
 
 # --- Configuration ---
 $vraServer = "vra1.yourdomain.com"
-$credential = Get-Credential -Message "vRA Admin Credentials"
+$outputCsv = "D:\vRA_History_Report.csv"  # <--- Set your path here
+$daysBack  = 30
 
-# --- Setup & Auth (Standard) ---
+# --- Auth & Setup ---
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
     Add-Type "using System.Net; using System.Security.Cryptography.X509Certificates; public class TrustAllCertsPolicy : ICertificatePolicy { public bool CheckValidationResult(ServicePoint svcPoint, X509Certificate certificate, WebRequest request, int certificateProblem) { return true; } }"
     [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
 }
 
-Write-Host "--- TEST 1: Authentication ---" -ForegroundColor Cyan
+$credential = Get-Credential -Message "vRA Admin Credentials"
+$authBody = @{ username = $credential.UserName; password = $credential.GetNetworkCredential().Password } | ConvertTo-Json
 try {
-    $authBody = @{ username = $credential.UserName; password = $credential.GetNetworkCredential().Password } | ConvertTo-Json
     $authRes = Invoke-RestMethod -Uri "https://$vraServer/csp/gateway/am/api/login" -Method Post -Headers @{"Content-Type"="application/json"} -Body $authBody
-    $token = $authRes.cspAuthToken
-    $headers = @{ "Authorization" = "Bearer $token"; "Content-Type" = "application/json" }
-    Write-Host "PASS: Authentication successful." -ForegroundColor Green
+    $vraHeaders = @{ "Authorization" = "Bearer $($authRes.cspAuthToken)"; "Content-Type" = "application/json" }
+} catch { Write-Host "Login Failed" -ForegroundColor Red; exit }
+
+# --- Step 1: Find the "Delete" Actions ---
+# We must find the Request ID and Deployment ID first to build your URL
+Write-Host "Searching for 'Deployment.Delete' actions in the last $daysBack days..." -ForegroundColor Cyan
+
+$dateStr = (Get-Date).AddDays(-$daysBack).ToString("yyyy-MM-dd")
+# This filter is the most common point of failure for 400 errors. We keep it simple.
+$reqUri = "https://$vraServer/deployment/api/requests?apiVersion=2020-08-25&`$filter=(actionId eq 'Deployment.Delete') and (createdAt ge '$dateStr')&`$top=1000"
+
+try {
+    $requests = (Invoke-RestMethod -Uri $reqUri -Method Get -Headers $vraHeaders).content
 } catch {
-    Write-Host "FAIL: Auth failed. Message: $($_.Exception.Message)" -ForegroundColor Red; exit
+    Write-Host "Error finding requests: $($_.Exception.Message)" -ForegroundColor Red
+    exit
 }
 
-# --- TEST 2: Basic Connectivity (No Filters) ---
-# Does the endpoint even exist in vRA 8.18?
-Write-Host "`n--- TEST 2: Raw Endpoint Check (No Filters) ---" -ForegroundColor Cyan
-$uri2 = "https://$vraServer/deployment/api/requests?apiVersion=2020-08-25&`$top=1"
-try {
-    Write-Host "Hitting: $uri2" -ForegroundColor Gray
-    $res2 = Invoke-RestMethod -Uri $uri2 -Method Get -Headers $headers
-    if ($res2.content.Count -ge 0) { Write-Host "PASS: Endpoint exists and returns data." -ForegroundColor Green }
-} catch {
-    Write-Host "FAIL: Endpoint dead or moved. Status: $($_.Exception.Message)" -ForegroundColor Red
+Write-Host "Found $($requests.Count) delete requests. Retrieving events using your URL structure..." -ForegroundColor Yellow
+
+$results = @()
+
+# --- Step 2: Loop and Hit Your Specific URL ---
+foreach ($req in $requests) {
+    
+    # We need both IDs for your URL
+    $depId = $req.deploymentId
+    $reqId = $req.id
+    
+    # Optional: Skip if Deployment ID is missing (can happen on failed initial requests)
+    if (-not $depId) { continue }
+
+    Write-Host "Fetching Events for: $($req.deploymentName)" -ForegroundColor Gray
+
+    # --- YOUR SPECIFIC URL FIX ---
+    # This matches the pattern you provided:
+    # /deployment/api/deployments/{deploymentId}/requests/{requestId}/events
+    # We include your parameters: page=0, size=50, deleted=true
+    $eventUri = "https://$vraServer/deployment/api/deployments/$depId/requests/$reqId/events?page=0&size=50&deleted=true&apiVersion=2020-08-25"
+
+    try {
+        $events = (Invoke-RestMethod -Uri $eventUri -Method Get -Headers $vraHeaders).content
+        
+        # If events are found, add them to our list
+        if ($events) {
+            foreach ($evt in $events) {
+                $results += [PSCustomObject]@{
+                    DeploymentName   = $req.deploymentName
+                    RequestedBy      = $req.requestedBy
+                    RequestStatus    = $req.status
+                    # Event Details
+                    EventTimestamp   = $evt.timestamp
+                    ResourceType     = $evt.resourceType # (e.g., Cloud.vSphere.Machine)
+                    EventStatus      = $evt.status       # (e.g., DELETE_FINISHED)
+                    Message          = $evt.message
+                    DeploymentID     = $depId
+                    RequestID        = $reqId
+                }
+            }
+        } else {
+            # Log it even if events are empty so you know it was checked
+            $results += [PSCustomObject]@{
+                DeploymentName   = $req.deploymentName
+                RequestedBy      = $req.requestedBy
+                RequestStatus    = $req.status
+                EventTimestamp   = "N/A"
+                ResourceType     = "No Events Returned"
+                EventStatus      = "N/A"
+                Message          = "Likely purged"
+                DeploymentID     = $depId
+                RequestID        = $reqId
+            }
+        }
+    } catch {
+        # If this specific URL fails (404/400), we log the error in the CSV
+        $err = $_.Exception.Message
+        $results += [PSCustomObject]@{
+            DeploymentName = $req.deploymentName
+            Message        = "API Error: $err"
+        }
+    }
 }
 
-# --- TEST 3: Simple Filter (Action ID) ---
-# Testing if 'actionId' is the valid field name in 8.18
-Write-Host "`n--- TEST 3: Filtering by Action ID ---" -ForegroundColor Cyan
-$uri3 = "https://$vraServer/deployment/api/requests?apiVersion=2020-08-25&`$filter=actionId eq 'Deployment.Delete'"
-try {
-    Write-Host "Hitting: $uri3" -ForegroundColor Gray
-    $res3 = Invoke-RestMethod -Uri $uri3 -Method Get -Headers $headers
-    Write-Host "PASS: Filter syntax 'actionId' is VALID. Found $($res3.content.Count) items." -ForegroundColor Green
-} catch {
-    Write-Host "FAIL: 'actionId' filter rejected. vRA 8.18 might use 'name' or 'blueprintId' instead here. Error: $($_.Exception.Message)" -ForegroundColor Red
-}
-
-# --- TEST 4: Date Filter Syntax ---
-# OData date filters are the #1 cause of 400 Bad Requests
-Write-Host "`n--- TEST 4: Date Filter Check ---" -ForegroundColor Cyan
-$dateStr = (Get-Date).AddDays(-1).ToString("yyyy-MM-dd")
-# Try simplified date format first
-$uri4 = "https://$vraServer/deployment/api/requests?apiVersion=2020-08-25&`$filter=createdAt ge '$dateStr'"
-try {
-    Write-Host "Hitting: $uri4" -ForegroundColor Gray
-    $res4 = Invoke-RestMethod -Uri $uri4 -Method Get -Headers $headers
-    Write-Host "PASS: Date filter syntax is valid." -ForegroundColor Green
-} catch {
-    Write-Host "FAIL: Date syntax rejected. Error: $($_.Exception.Message)" -ForegroundColor Red
-    Write-Host "Troubleshoot: Try using full ISO format (yyyy-MM-ddTHH:mm:ss.000Z) or check if field is 'requestedAt' instead of 'createdAt'." -ForegroundColor Yellow
-}
-
-# --- TEST 5: The "All-In" Query (Combining them) ---
-Write-Host "`n--- TEST 5: Combined Query (The one that was failing) ---" -ForegroundColor Cyan
-$uri5 = "https://$vraServer/deployment/api/requests?apiVersion=2020-08-25&`$filter=(actionId eq 'Deployment.Delete') and (createdAt ge '$dateStr')"
-try {
-    Write-Host "Hitting: $uri5" -ForegroundColor Gray
-    $res5 = Invoke-RestMethod -Uri $uri5 -Method Get -Headers $headers
-    Write-Host "PASS: Combined query works!" -ForegroundColor Green
-} catch {
-    Write-Host "FAIL: Combined query failed. It's likely the 'and' operator or parentheses spacing." -ForegroundColor Red
-    Write-Host "Error Details: $($_.Exception.Response.GetResponseStream() | %{ $_.ReadToEnd() })" -ForegroundColor Yellow
+# --- Step 3: Save File ---
+if ($results.Count -gt 0) {
+    $results | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
+    Write-Host "Done. File saved to: $outputCsv" -ForegroundColor Green
+} else {
+    Write-Host "No data found." -ForegroundColor Red
 }
