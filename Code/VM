@@ -1,391 +1,85 @@
-# vRA Deleted Deployments - Fixed Version
-# Now correctly handles deployments deleted recently but created long ago
+# vRA Total Deleted Deployment Extractor
+# This script bypasses API filters to pull all available deleted metadata.
 
-# Configuration
+# --- Configuration ---
 $vraServer = "vra1.yourdomain.com"
-$daysBack = 30
-$filterTemplateNames = @("Virtual Machine", "Database")
+$apiVersion = "2020-08-25"
+$daysBack = 90  # How far back to look in the local filter
 
-# Output
+# --- Output ---
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-$outputCsv = "C:\Logs\vRA_DeletionHistory_$timestamp.csv"
-$outputLog = "C:\Logs\vRA_DeletionHistory_$timestamp.log"
-$outputJson = "C:\Logs\vRA_AllDeployments_$timestamp.json"
+$outputCsv = "C:\Logs\vRA_All_Deleted_Deployments_$timestamp.csv"
 
-function Write-Log {
-    param([string]$Message, [string]$Level = "INFO")
-    $logTimestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $logMessage = "[$logTimestamp] [$Level] $Message"
-    
-    $color = switch ($Level) {
-        "ERROR" { "Red" }
-        "WARN" { "Yellow" }
-        "SUCCESS" { "Green" }
-        default { "Cyan" }
-    }
-    
-    Write-Host $logMessage -ForegroundColor $color
-    Add-Content -Path $outputLog -Value $logMessage
-}
-
+# --- Setup & Auth ---
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 function Disable-SSLValidation {
     if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
-        Add-Type @"
-using System.Net;
-using System.Security.Cryptography.X509Certificates;
-public class TrustAllCertsPolicy : ICertificatePolicy {
-    public bool CheckValidationResult(
-        ServicePoint svcPoint, X509Certificate certificate,
-        WebRequest request, int certificateProblem) {
-        return true;
-    }
-}
-"@
+        Add-Type "using System.Net; using System.Security.Cryptography.X509Certificates; public class TrustAllCertsPolicy : ICertificatePolicy { public bool CheckValidationResult(ServicePoint svcPoint, X509Certificate certificate, WebRequest request, int certificateProblem) { return true; } }"
         [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
     }
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 }
-
-Write-Log "===== vRA Deleted Deployments - Full Analysis =====" "SUCCESS"
 Disable-SSLValidation
 
-# Ensure log directory exists
-$logDir = Split-Path $outputLog -Parent
-if (!(Test-Path $logDir)) {
-    New-Item -ItemType Directory -Path $logDir -Force | Out-Null
-}
+$credential = Get-Credential -Message "Enter vRA Admin Credentials"
+$authBody = @{ username = $credential.UserName; password = $credential.GetNetworkCredential().Password } | ConvertTo-Json
+$authRes = Invoke-RestMethod -Uri "https://$vraServer/csp/gateway/am/api/login" -Method Post -Headers @{"Content-Type"="application/json"} -Body $authBody
+$vraHeaders = @{ "Authorization" = "Bearer $($authRes.cspAuthToken)"; "Content-Type" = "application/json" }
 
-# Get credentials
-Write-Log "`nRequesting credentials..."
-$credential = Get-Credential -Message "Enter credentials for vRA"
-if (-not $credential) {
-    Write-Log "Credentials not provided. Exiting." "ERROR"
-    exit
-}
+# STEP 1: Get ALL deployments (including deleted/archived metadata)
+Write-Host "Querying vRA for all deployment records..." -ForegroundColor Cyan
+# We use 'deleted=true' to tell vRA to include the 'tombstone' records in the response
+$deployUri = "https://$vraServer/deployment/api/deployments?apiVersion=$apiVersion&deleted=true&`$top=1000"
 
-# Authenticate
-Write-Log "Authenticating to vRA: $vraServer"
 try {
-    $authBody = @{
-        username = $credential.UserName
-        password = $credential.GetNetworkCredential().Password
-    } | ConvertTo-Json
-    
-    $authRes = Invoke-RestMethod -Uri "https://$vraServer/csp/gateway/am/api/login" `
-        -Method Post -Headers @{"Content-Type"="application/json"} -Body $authBody -ErrorAction Stop
-    
-    $vraHeaders = @{
-        "Authorization" = "Bearer $($authRes.cspAuthToken)"
-        "Content-Type" = "application/json"
-        "Accept" = "application/json"
-    }
-    Write-Log "Authenticated successfully" "SUCCESS"
-}
-catch {
-    Write-Log "Authentication failed: $($_.Exception.Message)" "ERROR"
+    $response = Invoke-RestMethod -Uri $deployUri -Method Get -Headers $vraHeaders
+    $allDeps = $response.content
+} catch {
+    Write-Host "Error: Could not retrieve deployment list. $($_.Exception.Message)" -ForegroundColor Red
     exit
 }
 
+# STEP 2: Filter for Deleted Items and Extract Details
+Write-Host "Filtering $($allDeps.Count) records for DELETED status..." -ForegroundColor Yellow
 $cutoffDate = (Get-Date).AddDays(-$daysBack)
+$deletedList = @()
 
-# ===== Get ALL Deployments =====
-Write-Log "`n===== Fetching ALL Deployments =====" "SUCCESS"
-Write-Log "NOTE: Fetching ALL deployments - this may take a while..."
-
-$allDeployments = @()
-$pageSize = 200
-$skip = 0
-$totalFetched = 0
-$maxDeployments = 5000  # Safety limit
-
-try {
-    # Fetch deployments in pages - REMOVED early cutoff logic
-    do {
-        # Removed apiVersion parameter - you can add it back if needed
-        $uri = "https://$vraServer/deployment/api/deployments?`$top=$pageSize&`$skip=$skip&`$orderby=lastUpdatedAt desc"
-        Write-Log "Fetching deployments (skip=$skip, top=$pageSize)..."
-        
-        $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $vraHeaders -ErrorAction Stop
-        $deployments = if ($response.content) { $response.content } else { $response }
-        
-        if ($deployments.Count -gt 0) {
-            $allDeployments += $deployments
-            $totalFetched = $allDeployments.Count
-            Write-Log "  Retrieved $($deployments.Count) deployments (Total: $totalFetched)" "SUCCESS"
-            $skip += $pageSize
-        } else {
-            Write-Log "  No more deployments to fetch" "SUCCESS"
-            break
+foreach ($dep in $allDeps) {
+    # We look for any status that indicates the VM is gone
+    $isDeleted = $dep.status -match "DELETE" -or $dep.status -eq "ARCHIVED"
+    
+    if ($isDeleted) {
+        # Filter by date if needed
+        if ($dep.lastUpdatedAt) {
+            $lastUpdate = [DateTime]$dep.lastUpdatedAt
+            if ($lastUpdate -lt $cutoffDate) { continue }
         }
-        
-        # Safety limit
-        if ($totalFetched -ge $maxDeployments) {
-            Write-Log "  Reached safety limit of $maxDeployments deployments" "WARN"
-            break
-        }
-        
-    } while ($deployments.Count -eq $pageSize)
-    
-    Write-Log "`nTotal deployments retrieved: $($allDeployments.Count)" "SUCCESS"
-}
-catch {
-    Write-Log "Error fetching deployments: $($_.Exception.Message)" "ERROR"
-    exit
-}
 
-# ===== Analyze Deployment Structure =====
-Write-Log "`n===== Analyzing Deployment Structure =====" "SUCCESS"
-
-if ($allDeployments.Count -gt 0) {
-    Write-Log "`nSample deployment fields (first deployment):"
-    $sample = $allDeployments[0]
-    $sample.PSObject.Properties | ForEach-Object {
-        if ($_.Value -is [string] -or $_.Value -is [int] -or $_.Value -is [bool] -or $null -eq $_.Value) {
-            Write-Log "  $($_.Name) = $($_.Value)"
-        } else {
-            Write-Log "  $($_.Name) = [Complex: $($_.Value.GetType().Name)]"
-        }
-    }
-    
-    # Analyze status values
-    Write-Log "`nStatus value distribution:"
-    $statusGroups = $allDeployments | Group-Object -Property status | Sort-Object Count -Descending
-    foreach ($group in $statusGroups) {
-        Write-Log "  '$($group.Name)': $($group.Count) deployments"
-    }
-    
-    # Look for any field that might indicate deletion
-    Write-Log "`nSearching for deletion indicators..."
-    $possibleDeleteFields = @("deleted", "isDeleted", "deletedAt", "deletedBy", "destroyDate", "terminated", "destroyedAt")
-    
-    foreach ($field in $possibleDeleteFields) {
-        $hasField = $sample.PSObject.Properties | Where-Object { $_.Name -eq $field }
-        if ($hasField) {
-            Write-Log "  Found field: $field = $($sample.$field)" "SUCCESS"
+        # Create a clean object with every available detail
+        $deletedList += [PSCustomObject]@{
+            DeploymentName = $dep.name
+            Status         = $dep.status
+            DeletedDate    = $dep.lastUpdatedAt
+            DeletedBy      = $dep.lastUpdatedBy  # This is usually the user who triggered delete
+            OwnedBy        = $dep.ownedBy
+            Project        = $dep.projectId
+            DeploymentID   = $dep.id
+            BlueprintID    = $dep.blueprintId
+            CatalogItemID  = $dep.catalogItemId
+            Description    = $dep.description
+            CreatedDate    = $dep.createdAt
+            CreatedBy      = $dep.createdBy
         }
     }
 }
 
-# ===== Find Potential Deleted Deployments =====
-Write-Log "`n===== Identifying Deleted Deployments =====" "SUCCESS"
-
-$deletedDeployments = @()
-
-# Strategy 1: Look for status containing "delete", "destroy", "archive", "terminate"
-Write-Log "`nStrategy 1: Status keyword matching"
-$statusKeywords = @("delete", "destroy", "archive", "terminate", "removed")
-
-foreach ($dep in $allDeployments) {
-    if ($dep.status) {
-        foreach ($keyword in $statusKeywords) {
-            if ($dep.status -match $keyword) {
-                if ($deletedDeployments.id -notcontains $dep.id) {
-                    $deletedDeployments += $dep
-                    Write-Log "  Found: $($dep.name) - Status: $($dep.status)" "SUCCESS"
-                }
-                break
-            }
-        }
-    }
+# STEP 3: Export to CSV
+if ($deletedList.Count -gt 0) {
+    $deletedList | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
+    Write-Host "SUCCESS: Found $($deletedList.Count) deleted deployments." -ForegroundColor Green
+    Write-Host "Results saved to: $outputCsv" -ForegroundColor White
+    
+    # Show a quick preview in the console
+    $deletedList | Select-Object DeploymentName, DeletedBy, DeletedDate -First 10 | Format-Table
+} else {
+    Write-Host "No deleted deployments found in the last $daysBack days." -ForegroundColor Gray
 }
-
-Write-Log "  Found $($deletedDeployments.Count) deployments with delete-related status"
-
-# Strategy 2: Look for deployments with deleted=true or isDeleted=true property
-Write-Log "`nStrategy 2: Deleted flag checking"
-$flagDeleted = $allDeployments | Where-Object {
-    ($_.deleted -eq $true) -or ($_.isDeleted -eq $true)
-}
-
-if ($flagDeleted.Count -gt 0) {
-    Write-Log "  Found $($flagDeleted.Count) deployments with deleted flag" "SUCCESS"
-    foreach ($dep in $flagDeleted) {
-        if ($deletedDeployments.id -notcontains $dep.id) {
-            $deletedDeployments += $dep
-        }
-    }
-}
-
-# Strategy 3: Look for deployments with deletedAt or destroyedAt timestamp
-Write-Log "`nStrategy 3: Deletion timestamp checking"
-$timestampDeleted = $allDeployments | Where-Object {
-    $_.deletedAt -or $_.destroyedAt -or $_.terminatedAt
-}
-
-if ($timestampDeleted.Count -gt 0) {
-    Write-Log "  Found $($timestampDeleted.Count) deployments with deletion timestamp" "SUCCESS"
-    foreach ($dep in $timestampDeleted) {
-        if ($deletedDeployments.id -notcontains $dep.id) {
-            $deletedDeployments += $dep
-        }
-    }
-}
-
-Write-Log "`nTotal potential deleted deployments: $($deletedDeployments.Count)" "SUCCESS"
-
-if ($deletedDeployments.Count -eq 0) {
-    Write-Log "`nNO DELETED DEPLOYMENTS DETECTED!" "WARN"
-    Write-Log "`nThis suggests one of the following:" "WARN"
-    Write-Log "  1. No deployments were deleted in the timeframe" "WARN"
-    Write-Log "  2. Deleted deployments are immediately purged from the API" "WARN"
-    Write-Log "  3. Your user account cannot see deleted deployments" "WARN"
-    Write-Log "  4. vRA stores deletion info in a different API endpoint" "WARN"
-    Write-Log "`nExporting all deployment data for manual inspection..." "WARN"
-    
-    # Export all deployments to JSON for manual analysis
-    $allDeployments | ConvertTo-Json -Depth 10 | Out-File -FilePath $outputJson -Encoding UTF8
-    Write-Log "All deployments exported to: $outputJson" "SUCCESS"
-    Write-Log "Review this file to manually identify deleted deployments" "SUCCESS"
-    
-    exit
-}
-
-# ===== Process Deleted Deployments =====
-Write-Log "`n===== Processing Deleted Deployments (Filtering by Date) =====" "SUCCESS"
-
-$finalResults = @()
-
-foreach ($dep in $deletedDeployments) {
-    Write-Log "`nProcessing: $($dep.name)"
-    Write-Log "  Status: $($dep.status)"
-    Write-Log "  Last Updated: $($dep.lastUpdatedAt) by $($dep.lastUpdatedBy)"
-    
-    # FIXED: Check DELETION date, not general lastUpdatedAt
-    $deletionDate = $null
-    $withinTimeRange = $false
-    
-    # Try to find deletion timestamp
-    if ($dep.deletedAt) {
-        $deletionDate = $dep.deletedAt
-    } elseif ($dep.destroyedAt) {
-        $deletionDate = $dep.destroyedAt
-    } elseif ($dep.terminatedAt) {
-        $deletionDate = $dep.terminatedAt
-    } elseif ($dep.lastUpdatedAt -and $dep.status -match "delete|destroy|terminate") {
-        # If no explicit deletion timestamp, use lastUpdatedAt if status suggests deletion
-        $deletionDate = $dep.lastUpdatedAt
-    }
-    
-    if ($deletionDate) {
-        try {
-            $delDate = [DateTime]$deletionDate
-            $withinTimeRange = ($delDate -ge $cutoffDate)
-            Write-Log "  Deletion Date: $deletionDate (Within range: $withinTimeRange)"
-        } catch {
-            Write-Log "  Could not parse deletion date: $deletionDate" "WARN"
-        }
-    } else {
-        Write-Log "  No deletion timestamp found - including anyway" "WARN"
-        $withinTimeRange = $true  # Include if we can't determine date
-    }
-    
-    if (-not $withinTimeRange) {
-        Write-Log "  Skipping - deletion outside date range" "WARN"
-        continue
-    }
-    
-    # Get template name
-    $templateName = "Unknown"
-    
-    if ($dep.catalogItemId) {
-        try {
-            $catUri = "https://$vraServer/catalog/api/items/$($dep.catalogItemId)"
-            $cat = Invoke-RestMethod -Uri $catUri -Method Get -Headers $vraHeaders -ErrorAction Stop
-            $templateName = $cat.name
-            Write-Log "  Template: $templateName"
-        } catch {
-            Write-Log "  Could not fetch catalog item" "WARN"
-        }
-    }
-    
-    if ($dep.blueprintId -and $templateName -eq "Unknown") {
-        try {
-            $bpUri = "https://$vraServer/blueprint/api/blueprints/$($dep.blueprintId)"
-            $bp = Invoke-RestMethod -Uri $bpUri -Method Get -Headers $vraHeaders -ErrorAction Stop
-            $templateName = $bp.name
-            Write-Log "  Template: $templateName"
-        } catch {
-            Write-Log "  Could not fetch blueprint" "WARN"
-        }
-    }
-    
-    # Apply template filter
-    if ($filterTemplateNames.Count -gt 0) {
-        $isMatch = $false
-        foreach ($f in $filterTemplateNames) {
-            if ($templateName -match $f) {
-                $isMatch = $true
-                Write-Log "  >>> MATCHES FILTER: $f <<<" "SUCCESS"
-                break
-            }
-        }
-        
-        if (-not $isMatch) {
-            Write-Log "  Skipping - doesn't match template filter" "WARN"
-            continue
-        }
-    }
-    
-    # Determine deletion info
-    $deletedBy = $dep.lastUpdatedBy
-    $deletedAt = $dep.lastUpdatedAt
-    
-    if ($dep.deletedBy) {
-        $deletedBy = $dep.deletedBy
-    }
-    if ($dep.deletedAt) {
-        $deletedAt = $dep.deletedAt
-    } elseif ($dep.destroyedAt) {
-        $deletedAt = $dep.destroyedAt
-    }
-    
-    $finalResults += [PSCustomObject]@{
-        DeploymentName = $dep.name
-        DeploymentId = $dep.id
-        Template = $templateName
-        Status = $dep.status
-        DeletedBy = $deletedBy
-        DeletedAt = $deletedAt
-        Owner = $dep.ownedBy
-        CreatedBy = $dep.createdBy
-        CreatedAt = $dep.createdAt
-        LastUpdatedBy = $dep.lastUpdatedBy
-        LastUpdatedAt = $dep.lastUpdatedAt
-        ProjectId = $dep.projectId
-    }
-    
-    Write-Log "  >>> ADDED TO OUTPUT <<<" "SUCCESS"
-}
-
-# ===== Summary and Export =====
-Write-Log "`n============================================" "SUCCESS"
-Write-Log "===== SUMMARY =====" "SUCCESS"
-Write-Log "============================================" "SUCCESS"
-
-if ($finalResults.Count -gt 0) {
-    Write-Log "Deleted deployments matching criteria: $($finalResults.Count)" "SUCCESS"
-    
-    # Export to CSV
-    $finalResults | Select-Object DeploymentName, Template, Status, DeletedBy, DeletedAt, Owner, CreatedBy, CreatedAt, DeploymentId |
-        Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
-    
-    Write-Log "Exported to: $outputCsv" "SUCCESS"
-    
-    # Display summary
-    Write-Log "`n=== DELETED DEPLOYMENTS ===" "SUCCESS"
-    foreach ($result in $finalResults) {
-        Write-Log "`n$($result.DeploymentName)" "SUCCESS"
-        Write-Log "  Template: $($result.Template)"
-        Write-Log "  Status: $($result.Status)"
-        Write-Log "  Deleted By: $($result.DeletedBy)"
-        Write-Log "  Deleted At: $($result.DeletedAt)"
-        Write-Log "  Created At: $($result.CreatedAt)"
-        Write-Log "  Original Owner: $($result.Owner)"
-    }
-}
-else {
-    Write-Log "NO MATCHING DELETED DEPLOYMENTS FOUND!" "WARN"
-}
-
-Write-Log "`n===== Script Completed =====" "SUCCESS"
-Write-Log "Log file: $outputLog"
