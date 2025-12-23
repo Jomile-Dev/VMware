@@ -1,83 +1,97 @@
-# vRA Merged Deep-Dive: Metadata + Specs + GUI History Logs
-# Matches the view from your provided image
+# vRA 8.18 History Reconstructor
+# Logic: Query Request Service -> Correlate Events -> Export CSV
+# Bypasses the broken /deployments endpoint entirely.
 
 # --- Configuration ---
 $vraServer = "vra1.yourdomain.com"
-$apiVersion = "2020-08-25" 
-$daysBack   = 30 
-$filterKeywords = @("Virtual Machine", "Database")
+$outputCsv = "D:\vRA_Delete_History.csv" # Direct path as requested
+$daysBack  = 30
 
-# --- Output ---
-$logDir = "C:\Logs"
-if (!(Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
-$timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-$outputLog = "$logDir\vRA_GUI_History_Match_$timestamp.log"
-
-# --- Setup & Auth ---
+# --- Auth & SSL ---
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-function Disable-SSLValidation {
-    if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
-        Add-Type "using System.Net; using System.Security.Cryptography.X509Certificates; public class TrustAllCertsPolicy : ICertificatePolicy { public bool CheckValidationResult(ServicePoint svcPoint, X509Certificate certificate, WebRequest request, int certificateProblem) { return true; } }"
-        [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
-    }
+if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
+    Add-Type "using System.Net; using System.Security.Cryptography.X509Certificates; public class TrustAllCertsPolicy : ICertificatePolicy { public bool CheckValidationResult(ServicePoint svcPoint, X509Certificate certificate, WebRequest request, int certificateProblem) { return true; } }"
+    [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
 }
-Disable-SSLValidation
 
 $credential = Get-Credential -Message "vRA Admin Credentials"
 $authBody = @{ username = $credential.UserName; password = $credential.GetNetworkCredential().Password } | ConvertTo-Json
 $authRes = Invoke-RestMethod -Uri "https://$vraServer/csp/gateway/am/api/login" -Method Post -Headers @{"Content-Type"="application/json"} -Body $authBody
 $vraHeaders = @{ "Authorization" = "Bearer $($authRes.cspAuthToken)"; "Content-Type" = "application/json" }
 
-# --- Processing ---
-Write-Host "Fetching Deployment Records..." -ForegroundColor Cyan
-$deployUri = "https://$vraServer/deployment/api/deployments?apiVersion=$apiVersion&deleted=true&`$top=100"
-$allDeps = (Invoke-RestMethod -Uri $deployUri -Method Get -Headers $vraHeaders).content
-$cutoffDate = (Get-Date).AddDays(-$daysBack)
+# --- Step 1: Query the Request Service (The "Root" of the data) ---
+Write-Host "Querying Request Service for 'Deployment.Delete' actions..." -ForegroundColor Cyan
 
-foreach ($dep in $allDeps) {
-    if ($dep.status -notmatch "DELETE" -and $dep.status -ne "ARCHIVED") { continue }
-    $nameMatch = $false
-    foreach ($k in $filterKeywords) { if ($dep.name -match $k) { $nameMatch = $true } }
-    if (-not $nameMatch) { continue }
+# vRA 8.x Filter: We look for actions starting with 'Deployment.Delete' or just 'Delete'
+# We filter by Date here to optimize the query
+$dateStr = (Get-Date).AddDays(-$daysBack).ToString("yyyy-MM-dd")
+$reqUri = "https://$vraServer/deployment/api/requests?apiVersion=2020-08-25&`$filter=(actionId eq 'Deployment.Delete') and (createdAt ge '$dateStr')&`$top=2000"
 
-    $header = "`n[DEPLOYMENT] $($dep.name) | DeletedBy: $($dep.lastUpdatedBy)"
-    Write-Host $header -ForegroundColor White -Bold
-    $header | Add-Content $outputLog
-
-    # 1. Grab Resource Specs (CPU/IP) from the Resource Endpoint
-    try {
-        $resUri = "https://$vraServer/deployment/api/deployments/$($dep.id)/resources?apiVersion=$apiVersion"
-        $resources = (Invoke-RestMethod -Uri $resUri -Method Get -Headers $vraHeaders).content
-        foreach ($res in $resources) {
-            $specLine = "  -> Resource: $($res.name) ($($res.type)) | IP: $($res.properties.address)"
-            Write-Host $specLine -ForegroundColor Cyan
-            $specLine | Add-Content $outputLog
-        }
-    } catch { "  -> Resource details purged." | Add-Content $outputLog }
-
-    # 2. Grab GUI History (Matches your Image)
-    try {
-        $reqUri = "https://$vraServer/deployment/api/deployments/$($dep.id)/requests?apiVersion=$apiVersion"
-        $requests = (Invoke-RestMethod -Uri $reqUri -Method Get -Headers $vraHeaders).content
-        
-        foreach ($req in $requests) {
-            $reqLine = "  [HISTORY] Action: $($req.name) | ID: $($req.id) | Requested By: $($req.requestedBy)"
-            Write-Host $reqLine -ForegroundColor Yellow
-            $reqLine | Add-Content $outputLog
-
-            # 3. Grab the specific Events inside that History item
-            try {
-                $eventUri = "https://$vraServer/deployment/api/requests/$($req.id)/events?apiVersion=$apiVersion"
-                $events = (Invoke-RestMethod -Uri $eventUri -Method Get -Headers $vraHeaders).content
-                foreach ($evt in $events) {
-                    # This captures 'Cloud.vSphere.Network', 'DELETE_FINISHED', etc.
-                    $evtLine = "    - $($evt.timestamp) | $($evt.status) | $($evt.resourceType) | $($evt.message)"
-                    Write-Host $evtLine -ForegroundColor DarkGray
-                    $evtLine | Add-Content $outputLog
-                }
-            } catch { "    - Events purged." | Add-Content $outputLog }
-        }
-    } catch { "  [HISTORY] Request history purged." | Add-Content $outputLog }
+try {
+    $requests = (Invoke-RestMethod -Uri $reqUri -Method Get -Headers $vraHeaders).content
+} catch {
+    Write-Host "Error querying requests: $($_.Exception.Message)" -ForegroundColor Red
+    exit
 }
 
-Write-Host "`nComplete! Check $outputLog" -ForegroundColor Green
+Write-Host "Found $($requests.Count) delete requests. Fetching event history..." -ForegroundColor Yellow
+
+$csvData = @()
+
+# --- Step 2: Loop Requests & Fetch Events (The "Rows" in your screenshot) ---
+foreach ($req in $requests) {
+    
+    # Optional: Filter by specific names if needed
+    # if ($req.deploymentName -notmatch "MyVM") { continue }
+
+    Write-Host "Processing: $($req.deploymentName) (Req ID: $($req.id))" -ForegroundColor Gray
+
+    try {
+        # This API call gets the table rows you see in the "History" tab
+        $eventUri = "https://$vraServer/deployment/api/requests/$($req.id)/events?apiVersion=2020-08-25"
+        $events = (Invoke-RestMethod -Uri $eventUri -Method Get -Headers $vraHeaders).content
+
+        if ($events) {
+            foreach ($evt in $events) {
+                # Create a flat object for the CSV row
+                $csvData += [PSCustomObject]@{
+                    DeploymentName   = $req.deploymentName
+                    RequestedBy      = $req.requestedBy
+                    RequestTimestamp = $req.createdAt
+                    RequestStatus    = $req.status
+                    # --- The "History" Table Columns ---
+                    EventTimestamp   = $evt.timestamp
+                    EventStatus      = $evt.status       # e.g., DELETE_FINISHED
+                    ResourceType     = $evt.resourceType # e.g., Cloud.vSphere.Machine
+                    ResourceName     = $evt.resourceName # e.g., Cloud_Network_1
+                    Message          = $evt.message      # The detailed text
+                    RequestID        = $req.id
+                }
+            }
+        } else {
+            # Capture the request even if logs are empty
+            $csvData += [PSCustomObject]@{
+                DeploymentName   = $req.deploymentName
+                RequestedBy      = $req.requestedBy
+                RequestTimestamp = $req.createdAt
+                RequestStatus    = $req.status
+                EventTimestamp   = "No Events Found"
+                EventStatus      = "N/A"
+                ResourceType     = "N/A"
+                ResourceName     = "N/A"
+                Message          = "Logs likely purged or empty"
+                RequestID        = $req.id
+            }
+        }
+    } catch {
+        Write-Host "  Could not retrieve events for $($req.id)" -ForegroundColor Red
+    }
+}
+
+# --- Step 3: Export ---
+if ($csvData.Count -gt 0) {
+    $csvData | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
+    Write-Host "Success! Data exported to $outputCsv" -ForegroundColor Green
+} else {
+    Write-Host "No delete records found." -ForegroundColor Yellow
+}
