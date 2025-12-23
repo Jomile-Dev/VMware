@@ -424,12 +424,102 @@ try {
         "X-Ops-API-use-unsupported" = "true"
     }
     
+    Write-DebugLog "Token received (first 20 chars): $($ariaToken.Substring(0, [Math]::Min(20, $ariaToken.Length)))..." "DEBUG"
+    
     # Calculate cutoff date
     $yesterday = [DateTimeOffset]::Now.AddDays(-$daysBack).ToUnixTimeMilliseconds()
     Write-DebugLog "Searching for VMs created after: $((Get-Date).AddDays(-$daysBack))"
+    Write-DebugLog "Unix timestamp (ms): $yesterday" "DEBUG"
+    
+    # Test API connectivity first with a simple call
+    Write-DebugLog "Testing API connectivity..." "DEBUG"
+    try {
+        $testUrl = "https://$ariaOpsServer/suite-api/api/resources?pageSize=1&resourceKind=VirtualMachine"
+        Write-DebugLog "Test URL: $testUrl" "DEBUG"
+        $testResponse = Invoke-WebRequest -Uri $testUrl -Headers $ariaHeaders -Method Get -ErrorAction Stop
+        Write-DebugLog "Test call successful - Status: $($testResponse.StatusCode)" "SUCCESS"
+    }
+    catch {
+        Write-DebugLog "Test call failed!" "ERROR"
+        Write-DebugLog "Status Code: $($_.Exception.Response.StatusCode.value__)" "ERROR"
+        Write-DebugLog "Status Description: $($_.Exception.Response.StatusDescription)" "ERROR"
+        
+        # Try to read error response
+        try {
+            $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+            $responseBody = $reader.ReadToEnd()
+            Write-DebugLog "Error Response Body: $responseBody" "ERROR"
+        }
+        catch {}
+        
+        # Try alternative authorization header formats
+        Write-DebugLog "Trying alternative authorization formats..." "WARN"
+        
+        # Alternative 1: Just the token without prefix
+        $altHeaders1 = @{
+            "Authorization" = $ariaToken
+            "Content-Type" = "application/json"
+            "Accept" = "application/json"
+        }
+        
+        try {
+            Write-DebugLog "Trying: Authorization = [token]" "DEBUG"
+            $testResponse = Invoke-RestMethod -Uri $testUrl -Headers $altHeaders1 -Method Get -ErrorAction Stop
+            Write-DebugLog "SUCCESS with plain token format!" "SUCCESS"
+            $ariaHeaders = $altHeaders1
+        }
+        catch {
+            Write-DebugLog "Plain token format failed" "WARN"
+        }
+        
+        # Alternative 2: Bearer format
+        $altHeaders2 = @{
+            "Authorization" = "Bearer $ariaToken"
+            "Content-Type" = "application/json"
+            "Accept" = "application/json"
+        }
+        
+        try {
+            Write-DebugLog "Trying: Authorization = Bearer [token]" "DEBUG"
+            $testResponse = Invoke-RestMethod -Uri $testUrl -Headers $altHeaders2 -Method Get -ErrorAction Stop
+            Write-DebugLog "SUCCESS with Bearer token format!" "SUCCESS"
+            $ariaHeaders = $altHeaders2
+        }
+        catch {
+            Write-DebugLog "Bearer token format failed" "WARN"
+        }
+        
+        # Alternative 3: CSPToken format
+        $altHeaders3 = @{
+            "Authorization" = "CSPToken $ariaToken"
+            "Content-Type" = "application/json"
+            "Accept" = "application/json"
+        }
+        
+        try {
+            Write-DebugLog "Trying: Authorization = CSPToken [token]" "DEBUG"
+            $testResponse = Invoke-RestMethod -Uri $testUrl -Headers $altHeaders3 -Method Get -ErrorAction Stop
+            Write-DebugLog "SUCCESS with CSPToken format!" "SUCCESS"
+            $ariaHeaders = $altHeaders3
+        }
+        catch {
+            Write-DebugLog "CSPToken format failed" "WARN"
+        }
+        
+        # If none worked, throw error
+        if ($testResponse -eq $null) {
+            Write-DebugLog "All authorization formats failed. Cannot continue." "ERROR"
+            Write-DebugLog "Possible issues:" "ERROR"
+            Write-DebugLog "  1. User lacks 'Read Only' or higher permissions in Aria Ops" "ERROR"
+            Write-DebugLog "  2. API version mismatch (check Aria Ops version)" "ERROR"
+            Write-DebugLog "  3. Authentication source mismatch" "ERROR"
+            throw "Cannot authenticate to Aria Operations API"
+        }
+    }
     
     # Query Aria Operations for new VMs
     $ariaInternalURL = "https://$ariaOpsServer/suite-api/api/resources?resourceKind=VirtualMachine"
+    Write-DebugLog "Querying for VMs: $ariaInternalURL" "DEBUG"
     $response = Invoke-RestMethod -Uri $ariaInternalURL -Headers $ariaHeaders -Method Get
     $vmIdentifiers = $response.resourceList | Where-Object { $_.creationTime -ge $yesterday } | Select-Object -ExpandProperty identifier
     
