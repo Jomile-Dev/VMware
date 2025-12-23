@@ -404,6 +404,18 @@ foreach ($deployment in $filteredDeployments) {
                 
                 # Create detailed records for each event
                 foreach ($event in $allEvents) {
+                        # Extract details - could be string, object, or array
+                        $detailsValue = $null
+                        if ($event.details) {
+                            if ($event.details -is [string]) {
+                                $detailsValue = $event.details
+                            }
+                            else {
+                                # Convert complex objects to JSON string for CSV
+                                $detailsValue = ($event.details | ConvertTo-Json -Compress -Depth 5)
+                            }
+                        }
+                        
                         $detailedResults += [PSCustomObject]@{
                             DeploymentName = $deployment.name
                             DeploymentId = $deployment.id
@@ -418,6 +430,7 @@ foreach ($deployment in $filteredDeployments) {
                             ResourceType = $event.resourceType
                             ResourceName = $event.resourceName
                             Message = $event.message
+                            Details = $detailsValue  # NEW: The "Details" column from the UI
                             EventId = $event.id
                             # Additional event properties
                             EventLogLevel = $event.logLevel
