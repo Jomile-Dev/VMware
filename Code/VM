@@ -2,7 +2,9 @@
 # PowerShell 5.1 Compatible
 # Tracks servers built in the last day and sends email report
 
-#region Configuration
+# ============================================
+# Configuration
+# ============================================
 $ariaOpsServer = "aria-ops.yourdomain.com"
 $ariaOpsDomain = "yourdomain.com"
 $ariaOpsAuthSource = "localos"
@@ -29,9 +31,10 @@ $smtpSubject = "New Server Deployment Report - $(Get-Date -Format 'yyyy-MM-dd')"
 $daysBack = 1
 $deletedDaysBack = 90  # How far back to search for deleted deployments
 $eventsPageSize = 200  # Page size for event fetching
-#endregion
 
-#region Helper Functions
+# ============================================
+# Helper Functions
+# ============================================
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
     
@@ -303,9 +306,9 @@ function Send-NewServerReport {
 <style>
     body { font-family: Arial, sans-serif; margin: 20px; }
     table { border-collapse: collapse; width: 100%; margin-top: 20px; }
-    th { background-color: #4CAF50; color: white; padding: 12px; text-align: left; font-weight: bold; }
+    th { background-color: #2196F3; color: white; padding: 12px; text-align: left; font-weight: bold; }
     td { border: 1px solid #ddd; padding: 10px; }
-    .summary { background-color: #f9f9f9; padding: 10px 15px; border-left: 4px solid #4CAF50; margin-bottom: 20px; }
+    .summary { background-color: #f9f9f9; padding: 10px 15px; border-left: 4px solid #2196F3; margin-bottom: 20px; }
 </style>
 </head>
 <body>
@@ -337,9 +340,10 @@ $htmlRows
     Send-MailMessage -To $To -From $From -Subject $Subject -Body $htmlBody -BodyAsHtml -SmtpServer $SmtpServer -Port $SmtpPort -UseSsl
     Write-Log "Email sent successfully!" "SUCCESS"
 }
-#endregion
 
-#region Main Script
+# ============================================
+# Main Script
+# ============================================
 Write-Log "===== New Server Tracker Started =====" "SUCCESS"
 Write-Log "PowerShell Version: $($PSVersionTable.PSVersion)"
 
@@ -359,9 +363,10 @@ if (-not $credential) {
 }
 $username = $credential.UserName
 $password = $credential.GetNetworkCredential().Password
-#endregion
 
-#region Aria Operations - Get New VMs
+# ============================================
+# Aria Operations - Get New VMs
+# ============================================
 Write-Log "`n===== Connecting to Aria Operations =====" "SUCCESS"
 
 try {
@@ -480,9 +485,10 @@ if ($newVMsData.Count -eq 0) {
     Write-Log "No new VMs found. Exiting." "WARN"
     exit
 }
-#endregion
 
-#region vRA - Get Deployment Info
+# ============================================
+# vRA - Get Deployment Info
+# ============================================
 Write-Log "`n===== Processing vRA Servers =====" "SUCCESS"
 $deploymentData = @{}
 $deletedDeploymentData = @{}
@@ -596,9 +602,10 @@ foreach ($vmName in $deletedDeploymentData.Keys) {
 }
 
 Write-Log "`nTotal deployments found: $($deploymentData.Count) (Active + Deleted)" "SUCCESS"
-#endregion
 
-#region vCenter - Get Creator Info for Non-vRA VMs
+# ============================================
+# vCenter - Get Creator Info for Non-vRA VMs
+# ============================================
 Write-Log "`n===== Connecting to vCenter =====" "SUCCESS"
 $vCenterLookup = @{}
 
@@ -640,9 +647,10 @@ if ($vmsNeedingVCenterLookup.Count -gt 0) {
         }
     }
 }
-#endregion
 
-#region Build Final Report
+# ============================================
+# Build Final Report
+# ============================================
 Write-Log "`n===== Building Final Report =====" "SUCCESS"
 $reportData = @()
 
@@ -704,9 +712,10 @@ foreach ($vmData in $newVMsData) {
 }
 
 Write-Log "Report contains $($reportData.Count) records" "SUCCESS"
-#endregion
 
-#region Send Email Report
+# ============================================
+# Send Email Report
+# ============================================
 Write-Log "`n===== Sending Email Report =====" "SUCCESS"
 
 Send-NewServerReport `
@@ -718,4 +727,3 @@ Send-NewServerReport `
     -Subject $smtpSubject
 
 Write-Log "`n===== Script Completed Successfully =====" "SUCCESS"
-#endregion
