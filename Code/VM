@@ -500,26 +500,60 @@ try {
             # Get resource health/badge from Aria Operations
             $healthProp = $response.property | Where-Object { $_.name -eq "badge|health" -or $_.name -eq "summary|health" } | Select-Object -First 1
             $resourceStateProp = $response.property | Where-Object { $_.name -eq "summary|resourceState" } | Select-Object -First 1
+            $powerStateProp = $response.property | Where-Object { $_.name -eq "summary|runtime|powerState" } | Select-Object -First 1
             
-            $status = "Decomm/Offline"
+            $status = "Unknown"
             
-            # Check resource health badge - if grey or not available, it's decomm
-            if ($healthProp -and $healthProp.value) {
-                $healthValue = $healthProp.value.ToString().ToUpper()
-                if ($healthValue -in @("GREEN", "YELLOW", "ORANGE", "RED")) {
+            # First check power state - if powered on, likely online
+            if ($powerStateProp -and $powerStateProp.value) {
+                $powerState = $powerStateProp.value.ToString().ToUpper()
+                Write-DebugLog "  Power State: $powerState" "DEBUG"
+                if ($powerState -eq "POWERED_ON" -or $powerState -eq "1") {
                     $status = "Online"
                 }
-                else {
-                    # Grey or unknown = Decomm/Offline
+                elseif ($powerState -eq "POWERED_OFF" -or $powerState -eq "0") {
                     $status = "Decomm/Offline"
                 }
             }
-            # Also check if resource state indicates it's not being monitored
-            elseif ($resourceStateProp -and $resourceStateProp.value) {
-                if ($resourceStateProp.value -eq "STARTED" -or $resourceStateProp.value -eq "MAINTAINED") {
+            
+            # Check resource health badge
+            if ($healthProp -and $healthProp.value) {
+                $healthValue = $healthProp.value.ToString().ToUpper()
+                Write-DebugLog "  Health Badge: $healthValue" "DEBUG"
+                
+                # Green, Yellow, Orange, Red = Online/Monitored
+                if ($healthValue -match "GREEN|YELLOW|ORANGE|RED") {
                     $status = "Online"
                 }
+                # Grey, Unknown, None = Decomm/Offline/Not Monitored
+                elseif ($healthValue -match "GREY|GRAY|UNKNOWN|NONE") {
+                    $status = "Decomm/Offline"
+                }
+                # Numeric values: 0=grey, 1=green, 2=yellow, 3=orange, 4=red
+                elseif ($healthValue -match "^[1-4]$") {
+                    $status = "Online"
+                }
+                elseif ($healthValue -eq "0") {
+                    $status = "Decomm/Offline"
+                }
             }
+            
+            # Check if resource state indicates it's not being monitored
+            if ($resourceStateProp -and $resourceStateProp.value) {
+                $resourceState = $resourceStateProp.value.ToString().ToUpper()
+                Write-DebugLog "  Resource State: $resourceState" "DEBUG"
+                if ($resourceState -in @("STARTED", "MAINTAINED", "RUNNING")) {
+                    # Only override to Online if we're unsure
+                    if ($status -eq "Unknown") {
+                        $status = "Online"
+                    }
+                }
+                elseif ($resourceState -in @("STOPPED", "NOT_EXISTING")) {
+                    $status = "Decomm/Offline"
+                }
+            }
+            
+            Write-DebugLog "  Final Status Decision: $status" "DEBUG"
             
             $vmObject = [PSCustomObject]@{
                 Name = $vmName
