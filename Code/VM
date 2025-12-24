@@ -693,6 +693,10 @@ foreach ($vmData in $newVMsData) {
                         Write-Log "  Found $vmName on $vCenter"
                         break
                     }
+                    else {
+                        # VM doesn't exist in this vCenter, try next one
+                        continue
+                    }
                 }
                 catch {
                     # Continue to next vCenter
@@ -725,6 +729,8 @@ foreach ($vmData in $newVMsData) {
     }
 }
 
+Write-Log "Report contains $($reportData.Count) records" "SUCCESS"
+
 # Disconnect any remaining vCenter connections
 foreach ($vCenter in $vCenterConnections.Keys) {
     try {
@@ -733,11 +739,19 @@ foreach ($vCenter in $vCenterConnections.Keys) {
     catch {}
 }
 
-# Send Report
+# Send Email Report
 Write-Log "`nSending Email Report" "SUCCESS"
-Send-NewServerReport -ReportData $reportData -SmtpServer $smtpServer -SmtpPort $smtpPort -From $smtpFrom -To $smtpTo -Cc $smtpCc -Subject $smtpSubject
+Send-NewServerReport `
+    -ReportData $reportData `
+    -SmtpServer $smtpServer `
+    -SmtpPort $smtpPort `
+    -From $smtpFrom `
+    -To $smtpTo `
+    -Cc $smtpCc `
+    -Subject $smtpSubject
 
-Write-Log "`nScript Completed Successfully!" "SUCCESS"
+Write-Log "`nScript Completed Successfully" "SUCCESS"
+                }
                 catch {
                     # Continue to next vCenter
                 }
@@ -781,4 +795,3 @@ Write-Log "`nScript Completed Successfully!" "SUCCESS"
                         Write-Log "  Found $vmName on $vCenter"
                         break
                     }
-                }
