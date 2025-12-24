@@ -1,5 +1,5 @@
 # New Server Tracker - Aria Operations + Multi-vRA (Active & Deleted) + vCenter
-# PowerShell 5.1 Compatible - FIXED VERSION with proper null handling
+# PowerShell 5.1 Compatible - FIXED VERSION with proper closing braces
 
 # Configuration Variables
 $ariaOpsServer = "aria-ops.yourdomain.com"
@@ -71,8 +71,12 @@ function Send-NewServerReport {
     $htmlRows = ""
     foreach ($record in $ReportData) {
         $rowClass = ""
-        if ($record.Source -notlike "*vRA*") { $rowClass = " style='background-color: #fff3cd;'" }
-        elseif ($record.Status -eq "Decomm/Offline") { $rowClass = " style='background-color: #f8d7da;'" }
+        if ($record.Source -notlike "*vRA*") { 
+            $rowClass = " style='background-color: #fff3cd;'" 
+        }
+        elseif ($record.Status -eq "Decomm/Offline") { 
+            $rowClass = " style='background-color: #f8d7da;'" 
+        }
         
         $htmlRows += "<tr$rowClass>"
         $htmlRows += "<td>$($record.Name)</td><td>$($record.Status)</td><td>$($record.Source)</td>"
@@ -99,7 +103,7 @@ tr:hover { background-color: #e8e8e8; }
     Write-DebugLog "Email sent successfully!" "SUCCESS"
 }
 
-# Main Script
+# Main Script Start
 Write-DebugLog "===== Script Started =====" "SUCCESS"
 Write-DebugLog "PowerShell Version: $($PSVersionTable.PSVersion)"
 
@@ -108,14 +112,17 @@ try {
     Import-Module VMware.VimAutomation.Core -ErrorAction Stop
     Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session | Out-Null
     Write-DebugLog "VMware PowerCLI module loaded" "SUCCESS"
-} catch {
+} 
+catch {
     Write-DebugLog "Failed to load VMware PowerCLI: $($_.Exception.Message)" "ERROR"
     exit
 }
 
 # Ensure log directory exists
 $logDir = Split-Path $outputCSV -Parent
-if (!(Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
+if (!(Test-Path $logDir)) { 
+    New-Item -ItemType Directory -Path $logDir -Force | Out-Null 
+}
 
 Disable-SSLValidation
 
@@ -222,7 +229,9 @@ try {
         # Filter VMs by creation time
         $vmIdentifiers = @()
         foreach ($resource in $allResources) {
-            if ($null -eq $resource) { continue }
+            if ($null -eq $resource) { 
+                continue 
+            }
             
             # Try to get creation time
             $creationTime = $null
@@ -243,7 +252,8 @@ try {
                             Write-DebugLog "  Including VM: $($resource.identifier)" "DEBUG"
                         }
                     }
-                } catch {
+                } 
+                catch {
                     Write-DebugLog "  Error parsing creation time for resource: $($_.Exception.Message)" "WARN"
                 }
             }
