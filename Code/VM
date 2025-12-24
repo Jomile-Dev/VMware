@@ -325,11 +325,15 @@ function Send-NewServerReport {
     
     Write-DebugLog "Building email report..."
     
-    # Filter out Decomm/Offline servers
-    $onlineServers = $ReportData | Where-Object { $_.Status -ne "Decomm/Offline" }
-    
-    # Sort: First by Status (Online first), then by Source
-    $sortedData = $onlineServers | Sort-Object @{Expression={if($_.Status -eq "Online"){"A"}else{"B"}}; Ascending=$true}, Source
+    # Sort: First by Status (Online first, then Decomm/Offline), then by Source within each status
+    $sortedData = $ReportData | Sort-Object @{
+        Expression={
+            if($_.Status -eq "Online"){"A"}
+            elseif($_.Status -eq "Decomm/Offline"){"B"}
+            else{"C"}
+        }; 
+        Ascending=$true
+    }, Source
     
     # Build HTML table for email
     $htmlRows = ""
@@ -364,6 +368,10 @@ $htmlRows
 </table>
 "@
     
+    # Count servers by status
+    $onlineCount = ($ReportData | Where-Object { $_.Status -eq "Online" }).Count
+    $decommCount = ($ReportData | Where-Object { $_.Status -eq "Decomm/Offline" }).Count
+    
     $htmlBody = @"
 <html>
 <head>
@@ -377,7 +385,8 @@ $htmlRows
 </head>
 <body>
 <div class="summary">
-    <p><strong>Total New Servers:</strong> $($sortedData.Count)</p>
+    <p><strong>Total New Servers:</strong> $($ReportData.Count)</p>
+    <p><strong>Online:</strong> $onlineCount | <strong>Decomm/Offline:</strong> $decommCount</p>
 </div>
 $htmlTable
 </body>
