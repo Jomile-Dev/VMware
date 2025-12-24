@@ -1,44 +1,35 @@
-# New Server Tracker - Aria Operations + Multi-vRA (Active & Deleted) + vCenter
-# PowerShell 5.1 Compatible - FIXED VERSION with proper closing braces
+# VMware vRA - Get ALL Deleted Deployments
+# Uses the EXACT API endpoint from the vRA UI network console
 
-# Configuration Variables
-$ariaOpsServer = "aria-ops.yourdomain.com"
-$ariaOpsDomain = "yourdomain.com"
-$ariaOpsAuthSource = "localos"
-$vraServers = @("vra1.yourdomain.com", "vra2.yourdomain.com")
-$vCenters = @("vcenter1.domain.com", "vcenter2.domain.com", "vcenter3.domain.com")
+# Configuration
+$vraServer = "vra1.yourdomain.com"
+$daysBack = 90  # How many days back to search for deleted deployments
+$pageSize = 200  # Items per page for deployments
+$eventsPageSize = 200  # Items per page for events (increased from 50)
+$filterResourceTypes = @("Cloud.vSphere.Machine")  # Filter events by resource type (empty array = no filter)
 
-# SMTP Configuration
-$smtpServer = "smtp.yourdomain.com"
-$smtpPort = 587
-$smtpFrom = "vra-reports@yourdomain.com"
-$smtpTo = @("admin@yourdomain.com")
-$smtpSubject = "New Server Deployment Report - $(Get-Date -Format 'yyyy-MM-dd')"
-
-# Time range
-$daysBack = 1
-$deletedDaysBack = 90
-$eventsPageSize = 200
-
-# Output
+# Output files
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-$outputLog = "C:\Logs\NewServers_$timestamp.log"
-$outputCSV = "C:\Logs\NewServers_$timestamp.csv"
+$outputCsv = "C:\Logs\vRA_DeletedDeployments_$timestamp.csv"
+$outputDetailedCsv = "C:\Logs\vRA_DeletedDeployments_Detailed_$timestamp.csv"
+$outputJson = "C:\Logs\vRA_DeletedDeployments_Raw_$timestamp.json"
+$outputLog = "C:\Logs\vRA_DeletedDeployments_$timestamp.log"
 
-# Helper Functions
-function Write-DebugLog {
+function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $logMessage = "[$timestamp] [$Level] $Message"
+    $logTimestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logMessage = "[$logTimestamp] [$Level] $Message"
+    
     $color = switch ($Level) {
         "ERROR" { "Red" }
         "WARN" { "Yellow" }
         "SUCCESS" { "Green" }
         "DEBUG" { "Magenta" }
-        default { "Cyan" }
+        default { "White" }
     }
+    
     Write-Host $logMessage -ForegroundColor $color
-    Add-Content -Path $outputLog -Value $logMessage
+    Add-Content -Path $outputLog -Value $logMessage -ErrorAction SilentlyContinue
 }
 
 function Disable-SSLValidation {
@@ -47,7 +38,9 @@ function Disable-SSLValidation {
 using System.Net;
 using System.Security.Cryptography.X509Certificates;
 public class TrustAllCertsPolicy : ICertificatePolicy {
-    public bool CheckValidationResult(ServicePoint svcPoint, X509Certificate certificate, WebRequest request, int certificateProblem) {
+    public bool CheckValidationResult(
+        ServicePoint svcPoint, X509Certificate certificate,
+        WebRequest request, int certificateProblem) {
         return true;
     }
 }
@@ -57,300 +50,483 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 }
 
-function Send-NewServerReport {
+function Test-ApiEndpoint {
     param(
-        [Parameter(Mandatory=$true)][Array]$ReportData,
-        [Parameter(Mandatory=$true)][string]$SmtpServer,
-        [Parameter(Mandatory=$true)][int]$SmtpPort,
-        [Parameter(Mandatory=$true)][string]$From,
-        [Parameter(Mandatory=$true)][Array]$To,
-        [Parameter(Mandatory=$true)][string]$Subject
+        [string]$Uri,
+        [hashtable]$Headers,
+        [string]$Description
     )
     
-    Write-DebugLog "Building email report..."
-    $htmlRows = ""
-    foreach ($record in $ReportData) {
-        $rowClass = ""
-        if ($record.Source -notlike "*vRA*") { 
-            $rowClass = " style='background-color: #fff3cd;'" 
+    Write-Log "`n--- Testing: $Description ---" "DEBUG"
+    Write-Log "URL: $Uri" "DEBUG"
+    
+    try {
+        $response = Invoke-WebRequest -Uri $Uri -Method Get -Headers $Headers -ErrorAction Stop
+        Write-Log "✓ SUCCESS - Status: $($response.StatusCode)" "SUCCESS"
+        Write-Log "Response Content-Type: $($response.Headers['Content-Type'])" "DEBUG"
+        
+        # Try to parse JSON
+        try {
+            $data = $response.Content | ConvertFrom-Json
+            if ($data.content) {
+                Write-Log "Found 'content' property with $($data.content.Count) items" "DEBUG"
+            }
+            elseif ($data -is [Array]) {
+                Write-Log "Response is array with $($data.Count) items" "DEBUG"
+            }
+            else {
+                Write-Log "Response properties: $($data.PSObject.Properties.Name -join ', ')" "DEBUG"
+            }
+            return $data
         }
-        elseif ($record.Status -eq "Decomm/Offline") { 
-            $rowClass = " style='background-color: #f8d7da;'" 
+        catch {
+            Write-Log "Could not parse JSON response" "WARN"
+            return $null
+        }
+    }
+    catch {
+        $statusCode = $_.Exception.Response.StatusCode.value__
+        $statusDesc = $_.Exception.Response.StatusDescription
+        
+        Write-Log "✗ FAILED - Status: $statusCode ($statusDesc)" "ERROR"
+        Write-Log "Error: $($_.Exception.Message)" "ERROR"
+        
+        # Detailed troubleshooting
+        switch ($statusCode) {
+            400 { 
+                Write-Log "`nTROUBLESHOOTING - 400 Bad Request:" "WARN"
+                Write-Log "  - Check URL parameters (deleted=true, apiVersion, page, size)" "WARN"
+                Write-Log "  - Verify parameter encoding (spaces, special chars)" "WARN"
+                Write-Log "  - Check if 'deleted' parameter format is correct" "WARN"
+                Write-Log "  - Try without optional parameters first" "WARN"
+            }
+            401 { 
+                Write-Log "`nTROUBLESHOOTING - 401 Unauthorized:" "WARN"
+                Write-Log "  - Token may have expired - re-authenticate" "WARN"
+                Write-Log "  - Check Authorization header format" "WARN"
+            }
+            403 { 
+                Write-Log "`nTROUBLESHOOTING - 403 Forbidden:" "WARN"
+                Write-Log "  - User lacks permissions to view deleted deployments" "WARN"
+                Write-Log "  - Check vRA role assignments" "WARN"
+                Write-Log "  - May need 'Service Broker Administrator' role" "WARN"
+            }
+            404 { 
+                Write-Log "`nTROUBLESHOOTING - 404 Not Found:" "WARN"
+                Write-Log "  - API endpoint path may be incorrect" "WARN"
+                Write-Log "  - Check vRA version - endpoint may differ" "WARN"
+                Write-Log "  - Deployment or request ID may not exist" "WARN"
+            }
+            500 { 
+                Write-Log "`nTROUBLESHOOTING - 500 Internal Server Error:" "WARN"
+                Write-Log "  - vRA backend issue" "WARN"
+                Write-Log "  - Check vRA logs" "WARN"
+                Write-Log "  - Try again later" "WARN"
+            }
+            default {
+                Write-Log "`nUnexpected error code: $statusCode" "ERROR"
+            }
         }
         
-        $htmlRows += "<tr$rowClass>"
-        $htmlRows += "<td>$($record.Name)</td><td>$($record.Status)</td><td>$($record.Source)</td>"
-        $htmlRows += "<td>$($record.RequestedBy)</td><td>$($record.Requestor)</td>"
-        $htmlRows += "<td>$($record.DeploymentName)</td><td>$($record.CatalogItem)</td></tr>"
+        # Try to get response body for more details
+        try {
+            $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+            $responseBody = $reader.ReadToEnd()
+            Write-Log "Response Body: $responseBody" "DEBUG"
+        }
+        catch {}
+        
+        return $null
     }
-    
-    $htmlBody = @"
-<html><head><style>
-body { font-family: Arial, sans-serif; margin: 20px; }
-table { border-collapse: collapse; width: 100%; margin-top: 20px; }
-th { background-color: #4CAF50; color: white; padding: 12px; text-align: left; font-weight: bold; }
-td { border: 1px solid #ddd; padding: 10px; }
-tr:nth-child(even) { background-color: #f2f2f2; }
-tr:hover { background-color: #e8e8e8; }
-.summary { background-color: #f9f9f9; padding: 10px 15px; border-left: 4px solid #4CAF50; margin-bottom: 20px; }
-</style></head><body>
-<div class="summary"><p><strong>Total New Servers:</strong> $($ReportData.Count)</p></div>
-<table><thead><tr><th>Name</th><th>Status</th><th>Source</th><th>Requested By</th><th>Requestor</th><th>Deployment Name</th><th>Catalog Item</th></tr></thead>
-<tbody>$htmlRows</tbody></table></body></html>
-"@
-    
-    Send-MailMessage -To $To -From $From -Subject $Subject -Body $htmlBody -BodyAsHtml -SmtpServer $SmtpServer -Port $SmtpPort -UseSsl
-    Write-DebugLog "Email sent successfully!" "SUCCESS"
 }
 
-# Main Script Start
-Write-DebugLog "===== Script Started =====" "SUCCESS"
-Write-DebugLog "PowerShell Version: $($PSVersionTable.PSVersion)"
-
-# Load VMware PowerCLI
-try {
-    Import-Module VMware.VimAutomation.Core -ErrorAction Stop
-    Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session | Out-Null
-    Write-DebugLog "VMware PowerCLI module loaded" "SUCCESS"
-} 
-catch {
-    Write-DebugLog "Failed to load VMware PowerCLI: $($_.Exception.Message)" "ERROR"
-    exit
-}
-
-# Ensure log directory exists
-$logDir = Split-Path $outputCSV -Parent
-if (!(Test-Path $logDir)) { 
-    New-Item -ItemType Directory -Path $logDir -Force | Out-Null 
-}
-
+Write-Log "===== vRA Deleted Deployments - Network Console Method =====" "SUCCESS"
+Write-Log "This script uses the EXACT API calls from the vRA UI" "SUCCESS"
 Disable-SSLValidation
 
+# Ensure output directory exists
+$logDir = Split-Path $outputLog -Parent
+if (!(Test-Path $logDir)) {
+    New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+}
+
 # Get credentials
-Write-DebugLog "Requesting credentials..."
-$credential = Get-Credential -Message "Enter credentials for Aria Operations, vRA, and vCenter"
+Write-Log "`nRequesting credentials for vRA..."
+$credential = Get-Credential -Message "Enter vRA credentials"
 if (-not $credential) {
-    Write-DebugLog "Credentials not provided. Exiting." "ERROR"
+    Write-Log "No credentials provided. Exiting." "ERROR"
     exit
 }
-$username = $credential.UserName
-$password = $credential.GetNetworkCredential().Password
 
-# Connect to Aria Operations
-Write-DebugLog "`n===== Connecting to Aria Operations =====" "INFO"
-$newVMsData = @()
+# Authenticate
+Write-Log "`n============================================"
+Write-Log "STEP 1: AUTHENTICATION"
+Write-Log "============================================"
+Write-Log "Authenticating to vRA: $vraServer"
 
 try {
-    Write-DebugLog "Authenticating to Aria Operations: $ariaOpsServer"
+    $authBody = @{
+        username = $credential.UserName
+        password = $credential.GetNetworkCredential().Password
+    } | ConvertTo-Json
     
-    $ariaUsername = "$username@$ariaOpsDomain@$ariaOpsAuthSource"
-    $ariaAuthUri = "https://$ariaOpsServer/suite-api/api/auth/token/acquire"
-    $ariaAuthBody = @{ username = $ariaUsername; password = $password } | ConvertTo-Json
+    $authResponse = Invoke-RestMethod `
+        -Uri "https://$vraServer/csp/gateway/am/api/login" `
+        -Method Post `
+        -Headers @{"Content-Type"="application/json"} `
+        -Body $authBody `
+        -ErrorAction Stop
     
-    $ariaAuthResponse = Invoke-RestMethod -Uri $ariaAuthUri -Method Post -Headers @{"Content-Type"="application/json"} -Body $ariaAuthBody -ErrorAction Stop
-    
-    if ($null -eq $ariaAuthResponse -or $null -eq $ariaAuthResponse.token) {
-        throw "Authentication failed - no token received"
-    }
-    
-    $ariaToken = $ariaAuthResponse.token
-    Write-DebugLog "Authenticated to Aria Operations successfully" "SUCCESS"
-    
-    $ariaHeaders = @{
-        "Authorization" = "vRealizeOpsToken $ariaToken"
+    $headers = @{
+        "Authorization" = "Bearer $($authResponse.cspAuthToken)"
         "Content-Type" = "application/json"
         "Accept" = "application/json"
     }
     
-    # Calculate cutoff date
-    $yesterday = [DateTimeOffset]::Now.AddDays(-$daysBack).ToUnixTimeMilliseconds()
-    Write-DebugLog "Searching for VMs created after: $((Get-Date).AddDays(-$daysBack))" "DEBUG"
-    Write-DebugLog "Unix timestamp (ms): $yesterday" "DEBUG"
-    
-    # Query Aria Operations
-    Write-DebugLog "`n===== Querying Aria Operations for VMs =====" "INFO"
-    $ariaURL = "https://$ariaOpsServer/suite-api/api/resources?resourceKind=VirtualMachine"
-    Write-DebugLog "URL: $ariaURL" "DEBUG"
-    
-    try {
-        $response = Invoke-RestMethod -Uri $ariaURL -Headers $ariaHeaders -Method Get -ErrorAction Stop
-        Write-DebugLog "API call successful" "SUCCESS"
-        
-        # Extract resources from response
-        $allResources = @()
-        
-        if ($null -eq $response) {
-            Write-DebugLog "Response is null!" "ERROR"
-            throw "API returned null response"
-        }
-        
-        Write-DebugLog "Response type: $($response.GetType().Name)" "DEBUG"
-        
-        # Try to find resources in response
-        if ($response -is [Array]) {
-            Write-DebugLog "Response is an array with $($response.Count) items" "DEBUG"
-            $allResources = $response
-        }
-        elseif ($null -ne $response.PSObject.Properties['resourceList']) {
-            Write-DebugLog "Found 'resourceList' property" "DEBUG"
-            $allResources = $response.resourceList
-        }
-        elseif ($null -ne $response.PSObject.Properties['resources']) {
-            Write-DebugLog "Found 'resources' property" "DEBUG"
-            $allResources = $response.resources
-        }
-        elseif ($null -ne $response.PSObject.Properties['content']) {
-            Write-DebugLog "Found 'content' property" "DEBUG"
-            $allResources = $response.content
-        }
-        else {
-            Write-DebugLog "Could not find resources in response. Available properties:" "WARN"
-            if ($null -ne $response.PSObject -and $null -ne $response.PSObject.Properties) {
-                foreach ($prop in $response.PSObject.Properties) {
-                    Write-DebugLog "  - $($prop.Name)" "DEBUG"
-                }
-            }
-            Write-DebugLog "Dumping response as JSON:" "DEBUG"
-            Write-DebugLog ($response | ConvertTo-Json -Depth 3) "DEBUG"
-        }
-        
-        # Ensure we have an array
-        if ($null -eq $allResources) {
-            Write-DebugLog "No resources found in response" "WARN"
-            $allResources = @()
-        }
-        elseif ($allResources -isnot [Array]) {
-            Write-DebugLog "Converting single resource to array" "DEBUG"
-            $allResources = @($allResources)
-        }
-        
-        Write-DebugLog "Total resources found: $($allResources.Count)" "SUCCESS"
-        
-        # Filter VMs by creation time
-        $vmIdentifiers = @()
-        foreach ($resource in $allResources) {
-            if ($null -eq $resource) { 
-                continue 
-            }
-            
-            # Try to get creation time
-            $creationTime = $null
-            if ($null -ne $resource.PSObject.Properties['creationTime']) {
-                $creationTime = $resource.creationTime
-            }
-            elseif ($null -ne $resource.PSObject.Properties['createTime']) {
-                $creationTime = $resource.createTime
-            }
-            
-            # Check if within time range
-            if ($null -ne $creationTime) {
-                try {
-                    $creationTimeLong = [long]$creationTime
-                    if ($creationTimeLong -ge $yesterday) {
-                        if ($null -ne $resource.PSObject.Properties['identifier']) {
-                            $vmIdentifiers += $resource.identifier
-                            Write-DebugLog "  Including VM: $($resource.identifier)" "DEBUG"
-                        }
-                    }
-                } 
-                catch {
-                    Write-DebugLog "  Error parsing creation time for resource: $($_.Exception.Message)" "WARN"
-                }
-            }
-        }
-        
-        Write-DebugLog "VMs created in last $daysBack day(s): $($vmIdentifiers.Count)" "SUCCESS"
-        
-        # Get properties for each VM
-        foreach ($identifier in $vmIdentifiers) {
-            $vmPropertiesURL = "https://$ariaOpsServer/suite-api/api/resources/$identifier/properties"
-            
-            try {
-                $vmProps = Invoke-RestMethod -Uri $vmPropertiesURL -Headers $ariaHeaders -Method Get -ErrorAction Stop
-                
-                # Extract VM name
-                $vmName = $null
-                if ($null -ne $vmProps.property) {
-                    $nameProp = $vmProps.property | Where-Object { $_.name -eq "config|name" -or $_.name -eq "summary|config|name" } | Select-Object -First 1
-                    if ($null -ne $nameProp -and $null -ne $nameProp.value) {
-                        $vmName = $nameProp.value
-                    }
-                }
-                
-                if ([string]::IsNullOrEmpty($vmName)) {
-                    Write-DebugLog "  Skipping VM $identifier - no name found" "WARN"
-                    continue
-                }
-                
-                # Get health status
-                $status = "Decomm/Offline"
-                if ($null -ne $vmProps.property) {
-                    $healthProp = $vmProps.property | Where-Object { $_.name -eq "badge|health" -or $_.name -eq "summary|health" } | Select-Object -First 1
-                    if ($null -ne $healthProp -and $null -ne $healthProp.value) {
-                        $healthValue = $healthProp.value.ToString().ToUpper()
-                        if ($healthValue -in @("GREEN", "YELLOW", "ORANGE", "RED")) {
-                            $status = "Online"
-                        }
-                    }
-                }
-                
-                $newVMsData += [PSCustomObject]@{
-                    Name = $vmName
-                    Status = $status
-                    ResourceId = $identifier
-                }
-                
-                Write-DebugLog "  Added VM: $vmName | Status: $status" "DEBUG"
-            }
-            catch {
-                Write-DebugLog "  Error getting properties for VM $identifier : $($_.Exception.Message)" "WARN"
-            }
-        }
-        
-        Write-DebugLog "Successfully retrieved $($newVMsData.Count) new VMs from Aria Operations" "SUCCESS"
-        
-    }
-    catch {
-        Write-DebugLog "Error querying Aria Operations: $($_.Exception.Message)" "ERROR"
-        Write-DebugLog "Stack trace: $($_.ScriptStackTrace)" "ERROR"
-        throw
-    }
+    Write-Log "✓ Authentication successful" "SUCCESS"
+    Write-Log "Token length: $($authResponse.cspAuthToken.Length) characters" "DEBUG"
 }
 catch {
-    Write-DebugLog "Failed to connect to Aria Operations: $($_.Exception.Message)" "ERROR"
+    Write-Log "✗ Authentication failed: $($_.Exception.Message)" "ERROR"
     exit
 }
 
-if ($newVMsData.Count -eq 0) {
-    Write-DebugLog "`nNo new VMs found in Aria Operations. Exiting." "WARN"
-    exit
-}
+# STEP 2: Get ALL Deployments with deleted=true filter
+Write-Log "`n============================================"
+Write-Log "STEP 2: FETCHING DELETED DEPLOYMENTS"
+Write-Log "============================================"
+Write-Log "Searching for deployments deleted in the last $daysBack days" "SUCCESS"
 
-# Build Final Report
-Write-DebugLog "`n===== Building Final Report =====" "INFO"
-$reportData = @()
+# Calculate cutoff date
+$cutoffDate = (Get-Date).AddDays(-$daysBack)
+$cutoffDateStr = $cutoffDate.ToString("yyyy-MM-dd")
+Write-Log "Cutoff date: $cutoffDateStr" "DEBUG"
 
-foreach ($vmData in $newVMsData) {
-    $reportData += [PSCustomObject]@{
-        Name = $vmData.Name
-        Status = $vmData.Status
-        DeploymentName = "N/A"
-        CatalogItem = "N/A"
-        RequestedBy = "N/A"
-        Requestor = "N/A"
-        Source = "Aria Ops"
+$allDeletedDeployments = @()
+$page = 0
+$pageSize = 200
+
+# Try different URL variations to find what works
+$urlVariations = @(
+    # Variation 1: As seen in network console (most likely)
+    "https://$vraServer/deployment/api/deployments?deleted=true&apiVersion=2020-08-25&page={0}&size=$pageSize",
+    
+    # Variation 2: OData style with $filter
+    "https://$vraServer/deployment/api/deployments?`$filter=deleted eq true&apiVersion=2020-08-25&`$top=$pageSize&`$skip={1}",
+    
+    # Variation 3: Simple deleted parameter
+    "https://$vraServer/deployment/api/deployments?deleted=true&`$top=$pageSize&`$skip={1}",
+    
+    # Variation 4: Array format like the URL shows [true]
+    "https://$vraServer/deployment/api/deployments?deleted=%5Btrue%5D&apiVersion=2020-08-25&page={0}&size=$pageSize"
+)
+
+$workingUrl = $null
+
+foreach ($urlTemplate in $urlVariations) {
+    $testUrl = $urlTemplate -f 0, 0
+    Write-Log "`nTrying URL variation: $testUrl" "DEBUG"
+    
+    $result = Test-ApiEndpoint -Uri $testUrl -Headers $headers -Description "Deleted Deployments (Variation)"
+    
+    if ($result) {
+        $workingUrl = $urlTemplate
+        Write-Log "✓ This URL variation works!" "SUCCESS"
+        
+        # Extract deployments from response
+        $deployments = if ($result.content) { $result.content } else { $result }
+        
+        if ($deployments -and $deployments.Count -gt 0) {
+            Write-Log "Found $($deployments.Count) deleted deployments in first page" "SUCCESS"
+            $allDeletedDeployments += $deployments
+            break
+        }
+        else {
+            Write-Log "No deployments returned, trying next variation..." "WARN"
+        }
     }
 }
 
-# Export to CSV
-Write-DebugLog "`n===== Exporting Data =====" "INFO"
-$reportData | Select-Object Name, Status, Source, RequestedBy, Requestor, DeploymentName, CatalogItem | Export-Csv -Path $outputCSV -NoTypeInformation
-Write-DebugLog "Exported to: $outputCSV" "SUCCESS"
+if (-not $workingUrl) {
+    Write-Log "`n✗ None of the URL variations worked!" "ERROR"
+    Write-Log "Please check:" "ERROR"
+    Write-Log "  1. vRA version and API compatibility" "ERROR"
+    Write-Log "  2. User permissions for viewing deleted deployments" "ERROR"
+    Write-Log "  3. Whether deleted deployments exist in the system" "ERROR"
+    Write-Log "`nManual test: Try accessing https://$vraServer/deployment/api/deployments in your browser" "WARN"
+    exit
+}
 
-# Send Email Report
-Write-DebugLog "`n===== Sending Email Report =====" "INFO"
-Send-NewServerReport -ReportData $reportData -SmtpServer $smtpServer -SmtpPort $smtpPort -From $smtpFrom -To $smtpTo -Subject $smtpSubject
+# Continue fetching remaining pages
+if ($allDeletedDeployments.Count -gt 0) {
+    Write-Log "`nFetching remaining pages..." "SUCCESS"
+    
+    $page = 1
+    do {
+        $skip = $page * $pageSize
+        $uri = $workingUrl -f $page, $skip
+        
+        Write-Log "Fetching page $page (skip=$skip)..." "DEBUG"
+        
+        $result = Test-ApiEndpoint -Uri $uri -Headers $headers -Description "Page $page"
+        
+        if ($result) {
+            $deployments = if ($result.content) { $result.content } else { $result }
+            
+            if ($deployments -and $deployments.Count -gt 0) {
+                $allDeletedDeployments += $deployments
+                Write-Log "  Retrieved $($deployments.Count) deployments (Total: $($allDeletedDeployments.Count))" "SUCCESS"
+                $page++
+            }
+            else {
+                Write-Log "No more deployments to fetch" "DEBUG"
+                break
+            }
+        }
+        else {
+            break
+        }
+        
+        # Safety limit
+        if ($allDeletedDeployments.Count -ge 10000) {
+            Write-Log "Reached safety limit of 10000 deployments" "WARN"
+            break
+        }
+        
+    } while ($true)
+}
 
-Write-DebugLog "`n===== Script Completed Successfully =====" "SUCCESS"
-Write-DebugLog "Results saved to: $outputCSV"
-Write-DebugLog "Log saved to: $outputLog"
+Write-Log "`nTotal deleted deployments retrieved: $($allDeletedDeployments.Count)" "SUCCESS"
+
+# Filter by date
+Write-Log "Filtering deployments by date (last $daysBack days)..." "DEBUG"
+$filteredDeployments = $allDeletedDeployments | Where-Object {
+    try {
+        $updateDate = [DateTime]$_.lastUpdatedAt
+        $updateDate -ge $cutoffDate
+    }
+    catch {
+        $true  # Include if can't parse date
+    }
+}
+
+Write-Log "Deployments after date filter: $($filteredDeployments.Count)" "SUCCESS"
+
+if ($filteredDeployments.Count -eq 0) {
+    Write-Log "`n✗ No deleted deployments found in the last $daysBack days!" "WARN"
+    Write-Log "This could mean:" "WARN"
+    Write-Log "  - No deployments have been deleted" "WARN"
+    Write-Log "  - Deleted deployments are purged immediately" "WARN"
+    Write-Log "  - The 'deleted' filter requires different syntax" "WARN"
+    Write-Log "  - Permissions issue" "WARN"
+    exit
+}
+
+# STEP 3: Get detailed event history for each deleted deployment
+Write-Log "`n============================================"
+Write-Log "STEP 3: FETCHING EVENT HISTORY"
+Write-Log "============================================"
+
+$summaryResults = @()
+$detailedResults = @()
+
+foreach ($deployment in $filteredDeployments) {
+    Write-Log "`nProcessing: $($deployment.name)" "SUCCESS"
+    Write-Log "  Deployment ID: $($deployment.id)" "DEBUG"
+    Write-Log "  Status: $($deployment.status)" "DEBUG"
+    Write-Log "  Last Updated: $($deployment.lastUpdatedAt)" "DEBUG"
+    
+    # Get requests for this deployment
+    try {
+        $requestsUri = "https://$vraServer/deployment/api/deployments/$($deployment.id)/requests?apiVersion=2020-08-25&deleted=true"
+        Write-Log "  Fetching requests..." "DEBUG"
+        Write-Log "  URL: $requestsUri" "DEBUG"
+        
+        $requestsResult = Test-ApiEndpoint -Uri $requestsUri -Headers $headers -Description "Deployment Requests"
+        
+        if ($requestsResult) {
+            $requests = if ($requestsResult.content) { $requestsResult.content } else { $requestsResult }
+            Write-Log "  Found $($requests.Count) requests" "SUCCESS"
+            
+            # Get events for each request
+            foreach ($request in $requests) {
+                Write-Log "    Request ID: $($request.id) - Action: $($request.actionId)" "DEBUG"
+                
+                # Fetch ALL events with pagination
+                $allEvents = @()
+                $eventPage = 0
+                $totalEventPages = 0
+                
+                do {
+                    # THIS IS THE EXACT URL FROM YOUR NETWORK CONSOLE with pagination
+                    $eventsUri = "https://$vraServer/deployment/api/deployments/$($deployment.id)/requests/$($request.id)/events?page=$eventPage&size=$eventsPageSize&deleted=true&apiVersion=2020-08-25"
+                    Write-Log "    Fetching events page $eventPage..." "DEBUG"
+                    Write-Log "    URL: $eventsUri" "DEBUG"
+                    
+                    $eventsResult = Test-ApiEndpoint -Uri $eventsUri -Headers $headers -Description "Request Events Page $eventPage"
+                    
+                    if ($eventsResult) {
+                        $events = if ($eventsResult.content) { $eventsResult.content } else { $eventsResult }
+                        
+                        if ($events -and $events.Count -gt 0) {
+                            $allEvents += $events
+                            Write-Log "    Retrieved $($events.Count) events (Total: $($allEvents.Count))" "SUCCESS"
+                            
+                            # Check if there are more pages
+                            if ($eventsResult.totalElements) {
+                                $totalEventPages = [Math]::Ceiling($eventsResult.totalElements / $eventsPageSize)
+                                Write-Log "    Total events available: $($eventsResult.totalElements) (Pages: $totalEventPages)" "DEBUG"
+                            }
+                            
+                            $eventPage++
+                            
+                            # Stop if we got fewer items than page size (last page)
+                            if ($events.Count -lt $eventsPageSize) {
+                                break
+                            }
+                        }
+                        else {
+                            break
+                        }
+                    }
+                    else {
+                        break
+                    }
+                    
+                    # Safety limit per request
+                    if ($allEvents.Count -ge 1000) {
+                        Write-Log "    Reached safety limit of 1000 events for this request" "WARN"
+                        break
+                    }
+                    
+                } while ($true)
+                
+                Write-Log "    Total events for request: $($allEvents.Count)" "SUCCESS"
+                
+                # Filter events by resource type if specified
+                $filteredEvents = $allEvents
+                if ($filterResourceTypes.Count -gt 0) {
+                    $filteredEvents = $allEvents | Where-Object {
+                        $eventResourceType = $_.resourceType
+                        $match = $false
+                        foreach ($filter in $filterResourceTypes) {
+                            if ($eventResourceType -eq $filter -or $eventResourceType -like $filter) {
+                                $match = $true
+                                break
+                            }
+                        }
+                        $match
+                    }
+                    Write-Log "    Events after resource type filter ($($filterResourceTypes -join ', ')): $($filteredEvents.Count)" "SUCCESS"
+                }
+                
+                # Create detailed records for each event
+                foreach ($event in $filteredEvents) {
+                        # Extract details - could be string, object, or array
+                        $detailsValue = $null
+                        if ($event.details) {
+                            if ($event.details -is [string]) {
+                                $detailsValue = $event.details
+                            }
+                            else {
+                                # Convert complex objects to JSON string for CSV
+                                $detailsValue = ($event.details | ConvertTo-Json -Compress -Depth 5)
+                            }
+                        }
+                        
+                        $detailedResults += [PSCustomObject]@{
+                            DeploymentName = $deployment.name
+                            DeploymentId = $deployment.id
+                            RequestId = $request.id
+                            RequestAction = $request.actionId
+                            RequestedBy = $request.requestedBy
+                            RequestedAt = $request.createdAt
+                            RequestStatus = $request.status
+                            EventTimestamp = $event.timestamp
+                            EventStatus = $event.status
+                            EventType = $event.eventType
+                            ResourceType = $event.resourceType
+                            ResourceName = $event.resourceName
+                            Message = $event.message
+                            Details = $detailsValue  # NEW: The "Details" column from the UI
+                            EventId = $event.id
+                            # Additional event properties
+                            EventLogLevel = $event.logLevel
+                            EventSource = $event.source
+                            EventCode = $event.code
+                        }
+                    }
+                }
+                
+                # Create summary record
+                $summaryResults += [PSCustomObject]@{
+                    DeploymentName = $deployment.name
+                    DeploymentId = $deployment.id
+                    Status = $deployment.status
+                    Owner = $deployment.ownedBy
+                    CreatedBy = $deployment.createdBy
+                    CreatedAt = $deployment.createdAt
+                    LastUpdatedBy = $deployment.lastUpdatedBy
+                    LastUpdatedAt = $deployment.lastUpdatedAt
+                    ProjectId = $deployment.projectId
+                    ProjectName = $deployment.projectName
+                    BlueprintId = $deployment.blueprintId
+                    RequestCount = $requests.Count
+                    TotalEventCount = $allEvents.Count
+                    FilteredEventCount = $filteredEvents.Count
+                }
+        }
+        else {
+            Write-Log "  Could not fetch requests for this deployment" "WARN"
+        }
+    }
+    catch {
+        Write-Log "  Error processing deployment: $($_.Exception.Message)" "ERROR"
+    }
+}
+
+# STEP 4: Export results
+Write-Log "`n============================================"
+Write-Log "STEP 4: EXPORTING RESULTS"
+Write-Log "============================================"
+
+if ($summaryResults.Count -gt 0) {
+    $summaryResults | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
+    Write-Log "✓ Summary CSV: $outputCsv" "SUCCESS"
+}
+
+if ($detailedResults.Count -gt 0) {
+    $detailedResults | Export-Csv -Path $outputDetailedCsv -NoTypeInformation -Encoding UTF8
+    Write-Log "✓ Detailed events CSV: $outputDetailedCsv" "SUCCESS"
+}
+
+# Export raw JSON
+$rawData = @{
+    Deployments = $allDeletedDeployments
+    Summary = $summaryResults
+    DetailedEvents = $detailedResults
+}
+$rawData | ConvertTo-Json -Depth 10 | Out-File -FilePath $outputJson -Encoding UTF8
+Write-Log "✓ Raw JSON: $outputJson" "SUCCESS"
+
+# Final summary
+Write-Log "`n============================================"
+Write-Log "FINAL SUMMARY"
+Write-Log "============================================"
+Write-Log "Date range: Last $daysBack days (since $cutoffDateStr)" "SUCCESS"
+Write-Log "Resource type filter: $(if ($filterResourceTypes.Count -gt 0) { $filterResourceTypes -join ', ' } else { 'None (all types)' })" "SUCCESS"
+Write-Log "Deleted deployments found: $($summaryResults.Count)" "SUCCESS"
+Write-Log "Total events captured: $($detailedResults.Count)" "SUCCESS"
+
+if ($summaryResults.Count -gt 0) {
+    Write-Log "`nMost recent deletions:" "SUCCESS"
+    $summaryResults | Sort-Object LastUpdatedAt -Descending | Select-Object -First 5 | ForEach-Object {
+        Write-Log "`n  $($_.DeploymentName)" "SUCCESS"
+        Write-Log "    Last Updated: $($_.LastUpdatedAt)" "DEBUG"
+        Write-Log "    Status: $($_.Status)" "DEBUG"
+        Write-Log "    Owner: $($_.Owner)" "DEBUG"
+    }
+}
+
+Write-Log "`n===== Script Complete =====" "SUCCESS"
+Write-Log "Log file: $outputLog"
