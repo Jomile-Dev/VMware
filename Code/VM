@@ -338,7 +338,16 @@ function Send-NewServerReport {
     # Build HTML table for email
     $htmlRows = ""
     foreach ($record in $sortedData) {
-        $htmlRows += "<tr>"
+        # Color code rows based on status
+        $rowClass = ""
+        if ($record.Status -eq "Online") {
+            $rowClass = " style='background-color: #e8f5e9;'"  # Light green for online
+        }
+        elseif ($record.Status -eq "Decomm/Offline") {
+            $rowClass = " style='background-color: #ffebee;'"  # Light red for decomm/offline
+        }
+        
+        $htmlRows += "<tr$rowClass>"
         $htmlRows += "<td>$($record.Name)</td>"
         $htmlRows += "<td>$($record.Status)</td>"
         $htmlRows += "<td>$($record.Source)</td>"
