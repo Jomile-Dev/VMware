@@ -325,19 +325,16 @@ function Send-NewServerReport {
     
     Write-DebugLog "Building email report..."
     
+    # Filter out Decomm/Offline servers
+    $onlineServers = $ReportData | Where-Object { $_.Status -ne "Decomm/Offline" }
+    
+    # Sort: First by Status (Online first), then by Source
+    $sortedData = $onlineServers | Sort-Object @{Expression={if($_.Status -eq "Online"){"A"}else{"B"}}; Ascending=$true}, Source
+    
     # Build HTML table for email
     $htmlRows = ""
-    foreach ($record in $ReportData) {
-        # Color code rows based on source and status
-        $rowClass = ""
-        if ($record.Status -eq "Decomm/Offline") {
-            $rowClass = " style='background-color: #ffcccc;'"  # Red for decomm
-        }
-        elseif ($record.Source -notlike "*vRA*") {
-            $rowClass = " style='background-color: #fff3cd;'"  # Yellow for non-vRA
-        }
-        
-        $htmlRows += "<tr$rowClass>"
+    foreach ($record in $sortedData) {
+        $htmlRows += "<tr>"
         $htmlRows += "<td>$($record.Name)</td>"
         $htmlRows += "<td>$($record.Status)</td>"
         $htmlRows += "<td>$($record.Source)</td>"
@@ -367,9 +364,6 @@ $htmlRows
 </table>
 "@
     
-    # Count decomm servers
-    $decommCount = ($ReportData | Where-Object { $_.Status -eq "Decomm/Offline" }).Count
-    
     $htmlBody = @"
 <html>
 <head>
@@ -378,28 +372,12 @@ $htmlRows
     table { border-collapse: collapse; width: 100%; margin-top: 20px; }
     th { background-color: #4CAF50; color: white; padding: 12px; text-align: left; font-weight: bold; }
     td { border: 1px solid #ddd; padding: 10px; }
-    tr:nth-child(even) { background-color: #f2f2f2; }
-    tr:hover { background-color: #e8e8e8; }
     .summary { background-color: #f9f9f9; padding: 10px 15px; border-left: 4px solid #4CAF50; margin-bottom: 20px; }
-    .legend { margin-top: 10px; font-size: 14px; }
-    .legend-item { display: inline-block; margin-right: 20px; }
-    .legend-color { display: inline-block; width: 20px; height: 20px; margin-right: 5px; vertical-align: middle; border: 1px solid #ddd; }
 </style>
 </head>
 <body>
 <div class="summary">
-    <p><strong>Total New Servers:</strong> $($ReportData.Count)</p>
-    <p><strong>Decomm/Offline Servers:</strong> $decommCount</p>
-</div>
-<div class="legend">
-    <div class="legend-item">
-        <span class="legend-color" style="background-color: #ffcccc;"></span>
-        <span>Decomm/Offline (from deleted deployments)</span>
-    </div>
-    <div class="legend-item">
-        <span class="legend-color" style="background-color: #fff3cd;"></span>
-        <span>Created outside vRA</span>
-    </div>
+    <p><strong>Total New Servers:</strong> $($sortedData.Count)</p>
 </div>
 $htmlTable
 </body>
