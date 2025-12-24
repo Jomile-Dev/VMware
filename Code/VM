@@ -284,6 +284,7 @@ function Send-NewServerReport {
         $htmlRows += "<tr$rowClass>"
         $htmlRows += "<td>$($record.Name)</td>"
         $htmlRows += "<td>$($record.Status)</td>"
+        $htmlRows += "<td>$($record.PowerState)</td>"
         $htmlRows += "<td>$($record.Source)</td>"
         $htmlRows += "<td>$($record.RequestedBy)</td>"
         $htmlRows += "<td>$($record.Requestor)</td>"
@@ -294,6 +295,8 @@ function Send-NewServerReport {
     
     $onlineCount = ($ReportData | Where-Object { $_.Status -eq "Online" }).Count
     $decommCount = ($ReportData | Where-Object { $_.Status -eq "Decomm/Offline" }).Count
+    $poweredOnCount = ($ReportData | Where-Object { $_.PowerState -eq "PoweredOn" }).Count
+    $poweredOffCount = ($ReportData | Where-Object { $_.PowerState -eq "PoweredOff" }).Count
     
     $htmlBody = @"
 <html>
@@ -309,13 +312,15 @@ function Send-NewServerReport {
 <body>
 <div class="summary">
     <p><strong>Total New Servers:</strong> $($ReportData.Count)</p>
-    <p><strong>Online:</strong> $onlineCount | <strong>Decomm/Offline:</strong> $decommCount</p>
+    <p><strong>Online (Exists):</strong> $onlineCount | <strong>Decomm/Offline (Deleted):</strong> $decommCount</p>
+    <p><strong>Powered On:</strong> $poweredOnCount | <strong>Powered Off:</strong> $poweredOffCount</p>
 </div>
 <table>
 <thead>
 <tr>
 <th>Name</th>
 <th>Status</th>
+<th>Power State</th>
 <th>Source</th>
 <th>Requested By</th>
 <th>Requestor</th>
@@ -414,27 +419,44 @@ try {
             $powerStateProp = $response.property | Where-Object { $_.name -eq "summary|runtime|powerState" } | Select-Object -First 1
             
             $status = "Unknown"
+            $powerState = "Unknown"
             
-            # Check power state
+            # Check power state first
             if ($powerStateProp -and $powerStateProp.value) {
-                $powerState = $powerStateProp.value.ToString().ToUpper()
-                if ($powerState -eq "POWERED_ON" -or $powerState -eq "1") {
+                $powerStateValue = $powerStateProp.value.ToString().ToUpper()
+                if ($powerStateValue -eq "POWERED_ON" -or $powerStateValue -eq "1") {
                     $status = "Online"
+                    $powerState = "PoweredOn"
                 }
-                elseif ($powerState -eq "POWERED_OFF" -or $powerState -eq "0") {
-                    $status = "Decomm/Offline"
+                elseif ($powerStateValue -eq "POWERED_OFF" -or $powerStateValue -eq "0") {
+                    $status = "Online"  # VM exists, just powered off
+                    $powerState = "PoweredOff"
                 }
             }
             
-            # Check health badge
-            if ($healthProp -and $healthProp.value) {
+            # Check resource state - this tells us if VM actually exists
+            if ($resourceStateProp -and $resourceStateProp.value) {
+                $resourceState = $resourceStateProp.value.ToString().ToUpper()
+                if ($resourceState -in @("NOT_EXISTING", "STOPPED")) {
+                    $status = "Decomm/Offline"  # VM no longer exists
+                    $powerState = "NotExisting"
+                }
+                elseif ($resourceState -in @("STARTED", "MAINTAINED", "RUNNING")) {
+                    if ($status -eq "Unknown") {
+                        $status = "Online"
+                    }
+                }
+            }
+            
+            # Check health badge as fallback
+            if ($status -eq "Unknown" -and $healthProp -and $healthProp.value) {
                 $healthValue = $healthProp.value.ToString().ToUpper()
                 
                 if ($healthValue -match "GREEN|YELLOW|ORANGE|RED") {
                     $status = "Online"
                 }
-                elseif ($healthValue -match "GREY|GRAY|UNKNOWN|NONE") {
-                    $status = "Decomm/Offline"
+                elseif ($healthValue -match "GREY|GRAY|NONE") {
+                    $status = "Decomm/Offline"  # No health data = doesn't exist
                 }
                 elseif ($healthValue -match "^[1-4]$") {
                     $status = "Online"
@@ -444,22 +466,10 @@ try {
                 }
             }
             
-            # Check resource state
-            if ($resourceStateProp -and $resourceStateProp.value) {
-                $resourceState = $resourceStateProp.value.ToString().ToUpper()
-                if ($resourceState -in @("STARTED", "MAINTAINED", "RUNNING")) {
-                    if ($status -eq "Unknown") {
-                        $status = "Online"
-                    }
-                }
-                elseif ($resourceState -in @("STOPPED", "NOT_EXISTING")) {
-                    $status = "Decomm/Offline"
-                }
-            }
-            
             $newVMsData += [PSCustomObject]@{
                 Name = $vmName
                 Status = $status
+                PowerState = $powerState
                 ResourceId = $identifier
             }
         }
@@ -668,16 +678,20 @@ foreach ($vmData in $newVMsData) {
     if ($depInfo) {
         # Determine final status
         $finalStatus = $vmData.Status
+        $finalPowerState = $vmData.PowerState
         
         if ($depInfo.Status -eq "DELETED" -or $depInfo.DeploymentStatus -eq "Decomm/Offline") {
             $finalStatus = "Decomm/Offline"
+            $finalPowerState = "NotExisting"
         }
         elseif ($vmData.Status -eq "Decomm/Offline") {
             $finalStatus = "Decomm/Offline"
+            $finalPowerState = "NotExisting"
         }
         elseif ($vmData.Status -eq "Unknown") {
             # Fallback: Try to determine status from vCenter for vRA VMs with Unknown status
             $finalStatus = "Online"  # Default assumption
+            $finalPowerState = "Unknown"
             
             foreach ($vCenter in $vCenters) {
                 try {
@@ -689,8 +703,9 @@ foreach ($vmData in $newVMsData) {
                     
                     $vm = Get-VM -Name $vmName -Server $vCenter -ErrorAction SilentlyContinue
                     if ($vm) {
-                        $finalStatus = if ($vm.PowerState -eq "PoweredOn") { "Online" } else { "Decomm/Offline" }
-                        Write-Log "  Found $vmName on $vCenter - Status: $finalStatus"
+                        $finalStatus = "Online"  # VM exists
+                        $finalPowerState = if ($vm.PowerState -eq "PoweredOn") { "PoweredOn" } else { "PoweredOff" }
+                        Write-Log "  Found $vmName on $vCenter - PowerState: $finalPowerState"
                         break
                     }
                 }
@@ -706,6 +721,7 @@ foreach ($vmData in $newVMsData) {
         $reportData += [PSCustomObject]@{
             Name = $vmName
             Status = $finalStatus
+            PowerState = $finalPowerState
             DeploymentName = $depInfo.DeploymentName
             CatalogItem = $depInfo.CatalogItem
             RequestedBy = $depInfo.RequestedBy
@@ -717,54 +733,63 @@ foreach ($vmData in $newVMsData) {
         # Not in vRA, check vCenter
         $vcInfo = $vCenterLookup[$vmName]
         $finalStatus = $vmData.Status
+        $finalPowerState = $vmData.PowerState
         
         # If status is Unknown, try to get actual power state from vCenter
         if ($finalStatus -eq "Unknown") {
             $finalStatus = "Online"  # Default to Online if we can't determine
+            $finalPowerState = "Unknown"
             
             # Try to connect to vCenter and check power state
             foreach ($vCenter in $vCenters) {
                 try {
                     if (-not $vCenterConnections.ContainsKey($vCenter)) {
                         Connect-VIServer -Server $vCenter -Credential $credential -ErrorAction Stop | Out-Null
-                        $vCenterConnections[$vCenter] = $true
+                        vCenterConnections[vCenterConnections[
+                        vCenterConnections[vCenter] = $true
                         Write-Log "  Connected to $vCenter for power state lookup"
                     }
-                    
                     $vm = Get-VM -Name $vmName -Server $vCenter -ErrorAction SilentlyContinue
-                    if ($vm) {
-                        $finalStatus = if ($vm.PowerState -eq "PoweredOn") { "Online" } else { "Decomm/Offline" }
-                        Write-Log "  Found $vmName on $vCenter - Status: $finalStatus"
-                        break
-                    }
+                if ($vm) {
+                    $finalStatus = "Online"  # VM exists
+                    $finalPowerState = if ($vm.PowerState -eq "PoweredOn") { "PoweredOn" } else { "PoweredOff" }
+                    Write-Log "  Found $vmName on $vCenter - PowerState: $finalPowerState"
+                    break
                 }
-                catch {
-                    # Continue to next vCenter
+                else {
+                    # VM doesn't exist in this vCenter, try next one
+                    continue
                 }
             }
-        }
-        
-        if ($vcInfo) {
-            $reportData += [PSCustomObject]@{
-                Name = $vmName
-                Status = $finalStatus
-                DeploymentName = "N/A"
-                CatalogItem = "N/A"
-                RequestedBy = $vcInfo.CreatedBy
-                Requestor = $vcInfo.CreatedBy
-                Source = $vcInfo.vCenter
-            }
-        }
-        else {
-            $reportData += [PSCustomObject]@{
-                Name = $vmName
-                Status = $finalStatus
-                DeploymentName = "N/A"
-                CatalogItem = "N/A"
-                RequestedBy = "N/A"
-                Requestor = "N/A"
-                Source = "Unknown"
+            catch {
+                # Continue to next vCenter
             }
         }
     }
+    
+    if ($vcInfo) {
+        $reportData += [PSCustomObject]@{
+            Name = $vmName
+            Status = $finalStatus
+            PowerState = $finalPowerState
+            DeploymentName = "N/A"
+            CatalogItem = "N/A"
+            RequestedBy = $vcInfo.CreatedBy
+            Requestor = $vcInfo.CreatedBy
+            Source = $vcInfo.vCenter
+        }
+    }
+    else {
+        $reportData += [PSCustomObject]@{
+            Name = $vmName
+            Status = $finalStatus
+            PowerState = $finalPowerState
+            DeploymentName = "N/A"
+            CatalogItem = "N/A"
+            RequestedBy = "N/A"
+            Requestor = "N/A"
+            Source = "Unknown"
+        }
+    }
+}
 }
