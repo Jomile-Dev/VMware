@@ -2,7 +2,6 @@
 # PowerShell 5.1 Compatible
 # Tracks servers built in the last day and sends email report
 
-# Configuration
 $ariaOpsServer = "aria-ops.yourdomain.com"
 $ariaOpsDomain = "yourdomain.com"
 $ariaOpsAuthSource = "localos"
@@ -18,32 +17,15 @@ $vCenters = @(
     "vcenter3.domain.com"
 )
 
-# SMTP Configuration
 $smtpServer = "smtp.yourdomain.com"
 $smtpPort = 587
 $smtpFrom = "vra-reports@yourdomain.com"
 $smtpTo = @("admin@yourdomain.com")
 $smtpSubject = "New Server Deployment Report - $(Get-Date -Format 'yyyy-MM-dd')"
 
-# Time range for new VMs (in days)
 $daysBack = 1
 $deletedDaysBack = 90
 $eventsPageSize = 200
-
-# Helper Functions
-function Write-Log {
-    param([string]$Message, [string]$Level = "INFO")
-    
-    $color = switch ($Level) {
-        "ERROR" { "Red" }
-        "WARN" { "Yellow" }
-        "SUCCESS" { "Green" }
-        default { "Cyan" }
-    }
-    
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    Write-Host "[$timestamp] [$Level] $Message" -ForegroundColor $color
-}
 
 function Disable-SSLValidation {
     if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
@@ -74,8 +56,6 @@ function Get-DeletedDeploymentServers {
         [Parameter(Mandatory=$true)]
         [int]$DaysBack
     )
-    
-    Write-Log "  Searching for deleted deployments (last $DaysBack days)..."
     
     $deletedServerData = @{}
     $cutoffDate = (Get-Date).AddDays(-$DaysBack)
@@ -108,7 +88,6 @@ function Get-DeletedDeploymentServers {
     }
     
     if (-not $workingUrl) {
-        Write-Log "  No deleted deployments found or not supported" "WARN"
         return $deletedServerData
     }
     
@@ -144,8 +123,6 @@ function Get-DeletedDeploymentServers {
             $true
         }
     }
-    
-    Write-Log "  Processing $($filteredDeployments.Count) deleted deployments..."
     
     foreach ($deployment in $filteredDeployments) {
         try {
@@ -230,7 +207,6 @@ function Get-DeletedDeploymentServers {
         }
     }
     
-    Write-Log "  Extracted $($deletedServerData.Count) servers from deleted deployments" "SUCCESS"
     return $deletedServerData
 }
 
@@ -255,11 +231,6 @@ function Send-NewServerReport {
         [string]$Subject
     )
     
-    Write-Log "Building email report..."
-    
-    <#
-    Sort: Online first, then Decomm/Offline, then by Source within each status
-    #>
     $sortedData = $ReportData | Sort-Object @{
         Expression={
             if($_.Status -eq "Online"){"A"}
@@ -329,37 +300,22 @@ $htmlRows
 </html>
 "@
     
-    Write-Log "Sending email to: $($To -join ', ')"
     Send-MailMessage -To $To -From $From -Subject $Subject -Body $htmlBody -BodyAsHtml -SmtpServer $SmtpServer -Port $SmtpPort -UseSsl
-    Write-Log "Email sent successfully!" "SUCCESS"
 }
 
-# Main Script
-Write-Log "New Server Tracker Started" "SUCCESS"
-Write-Log "PowerShell Version: $($PSVersionTable.PSVersion)"
-
-# Load VMware PowerCLI
 Import-Module VMware.PowerCLI -ErrorAction SilentlyContinue
 Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session | Out-Null
-Write-Log "VMware PowerCLI loaded" "SUCCESS"
 
 Disable-SSLValidation
 
-# Get credentials
-Write-Log "Requesting credentials..."
 $credential = Get-Credential -Message "Enter credentials for Aria Operations, vRA, and vCenter"
 if (-not $credential) {
-    Write-Log "Credentials not provided. Exiting." "ERROR"
     exit
 }
 $username = $credential.UserName
 $password = $credential.GetNetworkCredential().Password
 
-# Aria Operations - Get New VMs
-Write-Log "`nConnecting to Aria Operations" "SUCCESS"
-
 try {
-    # Authenticate
     $ariaUsername = "$username@$ariaOpsDomain@$ariaOpsAuthSource"
     $ariaAuthUri = "https://$ariaOpsServer/suite-api/api/auth/token/acquire"
     $ariaAuthBody = @{
@@ -379,16 +335,11 @@ try {
         "X-Ops-API-use-unsupported" = "true"
     }
     
-    Write-Log "Authenticated to Aria Operations successfully" "SUCCESS"
-    
-    # Query for new VMs
     $yesterday = [DateTimeOffset]::Now.AddDays(-$daysBack).ToUnixTimeMilliseconds()
     $ariaUri = "https://$ariaOpsServer/suite-api/api/resources?resourceKind=VirtualMachine"
     
     $response = Invoke-RestMethod -Uri $ariaUri -Headers $ariaHeaders -Method Get
     $vmIdentifiers = $response.resourceList | Where-Object { $_.creationTime -ge $yesterday } | Select-Object -ExpandProperty identifier
-    
-    Write-Log "Found $($vmIdentifiers.Count) VMs created in the last $daysBack day(s)"
     
     $newVMsData = @()
     
@@ -398,19 +349,16 @@ try {
         try {
             $response = Invoke-RestMethod -Uri $vmPropertiesURL -Headers $ariaHeaders -Method Get
             
-            # Get VM name
             $nameProp = $response.property | Where-Object { $_.name -eq "config|name" -or $_.name -eq "summary|config|name" } | Select-Object -First 1
             if (-not $nameProp) { continue }
             $vmName = $nameProp.value
             
-            # Determine status from Aria Operations
             $healthProp = $response.property | Where-Object { $_.name -eq "badge|health" -or $_.name -eq "summary|health" } | Select-Object -First 1
             $resourceStateProp = $response.property | Where-Object { $_.name -eq "summary|resourceState" } | Select-Object -First 1
             $powerStateProp = $response.property | Where-Object { $_.name -eq "summary|runtime|powerState" } | Select-Object -First 1
             
             $status = "Unknown"
             
-            # Check power state
             if ($powerStateProp -and $powerStateProp.value) {
                 $powerState = $powerStateProp.value.ToString().ToUpper()
                 if ($powerState -eq "POWERED_ON" -or $powerState -eq "1") {
@@ -421,7 +369,6 @@ try {
                 }
             }
             
-            # Check health badge
             if ($healthProp -and $healthProp.value) {
                 $healthValue = $healthProp.value.ToString().ToUpper()
                 
@@ -439,7 +386,6 @@ try {
                 }
             }
             
-            # Check resource state
             if ($resourceStateProp -and $resourceStateProp.value) {
                 $resourceState = $resourceStateProp.value.ToString().ToUpper()
                 if ($resourceState -in @("STARTED", "MAINTAINED", "RUNNING")) {
@@ -459,32 +405,23 @@ try {
             }
         }
         catch {
-            Write-Log "  Error getting properties for VM $identifier" "WARN"
+            continue
         }
     }
-    
-    Write-Log "Successfully retrieved $($newVMsData.Count) new VMs" "SUCCESS"
 }
 catch {
-    Write-Log "Failed to query Aria Operations: $($_.Exception.Message)" "ERROR"
     exit
 }
 
 if ($newVMsData.Count -eq 0) {
-    Write-Log "No new VMs found. Exiting." "WARN"
     exit
 }
 
-# vRA - Get Deployment Info
-Write-Log "`nProcessing vRA Servers" "SUCCESS"
 $deploymentData = @{}
 $deletedDeploymentData = @{}
 
 foreach ($vraServer in $vraServers) {
-    Write-Log "`nConnecting to vRA: $vraServer"
-    
     try {
-        # Authenticate
         $vraAuthUri = "https://$vraServer/csp/gateway/am/api/login"
         $vraAuthBody = @{
             username = $username
@@ -500,9 +437,6 @@ foreach ($vraServer in $vraServers) {
             "Content-Type" = "application/json"
         }
         
-        Write-Log "Authenticated successfully" "SUCCESS"
-        
-        # Fetch active deployments
         $vraUri = "https://$vraServer/deployment/api/deployments"
         $page = 0
         $size = 1000
@@ -526,11 +460,6 @@ foreach ($vraServer in $vraServers) {
             
         } while ($hasMore)
         
-        Write-Log "Retrieved $($allDeployments.Count) active deployments"
-        
-        <#
-        Process deployments with vSphere machines
-        #>
         foreach ($dep in $allDeployments) {
             if ($dep.resources) {
                 $vSphereMachines = $dep.resources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" }
@@ -541,7 +470,6 @@ foreach ($vraServer in $vraServers) {
                     if ($machine.properties) {
                         $props = $machine.properties
                         
-                        # PowerShell 5.1 compatible property access
                         if ($props.PSObject.Properties['hostname']) {
                             $hostname = $props.hostname
                         }
@@ -582,10 +510,6 @@ foreach ($vraServer in $vraServers) {
             }
         }
         
-        Write-Log "Processed active deployments" "SUCCESS"
-        
-        # Fetch deleted deployments
-        Write-Log "Fetching deleted deployments..."
         $deletedServers = Get-DeletedDeploymentServers -VraServer $vraServer -Headers $vraHeaders -DaysBack $deletedDaysBack
         
         foreach ($serverName in $deletedServers.Keys) {
@@ -595,31 +519,22 @@ foreach ($vraServer in $vraServers) {
         }
     }
     catch {
-        Write-Log "Error processing vRA server $vraServer : $($_.Exception.Message)" "ERROR"
+        continue
     }
 }
 
-# Merge deleted deployments
 foreach ($vmName in $deletedDeploymentData.Keys) {
     if (-not $deploymentData.ContainsKey($vmName)) {
         $deploymentData[$vmName] = $deletedDeploymentData[$vmName]
     }
 }
 
-Write-Log "`nTotal deployments found: $($deploymentData.Count) (Active + Deleted)" "SUCCESS"
-
-# vCenter - Get Creator Info for Non-vRA VMs
-Write-Log "`nConnecting to vCenter" "SUCCESS"
 $vCenterLookup = @{}
 
 $vmsNeedingVCenterLookup = $newVMsData | Where-Object { -not $deploymentData.ContainsKey($_.Name) } | Select-Object -ExpandProperty Name
 
-Write-Log "VMs needing vCenter lookup: $($vmsNeedingVCenterLookup.Count)"
-
 if ($vmsNeedingVCenterLookup.Count -gt 0) {
     foreach ($vCenter in $vCenters) {
-        Write-Log "Connecting to: $vCenter"
-        
         try {
             Connect-VIServer -Server $vCenter -Credential $credential -ErrorAction Stop | Out-Null
             
@@ -643,16 +558,13 @@ if ($vmsNeedingVCenterLookup.Count -gt 0) {
             }
             
             Disconnect-VIServer -Server $vCenter -Confirm:$false
-            Write-Log "Disconnected from $vCenter"
         }
         catch {
-            Write-Log "Error with vCenter $vCenter : $($_.Exception.Message)" "ERROR"
+            continue
         }
     }
 }
 
-# Build Final Report
-Write-Log "`nBuilding Final Report" "SUCCESS"
 $reportData = @()
 
 foreach ($vmData in $newVMsData) {
@@ -660,7 +572,6 @@ foreach ($vmData in $newVMsData) {
     $depInfo = $deploymentData[$vmName]
     
     if ($depInfo) {
-        # Determine final status
         $finalStatus = $vmData.Status
         
         if ($depInfo.Status -eq "DELETED" -or $depInfo.DeploymentStatus -eq "Decomm/Offline") {
@@ -684,7 +595,6 @@ foreach ($vmData in $newVMsData) {
         }
     }
     else {
-        # Not in vRA, check vCenter
         $vcInfo = $vCenterLookup[$vmName]
         
         if ($vcInfo) {
@@ -712,11 +622,6 @@ foreach ($vmData in $newVMsData) {
     }
 }
 
-Write-Log "Report contains $($reportData.Count) records" "SUCCESS"
-
-# Send Email Report
-Write-Log "`nSending Email Report" "SUCCESS"
-
 Send-NewServerReport `
     -ReportData $reportData `
     -SmtpServer $smtpServer `
@@ -724,5 +629,3 @@ Send-NewServerReport `
     -From $smtpFrom `
     -To $smtpTo `
     -Subject $smtpSubject
-
-Write-Log "`nScript Completed Successfully" "SUCCESS"
