@@ -628,18 +628,23 @@ if ($vmsNeedingVCenterLookup.Count -gt 0) {
             
             $cutoffDate = (Get-Date).AddDays(-$daysBack)
             $events = Get-VIEvent -Server $vCenter -Start $cutoffDate -MaxSamples 50000 | Where-Object {
-                $_.GetType().Name -in @('VmCreatedEvent', 'VmBeingDeployedEvent', 'VmRegisteredEvent', 'VmDeployedEvent') -and
+                $_.GetType().Name -in @('VmCreatedEvent', 'VmBeingDeployedEvent', 'VmRegisteredEvent', 'VmDeployedEvent', 'VmClonedEvent') -and
                 $_.Vm.Name -in $vmsNeedingVCenterLookup
             }
+            
+            Write-Log "  Found $($events.Count) creation events for VMs needing lookup"
             
             foreach ($event in $events) {
                 $vmName = $event.Vm.Name
                 
                 if (-not $vCenterLookup.ContainsKey($vmName)) {
                     $vCenterShort = ($vCenter -split '\.')[0]
+                    $createdBy = if ($event.UserName) { $event.UserName } else { "N/A" }
+                    
+                    Write-Log "  Found creator for $vmName : $createdBy"
                     
                     $vCenterLookup[$vmName] = @{
-                        CreatedBy = if ($event.UserName) { $event.UserName } else { "N/A" }
+                        CreatedBy = $createdBy
                         vCenter = $vCenterShort
                     }
                 }
@@ -691,6 +696,8 @@ foreach ($vmData in $newVMsData) {
         $vcInfo = $vCenterLookup[$vmName]
         
         if ($vcInfo) {
+            Write-Log "  $vmName - Built in vCenter by $($vcInfo.CreatedBy)" "INFO"
+            
             $reportData += [PSCustomObject]@{
                 Name = $vmName
                 Status = $vmData.Status
@@ -702,6 +709,8 @@ foreach ($vmData in $newVMsData) {
             }
         }
         else {
+            Write-Log "  $vmName - Unknown source (no vRA or vCenter data)" "WARN"
+            
             $reportData += [PSCustomObject]@{
                 Name = $vmName
                 Status = $vmData.Status
