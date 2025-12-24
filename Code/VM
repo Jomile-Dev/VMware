@@ -839,11 +839,23 @@ foreach ($vmData in $newVMsData) {
     if ($depInfo) {
         Write-DebugLog "Matched VM '$vmName' to vRA deployment: $($depInfo.DeploymentName)"
         
-        # Check if deployment was deleted - if so, override status to Decomm/Offline
-        $finalStatus = $vmData.Status
+        # Determine final status based on deployment and Aria Ops health
+        $finalStatus = $vmData.Status  # Start with Aria Ops status
+        
+        # If deployment was deleted, override to Decomm/Offline regardless of Aria Ops status
         if ($depInfo.Status -eq "DELETED" -or $depInfo.DeploymentStatus -eq "Decomm/Offline") {
             $finalStatus = "Decomm/Offline"
             Write-DebugLog "  Deployment is DELETED - setting status to Decomm/Offline"
+        }
+        # If deployment is active but Aria Ops shows it's offline/grey, keep that status
+        elseif ($vmData.Status -eq "Decomm/Offline") {
+            $finalStatus = "Decomm/Offline"
+            Write-DebugLog "  Aria Ops shows VM as Decomm/Offline (grey/not monitored)"
+        }
+        # Otherwise, deployment is active and VM is healthy in Aria Ops
+        else {
+            $finalStatus = "Online"
+            Write-DebugLog "  VM is Online (active deployment + healthy in Aria Ops)"
         }
         
         # VM found in vRA
