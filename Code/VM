@@ -284,7 +284,6 @@ function Send-NewServerReport {
         $htmlRows += "<tr$rowClass>"
         $htmlRows += "<td>$($record.Name)</td>"
         $htmlRows += "<td>$($record.Status)</td>"
-        $htmlRows += "<td>$($record.PowerState)</td>"
         $htmlRows += "<td>$($record.Source)</td>"
         $htmlRows += "<td>$($record.RequestedBy)</td>"
         $htmlRows += "<td>$($record.Requestor)</td>"
@@ -295,8 +294,6 @@ function Send-NewServerReport {
     
     $onlineCount = ($ReportData | Where-Object { $_.Status -eq "Online" }).Count
     $decommCount = ($ReportData | Where-Object { $_.Status -eq "Decomm/Offline" }).Count
-    $poweredOnCount = ($ReportData | Where-Object { $_.PowerState -eq "PoweredOn" }).Count
-    $poweredOffCount = ($ReportData | Where-Object { $_.PowerState -eq "PoweredOff" }).Count
     
     $htmlBody = @"
 <html>
@@ -313,14 +310,12 @@ function Send-NewServerReport {
 <div class="summary">
     <p><strong>Total New Servers:</strong> $($ReportData.Count)</p>
     <p><strong>Online (Exists):</strong> $onlineCount | <strong>Decomm/Offline (Deleted):</strong> $decommCount</p>
-    <p><strong>Powered On:</strong> $poweredOnCount | <strong>Powered Off:</strong> $poweredOffCount</p>
 </div>
 <table>
 <thead>
 <tr>
 <th>Name</th>
 <th>Status</th>
-<th>Power State</th>
 <th>Source</th>
 <th>Requested By</th>
 <th>Requestor</th>
