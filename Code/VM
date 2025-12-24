@@ -658,6 +658,9 @@ if ($vmsNeedingVCenterLookup.Count -gt 0) {
 Write-Log "`nBuilding Final Report" "SUCCESS"
 $reportData = @()
 
+# Build vCenter connection lookup for power state checks
+$vCenterConnections = @{}
+
 foreach ($vmData in $newVMsData) {
     $vmName = $vmData.Name
     $depInfo = $deploymentData[$vmName]
@@ -671,6 +674,30 @@ foreach ($vmData in $newVMsData) {
         }
         elseif ($vmData.Status -eq "Decomm/Offline") {
             $finalStatus = "Decomm/Offline"
+        }
+        elseif ($vmData.Status -eq "Unknown") {
+            # Fallback: Try to determine status from vCenter for vRA VMs with Unknown status
+            $finalStatus = "Online"  # Default assumption
+            
+            foreach ($vCenter in $vCenters) {
+                try {
+                    if (-not $vCenterConnections.ContainsKey($vCenter)) {
+                        Connect-VIServer -Server $vCenter -Credential $credential -ErrorAction Stop | Out-Null
+                        $vCenterConnections[$vCenter] = $true
+                        Write-Log "  Connected to $vCenter for power state lookup"
+                    }
+                    
+                    $vm = Get-VM -Name $vmName -Server $vCenter -ErrorAction SilentlyContinue
+                    if ($vm) {
+                        $finalStatus = if ($vm.PowerState -eq "PoweredOn") { "Online" } else { "Decomm/Offline" }
+                        Write-Log "  Found $vmName on $vCenter - Status: $finalStatus"
+                        break
+                    }
+                }
+                catch {
+                    # Continue to next vCenter
+                }
+            }
         }
         else {
             $finalStatus = "Online"
@@ -689,11 +716,38 @@ foreach ($vmData in $newVMsData) {
     else {
         # Not in vRA, check vCenter
         $vcInfo = $vCenterLookup[$vmName]
+        $finalStatus = $vmData.Status
+        
+        # If status is Unknown, try to get actual power state from vCenter
+        if ($finalStatus -eq "Unknown") {
+            $finalStatus = "Online"  # Default to Online if we can't determine
+            
+            # Try to connect to vCenter and check power state
+            foreach ($vCenter in $vCenters) {
+                try {
+                    if (-not $vCenterConnections.ContainsKey($vCenter)) {
+                        Connect-VIServer -Server $vCenter -Credential $credential -ErrorAction Stop | Out-Null
+                        $vCenterConnections[$vCenter] = $true
+                        Write-Log "  Connected to $vCenter for power state lookup"
+                    }
+                    
+                    $vm = Get-VM -Name $vmName -Server $vCenter -ErrorAction SilentlyContinue
+                    if ($vm) {
+                        $finalStatus = if ($vm.PowerState -eq "PoweredOn") { "Online" } else { "Decomm/Offline" }
+                        Write-Log "  Found $vmName on $vCenter - Status: $finalStatus"
+                        break
+                    }
+                }
+                catch {
+                    # Continue to next vCenter
+                }
+            }
+        }
         
         if ($vcInfo) {
             $reportData += [PSCustomObject]@{
                 Name = $vmName
-                Status = $vmData.Status
+                Status = $finalStatus
                 DeploymentName = "N/A"
                 CatalogItem = "N/A"
                 RequestedBy = $vcInfo.CreatedBy
@@ -704,7 +758,7 @@ foreach ($vmData in $newVMsData) {
         else {
             $reportData += [PSCustomObject]@{
                 Name = $vmName
-                Status = $vmData.Status
+                Status = $finalStatus
                 DeploymentName = "N/A"
                 CatalogItem = "N/A"
                 RequestedBy = "N/A"
@@ -714,19 +768,3 @@ foreach ($vmData in $newVMsData) {
         }
     }
 }
-
-Write-Log "Report contains $($reportData.Count) records" "SUCCESS"
-
-# Send Email Report
-Write-Log "`nSending Email Report" "SUCCESS"
-
-Send-NewServerReport `
-    -ReportData $reportData `
-    -SmtpServer $smtpServer `
-    -SmtpPort $smtpPort `
-    -From $smtpFrom `
-    -To $smtpTo `
-    -Cc $smtpCc `
-    -Subject $smtpSubject
-
-Write-Log "`nScript Completed Successfully" "SUCCESS"
