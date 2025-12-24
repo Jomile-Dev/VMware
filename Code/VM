@@ -681,15 +681,16 @@ foreach ($vmData in $newVMsData) {
     $depInfo = $deploymentData[$vmName]
     
     if ($depInfo) {
-        # Determine final status
+        # Determine final status - Aria Operations is the source of truth for VM existence
         $finalStatus = $vmData.Status
         $finalPowerState = $vmData.PowerState
         
-        if ($depInfo.Status -eq "DELETED" -or $depInfo.DeploymentStatus -eq "Decomm/Offline") {
+        # If Aria Operations says it doesn't exist, trust that over vRA deployment status
+        if ($vmData.Status -eq "Decomm/Offline") {
             $finalStatus = "Decomm/Offline"
             $finalPowerState = "NotExisting"
         }
-        elseif ($vmData.Status -eq "Decomm/Offline") {
+        elseif ($depInfo.Status -eq "DELETED" -or $depInfo.DeploymentStatus -eq "Decomm/Offline") {
             $finalStatus = "Decomm/Offline"
             $finalPowerState = "NotExisting"
         }
