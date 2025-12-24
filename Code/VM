@@ -793,3 +793,19 @@ foreach ($vmData in $newVMsData) {
     }
 }
 }
+
+Write-Log "Report contains $($reportData.Count) records" "SUCCESS"
+
+# Send Email Report
+Write-Log "`nSending Email Report" "SUCCESS"
+
+Send-NewServerReport `
+    -ReportData $reportData `
+    -SmtpServer $smtpServer `
+    -SmtpPort $smtpPort `
+    -From $smtpFrom `
+    -To $smtpTo `
+    -Cc $smtpCc `
+    -Subject $smtpSubject
+
+Write-Log "`nScript Completed Successfully" "SUCCESS"
