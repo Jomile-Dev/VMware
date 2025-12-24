@@ -23,6 +23,7 @@ $smtpServer = "smtp.yourdomain.com"
 $smtpPort = 587
 $smtpFrom = "vra-reports@yourdomain.com"
 $smtpTo = @("admin@yourdomain.com")
+$smtpCc = @("manager@yourdomain.com")
 $smtpSubject = "New Server Deployment Report - $(Get-Date -Format 'yyyy-MM-dd')"
 
 # Time range for new VMs (in days)
@@ -251,6 +252,9 @@ function Send-NewServerReport {
         [Parameter(Mandatory=$true)]
         [Array]$To,
         
+        [Parameter(Mandatory=$false)]
+        [Array]$Cc,
+        
         [Parameter(Mandatory=$true)]
         [string]$Subject
     )
@@ -328,7 +332,10 @@ $htmlRows
 "@
     
     Write-Log "Sending email to: $($To -join ', ')"
-    Send-MailMessage -To $To -From $From -Subject $Subject -Body $htmlBody -BodyAsHtml -SmtpServer $SmtpServer -Port $SmtpPort -UseSsl
+    if ($Cc) {
+        Write-Log "CC: $($Cc -join ', ')"
+    }
+    Send-MailMessage -To $To -From $From -Subject $Subject -Body $htmlBody -BodyAsHtml -SmtpServer $SmtpServer -Port $SmtpPort -UseSsl -Cc $Cc
     Write-Log "Email sent successfully!" "SUCCESS"
 }
 
@@ -719,6 +726,7 @@ Send-NewServerReport `
     -SmtpPort $smtpPort `
     -From $smtpFrom `
     -To $smtpTo `
+    -Cc $smtpCc `
     -Subject $smtpSubject
 
 Write-Log "`nScript Completed Successfully" "SUCCESS"
