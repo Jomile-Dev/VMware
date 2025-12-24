@@ -2,9 +2,7 @@
 # PowerShell 5.1 Compatible
 # Tracks servers built in the last day and sends email report
 
-# ============================================
 # Configuration
-# ============================================
 $ariaOpsServer = "aria-ops.yourdomain.com"
 $ariaOpsDomain = "yourdomain.com"
 $ariaOpsAuthSource = "localos"
@@ -29,12 +27,10 @@ $smtpSubject = "New Server Deployment Report - $(Get-Date -Format 'yyyy-MM-dd')"
 
 # Time range for new VMs (in days)
 $daysBack = 1
-$deletedDaysBack = 90  # How far back to search for deleted deployments
-$eventsPageSize = 200  # Page size for event fetching
+$deletedDaysBack = 90
+$eventsPageSize = 200
 
-# ============================================
 # Helper Functions
-# ============================================
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
     
@@ -87,7 +83,6 @@ function Get-DeletedDeploymentServers {
     $page = 0
     $pageSize = 200
     
-    # URL variations to try
     $urlVariations = @(
         "https://$VraServer/deployment/api/deployments?deleted=true&apiVersion=2020-08-25&page={0}&size=$pageSize",
         "https://$VraServer/deployment/api/deployments?deleted=%5Btrue%5D&apiVersion=2020-08-25&page={0}&size=$pageSize"
@@ -117,7 +112,6 @@ function Get-DeletedDeploymentServers {
         return $deletedServerData
     }
     
-    # Fetch remaining pages
     $page = 1
     do {
         try {
@@ -141,7 +135,6 @@ function Get-DeletedDeploymentServers {
         
     } while ($true)
     
-    # Filter by date
     $filteredDeployments = $allDeletedDeployments | Where-Object {
         try {
             $updateDate = [DateTime]$_.lastUpdatedAt
@@ -154,7 +147,6 @@ function Get-DeletedDeploymentServers {
     
     Write-Log "  Processing $($filteredDeployments.Count) deleted deployments..."
     
-    # Process each deleted deployment to extract server names
     foreach ($deployment in $filteredDeployments) {
         try {
             $requestsUri = "https://$VraServer/deployment/api/deployments/$($deployment.id)/requests?apiVersion=2020-08-25&deleted=true"
@@ -265,7 +257,9 @@ function Send-NewServerReport {
     
     Write-Log "Building email report..."
     
-    # Sort: Online first, then Decomm/Offline, then by Source within each status
+    <#
+    Sort: Online first, then Decomm/Offline, then by Source within each status
+    #>
     $sortedData = $ReportData | Sort-Object @{
         Expression={
             if($_.Status -eq "Online"){"A"}
@@ -275,7 +269,6 @@ function Send-NewServerReport {
         Ascending=$true
     }, Source
     
-    # Build HTML table
     $htmlRows = ""
     foreach ($record in $sortedData) {
         $rowClass = ""
@@ -341,10 +334,8 @@ $htmlRows
     Write-Log "Email sent successfully!" "SUCCESS"
 }
 
-# ============================================
 # Main Script
-# ============================================
-Write-Log "===== New Server Tracker Started =====" "SUCCESS"
+Write-Log "New Server Tracker Started" "SUCCESS"
 Write-Log "PowerShell Version: $($PSVersionTable.PSVersion)"
 
 # Load VMware PowerCLI
@@ -364,10 +355,8 @@ if (-not $credential) {
 $username = $credential.UserName
 $password = $credential.GetNetworkCredential().Password
 
-# ============================================
 # Aria Operations - Get New VMs
-# ============================================
-Write-Log "`n===== Connecting to Aria Operations =====" "SUCCESS"
+Write-Log "`nConnecting to Aria Operations" "SUCCESS"
 
 try {
     # Authenticate
@@ -486,15 +475,13 @@ if ($newVMsData.Count -eq 0) {
     exit
 }
 
-# ============================================
 # vRA - Get Deployment Info
-# ============================================
-Write-Log "`n===== Processing vRA Servers =====" "SUCCESS"
+Write-Log "`nProcessing vRA Servers" "SUCCESS"
 $deploymentData = @{}
 $deletedDeploymentData = @{}
 
 foreach ($vraServer in $vraServers) {
-    Write-Log "`n--- Connecting to vRA: $vraServer ---"
+    Write-Log "`nConnecting to vRA: $vraServer"
     
     try {
         # Authenticate
@@ -541,7 +528,9 @@ foreach ($vraServer in $vraServers) {
         
         Write-Log "Retrieved $($allDeployments.Count) active deployments"
         
-        # Process deployments with vSphere machines
+        <#
+        Process deployments with vSphere machines
+        #>
         foreach ($dep in $allDeployments) {
             if ($dep.resources) {
                 $vSphereMachines = $dep.resources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" }
@@ -551,7 +540,23 @@ foreach ($vraServer in $vraServers) {
                     
                     if ($machine.properties) {
                         $props = $machine.properties
-                        $hostname = $props.hostname ?? $props.resourceName ?? $props.name ?? $props.address ?? $props.hostName
+                        
+                        # PowerShell 5.1 compatible property access
+                        if ($props.PSObject.Properties['hostname']) {
+                            $hostname = $props.hostname
+                        }
+                        elseif ($props.PSObject.Properties['resourceName']) {
+                            $hostname = $props.resourceName
+                        }
+                        elseif ($props.PSObject.Properties['name']) {
+                            $hostname = $props.name
+                        }
+                        elseif ($props.PSObject.Properties['address']) {
+                            $hostname = $props.address
+                        }
+                        elseif ($props.PSObject.Properties['hostName']) {
+                            $hostname = $props.hostName
+                        }
                     }
                     
                     if (-not $hostname -and $machine.name) {
@@ -603,10 +608,8 @@ foreach ($vmName in $deletedDeploymentData.Keys) {
 
 Write-Log "`nTotal deployments found: $($deploymentData.Count) (Active + Deleted)" "SUCCESS"
 
-# ============================================
 # vCenter - Get Creator Info for Non-vRA VMs
-# ============================================
-Write-Log "`n===== Connecting to vCenter =====" "SUCCESS"
+Write-Log "`nConnecting to vCenter" "SUCCESS"
 $vCenterLookup = @{}
 
 $vmsNeedingVCenterLookup = $newVMsData | Where-Object { -not $deploymentData.ContainsKey($_.Name) } | Select-Object -ExpandProperty Name
@@ -648,10 +651,8 @@ if ($vmsNeedingVCenterLookup.Count -gt 0) {
     }
 }
 
-# ============================================
 # Build Final Report
-# ============================================
-Write-Log "`n===== Building Final Report =====" "SUCCESS"
+Write-Log "`nBuilding Final Report" "SUCCESS"
 $reportData = @()
 
 foreach ($vmData in $newVMsData) {
@@ -713,10 +714,8 @@ foreach ($vmData in $newVMsData) {
 
 Write-Log "Report contains $($reportData.Count) records" "SUCCESS"
 
-# ============================================
 # Send Email Report
-# ============================================
-Write-Log "`n===== Sending Email Report =====" "SUCCESS"
+Write-Log "`nSending Email Report" "SUCCESS"
 
 Send-NewServerReport `
     -ReportData $reportData `
@@ -726,4 +725,4 @@ Send-NewServerReport `
     -To $smtpTo `
     -Subject $smtpSubject
 
-Write-Log "`n===== Script Completed Successfully =====" "SUCCESS"
+Write-Log "`nScript Completed Successfully" "SUCCESS"
