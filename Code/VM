@@ -491,7 +491,43 @@ catch {
 }
 
 if ($newVMsData.Count -eq 0) {
-    Write-Log "No new VMs found. Exiting." "WARN"
+    Write-Log "No new VMs found. Sending notification email..." "WARN"
+    
+    # Send "No New VMs" notification email
+    $noVMsHtml = @"
+<html>
+<head>
+<style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    .info-box { background-color: #e3f2fd; padding: 20px; border-left: 4px solid #2196F3; margin: 20px 0; }
+    .info-box h2 { margin-top: 0; color: #1976D2; }
+    .info-box p { color: #424242; font-size: 14px; }
+</style>
+</head>
+<body>
+<div class="info-box">
+    <h2>No New Server Deployments</h2>
+    <p>No new virtual machines were built in the last $daysBack day(s).</p>
+    <p><strong>Report Date:</strong> $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</p>
+</div>
+</body>
+</html>
+"@
+    
+    try {
+        if ($smtpCc -and $smtpCc.Count -gt 0) {
+            Send-MailMessage -To $smtpTo -From $smtpFrom -Subject $smtpSubject -Body $noVMsHtml -BodyAsHtml -SmtpServer $smtpServer -Port $smtpPort -UseSsl -Cc $smtpCc
+        }
+        else {
+            Send-MailMessage -To $smtpTo -From $smtpFrom -Subject $smtpSubject -Body $noVMsHtml -BodyAsHtml -SmtpServer $smtpServer -Port $smtpPort -UseSsl
+        }
+        Write-Log "Notification email sent successfully!" "SUCCESS"
+    }
+    catch {
+        Write-Log "Failed to send notification email: $($_.Exception.Message)" "ERROR"
+    }
+    
+    Write-Log "`nScript Completed - No VMs Found" "SUCCESS"
     exit
 }
 
