@@ -1,44 +1,49 @@
-# Deleted VM Tracker - Aria Operations + Multi-vRA + vCenter
-# Version 2.0.0
+# ============================================================================
+# DELETED VM TRACKER - ARIA OPERATIONS + MULTI-VRA + VCENTER
+# Version 2.1.0
 # PowerShell 5.1 Compatible
-# Tracks VMs deleted in the last 24 hours with extensive debugging
+# ============================================================================
 
-# Configuration
-$ariaOpsServer = "aria-ops.yourdomain.com"
-$ariaOpsDomain = "yourdomain.com"
-$ariaOpsAuthSource = "localos"
+# ============================================================================
+# CONFIGURATION SECTION
+# ============================================================================
 
-$vraServers = @(
+$ariaOpsServer = "aria-ops.yourdomain.com"                                      # Aria Operations server FQDN
+$ariaOpsDomain = "yourdomain.com"                                               # Domain for Aria Ops authentication
+$ariaOpsAuthSource = "localos"                                                  # Auth source (localos, AD, etc.)
+
+$vraServers = @(                                                                # Array of vRA servers to check
     "vra1.yourdomain.com",
     "vra2.yourdomain.com"
 )
 
-$vCenters = @(
+$vCenters = @(                                                                  # Array of vCenter servers to check
     "vcenter1.domain.com",
     "vcenter2.domain.com",
     "vcenter3.domain.com"
 )
 
-# SMTP Configuration
-$smtpServer = "smtp.yourdomain.com"
-$smtpPort = 587
-$smtpFrom = "vra-reports@yourdomain.com"
-$smtpTo = @("admin@yourdomain.com")
-$smtpCc = @("manager@yourdomain.com")
-$smtpSubject = "Deleted VM Report - $(Get-Date -Format 'yyyy-MM-dd')"
+$smtpServer = "smtp.yourdomain.com"                                             # SMTP server for email reports
+$smtpPort = 587                                                                 # SMTP port (587 for TLS, 25 for non-TLS)
+$smtpFrom = "vra-reports@yourdomain.com"                                        # Email from address
+$smtpTo = @("admin@yourdomain.com")                                             # Email recipients (To:)
+$smtpCc = @("manager@yourdomain.com")                                           # Email CC recipients
+$smtpSubject = "Deleted VM Report - $(Get-Date -Format 'yyyy-MM-dd')"          # Email subject line
 
-# Time range (in days)
-$daysBack = 1
-$eventsPageSize = 200
+$daysBack = 1                                                                   # Number of days to look back for deletions
+$eventsPageSize = 200                                                           # Page size for event queries
 
-# Output file for debugging
-$debugOutputFile = "DeletedVMs_Debug_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
+$debugOutputFile = "DeletedVMs_Debug_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt" # Debug log file name
 
-# Helper Functions
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+# Write-Log: Outputs colored log messages to console and file
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
     
-    $color = switch ($Level) {
+    $color = switch ($Level) {                                                  # Set color based on log level
         "ERROR" { "Red" }
         "WARN" { "Yellow" }
         "SUCCESS" { "Green" }
@@ -46,23 +51,23 @@ function Write-Log {
         default { "Cyan" }
     }
     
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $logMessage = "[$timestamp] [$Level] $Message"
-    Write-Host $logMessage -ForegroundColor $color
-    
-    # Also write to debug file
-    Add-Content -Path $debugOutputFile -Value $logMessage
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"                         # Get current timestamp
+    $logMessage = "[$timestamp] [$Level] $Message"                              # Format log message
+    Write-Host $logMessage -ForegroundColor $color                              # Write to console
+    Add-Content -Path $debugOutputFile -Value $logMessage                       # Write to log file
 }
 
+# Write-DebugSection: Creates visual section headers in logs
 function Write-DebugSection {
     param([string]$Title)
     
-    $separator = "`n" + ("=" * 80) + "`n"
-    $header = "$separator$Title$separator"
-    Write-Host $header -ForegroundColor Cyan
-    Add-Content -Path $debugOutputFile -Value $header
+    $separator = "`n" + ("=" * 80) + "`n"                                       # Create separator line
+    $header = "$separator$Title$separator"                                      # Build header
+    Write-Host $header -ForegroundColor Cyan                                    # Write to console
+    Add-Content -Path $debugOutputFile -Value $header                           # Write to log file
 }
 
+# Disable-SSLValidation: Disables SSL certificate validation for self-signed certs
 function Disable-SSLValidation {
     if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
         Add-Type @"
@@ -78,9 +83,13 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
 "@
         [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
     }
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 # Force TLS 1.2
 }
 
+# ============================================================================
+# Get-ActiveDeploymentsWithDecommission: Finds VMs scheduled for decommission
+# NEW LOGIC: No date filtering - just find deployments with lease expiration
+# ============================================================================
 function Get-ActiveDeploymentsWithDecommission {
     param(
         [Parameter(Mandatory=$true)]
@@ -93,36 +102,32 @@ function Get-ActiveDeploymentsWithDecommission {
     Write-DebugSection "Checking Active Deployments with Decommission Requests: $VraServer"
     
     $decommissionData = @()
-    $cutoffDate = (Get-Date).AddDays(-$script:daysBack)
     
-    Write-Log "Cutoff date for decommission filter: $cutoffDate" "WARN"
-    Write-Log "NOTE: Checking ALL active deployments but only including decommissions initiated within last $script:daysBack days" "WARN"
     Write-Log "Fetching ALL active deployments..." "DEBUG"
     
-    # Get all active deployments with resource expansion
-    $vraUri = "https://$VraServer/deployment/api/deployments"
-    $page = 0
-    $size = 1000
-    $allDeployments = @()
+    $vraUri = "https://$VraServer/deployment/api/deployments"                   # Base URI for deployments
+    $page = 0                                                                   # Start at page 0
+    $size = 1000                                                                # Page size
+    $allDeployments = @()                                                       # Array to store all deployments
     
-    do {
-        $pagedUri = "$vraUri`?page=$page&size=$size&expand=resources"
+    do {                                                                        # Loop through all pages
+        $pagedUri = "$vraUri`?page=$page&size=$size&expand=resources"          # Build paged URI with resource expansion
         Write-Log "  Fetching page $page from: $pagedUri" "DEBUG"
         
         try {
             $vraResponse = Invoke-RestMethod -Uri $pagedUri -Method Get -Headers $Headers -ErrorAction Stop
             $deployments = if ($vraResponse.content) { $vraResponse.content } else { $vraResponse }
             
-            if ($deployments -and $deployments.Count -gt 0) {
-                $allDeployments += $deployments
+            if ($deployments -and $deployments.Count -gt 0) {                  # If we got deployments
+                $allDeployments += $deployments                                 # Add to collection
                 Write-Log "  Page $page : Found $($deployments.Count) deployments" "DEBUG"
-                $page++
+                $page++                                                         # Move to next page
             }
             else {
-                break
+                break                                                           # No more deployments, exit loop
             }
             
-            $hasMore = if ($vraResponse.totalPages) { 
+            $hasMore = if ($vraResponse.totalPages) {                           # Check if more pages exist
                 $page -lt $vraResponse.totalPages
             } elseif ($vraResponse.totalElements) { 
                 ($page * $size) -lt $vraResponse.totalElements
@@ -139,13 +144,12 @@ function Get-ActiveDeploymentsWithDecommission {
     
     Write-Log "Total active deployments retrieved: $($allDeployments.Count)" "DEBUG"
     
-    # Filter for deployments containing VMs only
-    Write-Log "`n--- Filtering for VM-containing deployments ---" "DEBUG"
+    Write-Log "`n--- Filtering for VM-containing deployments ---" "DEBUG"      # Filter for VMs only
     $filteredDeployments = $allDeployments | Where-Object {
         $hasVM = $false
         if ($_.resources) {
             foreach ($resource in $_.resources) {
-                if ($resource.type -eq "Cloud.vSphere.Machine") {
+                if ($resource.type -eq "Cloud.vSphere.Machine") {              # Check if resource is a VM
                     $hasVM = $true
                     break
                 }
@@ -164,8 +168,7 @@ function Get-ActiveDeploymentsWithDecommission {
     Write-Log "Deployments filtered out (no VMs): $(($allDeployments.Count - $filteredDeployments.Count))" "WARN"
     $allDeployments = $filteredDeployments
     
-    # Process each deployment looking for decommission requests
-    foreach ($deployment in $allDeployments) {
+    foreach ($deployment in $allDeployments) {                                  # Process each deployment
         Write-Log "`n--- Active Deployment: $($deployment.name) (ID: $($deployment.id)) ---" "DEBUG"
         Write-Log "  Status: $($deployment.status)" "DEBUG"
         Write-Log "  Created: $($deployment.createdAt)" "DEBUG"
@@ -174,24 +177,16 @@ function Get-ActiveDeploymentsWithDecommission {
         Write-Log "  Created By: $($deployment.createdBy)" "DEBUG"
         Write-Log "  Project: $($deployment.projectId)" "DEBUG"
         
-        # Log resources in deployment (VMs only)
-        if ($deployment.resources) {
+        if ($deployment.resources) {                                            # Log VM resources in deployment
             Write-Log "  Resources in deployment:" "DEBUG"
             foreach ($resource in $deployment.resources) {
                 if ($resource.type -eq "Cloud.vSphere.Machine") {
                     Write-Log "    - Type: $($resource.type), Name: $($resource.name), ID: $($resource.id)" "DEBUG"
-                    if ($resource.properties) {
-                        Write-Log "      Properties:" "DEBUG"
-                        $resource.properties.PSObject.Properties | ForEach-Object {
-                            Write-Log "        $($_.Name): $($_.Value)" "DEBUG"
-                        }
-                    }
                 }
             }
         }
         
-        # Get deployment requests with expanded details
-        try {
+        try {                                                                   # Get deployment requests
             $requestsUri = "https://$VraServer/deployment/api/deployments/$($deployment.id)/requests?apiVersion=2020-08-25"
             Write-Log "  Fetching requests from: $requestsUri" "DEBUG"
             
@@ -200,7 +195,7 @@ function Get-ActiveDeploymentsWithDecommission {
             
             Write-Log "  Found $($requests.Count) requests for this deployment" "DEBUG"
             
-            foreach ($request in $requests) {
+            foreach ($request in $requests) {                                   # Process each request
                 Write-Log "    ╔══════════════════════════════════════════════════════════════" "DEBUG"
                 Write-Log "    ║ Request ID: $($request.id)" "DEBUG"
                 Write-Log "    ║ Name: $($request.name)" "DEBUG"
@@ -210,101 +205,15 @@ function Get-ActiveDeploymentsWithDecommission {
                 Write-Log "    ║ Initiated At: $($request.initiatedAt)" "DEBUG"
                 Write-Log "    ║ Completed At: $($request.completedAt)" "DEBUG"
                 
-                # DUMP ALL REQUEST PROPERTIES TO FIND TIMESTAMPS
-                Write-Log "    ║" "DEBUG"
-                Write-Log "    ║ >>> FULL REQUEST OBJECT DUMP (ALL PROPERTIES) <<<" "WARN"
-                Write-Log "    ║" "DEBUG"
-                if ($request) {
-                    $request.PSObject.Properties | ForEach-Object {
-                        $propName = $_.Name
-                        $propValue = $_.Value
-                        if ($propValue -eq $null) {
-                            Write-Log "    ║   $propName = NULL" "WARN"
-                        }
-                        elseif ($propValue -is [string] -and [string]::IsNullOrWhiteSpace($propValue)) {
-                            Write-Log "    ║   $propName = [EMPTY STRING]" "WARN"
-                        }
-                        else {
-                            Write-Log "    ║   $propName = $propValue" "DEBUG"
-                        }
-                    }
-                }
-                else {
-                    Write-Log "    ║   REQUEST OBJECT IS NULL!" "ERROR"
-                }
-                Write-Log "    ║" "DEBUG"
-                Write-Log "    ║ >>> END REQUEST OBJECT DUMP <<<" "WARN"
-                Write-Log "    ║" "DEBUG"
-                
-                # Get ALL events for this request for troubleshooting
-                $eventPage = 0
-                $allRequestEvents = @()
-                
-                do {
-                    $eventsUri = "https://$VraServer/deployment/api/deployments/$($deployment.id)/requests/$($request.id)/events?page=$eventPage&size=$script:eventsPageSize&apiVersion=2020-08-25"
-                    
-                    try {
-                        $eventsResponse = Invoke-RestMethod -Uri $eventsUri -Method Get -Headers $Headers -ErrorAction Stop
-                        $events = if ($eventsResponse.content) { $eventsResponse.content } else { $eventsResponse }
-                        
-                        if ($events -and $events.Count -gt 0) {
-                            $allRequestEvents += $events
-                            $eventPage++
-                            if ($events.Count -lt $script:eventsPageSize) { break }
-                        }
-                        else {
-                            break
-                        }
-                    }
-                    catch {
-                        Write-Log "      Error fetching events page $eventPage : $($_.Exception.Message)" "ERROR"
-                        break
-                    }
-                    
-                    if ($eventPage -ge 20) { break }
-                    
-                } while ($true)
-                
-                Write-Log "    ║ Total Events: $($allRequestEvents.Count)" "DEBUG"
-                Write-Log "    ╠══════════════════════════════════════════════════════════════" "DEBUG"
-                
-                # Log all events for troubleshooting
-                $eventNum = 1
-                foreach ($event in $allRequestEvents) {
-                    Write-Log "    ║   Event #$eventNum" "DEBUG"
-                    Write-Log "    ║     Event Type: $($event.eventType)" "DEBUG"
-                    Write-Log "    ║     Resource Type: $($event.resourceType)" "DEBUG"
-                    Write-Log "    ║     Resource Name: $($event.resourceName)" "DEBUG"
-                    Write-Log "    ║     Status: $($event.status)" "DEBUG"
-                    Write-Log "    ║     Timestamp: $($event.timestamp)" "DEBUG"
-                    Write-Log "    ║     Message: $($event.message)" "DEBUG"
-                    
-                    if ($event.details) {
-                        $detailsText = if ($event.details -is [string]) { 
-                            $event.details 
-                        } else { 
-                            ($event.details | ConvertTo-Json -Compress -Depth 10)
-                        }
-                        Write-Log "    ║     Details: $detailsText" "DEBUG"
-                    }
-                    
-                    Write-Log "    ║   ─────────────────────────────────────────────────────" "DEBUG"
-                    $eventNum++
-                }
-                
-                Write-Log "    ╚══════════════════════════════════════════════════════════════" "DEBUG"
-                
-                # Check if this is a decommission request (still active, not deleted)
-                $isDecommission = $false
-                $matchedBy = "None"
+                $isDecommission = $false                                        # Flag to track if this is decommission
+                $matchedBy = "None"                                             # Track what matched
+                $expirationDate = $null                                         # Store expiration date
                 
                 Write-Log "    ║ Checking if this is a decommission request..." "DEBUG"
                 Write-Log "    ║   Request Name: '$($request.name)'" "DEBUG"
                 Write-Log "    ║   Action ID: '$($request.actionId)'" "DEBUG"
-                Write-Log "    ║   Initiated At: $($request.initiatedAt)" "DEBUG"
                 
-                # Check name pattern
-                $nameMatch = $false
+                $nameMatch = $false                                             # Check if name matches decommission pattern
                 if ($request.name -match "Initiate server decommission|decommission") {
                     $nameMatch = $true
                     Write-Log "    ║   ✓ Name matches decommission pattern" "WARN"
@@ -313,8 +222,7 @@ function Get-ActiveDeploymentsWithDecommission {
                     Write-Log "    ║   ✗ Name does NOT match decommission pattern" "DEBUG"
                 }
                 
-                # Check action ID pattern
-                $actionMatch = $false
+                $actionMatch = $false                                           # Check if action ID matches decommission pattern
                 if ($request.actionId -match "Deployment.Delete|Resource.Delete|Cloud.vSphere.Machine.Delete|Deployment.custom.initiate_server_decommission") {
                     $actionMatch = $true
                     Write-Log "    ║   ✓ Action ID matches decommission pattern" "WARN"
@@ -323,98 +231,69 @@ function Get-ActiveDeploymentsWithDecommission {
                     Write-Log "    ║   ✗ Action ID does NOT match decommission pattern" "DEBUG"
                 }
                 
-                # Check if either name or action matches
-                if ($nameMatch -or $actionMatch) {
-                    Write-Log "    ║   >>> Pattern matched! Checking date filter..." "WARN"
+                if ($nameMatch -or $actionMatch) {                              # If either pattern matches
+                    Write-Log "    ║   >>> Pattern matched! This is a decommission request <<<" "WARN"
+                    $isDecommission = $true
+                    $matchedBy = if ($nameMatch) { "Request Name" } else { "Action ID" }
                     
-                    # BUGFIX: Add null check for initiatedAt
-                    if ($request.initiatedAt) {
-                        try {
-                            $initiatedDate = [DateTime]$request.initiatedAt
-                            Write-Log "    ║   >>> Initiated Date: $initiatedDate" "DEBUG"
-                            Write-Log "    ║   >>> Cutoff Date: $cutoffDate" "DEBUG"
-                            Write-Log "    ║   >>> Days difference: $(($initiatedDate - $cutoffDate).Days) days" "DEBUG"
-                            
-                            if ($initiatedDate -ge $cutoffDate) {
-                                $isDecommission = $true
-                                $matchedBy = if ($nameMatch) { "Request Name" } else { "Action ID" }
-                                Write-Log "    ║   >>> ✓✓✓ DECOMMISSION REQUEST CONFIRMED ✓✓✓" "WARN"
-                                Write-Log "    ║   >>> Matched by: $matchedBy" "WARN"
-                                Write-Log "    ║   >>> This deployment will be included in the report" "WARN"
-                            }
-                            else {
-                                Write-Log "    ║   >>> ✗ REJECTED: Initiated date is BEFORE cutoff date" "ERROR"
-                                Write-Log "    ║   >>> This decommission is TOO OLD (> $script:daysBack days)" "ERROR"
-                            }
-                        }
-                        catch {
-                            Write-Log "    ║   >>> ✗ ERROR: Cannot convert initiatedAt to DateTime: $($_.Exception.Message)" "ERROR"
-                        }
+                    if ($deployment.leaseExpireAt) {                            # Check if deployment has lease expiration
+                        $expirationDate = $deployment.leaseExpireAt
+                        Write-Log "    ║   >>> Deployment expires at: $expirationDate <<<" "WARN"
                     }
                     else {
-                        Write-Log "    ║   >>> ✗ ERROR: initiatedAt is NULL - cannot verify date" "ERROR"
-                        Write-Log "    ║   >>> Skipping date check - assuming recent decommission" "WARN"
-                        # Still mark as decommission if pattern matches, even without date
-                        $isDecommission = $true
-                        $matchedBy = if ($nameMatch) { "Request Name" } else { "Action ID" }
+                        Write-Log "    ║   >>> WARNING: No lease expiration date found <<<" "WARN"
+                        $expirationDate = "N/A"
                     }
                 }
                 else {
                     Write-Log "    ║   >>> NOT a decommission request (no pattern match)" "DEBUG"
                 }
                 
-                if ($isDecommission) {
-                    # Get VMs from this deployment
+                if ($isDecommission) {                                          # If this is a decommission, extract VMs
                     $vSphereMachines = $deployment.resources | Where-Object { 
                         $_.type -eq "Cloud.vSphere.Machine"
                     }
                     
-                    foreach ($machine in $vSphereMachines) {
+                    foreach ($machine in $vSphereMachines) {                    # Process each VM in deployment
                         $hostname = $null
                         
-                        if ($machine.properties) {
+                        if ($machine.properties) {                              # Extract hostname from properties
                             $props = $machine.properties
                             
-                            # Prioritize actual hostname over resource name
-                            if ($props.PSObject.Properties['hostname']) {
+                            if ($props.PSObject.Properties['hostname']) {       # Prioritize actual hostname
                                 $hostname = $props.hostname
                             }
                             elseif ($props.PSObject.Properties['address']) {
                                 $hostname = $props.address
                             }
                             elseif ($props.PSObject.Properties['resourceName']) {
-                                # Only use resourceName if it doesn't look like Cloud_vSphere_Machine_X
                                 if ($props.resourceName -notmatch "Cloud_vSphere_Machine_\d+") {
                                     $hostname = $props.resourceName
                                 }
                             }
                             elseif ($props.PSObject.Properties['name']) {
-                                # Only use name if it doesn't look like Cloud_vSphere_Machine_X
                                 if ($props.name -notmatch "Cloud_vSphere_Machine_\d+") {
                                     $hostname = $props.name
                                 }
                             }
                         }
                         
-                        # Fall back to machine.name only if it's not a generic resource name
                         if (-not $hostname -and $machine.name -and $machine.name -notmatch "Cloud_vSphere_Machine_\d+") {
-                            $hostname = $machine.name
+                            $hostname = $machine.name                           # Fall back to machine.name
                         }
                         
-                        if ($hostname) {
+                        if ($hostname) {                                        # If we found a hostname
                             Write-Log "      >>> VM in Decommission: $hostname <<<" "WARN"
                             Write-Log "      >>> Matched decommission by: $matchedBy <<<" "DEBUG"
-                            Write-Log "      >>> Request Name: $($request.name) <<<" "DEBUG"
-                            Write-Log "      >>> Action ID: $($request.actionId) <<<" "DEBUG"
+                            Write-Log "      >>> Deployment will expire: $expirationDate <<<" "WARN"
                             
-                            $vraServerShort = ($VraServer -split '\.')[0]
+                            $vraServerShort = ($VraServer -split '\.')[0]       # Get short server name
                             $catalogItem = if ($deployment.inputs._catalogItemName) { $deployment.inputs._catalogItemName } else { "N/A" }
                             
-                            # BUGFIX: Handle null initiatedAt
                             $initiatedAtValue = if ($request.initiatedAt) { $request.initiatedAt } else { "N/A" }
                             $completedAtValue = if ($request.completedAt) { $request.completedAt } else { "N/A" }
                             
-                            $decommissionData += [PSCustomObject]@{
+                            $decommissionData += [PSCustomObject]@{             # Add VM to decommission list
                                 VMName = $hostname
                                 ResourceType = $machine.type
                                 DeploymentName = $deployment.name
@@ -428,14 +307,15 @@ function Get-ActiveDeploymentsWithDecommission {
                                 CatalogItem = $catalogItem
                                 InitiatedAt = $initiatedAtValue
                                 CompletedAt = $completedAtValue
+                                ExpirationDate = $expirationDate
                                 vRAServer = $vraServerShort
                                 Source = "vRA-Decommission-InProgress"
                                 IsStillActive = $true
-                                TotalEvents = $allRequestEvents.Count
                             }
                         }
                     }
                 }
+                Write-Log "    ╚══════════════════════════════════════════════════════════════" "DEBUG"
             }
         }
         catch {
@@ -454,21 +334,20 @@ function Get-ActiveDeploymentsWithDecommission {
         Write-Log "║ VMs Found in Decommission:" "SUCCESS"
         foreach ($vm in $decommissionData) {
             Write-Log "║   - $($vm.VMName) (Deployment: $($vm.DeploymentName))" "SUCCESS"
-            Write-Log "║     Status: $($vm.RequestStatus), Initiated: $($vm.InitiatedAt)" "SUCCESS"
+            Write-Log "║     Status: $($vm.RequestStatus), Expires: $($vm.ExpirationDate)" "SUCCESS"
         }
     }
     else {
         Write-Log "║ ⚠ WARNING: No VMs with decommission requests found!" "WARN"
-        Write-Log "║ Possible reasons:" "WARN"
-        Write-Log "║   1. No decommissions were initiated in the last $script:daysBack days" "WARN"
-        Write-Log "║   2. Decommissions already completed and deployments deleted" "WARN"
-        Write-Log "║   3. Request names/action IDs don't match expected patterns" "WARN"
     }
     Write-Log "╚════════════════════════════════════════════════════════════════════════════════" "SUCCESS"
     
     return $decommissionData
 }
 
+# ============================================================================
+# Get-DeletedVMsFromVRA: Retrieves VMs from deleted deployments
+# ============================================================================
 function Get-DeletedVMsFromVRA {
     param(
         [Parameter(Mandatory=$true)]
@@ -484,14 +363,12 @@ function Get-DeletedVMsFromVRA {
     Write-DebugSection "Processing Deleted Deployments from vRA: $VraServer"
     
     $deletedVMData = @()
-    $cutoffDate = (Get-Date).AddDays(-$DaysBack)
+    $cutoffDate = (Get-Date).AddDays(-$DaysBack)                                # Calculate cutoff date
     
     Write-Log "Cutoff date: $cutoffDate" "DEBUG"
-    
-    # Get deleted deployments
     Write-Log "Searching for deleted deployments..." "DEBUG"
     
-    $urlVariations = @(
+    $urlVariations = @(                                                         # Try different URL formats for deleted deployments
         "https://$VraServer/deployment/api/deployments?deleted=true&apiVersion=2020-08-25&page={0}&size=$script:eventsPageSize",
         "https://$VraServer/deployment/api/deployments?deleted=%5Btrue%5D&apiVersion=2020-08-25&page={0}&size=$script:eventsPageSize"
     )
@@ -499,14 +376,14 @@ function Get-DeletedVMsFromVRA {
     $workingUrl = $null
     $allDeletedDeployments = @()
     
-    foreach ($urlTemplate in $urlVariations) {
+    foreach ($urlTemplate in $urlVariations) {                                  # Test each URL variation
         try {
             $testUrl = $urlTemplate -f 0
             Write-Log "  Testing URL: $testUrl" "DEBUG"
             $response = Invoke-RestMethod -Uri $testUrl -Method Get -Headers $Headers -ErrorAction Stop
             $deployments = if ($response.content) { $response.content } else { $response }
             
-            if ($deployments -and $deployments.Count -gt 0) {
+            if ($deployments -and $deployments.Count -gt 0) {                  # If URL works
                 $workingUrl = $urlTemplate
                 $allDeletedDeployments += $deployments
                 Write-Log "  URL works! Found $($deployments.Count) deployments on page 0" "SUCCESS"
@@ -519,13 +396,12 @@ function Get-DeletedVMsFromVRA {
         }
     }
     
-    if (-not $workingUrl) {
+    if (-not $workingUrl) {                                                     # If no working URL found
         Write-Log "No deleted deployments found or API not supported" "WARN"
         return $deletedVMData
     }
     
-    # Get remaining pages
-    $page = 1
+    $page = 1                                                                   # Get remaining pages
     do {
         try {
             $uri = $workingUrl -f $page
@@ -546,14 +422,13 @@ function Get-DeletedVMsFromVRA {
             break
         }
         
-        if ($allDeletedDeployments.Count -ge 5000) { break }
+        if ($allDeletedDeployments.Count -ge 5000) { break }                    # Safety limit
         
     } while ($true)
     
     Write-Log "Total deleted deployments retrieved: $($allDeletedDeployments.Count)" "SUCCESS"
     
-    # Filter by date
-    $filteredDeployments = $allDeletedDeployments | Where-Object {
+    $filteredDeployments = $allDeletedDeployments | Where-Object {              # Filter by date
         try {
             $updateDate = [DateTime]$_.lastUpdatedAt
             $updateDate -ge $cutoffDate
@@ -565,10 +440,8 @@ function Get-DeletedVMsFromVRA {
     
     Write-Log "Deployments within time range: $($filteredDeployments.Count)" "SUCCESS"
     
-    # Filter for deployments containing VMs only
-    $vmDeployments = $filteredDeployments | Where-Object {
+    $vmDeployments = $filteredDeployments | Where-Object {                      # Filter for VM deployments
         $hasVM = $false
-        # Check if deployment name suggests VM deployment
         if ($_.name -match "VM|Virtual|Server|Machine") {
             $hasVM = $true
         }
@@ -578,15 +451,12 @@ function Get-DeletedVMsFromVRA {
     Write-Log "Deleted deployments with VMs: $($vmDeployments.Count)" "SUCCESS"
     $filteredDeployments = $vmDeployments
     
-    # Process each deleted deployment
-    foreach ($deployment in $filteredDeployments) {
+    foreach ($deployment in $filteredDeployments) {                             # Process each deleted deployment
         Write-Log "`n--- Deleted Deployment: $($deployment.name) (ID: $($deployment.id)) ---" "DEBUG"
         Write-Log "  Status: $($deployment.status)" "DEBUG"
         Write-Log "  Last Updated: $($deployment.lastUpdatedAt)" "DEBUG"
         Write-Log "  Owned By: $($deployment.ownedBy)" "DEBUG"
-        Write-Log "  Created By: $($deployment.createdBy)" "DEBUG"
         
-        # Get deployment requests with expanded event details
         try {
             $requestsUri = "https://$VraServer/deployment/api/deployments/$($deployment.id)/requests?apiVersion=2020-08-25&deleted=true"
             Write-Log "  Fetching requests from: $requestsUri" "DEBUG"
@@ -596,17 +466,13 @@ function Get-DeletedVMsFromVRA {
             
             Write-Log "  Found $($requests.Count) requests" "DEBUG"
             
-            foreach ($request in $requests) {
+            foreach ($request in $requests) {                                   # Process each request
                 Write-Log "    ╔══════════════════════════════════════════════════════════════" "DEBUG"
                 Write-Log "    ║ Request ID: $($request.id)" "DEBUG"
                 Write-Log "    ║ Action: $($request.name)" "DEBUG"
-                Write-Log "    ║ Action ID: $($request.actionId)" "DEBUG"
                 Write-Log "    ║ Status: $($request.status)" "DEBUG"
-                Write-Log "    ║ Requested By: $($request.requestedBy)" "DEBUG"
-                Write-Log "    ║ Initiated At: $($request.initiatedAt)" "DEBUG"
                 
-                # Get ALL events for this request for troubleshooting
-                $eventPage = 0
+                $eventPage = 0                                                  # Get all events for this request
                 $allEvents = @()
                 
                 do {
@@ -630,85 +496,52 @@ function Get-DeletedVMsFromVRA {
                         break
                     }
                     
-                    if ($eventPage -ge 20) { break }
+                    if ($eventPage -ge 20) { break }                            # Safety limit
                     
                 } while ($true)
                 
                 Write-Log "    ║ Total Events: $($allEvents.Count)" "DEBUG"
                 Write-Log "    ╠══════════════════════════════════════════════════════════════" "DEBUG"
                 
-                # Log all events for troubleshooting
-                $eventNum = 1
-                foreach ($event in $allEvents) {
-                    Write-Log "    ║   Event #$eventNum" "DEBUG"
-                    Write-Log "    ║     Event Type: $($event.eventType)" "DEBUG"
-                    Write-Log "    ║     Resource Type: $($event.resourceType)" "DEBUG"
-                    Write-Log "    ║     Resource Name: $($event.resourceName)" "DEBUG"
-                    Write-Log "    ║     Status: $($event.status)" "DEBUG"
-                    Write-Log "    ║     Timestamp: $($event.timestamp)" "DEBUG"
-                    Write-Log "    ║     Message: $($event.message)" "DEBUG"
-                    
-                    if ($event.details) {
-                        $detailsText = if ($event.details -is [string]) { 
-                            $event.details 
-                        } else { 
-                            ($event.details | ConvertTo-Json -Compress -Depth 10)
-                        }
-                        Write-Log "    ║     Details: $detailsText" "DEBUG"
-                    }
-                    
-                    # Check if this is a VM resource
-                    if ($event.resourceType -eq "Cloud.vSphere.Machine") {
+                foreach ($event in $allEvents) {                                # Process each event
+                    if ($event.resourceType -eq "Cloud.vSphere.Machine") {     # Check if this is a VM resource
                         $serverName = $null
                         
-                        # Extract server name from details - prioritize actual VM name
-                        if ($event.details) {
+                        if ($event.details) {                                   # Extract server name from details
                             $detailsText = if ($event.details -is [string]) { 
                                 $event.details 
                             } else { 
                                 ($event.details | ConvertTo-Json -Compress -Depth 5)
                             }
                             
-                            # Look for hostname or VM name in details
                             if ($detailsText -match '"hostname"\s*:\s*"([^"]+)"') {
                                 $serverName = $matches[1].Trim()
                             }
                             elseif ($detailsText -match '"address"\s*:\s*"([^"]+)"') {
                                 $serverName = $matches[1].Trim()
                             }
-                            elseif ($detailsText -match 'Cloud Resource Name:\s*([^\s,;]+)') {
-                                $potentialName = $matches[1].Trim()
-                                # Only use if not a generic resource name
-                                if ($potentialName -notmatch "Cloud_vSphere_Machine_\d+") {
-                                    $serverName = $potentialName
-                                }
-                            }
                             elseif ($detailsText -match '"cloudResourceName"\s*:\s*"([^"]+)"') {
                                 $potentialName = $matches[1].Trim()
-                                # Only use if not a generic resource name
                                 if ($potentialName -notmatch "Cloud_vSphere_Machine_\d+") {
                                     $serverName = $potentialName
                                 }
                             }
                         }
                         
-                        # Fall back to event.resourceName only if not generic
-                        if (-not $serverName -and $event.resourceName) {
+                        if (-not $serverName -and $event.resourceName) {        # Fall back to event.resourceName
                             if ($event.resourceName -notmatch "Cloud_vSphere_Machine_\d+") {
                                 $serverName = $event.resourceName
                             }
                         }
                         
-                        if ($serverName) {
+                        if ($serverName) {                                      # If we found a server name
                             Write-Log "    ║     >>> FOUND DELETED VM: $serverName <<<" "SUCCESS"
-                            Write-Log "    ║     >>> Adding to deleted VMs list <<<" "DEBUG"
                             
-                            # Check if we already have this VM (case-insensitive)
-                            $vmKey = $serverName.ToLower()
+                            $vmKey = $serverName.ToLower()                      # Check for duplicates
                             $existingVM = $deletedVMData | Where-Object { $_.VMName.ToLower() -eq $vmKey }
                             
                             if ($existingVM) {
-                                Write-Log "    ║     >>> WARNING: VM '$serverName' already exists in deleted list - SKIPPING DUPLICATE <<<" "WARN"
+                                Write-Log "    ║     >>> WARNING: VM '$serverName' already exists - SKIPPING <<<" "WARN"
                             }
                             else {
                                 $vraServerShort = ($VraServer -split '\.')[0]
@@ -716,7 +549,7 @@ function Get-DeletedVMsFromVRA {
                                 $requestor = if ($deployment.ownedBy) { $deployment.ownedBy } else { $requestedBy }
                                 $catalogItem = if ($deployment.inputs._catalogItemName) { $deployment.inputs._catalogItemName } else { "N/A" }
                                 
-                                $deletedVMData += [PSCustomObject]@{
+                                $deletedVMData += [PSCustomObject]@{            # Add VM to deleted list
                                     VMName = $serverName
                                     ResourceType = $event.resourceType
                                     DeploymentName = $deployment.name
@@ -736,16 +569,12 @@ function Get-DeletedVMsFromVRA {
                                     EventMessage = $event.message
                                     Source = "vRA-Deleted"
                                     IsStillActive = $false
-                                    TotalEvents = $allEvents.Count
                                 }
                                 
-                                Write-Log "    ║     >>> Successfully added VM '$serverName' to deleted list <<<" "SUCCESS"
+                                Write-Log "    ║     >>> Successfully added VM '$serverName' <<<" "SUCCESS"
                             }
                         }
                     }
-                    
-                    Write-Log "    ║   ─────────────────────────────────────────────────────" "DEBUG"
-                    $eventNum++
                 }
                 
                 Write-Log "    ╚══════════════════════════════════════════════════════════════" "DEBUG"
@@ -760,6 +589,9 @@ function Get-DeletedVMsFromVRA {
     return $deletedVMData
 }
 
+# ============================================================================
+# Get-DeletedVMsFromVCenter: Retrieves VMs deleted directly from vCenter
+# ============================================================================
 function Get-DeletedVMsFromVCenter {
     param(
         [Parameter(Mandatory=$true)]
@@ -781,27 +613,25 @@ function Get-DeletedVMsFromVCenter {
         Connect-VIServer -Server $VCenter -Credential $Credential -ErrorAction Stop | Out-Null
         Write-Log "Connected successfully" "SUCCESS"
         
-        $cutoffDate = (Get-Date).AddDays(-$DaysBack)
+        $cutoffDate = (Get-Date).AddDays(-$DaysBack)                            # Calculate cutoff date
         Write-Log "Fetching deletion events since: $cutoffDate" "DEBUG"
         
-        # Get VM deletion events
         $events = Get-VIEvent -Server $VCenter -Start $cutoffDate -MaxSamples 50000 | Where-Object {
             $_.GetType().Name -in @('VmRemovedEvent', 'VmBeingDeletedEvent', 'VmUnregisteredEvent')
         }
         
         Write-Log "Found $($events.Count) deletion events" "SUCCESS"
         
-        foreach ($event in $events) {
+        foreach ($event in $events) {                                           # Process each deletion event
             Write-Log "`n--- Deletion Event ---" "DEBUG"
             Write-Log "  VM Name: $($event.Vm.Name)" "DEBUG"
             Write-Log "  Event Type: $($event.GetType().Name)" "DEBUG"
             Write-Log "  Created Time: $($event.CreatedTime)" "DEBUG"
             Write-Log "  User: $($event.UserName)" "DEBUG"
-            Write-Log "  Message: $($event.FullFormattedMessage)" "DEBUG"
             
-            $vCenterShort = ($VCenter -split '\.')[0]
+            $vCenterShort = ($VCenter -split '\.')[0]                           # Get short vCenter name
             
-            $deletedVMs += [PSCustomObject]@{
+            $deletedVMs += [PSCustomObject]@{                                   # Add VM to deleted list
                 VMName = $event.Vm.Name
                 DeletedAt = $event.CreatedTime
                 DeletedBy = if ($event.UserName) { $event.UserName } else { "N/A" }
@@ -823,11 +653,11 @@ function Get-DeletedVMsFromVCenter {
     return $deletedVMs
 }
 
+# ============================================================================
+# Send-DeletedVMReport: Builds and sends HTML email report
+# ============================================================================
 function Send-DeletedVMReport {
     param(
-        [Parameter(Mandatory=$false)]
-        [Array]$AriaOpsData = @(),
-        
         [Parameter(Mandatory=$false)]
         [Array]$VraDeletedData = @(),
         
@@ -858,8 +688,7 @@ function Send-DeletedVMReport {
     
     Write-Log "Building HTML email report..." "DEBUG"
     
-    # Build lookup of VMs in vRA (both deleted and decommission) for deduplication
-    $vraVMNames = @{}
+    $vraVMNames = @{}                                                           # Build lookup for deduplication
     foreach ($vm in $VraDeletedData) {
         $vraVMNames[$vm.VMName.ToLower()] = $true
     }
@@ -869,12 +698,10 @@ function Send-DeletedVMReport {
     
     Write-Log "VMs found in vRA (for deduplication): $($vraVMNames.Count)" "DEBUG"
     
-    # Separate deleted VMs and decommission VMs into different sections
-    $deletedVMs = @()
+    $deletedVMs = @()                                                           # Separate deleted and decommission VMs
     $decommissionVMs = @()
     
-    # Add vRA Deleted VMs to deleted section
-    foreach ($vm in $VraDeletedData) {
+    foreach ($vm in $VraDeletedData) {                                          # Add vRA deleted VMs
         Write-Log "Adding vRA deleted VM to report: $($vm.VMName) from $($vm.vRAServer)" "DEBUG"
         $deletedVMs += [PSCustomObject]@{
             VMName = $vm.VMName
@@ -887,8 +714,7 @@ function Send-DeletedVMReport {
         }
     }
     
-    # Add vCenter VMs to deleted section ONLY if NOT found in vRA
-    foreach ($vm in $VCenterData) {
+    foreach ($vm in $VCenterData) {                                             # Add vCenter VMs (if not in vRA)
         $vmLower = $vm.VMName.ToLower()
         if ($vraVMNames.ContainsKey($vmLower)) {
             Write-Log "SKIPPING vCenter VM (already in vRA): $($vm.VMName) from $($vm.vCenter)" "WARN"
@@ -907,28 +733,25 @@ function Send-DeletedVMReport {
         }
     }
     
-    # Add vRA Decommission VMs to separate decommission section
-    foreach ($vm in $VraDecommissionData) {
+    foreach ($vm in $VraDecommissionData) {                                     # Add vRA decommission VMs
         Write-Log "Adding decommission VM to report: $($vm.VMName) from $($vm.vRAServer)" "DEBUG"
         $decommissionVMs += [PSCustomObject]@{
             VMName = $vm.VMName
             RequestedBy = $vm.RequestedBy
             InitiatedAt = $vm.InitiatedAt
+            ExpirationDate = $vm.ExpirationDate
             DeploymentName = $vm.DeploymentName
             DeploymentStatus = $vm.DeploymentStatus
             RequestAction = $vm.RequestAction
             RequestStatus = $vm.RequestStatus
             Source = $vm.vRAServer
-            TotalEvents = $vm.TotalEvents
         }
     }
     
     Write-Log "Total Deleted VMs for report: $($deletedVMs.Count)" "DEBUG"
     Write-Log "Total Decommission VMs for report: $($decommissionVMs.Count)" "DEBUG"
-    Write-Log "vCenter VMs excluded (duplicates in vRA): $(($VCenterData.Count - ($deletedVMs | Where-Object { $_.Source -match 'vcenter' }).Count))" "DEBUG"
     
-    # Build deleted VMs table rows
-    $deletedTableRows = ""
+    $deletedTableRows = ""                                                      # Build deleted VMs table
     foreach ($vm in ($deletedVMs | Sort-Object VMName)) {
         $deletedTableRows += "<tr>"
         $deletedTableRows += "<td>$($vm.VMName)</td>"
@@ -941,8 +764,7 @@ function Send-DeletedVMReport {
         $deletedTableRows += "</tr>"
     }
     
-    # Build decommission VMs table rows
-    $decommissionTableRows = ""
+    $decommissionTableRows = ""                                                 # Build decommission VMs table
     foreach ($vm in ($decommissionVMs | Sort-Object VMName)) {
         $decommissionTableRows += "<tr style='background-color: #fff9c4;'>"
         $decommissionTableRows += "<td>$($vm.VMName)</td>"
@@ -952,11 +774,12 @@ function Send-DeletedVMReport {
         $decommissionTableRows += "<td>$($vm.RequestStatus)</td>"
         $decommissionTableRows += "<td>$($vm.RequestedBy)</td>"
         $decommissionTableRows += "<td>$($vm.InitiatedAt)</td>"
+        $decommissionTableRows += "<td>$($vm.ExpirationDate)</td>"
         $decommissionTableRows += "<td>$($vm.Source)</td>"
         $decommissionTableRows += "</tr>"
     }
     
-    $htmlBody = @"
+    $htmlBody = @"                                                              <!-- Build HTML email body -->
 <html>
 <head>
 <style>
@@ -969,7 +792,6 @@ function Send-DeletedVMReport {
     .summary { background-color: #f9f9f9; padding: 15px; border-left: 4px solid #2196F3; margin-bottom: 20px; }
     .summary-item { margin: 5px 0; }
     .no-data { padding: 15px; background-color: #e8f5e9; color: #2e7d32; border-left: 4px solid #4caf50; }
-    .section-header { background-color: #ffecb3; padding: 10px; margin-top: 20px; border-left: 4px solid #ff9800; }
     .decom-warning { background-color: #fff9c4; padding: 10px; margin-top: 10px; border-left: 4px solid #ffc107; }
 </style>
 </head>
@@ -1013,10 +835,10 @@ $deletedTableRows
 })
 
 <h2>⚠️ Section 2: Decommissions In Progress</h2>
-<p><em>VMs currently undergoing decommission process (deployments still active in vRA)</em></p>
+<p><em>VMs scheduled for decommission (lease expiration)</em></p>
 $(if($decommissionVMs.Count -gt 0) {
 "<div class='decom-warning'>
-<strong>⚠️ Warning:</strong> These VMs are currently being decommissioned but the process is not yet complete.
+<strong>⚠️ Warning:</strong> These VMs are scheduled for decommission. The expiration date shows when the deployment will be automatically deleted.
 </div>
 <table>
 <thead>
@@ -1028,6 +850,7 @@ $(if($decommissionVMs.Count -gt 0) {
 <th>Request Status</th>
 <th>Requested By</th>
 <th>Initiated At</th>
+<th>Expiration Date</th>
 <th>Source</th>
 </tr>
 </thead>
@@ -1036,7 +859,7 @@ $decommissionTableRows
 </tbody>
 </table>"
 } else {
-"<p class='no-data'>✓ No decommissions currently in progress</p>"
+"<p class='no-data'>✓ No decommissions currently scheduled</p>"
 })
 
 <hr style="margin: 30px 0;">
@@ -1045,7 +868,8 @@ $decommissionTableRows
 • <span style="background-color: #fff9c4; padding: 2px 5px;">Yellow highlight</span> = Decommission in progress<br>
 • vRA = VMware Aria Automation (formerly vRealize Automation)<br>
 • vCenter = Direct deletion from vCenter (bypassing vRA)<br>
-• Note: VMs deleted through vRA will only show in the vRA section, not vCenter, to avoid duplicates
+• Expiration Date = When the deployment lease expires and VM will be deleted<br>
+• Note: VMs deleted through vRA will only show in the vRA section to avoid duplicates
 </p>
 
 </body>
@@ -1054,13 +878,12 @@ $decommissionTableRows
     
     Write-Log "Sending email to: $($To -join ', ')" "DEBUG"
     Write-Log "Email subject: $Subject" "DEBUG"
-    Write-Log "Total sections in email - Deleted: $($deletedVMs.Count), Decommission: $($decommissionVMs.Count)" "DEBUG"
     
     try {
-        if ($Cc -and $Cc.Count -gt 0) {
+        if ($Cc -and $Cc.Count -gt 0) {                                         # Send email with CC if provided
             Send-MailMessage -To $To -From $From -Subject $Subject -Body $htmlBody -BodyAsHtml -SmtpServer $SmtpServer -Port $SmtpPort -UseSsl -Cc $Cc
         }
-        else {
+        else {                                                                  # Send email without CC
             Send-MailMessage -To $To -From $From -Subject $Subject -Body $htmlBody -BodyAsHtml -SmtpServer $SmtpServer -Port $SmtpPort -UseSsl
         }
         Write-Log "Email sent successfully!" "SUCCESS"
@@ -1071,14 +894,16 @@ $decommissionTableRows
     }
 }
 
-# Main Script
+# ============================================================================
+# MAIN SCRIPT EXECUTION
+# ============================================================================
+
 Write-DebugSection "DELETED VM TRACKER - STARTED"
-Write-Log "Script Version: 2.0.0" "SUCCESS"
+Write-Log "Script Version: 2.1.0" "SUCCESS"
 Write-Log "PowerShell Version: $($PSVersionTable.PSVersion)"
 Write-Log "Debug output file: $debugOutputFile" "SUCCESS"
 
-# Load VMware PowerCLI
-try {
+try {                                                                           # Load VMware PowerCLI module
     Import-Module VMware.PowerCLI -ErrorAction Stop
     Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session | Out-Null
     Write-Log "VMware PowerCLI loaded" "SUCCESS"
@@ -1089,10 +914,9 @@ catch {
     exit
 }
 
-Disable-SSLValidation
+Disable-SSLValidation                                                           # Disable SSL validation for self-signed certs
 
-# Get credentials
-Write-Log "Requesting credentials..." "DEBUG"
+Write-Log "Requesting credentials..." "DEBUG"                                   # Get credentials from user
 $credential = Get-Credential -Message "Enter credentials for Aria Operations, vRA, and vCenter"
 if (-not $credential) {
     Write-Log "Credentials not provided. Exiting." "ERROR"
@@ -1101,107 +925,19 @@ if (-not $credential) {
 $username = $credential.UserName
 $password = $credential.GetNetworkCredential().Password
 
-# ================================================================================
-# ARIA OPERATIONS - Get Deleted/Status Changed VMs
-# ================================================================================
-Write-DebugSection "ARIA OPERATIONS - CHECKING FOR DELETED/CHANGED VMs"
+# ============================================================================
+# VRA - GET ACTIVE DEPLOYMENTS WITH DECOMMISSION REQUESTS
+# ============================================================================
 
-$ariaDeletedVMs = @()
-
-try {
-    # Authenticate
-    $ariaUsername = "$username@$ariaOpsDomain@$ariaOpsAuthSource"
-    $ariaAuthUri = "https://$ariaOpsServer/suite-api/api/auth/token/acquire"
-    $ariaAuthBody = @{
-        username = $ariaUsername
-        password = $password
-    } | ConvertTo-Json
-    
-    Write-Log "Authenticating to Aria Operations..." "DEBUG"
-    Write-Log "Auth URI: $ariaAuthUri" "DEBUG"
-    
-    $ariaAuthResponse = Invoke-RestMethod -Uri $ariaAuthUri -Method Post -Headers @{
-        "Content-Type" = "application/json"
-        "Accept" = "application/json"
-    } -Body $ariaAuthBody -ErrorAction Stop
-    
-    $ariaHeaders = @{
-        "Authorization" = "vRealizeOpsToken $($ariaAuthResponse.token)"
-        "Content-Type" = "application/json"
-        "Accept" = "application/json"
-        "X-Ops-API-use-unsupported" = "true"
-    }
-    
-    Write-Log "Authenticated successfully" "SUCCESS"
-    
-    # Query all VMs
-    $ariaUri = "https://$ariaOpsServer/suite-api/api/resources?resourceKind=VirtualMachine"
-    Write-Log "Querying VMs from: $ariaUri" "DEBUG"
-    
-    $response = Invoke-RestMethod -Uri $ariaUri -Headers $ariaHeaders -Method Get
-    $allVMs = $response.resourceList
-    
-    Write-Log "Total VMs found: $($allVMs.Count)" "DEBUG"
-    
-    $cutoffDate = (Get-Date).AddDays(-$daysBack)
-    Write-Log "Checking for status changes since: $cutoffDate" "DEBUG"
-    
-    foreach ($vm in $allVMs) {
-        try {
-            $vmPropertiesURL = "https://$ariaOpsServer/suite-api/api/resources/$($vm.identifier)/properties?_no_links=true"
-            $propsResponse = Invoke-RestMethod -Uri $vmPropertiesURL -Headers $ariaHeaders -Method Get
-            
-            # Get VM name
-            $nameProp = $propsResponse.property | Where-Object { $_.name -eq "config|name" -or $_.name -eq "summary|config|name" } | Select-Object -First 1
-            if (-not $nameProp) { continue }
-            $vmName = $nameProp.value
-            
-            # Check resource state
-            $resourceStateProp = $propsResponse.property | Where-Object { $_.name -eq "summary|resourceState" } | Select-Object -First 1
-            $powerStateProp = $propsResponse.property | Where-Object { $_.name -eq "summary|runtime|powerState" } | Select-Object -First 1
-            
-            if ($resourceStateProp -and $resourceStateProp.value) {
-                $resourceState = $resourceStateProp.value.ToString().ToUpper()
-                
-                # Check if VM is marked as not existing or stopped
-                if ($resourceState -in @("NOT_EXISTING", "STOPPED")) {
-                    Write-Log "  Found deleted/stopped VM: $vmName (State: $resourceState)" "WARN"
-                    
-                    $ariaDeletedVMs += [PSCustomObject]@{
-                        VMName = $vmName
-                        ResourceState = $resourceState
-                        PowerState = if ($powerStateProp) { $powerStateProp.value } else { "N/A" }
-                        LastStatusChange = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-                        ResourceId = $vm.identifier
-                        Source = "Aria Operations"
-                    }
-                }
-            }
-        }
-        catch {
-            Write-Log "  Error checking VM $($vm.identifier): $($_.Exception.Message)" "DEBUG"
-        }
-    }
-    
-    Write-Log "Aria Operations: Found $($ariaDeletedVMs.Count) deleted/changed VMs" "SUCCESS"
-}
-catch {
-    Write-Log "Failed to query Aria Operations: $($_.Exception.Message)" "ERROR"
-}
-
-# ================================================================================
-# vRA - Get Active Deployments with Decommission Requests
-# ================================================================================
 Write-DebugSection "vRA - PROCESSING ACTIVE DEPLOYMENTS WITH DECOMMISSION REQUESTS"
 
 $allVraDecommissionVMs = @()
 
-foreach ($vraServer in $vraServers) {
+foreach ($vraServer in $vraServers) {                                           # Process each vRA server
     try {
         Write-Log "`nConnecting to vRA: $vraServer" "DEBUG"
         
-        # Authenticate
-        $vraAuthUri = "https://$vraServer/csp/gateway/am/api/login"
+        $vraAuthUri = "https://$vraServer/csp/gateway/am/api/login"            # Authenticate to vRA
         $vraAuthBody = @{
             username = $username
             password = $password
@@ -1211,14 +947,13 @@ foreach ($vraServer in $vraServers) {
             "Content-Type" = "application/json"
         } -Body $vraAuthBody -ErrorAction Stop
         
-        $vraHeaders = @{
+        $vraHeaders = @{                                                        # Build auth headers
             "Authorization" = "Bearer $($vraAuthResponse.cspAuthToken)"
             "Content-Type" = "application/json"
         }
         
         Write-Log "Authenticated successfully" "SUCCESS"
         
-        # Get active deployments with decommission requests (NO TIME LIMIT)
         $decommVMs = Get-ActiveDeploymentsWithDecommission -VraServer $vraServer -Headers $vraHeaders
         $allVraDecommissionVMs += $decommVMs
         
@@ -1230,19 +965,19 @@ foreach ($vraServer in $vraServers) {
 
 Write-Log "`nvRA Decommission Total: Found $($allVraDecommissionVMs.Count) VMs with active decommission requests" "SUCCESS"
 
-# ================================================================================
-# vRA - Get Deleted Deployments
-# ================================================================================
+# ============================================================================
+# VRA - GET DELETED DEPLOYMENTS
+# ============================================================================
+
 Write-DebugSection "vRA - PROCESSING DELETED DEPLOYMENTS"
 
 $allVraDeletedVMs = @()
 
-foreach ($vraServer in $vraServers) {
+foreach ($vraServer in $vraServers) {                                           # Process each vRA server
     try {
         Write-Log "`nConnecting to vRA: $vraServer" "DEBUG"
         
-        # Authenticate
-        $vraAuthUri = "https://$vraServer/csp/gateway/am/api/login"
+        $vraAuthUri = "https://$vraServer/csp/gateway/am/api/login"            # Authenticate to vRA
         $vraAuthBody = @{
             username = $username
             password = $password
@@ -1252,14 +987,13 @@ foreach ($vraServer in $vraServers) {
             "Content-Type" = "application/json"
         } -Body $vraAuthBody -ErrorAction Stop
         
-        $vraHeaders = @{
+        $vraHeaders = @{                                                        # Build auth headers
             "Authorization" = "Bearer $($vraAuthResponse.cspAuthToken)"
             "Content-Type" = "application/json"
         }
         
         Write-Log "Authenticated successfully" "SUCCESS"
         
-        # Get deleted VMs from this vRA server
         $deletedVMs = Get-DeletedVMsFromVRA -VraServer $vraServer -Headers $vraHeaders -DaysBack $daysBack
         $allVraDeletedVMs += $deletedVMs
         
@@ -1271,89 +1005,37 @@ foreach ($vraServer in $vraServers) {
 
 Write-Log "`nvRA Deleted Total: Found $($allVraDeletedVMs.Count) deleted VMs across all servers" "SUCCESS"
 
-# ================================================================================
-# vCENTER - Get Direct Deletions
-# ================================================================================
+# ============================================================================
+# VCENTER - GET DIRECT DELETIONS
+# ============================================================================
+
 Write-DebugSection "vCENTER - CHECKING DIRECT VM DELETIONS"
 
 $allVCenterDeletedVMs = @()
 
-foreach ($vCenter in $vCenters) {
+foreach ($vCenter in $vCenters) {                                               # Process each vCenter
     $deletedVMs = Get-DeletedVMsFromVCenter -VCenter $vCenter -Credential $credential -DaysBack $daysBack
     $allVCenterDeletedVMs += $deletedVMs
 }
 
 Write-Log "`nvCenter Total: Found $($allVCenterDeletedVMs.Count) deleted VMs across all servers" "SUCCESS"
 
-# ================================================================================
+# ============================================================================
 # SUMMARY AND REPORT
-# ================================================================================
+# ============================================================================
+
 Write-DebugSection "SUMMARY AND REPORTING"
 
-Write-Log "Aria Operations Deleted/Changed: $($ariaDeletedVMs.Count)" "SUCCESS"
 Write-Log "vRA Decommission In Progress: $($allVraDecommissionVMs.Count)" "SUCCESS"
 Write-Log "vRA Deleted Deployments: $($allVraDeletedVMs.Count)" "SUCCESS"
 Write-Log "vCenter Direct Deletions: $($allVCenterDeletedVMs.Count)" "SUCCESS"
 
-$totalDeleted = $ariaDeletedVMs.Count + $allVraDeletedVMs.Count + $allVCenterDeletedVMs.Count + $allVraDecommissionVMs.Count
-Write-Log "TOTAL (before deduplication): $totalDeleted" "SUCCESS"
-
-# Cross-reference analysis
-Write-DebugSection "CROSS-REFERENCE ANALYSIS"
-
-Write-Log "Analyzing VM deletions across all sources..." "DEBUG"
-
-# Create a combined list for analysis
-$allVMNames = @()
-$allVMNames += $ariaDeletedVMs | Select-Object -ExpandProperty VMName
-$allVMNames += $allVraDecommissionVMs | Select-Object -ExpandProperty VMName
-$allVMNames += $allVraDeletedVMs | Select-Object -ExpandProperty VMName
-$allVMNames += $allVCenterDeletedVMs | Select-Object -ExpandProperty VMName
-$uniqueVMNames = $allVMNames | Select-Object -Unique
-
-Write-Log "Unique VM names across all sources: $($uniqueVMNames.Count)" "DEBUG"
-
-foreach ($vmName in $uniqueVMNames) {
-    $inAria = $ariaDeletedVMs | Where-Object { $_.VMName -eq $vmName }
-    $inVraDecomm = $allVraDecommissionVMs | Where-Object { $_.VMName -eq $vmName }
-    $inVraDel = $allVraDeletedVMs | Where-Object { $_.VMName -eq $vmName }
-    $inVC = $allVCenterDeletedVMs | Where-Object { $_.VMName -eq $vmName }
-    
-    Write-Log "`nVM: $vmName" "DEBUG"
-    Write-Log "  In Aria Operations: $(if($inAria){'YES'}else{'NO'})" "DEBUG"
-    Write-Log "  In vRA Decommission (Active): $(if($inVraDecomm){'YES'}else{'NO'})" "DEBUG"
-    Write-Log "  In vRA Deleted: $(if($inVraDel){'YES'}else{'NO'})" "DEBUG"
-    Write-Log "  In vCenter: $(if($inVC){'YES'}else{'NO'})" "DEBUG"
-    
-    if ($inVraDecomm) {
-        Write-Log "  vRA Decommission Details:" "DEBUG"
-        Write-Log "    Deployment: $($inVraDecomm.DeploymentName)" "DEBUG"
-        Write-Log "    Request Action: $($inVraDecomm.RequestAction)" "DEBUG"
-        Write-Log "    Request Status: $($inVraDecomm.RequestStatus)" "DEBUG"
-        Write-Log "    Requested By: $($inVraDecomm.RequestedBy)" "DEBUG"
-    }
-    
-    if ($inVraDel) {
-        Write-Log "  vRA Deleted Details:" "DEBUG"
-        Write-Log "    Deployment: $($inVraDel.DeploymentName)" "DEBUG"
-        Write-Log "    Request Action: $($inVraDel.RequestAction)" "DEBUG"
-        Write-Log "    Requested By: $($inVraDel.RequestedBy)" "DEBUG"
-    }
-}
-
-# Send Email Report
-Write-DebugSection "SENDING EMAIL REPORT"
-
-# Check if there are any deleted or decommissioned VMs from vRA and vCenter only
 $vraVCenterTotal = $allVraDeletedVMs.Count + $allVraDecommissionVMs.Count + $allVCenterDeletedVMs.Count
 
-Write-Log "vRA Deleted VMs: $($allVraDeletedVMs.Count)" "DEBUG"
-Write-Log "vRA Decommission VMs: $($allVraDecommissionVMs.Count)" "DEBUG"
-Write-Log "vCenter Deleted VMs: $($allVCenterDeletedVMs.Count)" "DEBUG"
 Write-Log "Total (vRA + vCenter): $vraVCenterTotal" "DEBUG"
 
-if ($vraVCenterTotal -eq 0) {
-    Write-Log "No deleted or decommissioned VMs found in vRA or vCenter. Sending notification email..." "WARN"
+if ($vraVCenterTotal -eq 0) {                                                   # If no VMs found, send notification
+    Write-Log "No deleted or decommissioned VMs found. Sending notification email..." "WARN"
     
     $noDeletedVMsHtml = @"
 <html>
@@ -1401,10 +1083,9 @@ if ($vraVCenterTotal -eq 0) {
         Write-Log "Failed to send notification email: $($_.Exception.Message)" "ERROR"
     }
 }
-else {
+else {                                                                          # If VMs found, send detailed report
     Write-Log "Found VMs to report. Sending detailed report..." "DEBUG"
     Send-DeletedVMReport `
-        -AriaOpsData $ariaDeletedVMs `
         -VraDeletedData $allVraDeletedVMs `
         -VraDecommissionData $allVraDecommissionVMs `
         -VCenterData $allVCenterDeletedVMs `
@@ -1417,6 +1098,6 @@ else {
 }
 
 Write-DebugSection "SCRIPT COMPLETED"
-Write-Log "Script Version: 2.0.0" "SUCCESS"
+Write-Log "Script Version: 2.1.0" "SUCCESS"
 Write-Log "Debug log saved to: $debugOutputFile" "SUCCESS"
 Write-Log "`nScript finished. Check the debug file for detailed logs." "SUCCESS"
