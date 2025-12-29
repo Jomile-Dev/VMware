@@ -94,7 +94,9 @@ function Get-ActiveDeploymentsWithDecommission {
     $decommissionData = @()
     $cutoffDate = (Get-Date).AddDays(-$script:daysBack)
     
-    Write-Log "Fetching ALL active deployments (no time filter for decommission)..." "DEBUG"
+    Write-Log "Cutoff date for decommission filter: $cutoffDate" "WARN"
+    Write-Log "NOTE: Checking ALL active deployments but only including decommissions initiated within last $script:daysBack days" "WARN"
+    Write-Log "Fetching ALL active deployments..." "DEBUG"
     
     # Get all active deployments with resource expansion
     $vraUri = "https://$VraServer/deployment/api/deployments"
@@ -137,6 +139,7 @@ function Get-ActiveDeploymentsWithDecommission {
     Write-Log "Total active deployments retrieved: $($allDeployments.Count)" "DEBUG"
     
     # Filter for deployments containing VMs only
+    Write-Log "`n--- Filtering for VM-containing deployments ---" "DEBUG"
     $filteredDeployments = $allDeployments | Where-Object {
         $hasVM = $false
         if ($_.resources) {
@@ -147,10 +150,17 @@ function Get-ActiveDeploymentsWithDecommission {
                 }
             }
         }
+        if ($hasVM) {
+            Write-Log "  ✓ Deployment '$($_.name)' has VMs - KEEPING" "DEBUG"
+        }
+        else {
+            Write-Log "  ✗ Deployment '$($_.name)' has NO VMs - FILTERING OUT" "DEBUG"
+        }
         $hasVM
     }
     
-    Write-Log "Deployments containing VMs: $($filteredDeployments.Count)" "SUCCESS"
+    Write-Log "`nDeployments containing VMs: $($filteredDeployments.Count)" "SUCCESS"
+    Write-Log "Deployments filtered out (no VMs): $(($allDeployments.Count - $filteredDeployments.Count))" "WARN"
     $allDeployments = $filteredDeployments
     
     # Process each deployment looking for decommission requests
@@ -260,16 +270,55 @@ function Get-ActiveDeploymentsWithDecommission {
                 # Check if this is a decommission request (still active, not deleted)
                 $isDecommission = $false
                 $matchedBy = "None"
-                if ($request.name -match "Initiate server decommission|decommission" -or 
-                    $request.actionId -match "Deployment.Delete|Resource.Delete|Cloud.vSphere.Machine.Delete|Deployment.custom.initiate_server_decommission") {
+                
+                Write-Log "    ║ Checking if this is a decommission request..." "DEBUG"
+                Write-Log "    ║   Request Name: '$($request.name)'" "DEBUG"
+                Write-Log "    ║   Action ID: '$($request.actionId)'" "DEBUG"
+                Write-Log "    ║   Initiated At: $($request.initiatedAt)" "DEBUG"
+                
+                # Check name pattern
+                $nameMatch = $false
+                if ($request.name -match "Initiate server decommission|decommission") {
+                    $nameMatch = $true
+                    Write-Log "    ║   ✓ Name matches decommission pattern" "WARN"
+                }
+                else {
+                    Write-Log "    ║   ✗ Name does NOT match decommission pattern" "DEBUG"
+                }
+                
+                # Check action ID pattern
+                $actionMatch = $false
+                if ($request.actionId -match "Deployment.Delete|Resource.Delete|Cloud.vSphere.Machine.Delete|Deployment.custom.initiate_server_decommission") {
+                    $actionMatch = $true
+                    Write-Log "    ║   ✓ Action ID matches decommission pattern" "WARN"
+                }
+                else {
+                    Write-Log "    ║   ✗ Action ID does NOT match decommission pattern" "DEBUG"
+                }
+                
+                # Check if either name or action matches
+                if ($nameMatch -or $actionMatch) {
+                    Write-Log "    ║   >>> Pattern matched! Checking date filter..." "WARN"
                     
                     $initiatedDate = [DateTime]$request.initiatedAt
+                    Write-Log "    ║   >>> Initiated Date: $initiatedDate" "DEBUG"
+                    Write-Log "    ║   >>> Cutoff Date: $cutoffDate" "DEBUG"
+                    Write-Log "    ║   >>> Days difference: $(($initiatedDate - $cutoffDate).Days) days" "DEBUG"
+                    
                     if ($initiatedDate -ge $cutoffDate) {
                         $isDecommission = $true
-                        $matchedBy = if ($request.name -match "decommission") { "Request Name" } else { "Action ID" }
-                        Write-Log "    >>> DECOMMISSION REQUEST FOUND (Still Active Deployment) <<<" "WARN"
-                        Write-Log "    >>> Action: $($request.name), Action ID: $($request.actionId) <<<" "WARN"
+                        $matchedBy = if ($nameMatch) { "Request Name" } else { "Action ID" }
+                        Write-Log "    ║   >>> ✓✓✓ DECOMMISSION REQUEST CONFIRMED ✓✓✓" "WARN"
+                        Write-Log "    ║   >>> Matched by: $matchedBy" "WARN"
+                        Write-Log "    ║   >>> This deployment will be included in the report" "WARN"
                     }
+                    else {
+                        Write-Log "    ║   >>> ✗ REJECTED: Initiated date is BEFORE cutoff date" "ERROR"
+                        Write-Log "    ║   >>> This decommission is TOO OLD (> $script:daysBack days)" "ERROR"
+                    }
+                }
+                else {
+                    Write-Log "    ║   >>> NOT a decommission request (no pattern match)" "DEBUG"
                 }
                 
                 if ($isDecommission) {
@@ -348,7 +397,28 @@ function Get-ActiveDeploymentsWithDecommission {
         }
     }
     
-    Write-Log "`nFound $($decommissionData.Count) VMs with decommission requests (still active deployments)" "SUCCESS"
+    Write-Log "`n╔════════════════════════════════════════════════════════════════════════════════" "SUCCESS"
+    Write-Log "║ DECOMMISSION SUMMARY for $VraServer" "SUCCESS"
+    Write-Log "╠════════════════════════════════════════════════════════════════════════════════" "SUCCESS"
+    Write-Log "║ Total Active Deployments Checked: $($allDeployments.Count)" "SUCCESS"
+    Write-Log "║ VMs with Decommission Requests Found: $($decommissionData.Count)" "SUCCESS"
+    if ($decommissionData.Count -gt 0) {
+        Write-Log "║" "SUCCESS"
+        Write-Log "║ VMs Found in Decommission:" "SUCCESS"
+        foreach ($vm in $decommissionData) {
+            Write-Log "║   - $($vm.VMName) (Deployment: $($vm.DeploymentName))" "SUCCESS"
+            Write-Log "║     Status: $($vm.RequestStatus), Initiated: $($vm.InitiatedAt)" "SUCCESS"
+        }
+    }
+    else {
+        Write-Log "║ ⚠ WARNING: No VMs with decommission requests found!" "WARN"
+        Write-Log "║ Possible reasons:" "WARN"
+        Write-Log "║   1. No decommissions were initiated in the last $script:daysBack days" "WARN"
+        Write-Log "║   2. Decommissions already completed and deployments deleted" "WARN"
+        Write-Log "║   3. Request names/action IDs don't match expected patterns" "WARN"
+    }
+    Write-Log "╚════════════════════════════════════════════════════════════════════════════════" "SUCCESS"
+    
     return $decommissionData
 }
 
@@ -1183,35 +1253,51 @@ foreach ($vmName in $uniqueVMNames) {
 # Send Email Report
 Write-DebugSection "SENDING EMAIL REPORT"
 
-if ($totalDeleted -eq 0) {
-    Write-Log "No deleted VMs found. Sending notification email..." "WARN"
+# Check if there are any deleted or decommissioned VMs from vRA and vCenter only
+$vraVCenterTotal = $allVraDeletedVMs.Count + $allVraDecommissionVMs.Count + $allVCenterDeletedVMs.Count
+
+if ($vraVCenterTotal -eq 0) {
+    Write-Log "No deleted or decommissioned VMs found in vRA or vCenter. Sending notification email..." "WARN"
     
     $noDeletedVMsHtml = @"
 <html>
 <head>
 <style>
     body { font-family: Arial, sans-serif; margin: 20px; }
-    .info-box { background-color: #e3f2fd; padding: 20px; border-left: 4px solid #2196F3; margin: 20px 0; }
-    .info-box h2 { margin-top: 0; color: #1976D2; }
-    .info-box p { color: #424242; font-size: 14px; }
+    .info-box { background-color: #e8f5e9; padding: 20px; border-left: 4px solid #4caf50; margin: 20px 0; }
+    .info-box h2 { margin-top: 0; color: #2e7d32; }
+    .info-box p { color: #424242; font-size: 14px; line-height: 1.6; }
+    .details { background-color: #f5f5f5; padding: 10px; margin-top: 15px; border-radius: 4px; }
 </style>
 </head>
 <body>
 <div class="info-box">
-    <h2>No Deleted VMs Detected</h2>
-    <p>No virtual machines were deleted in the last $daysBack day(s).</p>
-    <p><strong>Debug Log File:</strong> $debugOutputFile</p>
+    <h2>✓ No VM Deletions Detected</h2>
+    <p><strong>Good news!</strong> No virtual machines were deleted or decommissioned in the last $daysBack day(s).</p>
+    
+    <div class="details">
+        <p><strong>Sources Checked:</strong></p>
+        <ul>
+            <li>vRA Deleted Deployments: 0</li>
+            <li>vRA Decommission In Progress: 0</li>
+            <li>vCenter Direct Deletions: 0</li>
+        </ul>
+        <p><strong>Report Generated:</strong> $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</p>
+        <p><strong>Debug Log File:</strong> $debugOutputFile</p>
+    </div>
 </div>
 </body>
 </html>
 "@
     
+    $noVMSubject = "No VM Deletions - $(Get-Date -Format 'yyyy-MM-dd')"
+    
     try {
         if ($smtpCc -and $smtpCc.Count -gt 0) {
-            Send-MailMessage -To $smtpTo -From $smtpFrom -Subject $smtpSubject -Body $noDeletedVMsHtml -BodyAsHtml -SmtpServer $smtpServer -Port $smtpPort -UseSsl -Cc $smtpCc
+            Send-MailMessage -To $smtpTo -From $smtpFrom -Subject $noVMSubject -Body $noDeletedVMsHtml -BodyAsHtml -SmtpServer $smtpServer -Port $smtpPort -UseSsl -Cc $smtpCc
         }
         else {
-            Send-MailMessage -To $smtpTo -From $smtpFrom -Subject $smtpSubject -Body $noDeletedVMsHtml -BodyAsHtml -SmtpServer $smtpServer -Port $smtpPort -UseSsl
+            Send-MailMessage -To $smtpTo -From $smtpFrom -Subject $noVMSubject -Body $noDeletedVMsHtml -BodyAsHtml -SmtpServer $smtpServer -Port $smtpPort -UseSsl
         }
         Write-Log "Notification email sent successfully!" "SUCCESS"
     }
@@ -1220,6 +1306,7 @@ if ($totalDeleted -eq 0) {
     }
 }
 else {
+    Write-Log "Found VMs to report. Sending detailed report..." "DEBUG"
     Send-DeletedVMReport `
         -AriaOpsData $ariaDeletedVMs `
         -VraDeletedData $allVraDeletedVMs `
