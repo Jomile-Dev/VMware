@@ -286,21 +286,29 @@ function Get-ActiveDeploymentsWithDecommission {
                         if ($machine.properties) {
                             $props = $machine.properties
                             
+                            # Prioritize actual hostname over resource name
                             if ($props.PSObject.Properties['hostname']) {
                                 $hostname = $props.hostname
-                            }
-                            elseif ($props.PSObject.Properties['resourceName']) {
-                                $hostname = $props.resourceName
-                            }
-                            elseif ($props.PSObject.Properties['name']) {
-                                $hostname = $props.name
                             }
                             elseif ($props.PSObject.Properties['address']) {
                                 $hostname = $props.address
                             }
+                            elseif ($props.PSObject.Properties['resourceName']) {
+                                # Only use resourceName if it doesn't look like Cloud_vSphere_Machine_X
+                                if ($props.resourceName -notmatch "Cloud_vSphere_Machine_\d+") {
+                                    $hostname = $props.resourceName
+                                }
+                            }
+                            elseif ($props.PSObject.Properties['name']) {
+                                # Only use name if it doesn't look like Cloud_vSphere_Machine_X
+                                if ($props.name -notmatch "Cloud_vSphere_Machine_\d+") {
+                                    $hostname = $props.name
+                                }
+                            }
                         }
                         
-                        if (-not $hostname -and $machine.name) {
+                        # Fall back to machine.name only if it's not a generic resource name
+                        if (-not $hostname -and $machine.name -and $machine.name -notmatch "Cloud_vSphere_Machine_\d+") {
                             $hostname = $machine.name
                         }
                         
@@ -535,7 +543,7 @@ function Get-DeletedVMsFromVRA {
                     if ($event.resourceType -eq "Cloud.vSphere.Machine") {
                         $serverName = $null
                         
-                        # Extract server name from details
+                        # Extract server name from details - prioritize actual VM name
                         if ($event.details) {
                             $detailsText = if ($event.details -is [string]) { 
                                 $event.details 
@@ -543,16 +551,34 @@ function Get-DeletedVMsFromVRA {
                                 ($event.details | ConvertTo-Json -Compress -Depth 5)
                             }
                             
-                            if ($detailsText -match "Cloud Resource Name:\s*([^\s,;]+)") {
+                            # Look for hostname or VM name in details
+                            if ($detailsText -match '"hostname"\s*:\s*"([^"]+)"') {
                                 $serverName = $matches[1].Trim()
                             }
-                            elseif ($detailsText -match '"cloudResourceName"\s*:\s*"([^"]+)"') {
+                            elseif ($detailsText -match '"address"\s*:\s*"([^"]+)"') {
                                 $serverName = $matches[1].Trim()
+                            }
+                            elseif ($detailsText -match 'Cloud Resource Name:\s*([^\s,;]+)') {
+                                $potentialName = $matches[1].Trim()
+                                # Only use if not a generic resource name
+                                if ($potentialName -notmatch "Cloud_vSphere_Machine_\d+") {
+                                    $serverName = $potentialName
+                                }
+                            }
+                            elseif ($detailsText -match '"cloudResourceName"\s*:\s*"([^"]+)"') {
+                                $potentialName = $matches[1].Trim()
+                                # Only use if not a generic resource name
+                                if ($potentialName -notmatch "Cloud_vSphere_Machine_\d+") {
+                                    $serverName = $potentialName
+                                }
                             }
                         }
                         
+                        # Fall back to event.resourceName only if not generic
                         if (-not $serverName -and $event.resourceName) {
-                            $serverName = $event.resourceName
+                            if ($event.resourceName -notmatch "Cloud_vSphere_Machine_\d+") {
+                                $serverName = $event.resourceName
+                            }
                         }
                         
                         if ($serverName) {
@@ -702,13 +728,14 @@ function Send-DeletedVMReport {
     
     Write-Log "Building HTML email report..." "DEBUG"
     
-    # Build a combined unique list of VMs
+    # Build a combined unique list of VMs (using actual VM hostnames only)
     $allVMs = @{}
     
     # Add vRA Deleted VMs
     foreach ($vm in $VraDeletedData) {
-        if (-not $allVMs.ContainsKey($vm.VMName)) {
-            $allVMs[$vm.VMName] = [PSCustomObject]@{
+        $vmKey = $vm.VMName.ToLower()
+        if (-not $allVMs.ContainsKey($vmKey)) {
+            $allVMs[$vmKey] = [PSCustomObject]@{
                 VMName = $vm.VMName
                 RequestedBy = $vm.RequestedBy
                 DeletedAt = $vm.DeletedAt
@@ -725,13 +752,14 @@ function Send-DeletedVMReport {
     
     # Add vRA Decommission VMs (in progress)
     foreach ($vm in $VraDecommissionData) {
-        if ($allVMs.ContainsKey($vm.VMName)) {
+        $vmKey = $vm.VMName.ToLower()
+        if ($allVMs.ContainsKey($vmKey)) {
             # VM exists, mark it as also in decommission
-            $allVMs[$vm.VMName].InDecommission = $true
-            $allVMs[$vm.VMName].Source = "vRA - Deleted & Decommission"
+            $allVMs[$vmKey].InDecommission = $true
+            $allVMs[$vmKey].Source = "vRA - Deleted & Decommission"
         }
         else {
-            $allVMs[$vm.VMName] = [PSCustomObject]@{
+            $allVMs[$vmKey] = [PSCustomObject]@{
                 VMName = $vm.VMName
                 RequestedBy = $vm.RequestedBy
                 DeletedAt = $vm.InitiatedAt
@@ -748,8 +776,9 @@ function Send-DeletedVMReport {
     
     # Add vCenter VMs only if NOT already in vRA
     foreach ($vm in $VCenterData) {
-        if (-not $allVMs.ContainsKey($vm.VMName)) {
-            $allVMs[$vm.VMName] = [PSCustomObject]@{
+        $vmKey = $vm.VMName.ToLower()
+        if (-not $allVMs.ContainsKey($vmKey)) {
+            $allVMs[$vmKey] = [PSCustomObject]@{
                 VMName = $vm.VMName
                 RequestedBy = $vm.DeletedBy
                 DeletedAt = $vm.DeletedAt
@@ -763,8 +792,8 @@ function Send-DeletedVMReport {
             }
         }
         else {
-            # Mark that it's also in vCenter
-            $allVMs[$vm.VMName].InvCenter = $true
+            # Mark that it's also in vCenter but don't duplicate
+            $allVMs[$vmKey].InvCenter = $true
         }
     }
     
