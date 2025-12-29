@@ -899,50 +899,101 @@ function Send-DeletedVMReport {
 <head>
 <style>
     body { font-family: Arial, sans-serif; margin: 20px; }
+    h1 { color: #d32f2f; border-bottom: 3px solid #f44336; padding-bottom: 10px; }
     h2 { color: #1976D2; border-bottom: 2px solid #2196F3; padding-bottom: 5px; margin-top: 30px; }
     table { border-collapse: collapse; width: 100%; margin-top: 10px; margin-bottom: 30px; }
     th { background-color: #2196F3; color: white; padding: 12px; text-align: left; font-weight: bold; }
     td { border: 1px solid #ddd; padding: 10px; }
     .summary { background-color: #f9f9f9; padding: 15px; border-left: 4px solid #2196F3; margin-bottom: 20px; }
+    .summary-item { margin: 5px 0; }
+    .no-data { padding: 15px; background-color: #e8f5e9; color: #2e7d32; border-left: 4px solid #4caf50; }
+    .section-header { background-color: #ffecb3; padding: 10px; margin-top: 20px; border-left: 4px solid #ff9800; }
+    .decom-warning { background-color: #fff9c4; padding: 10px; margin-top: 10px; border-left: 4px solid #ffc107; }
 </style>
 </head>
 <body>
-<h1>Deleted VM Report - $(Get-Date -Format 'yyyy-MM-dd')</h1>
+<h1>🔴 VM Deletion & Decommission Report</h1>
+<p><strong>Report Date:</strong> $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</p>
+<p><strong>Time Range:</strong> Last $($daysBack) day(s)</p>
 
 <div class="summary">
-    <p><strong>Total VMs:</strong> $($allVMs.Count)</p>
-    <p><strong>vRA Deleted Deployments:</strong> $($VraDeletedData.Count)</p>
-    <p><strong>vRA Decommission In Progress:</strong> $($VraDecommissionData.Count)</p>
-    <p><strong>vCenter Direct Deletions (not in vRA):</strong> $(($VCenterData | Where-Object { $vmKey = $_.VMName.ToLower(); -not $allVMs.ContainsKey($vmKey) }).Count)</p>
+    <h3>Executive Summary</h3>
+    <div class="summary-item"><strong>Total Deleted VMs:</strong> $($deletedVMs.Count)</div>
+    <div class="summary-item"><strong>Total Decommissions In Progress:</strong> $($decommissionVMs.Count)</div>
+    <div class="summary-item"><strong>Grand Total:</strong> $(($deletedVMs.Count + $decommissionVMs.Count))</div>
+    <hr style="margin: 10px 0;">
+    <div class="summary-item"><strong>vRA Deleted Deployments:</strong> $($VraDeletedData.Count)</div>
+    <div class="summary-item"><strong>vCenter Direct Deletions:</strong> $($VCenterData.Count)</div>
+    <div class="summary-item"><strong>vRA Decommissions (Active):</strong> $($VraDecommissionData.Count)</div>
 </div>
 
-<h2>Deleted Virtual Machines</h2>
-$(if($allVMs.Count -gt 0) {
+<h2>📋 Section 1: Deleted Virtual Machines</h2>
+<p><em>VMs that have been completely deleted from vRA and/or vCenter</em></p>
+$(if($deletedVMs.Count -gt 0) {
 "<table>
 <thead>
 <tr>
 <th>VM Name</th>
-<th>Type</th>
+<th>Source Type</th>
 <th>Deployment Name</th>
-<th>Request Action</th>
-<th>Requested By</th>
-<th>Deleted/Initiated At</th>
-<th>Source (vRA/vCenter)</th>
+<th>Action</th>
+<th>Status</th>
+<th>Requested/Deleted By</th>
+<th>Deleted At</th>
+<th>Server</th>
 </tr>
 </thead>
 <tbody>
-$tableRows
+$deletedTableRows
 </tbody>
 </table>"
 } else {
-"<p class='no-data'>No deleted VMs found</p>"
+"<p class='no-data'>✓ No deleted VMs found in this time period</p>"
 })
+
+<h2>⚠️ Section 2: Decommissions In Progress</h2>
+<p><em>VMs currently undergoing decommission process (deployments still active in vRA)</em></p>
+$(if($decommissionVMs.Count -gt 0) {
+"<div class='decom-warning'>
+<strong>⚠️ Warning:</strong> These VMs are currently being decommissioned but the process is not yet complete.
+</div>
+<table>
+<thead>
+<tr style='background-color: #ff9800;'>
+<th>VM Name</th>
+<th>Deployment Name</th>
+<th>Deployment Status</th>
+<th>Request Action</th>
+<th>Request Status</th>
+<th>Requested By</th>
+<th>Initiated At</th>
+<th>vRA Server</th>
+</tr>
+</thead>
+<tbody>
+$decommissionTableRows
+</tbody>
+</table>"
+} else {
+"<p class='no-data'>✓ No decommissions currently in progress</p>"
+})
+
+<hr style="margin: 30px 0;">
+<p style="font-size: 12px; color: #666;">
+<strong>Legend:</strong><br>
+• <span style="background-color: #fff9c4; padding: 2px 5px;">Yellow highlight</span> = Decommission in progress<br>
+• vRA = VMware Aria Automation (formerly vRealize Automation)<br>
+• vCenter = Direct deletion from vCenter (bypassing vRA)
+</p>
 
 </body>
 </html>
 "@
     
     Write-Log "Sending email to: $($To -join ', ')" "DEBUG"
+    Write-Log "Email subject: $Subject" "DEBUG"
+    Write-Log "Total sections in email - Deleted: $($deletedVMs.Count), Decommission: $($decommissionVMs.Count)" "DEBUG"
+    
     try {
         if ($Cc -and $Cc.Count -gt 0) {
             Send-MailMessage -To $To -From $From -Subject $Subject -Body $htmlBody -BodyAsHtml -SmtpServer $SmtpServer -Port $SmtpPort -UseSsl -Cc $Cc
@@ -954,6 +1005,7 @@ $tableRows
     }
     catch {
         Write-Log "Failed to send email: $($_.Exception.Message)" "ERROR"
+        Write-Log "Full error details: $($_.Exception)" "ERROR"
     }
 }
 
@@ -1231,6 +1283,11 @@ Write-DebugSection "SENDING EMAIL REPORT"
 
 # Check if there are any deleted or decommissioned VMs from vRA and vCenter only
 $vraVCenterTotal = $allVraDeletedVMs.Count + $allVraDecommissionVMs.Count + $allVCenterDeletedVMs.Count
+
+Write-Log "vRA Deleted VMs: $($allVraDeletedVMs.Count)" "DEBUG"
+Write-Log "vRA Decommission VMs: $($allVraDecommissionVMs.Count)" "DEBUG"
+Write-Log "vCenter Deleted VMs: $($allVCenterDeletedVMs.Count)" "DEBUG"
+Write-Log "Total (vRA + vCenter): $vraVCenterTotal" "DEBUG"
 
 if ($vraVCenterTotal -eq 0) {
     Write-Log "No deleted or decommissioned VMs found in vRA or vCenter. Sending notification email..." "WARN"
