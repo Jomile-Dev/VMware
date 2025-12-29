@@ -811,111 +811,87 @@ function Send-DeletedVMReport {
     
     Write-Log "Building HTML email report..." "DEBUG"
     
-    # Build a combined unique list of VMs (using actual VM hostnames only)
-    $allVMs = @{}
+    # Separate deleted VMs and decommission VMs into different sections
+    $deletedVMs = @()
+    $decommissionVMs = @()
     
-    # Add vRA Deleted VMs
+    # Add vRA Deleted VMs to deleted section
     foreach ($vm in $VraDeletedData) {
-        $vmKey = $vm.VMName.ToLower()
-        if (-not $allVMs.ContainsKey($vmKey)) {
-            Write-Log "Adding deleted VM to report: $($vm.VMName) from $($vm.vRAServer)" "DEBUG"
-            $allVMs[$vmKey] = [PSCustomObject]@{
-                VMName = $vm.VMName
-                RequestedBy = $vm.RequestedBy
-                DeletedAt = $vm.DeletedAt
-                DeploymentName = $vm.DeploymentName
-                RequestAction = $vm.RequestAction
-                Source = $vm.vRAServer
-                SourceType = "vRA - Deleted"
-                InDecommission = $false
-                InDeleted = $true
-                InvCenter = $false
-            }
-        }
-        else {
-            Write-Log "VM $($vm.VMName) already exists in report - skipping duplicate" "WARN"
+        Write-Log "Adding vRA deleted VM to report: $($vm.VMName) from $($vm.vRAServer)" "DEBUG"
+        $deletedVMs += [PSCustomObject]@{
+            VMName = $vm.VMName
+            RequestedBy = $vm.RequestedBy
+            DeletedAt = $vm.DeletedAt
+            DeploymentName = $vm.DeploymentName
+            RequestAction = $vm.RequestAction
+            RequestStatus = $vm.RequestStatus
+            Source = $vm.vRAServer
+            SourceType = "vRA"
         }
     }
     
-    # Add vRA Decommission VMs (in progress)
-    foreach ($vm in $VraDecommissionData) {
-        $vmKey = $vm.VMName.ToLower()
-        if ($allVMs.ContainsKey($vmKey)) {
-            # VM exists, mark it as also in decommission
-            Write-Log "VM $($vm.VMName) found in both deleted and decommission" "DEBUG"
-            $allVMs[$vmKey].InDecommission = $true
-            $allVMs[$vmKey].SourceType = "vRA - Deleted & Decommission"
-        }
-        else {
-            Write-Log "Adding decommission VM to report: $($vm.VMName) from $($vm.vRAServer)" "DEBUG"
-            $allVMs[$vmKey] = [PSCustomObject]@{
-                VMName = $vm.VMName
-                RequestedBy = $vm.RequestedBy
-                DeletedAt = $vm.InitiatedAt
-                DeploymentName = $vm.DeploymentName
-                RequestAction = $vm.RequestAction
-                Source = $vm.vRAServer
-                SourceType = "vRA - Decommission In Progress"
-                InDecommission = $true
-                InDeleted = $false
-                InvCenter = $false
-            }
-        }
-    }
-    
-    # Add vCenter VMs only if NOT already in vRA
+    # Add vCenter VMs to deleted section
     foreach ($vm in $VCenterData) {
-        $vmKey = $vm.VMName.ToLower()
-        if (-not $allVMs.ContainsKey($vmKey)) {
-            Write-Log "Adding vCenter-only deleted VM to report: $($vm.VMName) from $($vm.vCenter)" "DEBUG"
-            $allVMs[$vmKey] = [PSCustomObject]@{
-                VMName = $vm.VMName
-                RequestedBy = $vm.DeletedBy
-                DeletedAt = $vm.DeletedAt
-                DeploymentName = "N/A"
-                RequestAction = $vm.EventType
-                Source = $vm.vCenter
-                SourceType = "vCenter - Direct Deletion"
-                InDecommission = $false
-                InDeleted = $false
-                InvCenter = $true
-            }
-        }
-        else {
-            # Mark that it's also in vCenter but don't duplicate
-            Write-Log "VM $($vm.VMName) already in vRA, also found in vCenter - marking as in vCenter" "DEBUG"
-            $allVMs[$vmKey].InvCenter = $true
+        Write-Log "Adding vCenter deleted VM to report: $($vm.VMName) from $($vm.vCenter)" "DEBUG"
+        $deletedVMs += [PSCustomObject]@{
+            VMName = $vm.VMName
+            RequestedBy = $vm.DeletedBy
+            DeletedAt = $vm.DeletedAt
+            DeploymentName = "N/A"
+            RequestAction = $vm.EventType
+            RequestStatus = "Deleted"
+            Source = $vm.vCenter
+            SourceType = "vCenter"
         }
     }
     
-    # Build table rows
-    $tableRows = ""
-    foreach ($vmName in ($allVMs.Keys | Sort-Object)) {
-        $vm = $allVMs[$vmName]
-        
-        $rowColor = ""
-        if ($vm.InDecommission -and $vm.InDeleted) {
-            $rowColor = " style='background-color: #ffecb3;'"  # Light orange - both
+    # Add vRA Decommission VMs to separate decommission section
+    foreach ($vm in $VraDecommissionData) {
+        Write-Log "Adding decommission VM to report: $($vm.VMName) from $($vm.vRAServer)" "DEBUG"
+        $decommissionVMs += [PSCustomObject]@{
+            VMName = $vm.VMName
+            RequestedBy = $vm.RequestedBy
+            InitiatedAt = $vm.InitiatedAt
+            DeploymentName = $vm.DeploymentName
+            DeploymentStatus = $vm.DeploymentStatus
+            RequestAction = $vm.RequestAction
+            RequestStatus = $vm.RequestStatus
+            Source = $vm.vRAServer
+            TotalEvents = $vm.TotalEvents
         }
-        elseif ($vm.InDecommission) {
-            $rowColor = " style='background-color: #fff9c4;'"  # Yellow - decommission only
-        }
-        elseif ($vm.InDeleted) {
-            $rowColor = " style='background-color: #ffebee;'"  # Light red - deleted
-        }
-        elseif ($vm.InvCenter) {
-            $rowColor = " style='background-color: #f3e5f5;'"  # Purple - vCenter only
-        }
-        
-        $tableRows += "<tr$rowColor>"
-        $tableRows += "<td>$($vm.VMName)</td>"
-        $tableRows += "<td>$($vm.SourceType)</td>"
-        $tableRows += "<td>$($vm.DeploymentName)</td>"
-        $tableRows += "<td>$($vm.RequestAction)</td>"
-        $tableRows += "<td>$($vm.RequestedBy)</td>"
-        $tableRows += "<td>$($vm.DeletedAt)</td>"
-        $tableRows += "<td>$($vm.Source)</td>"
-        $tableRows += "</tr>"
+    }
+    
+    Write-Log "Total Deleted VMs for report: $($deletedVMs.Count)" "DEBUG"
+    Write-Log "Total Decommission VMs for report: $($decommissionVMs.Count)" "DEBUG"
+    
+    # Build deleted VMs table rows
+    $deletedTableRows = ""
+    foreach ($vm in ($deletedVMs | Sort-Object VMName)) {
+        $deletedTableRows += "<tr>"
+        $deletedTableRows += "<td>$($vm.VMName)</td>"
+        $deletedTableRows += "<td>$($vm.SourceType)</td>"
+        $deletedTableRows += "<td>$($vm.DeploymentName)</td>"
+        $deletedTableRows += "<td>$($vm.RequestAction)</td>"
+        $deletedTableRows += "<td>$($vm.RequestStatus)</td>"
+        $deletedTableRows += "<td>$($vm.RequestedBy)</td>"
+        $deletedTableRows += "<td>$($vm.DeletedAt)</td>"
+        $deletedTableRows += "<td>$($vm.Source)</td>"
+        $deletedTableRows += "</tr>"
+    }
+    
+    # Build decommission VMs table rows
+    $decommissionTableRows = ""
+    foreach ($vm in ($decommissionVMs | Sort-Object VMName)) {
+        $decommissionTableRows += "<tr style='background-color: #fff9c4;'>"
+        $decommissionTableRows += "<td>$($vm.VMName)</td>"
+        $decommissionTableRows += "<td>$($vm.DeploymentName)</td>"
+        $decommissionTableRows += "<td>$($vm.DeploymentStatus)</td>"
+        $decommissionTableRows += "<td>$($vm.RequestAction)</td>"
+        $decommissionTableRows += "<td>$($vm.RequestStatus)</td>"
+        $decommissionTableRows += "<td>$($vm.RequestedBy)</td>"
+        $decommissionTableRows += "<td>$($vm.InitiatedAt)</td>"
+        $decommissionTableRows += "<td>$($vm.Source)</td>"
+        $decommissionTableRows += "</tr>"
     }
     
     $htmlBody = @"
