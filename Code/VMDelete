@@ -210,6 +210,32 @@ function Get-ActiveDeploymentsWithDecommission {
                 Write-Log "    ║ Initiated At: $($request.initiatedAt)" "DEBUG"
                 Write-Log "    ║ Completed At: $($request.completedAt)" "DEBUG"
                 
+                # DUMP ALL REQUEST PROPERTIES TO FIND TIMESTAMPS
+                Write-Log "    ║" "DEBUG"
+                Write-Log "    ║ >>> FULL REQUEST OBJECT DUMP (ALL PROPERTIES) <<<" "WARN"
+                Write-Log "    ║" "DEBUG"
+                if ($request) {
+                    $request.PSObject.Properties | ForEach-Object {
+                        $propName = $_.Name
+                        $propValue = $_.Value
+                        if ($propValue -eq $null) {
+                            Write-Log "    ║   $propName = NULL" "WARN"
+                        }
+                        elseif ($propValue -is [string] -and [string]::IsNullOrWhiteSpace($propValue)) {
+                            Write-Log "    ║   $propName = [EMPTY STRING]" "WARN"
+                        }
+                        else {
+                            Write-Log "    ║   $propName = $propValue" "DEBUG"
+                        }
+                    }
+                }
+                else {
+                    Write-Log "    ║   REQUEST OBJECT IS NULL!" "ERROR"
+                }
+                Write-Log "    ║" "DEBUG"
+                Write-Log "    ║ >>> END REQUEST OBJECT DUMP <<<" "WARN"
+                Write-Log "    ║" "DEBUG"
+                
                 # Get ALL events for this request for troubleshooting
                 $eventPage = 0
                 $allRequestEvents = @()
