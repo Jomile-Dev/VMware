@@ -86,19 +86,14 @@ function Get-ActiveDeploymentsWithDecommission {
         [string]$VraServer,
         
         [Parameter(Mandatory=$true)]
-        [hashtable]$Headers,
-        
-        [Parameter(Mandatory=$true)]
-        [int]$DaysBack
+        [hashtable]$Headers
     )
     
     Write-DebugSection "Checking Active Deployments with Decommission Requests: $VraServer"
     
     $decommissionData = @()
-    $cutoffDate = (Get-Date).AddDays(-$DaysBack)
     
-    Write-Log "Cutoff date: $cutoffDate" "DEBUG"
-    Write-Log "Fetching active deployments..." "DEBUG"
+    Write-Log "Fetching ALL active deployments (no time filter for decommission)..." "DEBUG"
     
     # Get all active deployments with resource expansion
     $vraUri = "https://$VraServer/deployment/api/deployments"
@@ -314,6 +309,9 @@ function Get-ActiveDeploymentsWithDecommission {
                         
                         if ($hostname) {
                             Write-Log "      >>> VM in Decommission: $hostname <<<" "WARN"
+                            Write-Log "      >>> Matched decommission by: $matchedBy <<<" "DEBUG"
+                            Write-Log "      >>> Request Name: $($request.name) <<<" "DEBUG"
+                            Write-Log "      >>> Action ID: $($request.actionId) <<<" "DEBUG"
                             
                             $vraServerShort = ($VraServer -split '\.')[0]
                             $catalogItem = if ($deployment.inputs._catalogItemName) { $deployment.inputs._catalogItemName } else { "N/A" }
@@ -583,33 +581,49 @@ function Get-DeletedVMsFromVRA {
                         
                         if ($serverName) {
                             Write-Log "    ║     >>> FOUND DELETED VM: $serverName <<<" "SUCCESS"
+                            Write-Log "    ║     >>> Adding to deleted VMs list <<<" "DEBUG"
                             
-                            $vraServerShort = ($VraServer -split '\.')[0]
-                            $requestedBy = if ($request.requestedBy) { $request.requestedBy } else { "N/A" }
-                            $requestor = if ($deployment.ownedBy) { $deployment.ownedBy } else { $requestedBy }
-                            $catalogItem = if ($deployment.inputs._catalogItemName) { $deployment.inputs._catalogItemName } else { "N/A" }
+                            # Check if we already have this VM (case-insensitive)
+                            $vmKey = $serverName.ToLower()
+                            $existingVM = $deletedVMData | Where-Object { $_.VMName.ToLower() -eq $vmKey }
                             
-                            $deletedVMData += [PSCustomObject]@{
-                                VMName = $serverName
-                                ResourceType = $event.resourceType
-                                DeploymentName = $deployment.name
-                                DeploymentID = $deployment.id
-                                DeploymentStatus = $deployment.status
-                                RequestID = $request.id
-                                RequestAction = $request.name
-                                RequestStatus = $request.status
-                                RequestedBy = $requestedBy
-                                Requestor = $requestor
-                                CatalogItem = $catalogItem
-                                DeletedAt = $deployment.lastUpdatedAt
-                                InitiatedAt = $request.initiatedAt
-                                vRAServer = $vraServerShort
-                                EventType = $event.eventType
-                                EventStatus = $event.status
-                                EventMessage = $event.message
-                                Source = "vRA-Deleted"
-                                IsStillActive = $false
-                                TotalEvents = $allEvents.Count
+                            if ($existingVM) {
+                                Write-Log "    ║     >>> WARNING: VM '$serverName' already exists in deleted list - SKIPPING DUPLICATE <<<" "WARN"
+                            }
+                            else {
+                            if ($existingVM) {
+                                Write-Log "    ║     >>> WARNING: VM '$serverName' already exists in deleted list - SKIPPING DUPLICATE <<<" "WARN"
+                            }
+                            else {
+                                $vraServerShort = ($VraServer -split '\.')[0]
+                                $requestedBy = if ($request.requestedBy) { $request.requestedBy } else { "N/A" }
+                                $requestor = if ($deployment.ownedBy) { $deployment.ownedBy } else { $requestedBy }
+                                $catalogItem = if ($deployment.inputs._catalogItemName) { $deployment.inputs._catalogItemName } else { "N/A" }
+                                
+                                $deletedVMData += [PSCustomObject]@{
+                                    VMName = $serverName
+                                    ResourceType = $event.resourceType
+                                    DeploymentName = $deployment.name
+                                    DeploymentID = $deployment.id
+                                    DeploymentStatus = $deployment.status
+                                    RequestID = $request.id
+                                    RequestAction = $request.name
+                                    RequestStatus = $request.status
+                                    RequestedBy = $requestedBy
+                                    Requestor = $requestor
+                                    CatalogItem = $catalogItem
+                                    DeletedAt = $deployment.lastUpdatedAt
+                                    InitiatedAt = $request.initiatedAt
+                                    vRAServer = $vraServerShort
+                                    EventType = $event.eventType
+                                    EventStatus = $event.status
+                                    EventMessage = $event.message
+                                    Source = "vRA-Deleted"
+                                    IsStillActive = $false
+                                    TotalEvents = $allEvents.Count
+                                }
+                                
+                                Write-Log "    ║     >>> Successfully added VM '$serverName' to deleted list <<<" "SUCCESS"
                             }
                         }
                     }
@@ -735,18 +749,22 @@ function Send-DeletedVMReport {
     foreach ($vm in $VraDeletedData) {
         $vmKey = $vm.VMName.ToLower()
         if (-not $allVMs.ContainsKey($vmKey)) {
+            Write-Log "Adding deleted VM to report: $($vm.VMName) from $($vm.vRAServer)" "DEBUG"
             $allVMs[$vmKey] = [PSCustomObject]@{
                 VMName = $vm.VMName
                 RequestedBy = $vm.RequestedBy
                 DeletedAt = $vm.DeletedAt
                 DeploymentName = $vm.DeploymentName
                 RequestAction = $vm.RequestAction
-                vRAServer = $vm.vRAServer
-                Source = "vRA - Deleted"
+                Source = $vm.vRAServer
+                SourceType = "vRA - Deleted"
                 InDecommission = $false
                 InDeleted = $true
                 InvCenter = $false
             }
+        }
+        else {
+            Write-Log "VM $($vm.VMName) already exists in report - skipping duplicate" "WARN"
         }
     }
     
@@ -755,18 +773,20 @@ function Send-DeletedVMReport {
         $vmKey = $vm.VMName.ToLower()
         if ($allVMs.ContainsKey($vmKey)) {
             # VM exists, mark it as also in decommission
+            Write-Log "VM $($vm.VMName) found in both deleted and decommission" "DEBUG"
             $allVMs[$vmKey].InDecommission = $true
-            $allVMs[$vmKey].Source = "vRA - Deleted & Decommission"
+            $allVMs[$vmKey].SourceType = "vRA - Deleted & Decommission"
         }
         else {
+            Write-Log "Adding decommission VM to report: $($vm.VMName) from $($vm.vRAServer)" "DEBUG"
             $allVMs[$vmKey] = [PSCustomObject]@{
                 VMName = $vm.VMName
                 RequestedBy = $vm.RequestedBy
                 DeletedAt = $vm.InitiatedAt
                 DeploymentName = $vm.DeploymentName
                 RequestAction = $vm.RequestAction
-                vRAServer = $vm.vRAServer
-                Source = "vRA - Decommission In Progress"
+                Source = $vm.vRAServer
+                SourceType = "vRA - Decommission In Progress"
                 InDecommission = $true
                 InDeleted = $false
                 InvCenter = $false
@@ -778,14 +798,15 @@ function Send-DeletedVMReport {
     foreach ($vm in $VCenterData) {
         $vmKey = $vm.VMName.ToLower()
         if (-not $allVMs.ContainsKey($vmKey)) {
+            Write-Log "Adding vCenter-only deleted VM to report: $($vm.VMName) from $($vm.vCenter)" "DEBUG"
             $allVMs[$vmKey] = [PSCustomObject]@{
                 VMName = $vm.VMName
                 RequestedBy = $vm.DeletedBy
                 DeletedAt = $vm.DeletedAt
                 DeploymentName = "N/A"
                 RequestAction = $vm.EventType
-                vRAServer = $vm.vCenter
-                Source = "vCenter - Direct Deletion"
+                Source = $vm.vCenter
+                SourceType = "vCenter - Direct Deletion"
                 InDecommission = $false
                 InDeleted = $false
                 InvCenter = $true
@@ -793,6 +814,7 @@ function Send-DeletedVMReport {
         }
         else {
             # Mark that it's also in vCenter but don't duplicate
+            Write-Log "VM $($vm.VMName) already in vRA, also found in vCenter - marking as in vCenter" "DEBUG"
             $allVMs[$vmKey].InvCenter = $true
         }
     }
@@ -818,12 +840,12 @@ function Send-DeletedVMReport {
         
         $tableRows += "<tr$rowColor>"
         $tableRows += "<td>$($vm.VMName)</td>"
-        $tableRows += "<td>$($vm.Source)</td>"
+        $tableRows += "<td>$($vm.SourceType)</td>"
         $tableRows += "<td>$($vm.DeploymentName)</td>"
         $tableRows += "<td>$($vm.RequestAction)</td>"
         $tableRows += "<td>$($vm.RequestedBy)</td>"
         $tableRows += "<td>$($vm.DeletedAt)</td>"
-        $tableRows += "<td>$($vm.vRAServer)</td>"
+        $tableRows += "<td>$($vm.Source)</td>"
         $tableRows += "</tr>"
     }
     
@@ -855,12 +877,12 @@ $(if($allVMs.Count -gt 0) {
 <thead>
 <tr>
 <th>VM Name</th>
-<th>Source</th>
+<th>Type</th>
 <th>Deployment Name</th>
 <th>Request Action</th>
 <th>Requested By</th>
 <th>Deleted/Initiated At</th>
-<th>Server/vCenter</th>
+<th>Source (vRA/vCenter)</th>
 </tr>
 </thead>
 <tbody>
@@ -1036,8 +1058,8 @@ foreach ($vraServer in $vraServers) {
         
         Write-Log "Authenticated successfully" "SUCCESS"
         
-        # Get active deployments with decommission requests
-        $decommVMs = Get-ActiveDeploymentsWithDecommission -VraServer $vraServer -Headers $vraHeaders -DaysBack $daysBack
+        # Get active deployments with decommission requests (NO TIME LIMIT)
+        $decommVMs = Get-ActiveDeploymentsWithDecommission -VraServer $vraServer -Headers $vraHeaders
         $allVraDecommissionVMs += $decommVMs
         
     }
