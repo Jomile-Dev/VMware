@@ -1361,11 +1361,8 @@ function Send-DeletedVMReport {
 
 <h2>Deleted Virtual Machines</h2>
 <p><em>VMs that have been completely deleted from vRA and/or vCenter</em></p>
-"@
-
-    if ($deletedVMs.Count -gt 0) {
-        $htmlBody += @"
-<table>
+$(if($deletedVMs.Count -gt 0) {
+"<table>
 <thead>
 <tr>
 <th>VM Name</th>
@@ -1380,22 +1377,15 @@ function Send-DeletedVMReport {
 <tbody>
 $deletedTableRows
 </tbody>
-</table>
-"@
-    }
-    else {
-        $htmlBody += "<p class='no-data'>✓ No deleted VMs found in this time period</p>"
-    }
-
-    $htmlBody += @"
+</table>"
+} else {
+"<p class='no-data'>✓ No deleted VMs found in this time period</p>"
+})
 
 <h2>Decommissions In Progress</h2>
 <p><em>VMs currently undergoing decommission process (deployments still active in vRA)</em></p>
-"@
-
-    if ($decommissionVMs.Count -gt 0) {
-        $htmlBody += @"
-<div class='decom-warning'>
+$(if($decommissionVMs.Count -gt 0) {
+"<div class='decom-warning'>
 <strong>⚠️ Warning:</strong> These VMs are currently being decommissioned but the process is not yet complete.
 </div>
 <table>
@@ -1415,14 +1405,10 @@ $deletedTableRows
 <tbody>
 $decommissionTableRows
 </tbody>
-</table>
-"@
-    }
-    else {
-        $htmlBody += "<p class='no-data'>✓ No decommissions currently in progress</p>"
-    }
-
-    $htmlBody += @"
+</table>"
+} else {
+"<p class='no-data'>✓ No decommissions currently in progress</p>"
+})
 
 </body>
 </html>
