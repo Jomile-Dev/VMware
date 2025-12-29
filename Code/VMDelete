@@ -1,4 +1,5 @@
 # Deleted VM Tracker - Aria Operations + Multi-vRA + vCenter
+# Version 2.0.0
 # PowerShell 5.1 Compatible
 # Tracks VMs deleted in the last 24 hours with extensive debugging
 
@@ -300,21 +301,36 @@ function Get-ActiveDeploymentsWithDecommission {
                 if ($nameMatch -or $actionMatch) {
                     Write-Log "    ║   >>> Pattern matched! Checking date filter..." "WARN"
                     
-                    $initiatedDate = [DateTime]$request.initiatedAt
-                    Write-Log "    ║   >>> Initiated Date: $initiatedDate" "DEBUG"
-                    Write-Log "    ║   >>> Cutoff Date: $cutoffDate" "DEBUG"
-                    Write-Log "    ║   >>> Days difference: $(($initiatedDate - $cutoffDate).Days) days" "DEBUG"
-                    
-                    if ($initiatedDate -ge $cutoffDate) {
-                        $isDecommission = $true
-                        $matchedBy = if ($nameMatch) { "Request Name" } else { "Action ID" }
-                        Write-Log "    ║   >>> ✓✓✓ DECOMMISSION REQUEST CONFIRMED ✓✓✓" "WARN"
-                        Write-Log "    ║   >>> Matched by: $matchedBy" "WARN"
-                        Write-Log "    ║   >>> This deployment will be included in the report" "WARN"
+                    # BUGFIX: Add null check for initiatedAt
+                    if ($request.initiatedAt) {
+                        try {
+                            $initiatedDate = [DateTime]$request.initiatedAt
+                            Write-Log "    ║   >>> Initiated Date: $initiatedDate" "DEBUG"
+                            Write-Log "    ║   >>> Cutoff Date: $cutoffDate" "DEBUG"
+                            Write-Log "    ║   >>> Days difference: $(($initiatedDate - $cutoffDate).Days) days" "DEBUG"
+                            
+                            if ($initiatedDate -ge $cutoffDate) {
+                                $isDecommission = $true
+                                $matchedBy = if ($nameMatch) { "Request Name" } else { "Action ID" }
+                                Write-Log "    ║   >>> ✓✓✓ DECOMMISSION REQUEST CONFIRMED ✓✓✓" "WARN"
+                                Write-Log "    ║   >>> Matched by: $matchedBy" "WARN"
+                                Write-Log "    ║   >>> This deployment will be included in the report" "WARN"
+                            }
+                            else {
+                                Write-Log "    ║   >>> ✗ REJECTED: Initiated date is BEFORE cutoff date" "ERROR"
+                                Write-Log "    ║   >>> This decommission is TOO OLD (> $script:daysBack days)" "ERROR"
+                            }
+                        }
+                        catch {
+                            Write-Log "    ║   >>> ✗ ERROR: Cannot convert initiatedAt to DateTime: $($_.Exception.Message)" "ERROR"
+                        }
                     }
                     else {
-                        Write-Log "    ║   >>> ✗ REJECTED: Initiated date is BEFORE cutoff date" "ERROR"
-                        Write-Log "    ║   >>> This decommission is TOO OLD (> $script:daysBack days)" "ERROR"
+                        Write-Log "    ║   >>> ✗ ERROR: initiatedAt is NULL - cannot verify date" "ERROR"
+                        Write-Log "    ║   >>> Skipping date check - assuming recent decommission" "WARN"
+                        # Still mark as decommission if pattern matches, even without date
+                        $isDecommission = $true
+                        $matchedBy = if ($nameMatch) { "Request Name" } else { "Action ID" }
                     }
                 }
                 else {
@@ -368,6 +384,10 @@ function Get-ActiveDeploymentsWithDecommission {
                             $vraServerShort = ($VraServer -split '\.')[0]
                             $catalogItem = if ($deployment.inputs._catalogItemName) { $deployment.inputs._catalogItemName } else { "N/A" }
                             
+                            # BUGFIX: Handle null initiatedAt
+                            $initiatedAtValue = if ($request.initiatedAt) { $request.initiatedAt } else { "N/A" }
+                            $completedAtValue = if ($request.completedAt) { $request.completedAt } else { "N/A" }
+                            
                             $decommissionData += [PSCustomObject]@{
                                 VMName = $hostname
                                 ResourceType = $machine.type
@@ -380,8 +400,8 @@ function Get-ActiveDeploymentsWithDecommission {
                                 RequestedBy = $request.requestedBy
                                 Requestor = if ($deployment.ownedBy) { $deployment.ownedBy } else { $request.requestedBy }
                                 CatalogItem = $catalogItem
-                                InitiatedAt = $request.initiatedAt
-                                CompletedAt = $request.completedAt
+                                InitiatedAt = $initiatedAtValue
+                                CompletedAt = $completedAtValue
                                 vRAServer = $vraServerShort
                                 Source = "vRA-Decommission-InProgress"
                                 IsStillActive = $true
@@ -394,6 +414,7 @@ function Get-ActiveDeploymentsWithDecommission {
         }
         catch {
             Write-Log "  Error processing deployment requests: $($_.Exception.Message)" "ERROR"
+            Write-Log "  Full error: $($_.Exception)" "ERROR"
         }
     }
     
@@ -811,6 +832,17 @@ function Send-DeletedVMReport {
     
     Write-Log "Building HTML email report..." "DEBUG"
     
+    # Build lookup of VMs in vRA (both deleted and decommission) for deduplication
+    $vraVMNames = @{}
+    foreach ($vm in $VraDeletedData) {
+        $vraVMNames[$vm.VMName.ToLower()] = $true
+    }
+    foreach ($vm in $VraDecommissionData) {
+        $vraVMNames[$vm.VMName.ToLower()] = $true
+    }
+    
+    Write-Log "VMs found in vRA (for deduplication): $($vraVMNames.Count)" "DEBUG"
+    
     # Separate deleted VMs and decommission VMs into different sections
     $deletedVMs = @()
     $decommissionVMs = @()
@@ -826,22 +858,26 @@ function Send-DeletedVMReport {
             RequestAction = $vm.RequestAction
             RequestStatus = $vm.RequestStatus
             Source = $vm.vRAServer
-            SourceType = "vRA"
         }
     }
     
-    # Add vCenter VMs to deleted section
+    # Add vCenter VMs to deleted section ONLY if NOT found in vRA
     foreach ($vm in $VCenterData) {
-        Write-Log "Adding vCenter deleted VM to report: $($vm.VMName) from $($vm.vCenter)" "DEBUG"
-        $deletedVMs += [PSCustomObject]@{
-            VMName = $vm.VMName
-            RequestedBy = $vm.DeletedBy
-            DeletedAt = $vm.DeletedAt
-            DeploymentName = "N/A"
-            RequestAction = $vm.EventType
-            RequestStatus = "Deleted"
-            Source = $vm.vCenter
-            SourceType = "vCenter"
+        $vmLower = $vm.VMName.ToLower()
+        if ($vraVMNames.ContainsKey($vmLower)) {
+            Write-Log "SKIPPING vCenter VM (already in vRA): $($vm.VMName) from $($vm.vCenter)" "WARN"
+        }
+        else {
+            Write-Log "Adding vCenter deleted VM to report: $($vm.VMName) from $($vm.vCenter)" "DEBUG"
+            $deletedVMs += [PSCustomObject]@{
+                VMName = $vm.VMName
+                RequestedBy = $vm.DeletedBy
+                DeletedAt = $vm.DeletedAt
+                DeploymentName = "N/A"
+                RequestAction = $vm.EventType
+                RequestStatus = "Deleted"
+                Source = $vm.vCenter
+            }
         }
     }
     
@@ -863,13 +899,13 @@ function Send-DeletedVMReport {
     
     Write-Log "Total Deleted VMs for report: $($deletedVMs.Count)" "DEBUG"
     Write-Log "Total Decommission VMs for report: $($decommissionVMs.Count)" "DEBUG"
+    Write-Log "vCenter VMs excluded (duplicates in vRA): $(($VCenterData.Count - ($deletedVMs | Where-Object { $_.Source -match 'vcenter' }).Count))" "DEBUG"
     
     # Build deleted VMs table rows
     $deletedTableRows = ""
     foreach ($vm in ($deletedVMs | Sort-Object VMName)) {
         $deletedTableRows += "<tr>"
         $deletedTableRows += "<td>$($vm.VMName)</td>"
-        $deletedTableRows += "<td>$($vm.SourceType)</td>"
         $deletedTableRows += "<td>$($vm.DeploymentName)</td>"
         $deletedTableRows += "<td>$($vm.RequestAction)</td>"
         $deletedTableRows += "<td>$($vm.RequestStatus)</td>"
@@ -923,7 +959,7 @@ function Send-DeletedVMReport {
     <div class="summary-item"><strong>Grand Total:</strong> $(($deletedVMs.Count + $decommissionVMs.Count))</div>
     <hr style="margin: 10px 0;">
     <div class="summary-item"><strong>vRA Deleted Deployments:</strong> $($VraDeletedData.Count)</div>
-    <div class="summary-item"><strong>vCenter Direct Deletions:</strong> $($VCenterData.Count)</div>
+    <div class="summary-item"><strong>vCenter Direct Deletions:</strong> $(($deletedVMs | Where-Object { $_.Source -match 'vcenter' }).Count)</div>
     <div class="summary-item"><strong>vRA Decommissions (Active):</strong> $($VraDecommissionData.Count)</div>
 </div>
 
@@ -934,13 +970,12 @@ $(if($deletedVMs.Count -gt 0) {
 <thead>
 <tr>
 <th>VM Name</th>
-<th>Source Type</th>
 <th>Deployment Name</th>
 <th>Action</th>
 <th>Status</th>
 <th>Requested/Deleted By</th>
 <th>Deleted At</th>
-<th>Server</th>
+<th>Source</th>
 </tr>
 </thead>
 <tbody>
@@ -967,7 +1002,7 @@ $(if($decommissionVMs.Count -gt 0) {
 <th>Request Status</th>
 <th>Requested By</th>
 <th>Initiated At</th>
-<th>vRA Server</th>
+<th>Source</th>
 </tr>
 </thead>
 <tbody>
@@ -983,7 +1018,8 @@ $decommissionTableRows
 <strong>Legend:</strong><br>
 • <span style="background-color: #fff9c4; padding: 2px 5px;">Yellow highlight</span> = Decommission in progress<br>
 • vRA = VMware Aria Automation (formerly vRealize Automation)<br>
-• vCenter = Direct deletion from vCenter (bypassing vRA)
+• vCenter = Direct deletion from vCenter (bypassing vRA)<br>
+• Note: VMs deleted through vRA will only show in the vRA section, not vCenter, to avoid duplicates
 </p>
 
 </body>
@@ -1011,6 +1047,7 @@ $decommissionTableRows
 
 # Main Script
 Write-DebugSection "DELETED VM TRACKER - STARTED"
+Write-Log "Script Version: 2.0.0" "SUCCESS"
 Write-Log "PowerShell Version: $($PSVersionTable.PSVersion)"
 Write-Log "Debug output file: $debugOutputFile" "SUCCESS"
 
@@ -1233,7 +1270,7 @@ Write-Log "vRA Deleted Deployments: $($allVraDeletedVMs.Count)" "SUCCESS"
 Write-Log "vCenter Direct Deletions: $($allVCenterDeletedVMs.Count)" "SUCCESS"
 
 $totalDeleted = $ariaDeletedVMs.Count + $allVraDeletedVMs.Count + $allVCenterDeletedVMs.Count + $allVraDecommissionVMs.Count
-Write-Log "TOTAL: $totalDeleted" "SUCCESS"
+Write-Log "TOTAL (before deduplication): $totalDeleted" "SUCCESS"
 
 # Cross-reference analysis
 Write-DebugSection "CROSS-REFERENCE ANALYSIS"
@@ -1354,5 +1391,6 @@ else {
 }
 
 Write-DebugSection "SCRIPT COMPLETED"
+Write-Log "Script Version: 2.0.0" "SUCCESS"
 Write-Log "Debug log saved to: $debugOutputFile" "SUCCESS"
 Write-Log "`nScript finished. Check the debug file for detailed logs." "SUCCESS"
