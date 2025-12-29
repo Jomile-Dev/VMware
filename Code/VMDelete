@@ -843,11 +843,10 @@ function Send-DeletedVMReport {
 <h1>Deleted VM Report - $(Get-Date -Format 'yyyy-MM-dd')</h1>
 
 <div class="summary">
-    <p><strong>Total Unique VMs:</strong> $($allVMs.Count)</p>
+    <p><strong>Total VMs:</strong> $($allVMs.Count)</p>
     <p><strong>vRA Deleted Deployments:</strong> $($VraDeletedData.Count)</p>
     <p><strong>vRA Decommission In Progress:</strong> $($VraDecommissionData.Count)</p>
-    <p><strong>vCenter Direct Deletions (not in vRA):</strong> $(($VCenterData | Where-Object { -not $allVMs[$_.VMName].InDeleted -and -not $allVMs[$_.VMName].InDecommission }).Count)</p>
-    <p><strong>Debug Log File:</strong> $debugOutputFile</p>
+    <p><strong>vCenter Direct Deletions (not in vRA):</strong> $(($VCenterData | Where-Object { $vmKey = $_.VMName.ToLower(); -not $allVMs.ContainsKey($vmKey) }).Count)</p>
 </div>
 
 <h2>Deleted Virtual Machines</h2>
