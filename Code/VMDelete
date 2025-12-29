@@ -92,6 +92,7 @@ function Get-ActiveDeploymentsWithDecommission {
     Write-DebugSection "Checking Active Deployments with Decommission Requests: $VraServer"
     
     $decommissionData = @()
+    $cutoffDate = (Get-Date).AddDays(-$script:daysBack)
     
     Write-Log "Fetching ALL active deployments (no time filter for decommission)..." "DEBUG"
     
@@ -203,7 +204,7 @@ function Get-ActiveDeploymentsWithDecommission {
                 $allRequestEvents = @()
                 
                 do {
-                    $eventsUri = "https://$VraServer/deployment/api/deployments/$($deployment.id)/requests/$($request.id)/events?page=$eventPage&size=$eventsPageSize&apiVersion=2020-08-25"
+                    $eventsUri = "https://$VraServer/deployment/api/deployments/$($deployment.id)/requests/$($request.id)/events?page=$eventPage&size=$script:eventsPageSize&apiVersion=2020-08-25"
                     
                     try {
                         $eventsResponse = Invoke-RestMethod -Uri $eventsUri -Method Get -Headers $Headers -ErrorAction Stop
@@ -212,7 +213,7 @@ function Get-ActiveDeploymentsWithDecommission {
                         if ($events -and $events.Count -gt 0) {
                             $allRequestEvents += $events
                             $eventPage++
-                            if ($events.Count -lt $eventsPageSize) { break }
+                            if ($events.Count -lt $script:eventsPageSize) { break }
                         }
                         else {
                             break
@@ -258,12 +259,14 @@ function Get-ActiveDeploymentsWithDecommission {
                 
                 # Check if this is a decommission request (still active, not deleted)
                 $isDecommission = $false
+                $matchedBy = "None"
                 if ($request.name -match "Initiate server decommission|decommission" -or 
                     $request.actionId -match "Deployment.Delete|Resource.Delete|Cloud.vSphere.Machine.Delete|Deployment.custom.initiate_server_decommission") {
                     
                     $initiatedDate = [DateTime]$request.initiatedAt
                     if ($initiatedDate -ge $cutoffDate) {
                         $isDecommission = $true
+                        $matchedBy = if ($request.name -match "decommission") { "Request Name" } else { "Action ID" }
                         Write-Log "    >>> DECOMMISSION REQUEST FOUND (Still Active Deployment) <<<" "WARN"
                         Write-Log "    >>> Action: $($request.name), Action ID: $($request.actionId) <<<" "WARN"
                     }
@@ -372,8 +375,8 @@ function Get-DeletedVMsFromVRA {
     Write-Log "Searching for deleted deployments..." "DEBUG"
     
     $urlVariations = @(
-        "https://$VraServer/deployment/api/deployments?deleted=true&apiVersion=2020-08-25&page={0}&size=$eventsPageSize",
-        "https://$VraServer/deployment/api/deployments?deleted=%5Btrue%5D&apiVersion=2020-08-25&page={0}&size=$eventsPageSize"
+        "https://$VraServer/deployment/api/deployments?deleted=true&apiVersion=2020-08-25&page={0}&size=$script:eventsPageSize",
+        "https://$VraServer/deployment/api/deployments?deleted=%5Btrue%5D&apiVersion=2020-08-25&page={0}&size=$script:eventsPageSize"
     )
     
     $workingUrl = $null
@@ -490,7 +493,7 @@ function Get-DeletedVMsFromVRA {
                 $allEvents = @()
                 
                 do {
-                    $eventsUri = "https://$VraServer/deployment/api/deployments/$($deployment.id)/requests/$($request.id)/events?page=$eventPage&size=$eventsPageSize&deleted=true&apiVersion=2020-08-25"
+                    $eventsUri = "https://$VraServer/deployment/api/deployments/$($deployment.id)/requests/$($request.id)/events?page=$eventPage&size=$script:eventsPageSize&deleted=true&apiVersion=2020-08-25"
                     
                     try {
                         $eventsResponse = Invoke-RestMethod -Uri $eventsUri -Method Get -Headers $Headers -ErrorAction Stop
@@ -499,7 +502,7 @@ function Get-DeletedVMsFromVRA {
                         if ($events -and $events.Count -gt 0) {
                             $allEvents += $events
                             $eventPage++
-                            if ($events.Count -lt $eventsPageSize) { break }
+                            if ($events.Count -lt $script:eventsPageSize) { break }
                         }
                         else {
                             break
@@ -587,10 +590,6 @@ function Get-DeletedVMsFromVRA {
                             $vmKey = $serverName.ToLower()
                             $existingVM = $deletedVMData | Where-Object { $_.VMName.ToLower() -eq $vmKey }
                             
-                            if ($existingVM) {
-                                Write-Log "    ║     >>> WARNING: VM '$serverName' already exists in deleted list - SKIPPING DUPLICATE <<<" "WARN"
-                            }
-                            else {
                             if ($existingVM) {
                                 Write-Log "    ║     >>> WARNING: VM '$serverName' already exists in deleted list - SKIPPING DUPLICATE <<<" "WARN"
                             }
