@@ -263,13 +263,14 @@ function Get-ActiveDeploymentsWithDecommission {
                 
                 # Check if this is a decommission request (still active, not deleted)
                 $isDecommission = $false
-                if ($request.name -match "decommission" -or 
-                    $request.actionId -match "Deployment.Delete|Resource.Delete|Cloud.vSphere.Machine.Delete") {
+                if ($request.name -match "Initiate server decommission|decommission" -or 
+                    $request.actionId -match "Deployment.Delete|Resource.Delete|Cloud.vSphere.Machine.Delete|Deployment.custom.initiate_server_decommission") {
                     
                     $initiatedDate = [DateTime]$request.initiatedAt
                     if ($initiatedDate -ge $cutoffDate) {
                         $isDecommission = $true
                         Write-Log "    >>> DECOMMISSION REQUEST FOUND (Still Active Deployment) <<<" "WARN"
+                        Write-Log "    >>> Action: $($request.name), Action ID: $($request.actionId) <<<" "WARN"
                     }
                 }
                 
@@ -701,62 +702,100 @@ function Send-DeletedVMReport {
     
     Write-Log "Building HTML email report..." "DEBUG"
     
-    # Aria Operations Section
-    $ariaRows = ""
-    if ($AriaOpsData.Count -gt 0) {
-        foreach ($vm in $AriaOpsData) {
-            $ariaRows += "<tr style='background-color: #fff3e0;'>"
-            $ariaRows += "<td>$($vm.VMName)</td>"
-            $ariaRows += "<td>$($vm.ResourceState)</td>"
-            $ariaRows += "<td>$($vm.LastStatusChange)</td>"
-            $ariaRows += "<td>Aria Operations</td>"
-            $ariaRows += "</tr>"
+    # Build a combined unique list of VMs
+    $allVMs = @{}
+    
+    # Add vRA Deleted VMs
+    foreach ($vm in $VraDeletedData) {
+        if (-not $allVMs.ContainsKey($vm.VMName)) {
+            $allVMs[$vm.VMName] = [PSCustomObject]@{
+                VMName = $vm.VMName
+                RequestedBy = $vm.RequestedBy
+                DeletedAt = $vm.DeletedAt
+                DeploymentName = $vm.DeploymentName
+                RequestAction = $vm.RequestAction
+                vRAServer = $vm.vRAServer
+                Source = "vRA - Deleted"
+                InDecommission = $false
+                InDeleted = $true
+                InvCenter = $false
+            }
         }
     }
     
-    # vRA Deleted Section
-    $vraDeletedRows = ""
-    if ($VraDeletedData.Count -gt 0) {
-        foreach ($vm in $VraDeletedData) {
-            $vraDeletedRows += "<tr style='background-color: #ffebee;'>"
-            $vraDeletedRows += "<td>$($vm.VMName)</td>"
-            $vraDeletedRows += "<td>$($vm.DeploymentName)</td>"
-            $vraDeletedRows += "<td>$($vm.RequestAction)</td>"
-            $vraDeletedRows += "<td>$($vm.RequestedBy)</td>"
-            $vraDeletedRows += "<td>$($vm.DeletedAt)</td>"
-            $vraDeletedRows += "<td>$($vm.vRAServer)</td>"
-            $vraDeletedRows += "</tr>"
+    # Add vRA Decommission VMs (in progress)
+    foreach ($vm in $VraDecommissionData) {
+        if ($allVMs.ContainsKey($vm.VMName)) {
+            # VM exists, mark it as also in decommission
+            $allVMs[$vm.VMName].InDecommission = $true
+            $allVMs[$vm.VMName].Source = "vRA - Deleted & Decommission"
+        }
+        else {
+            $allVMs[$vm.VMName] = [PSCustomObject]@{
+                VMName = $vm.VMName
+                RequestedBy = $vm.RequestedBy
+                DeletedAt = $vm.InitiatedAt
+                DeploymentName = $vm.DeploymentName
+                RequestAction = $vm.RequestAction
+                vRAServer = $vm.vRAServer
+                Source = "vRA - Decommission In Progress"
+                InDecommission = $true
+                InDeleted = $false
+                InvCenter = $false
+            }
         }
     }
     
-    # vRA Decommission (Still Active) Section
-    $vraDecommRows = ""
-    if ($VraDecommissionData.Count -gt 0) {
-        foreach ($vm in $VraDecommissionData) {
-            $vraDecommRows += "<tr style='background-color: #fff9c4;'>"
-            $vraDecommRows += "<td>$($vm.VMName)</td>"
-            $vraDecommRows += "<td>$($vm.DeploymentName)</td>"
-            $vraDecommRows += "<td>$($vm.RequestAction)</td>"
-            $vraDecommRows += "<td>$($vm.RequestStatus)</td>"
-            $vraDecommRows += "<td>$($vm.RequestedBy)</td>"
-            $vraDecommRows += "<td>$($vm.InitiatedAt)</td>"
-            $vraDecommRows += "<td>$($vm.vRAServer)</td>"
-            $vraDecommRows += "</tr>"
+    # Add vCenter VMs only if NOT already in vRA
+    foreach ($vm in $VCenterData) {
+        if (-not $allVMs.ContainsKey($vm.VMName)) {
+            $allVMs[$vm.VMName] = [PSCustomObject]@{
+                VMName = $vm.VMName
+                RequestedBy = $vm.DeletedBy
+                DeletedAt = $vm.DeletedAt
+                DeploymentName = "N/A"
+                RequestAction = $vm.EventType
+                vRAServer = $vm.vCenter
+                Source = "vCenter - Direct Deletion"
+                InDecommission = $false
+                InDeleted = $false
+                InvCenter = $true
+            }
+        }
+        else {
+            # Mark that it's also in vCenter
+            $allVMs[$vm.VMName].InvCenter = $true
         }
     }
     
-    # vCenter Section
-    $vcRows = ""
-    if ($VCenterData.Count -gt 0) {
-        foreach ($vm in $VCenterData) {
-            $vcRows += "<tr style='background-color: #f3e5f5;'>"
-            $vcRows += "<td>$($vm.VMName)</td>"
-            $vcRows += "<td>$($vm.EventType)</td>"
-            $vcRows += "<td>$($vm.DeletedBy)</td>"
-            $vcRows += "<td>$($vm.DeletedAt)</td>"
-            $vcRows += "<td>$($vm.vCenter)</td>"
-            $vcRows += "</tr>"
+    # Build table rows
+    $tableRows = ""
+    foreach ($vmName in ($allVMs.Keys | Sort-Object)) {
+        $vm = $allVMs[$vmName]
+        
+        $rowColor = ""
+        if ($vm.InDecommission -and $vm.InDeleted) {
+            $rowColor = " style='background-color: #ffecb3;'"  # Light orange - both
         }
+        elseif ($vm.InDecommission) {
+            $rowColor = " style='background-color: #fff9c4;'"  # Yellow - decommission only
+        }
+        elseif ($vm.InDeleted) {
+            $rowColor = " style='background-color: #ffebee;'"  # Light red - deleted
+        }
+        elseif ($vm.InvCenter) {
+            $rowColor = " style='background-color: #f3e5f5;'"  # Purple - vCenter only
+        }
+        
+        $tableRows += "<tr$rowColor>"
+        $tableRows += "<td>$($vm.VMName)</td>"
+        $tableRows += "<td>$($vm.Source)</td>"
+        $tableRows += "<td>$($vm.DeploymentName)</td>"
+        $tableRows += "<td>$($vm.RequestAction)</td>"
+        $tableRows += "<td>$($vm.RequestedBy)</td>"
+        $tableRows += "<td>$($vm.DeletedAt)</td>"
+        $tableRows += "<td>$($vm.vRAServer)</td>"
+        $tableRows += "</tr>"
     }
     
     $htmlBody = @"
@@ -769,105 +808,39 @@ function Send-DeletedVMReport {
     th { background-color: #2196F3; color: white; padding: 12px; text-align: left; font-weight: bold; }
     td { border: 1px solid #ddd; padding: 10px; }
     .summary { background-color: #f9f9f9; padding: 15px; border-left: 4px solid #2196F3; margin-bottom: 20px; }
-    .no-data { color: #757575; font-style: italic; padding: 10px; }
-    .note { background-color: #fff9c4; padding: 10px; border-left: 4px solid #fbc02d; margin-bottom: 20px; }
 </style>
 </head>
 <body>
 <h1>Deleted VM Report - $(Get-Date -Format 'yyyy-MM-dd')</h1>
 
 <div class="summary">
-    <p><strong>Aria Operations Deleted/Changed:</strong> $($AriaOpsData.Count)</p>
+    <p><strong>Total Unique VMs:</strong> $($allVMs.Count)</p>
     <p><strong>vRA Deleted Deployments:</strong> $($VraDeletedData.Count)</p>
-    <p><strong>vRA Decommission In Progress (Still Active):</strong> $($VraDecommissionData.Count)</p>
-    <p><strong>vCenter Direct Deletions:</strong> $($VCenterData.Count)</p>
+    <p><strong>vRA Decommission In Progress:</strong> $($VraDecommissionData.Count)</p>
+    <p><strong>vCenter Direct Deletions (not in vRA):</strong> $(($VCenterData | Where-Object { -not $allVMs[$_.VMName].InDeleted -and -not $allVMs[$_.VMName].InDecommission }).Count)</p>
     <p><strong>Debug Log File:</strong> $debugOutputFile</p>
 </div>
 
-<div class="note">
-    <strong>Note:</strong> Yellow highlighted rows show VMs with "Initiate Server Decommission" requests that are still active deployments (not yet deleted).
-</div>
-
-<h2>Aria Operations - Deleted/Status Changed VMs</h2>
-$(if($AriaOpsData.Count -gt 0) {
+<h2>Deleted Virtual Machines</h2>
+$(if($allVMs.Count -gt 0) {
 "<table>
 <thead>
 <tr>
 <th>VM Name</th>
-<th>Resource State</th>
-<th>Status Change Time</th>
 <th>Source</th>
-</tr>
-</thead>
-<tbody>
-$ariaRows
-</tbody>
-</table>"
-} else {
-"<p class='no-data'>No VMs found with status changes in Aria Operations</p>"
-})
-
-<h2>vRA - Deleted Deployments (Completed)</h2>
-$(if($VraDeletedData.Count -gt 0) {
-"<table>
-<thead>
-<tr>
-<th>VM Name</th>
 <th>Deployment Name</th>
 <th>Request Action</th>
 <th>Requested By</th>
-<th>Deleted At</th>
-<th>vRA Server</th>
+<th>Deleted/Initiated At</th>
+<th>Server/vCenter</th>
 </tr>
 </thead>
 <tbody>
-$vraDeletedRows
+$tableRows
 </tbody>
 </table>"
 } else {
-"<p class='no-data'>No deleted deployments found in vRA</p>"
-})
-
-<h2>vRA - Decommission In Progress (Still Active Deployments)</h2>
-$(if($VraDecommissionData.Count -gt 0) {
-"<table>
-<thead>
-<tr>
-<th>VM Name</th>
-<th>Deployment Name</th>
-<th>Request Action</th>
-<th>Request Status</th>
-<th>Requested By</th>
-<th>Initiated At</th>
-<th>vRA Server</th>
-</tr>
-</thead>
-<tbody>
-$vraDecommRows
-</tbody>
-</table>"
-} else {
-"<p class='no-data'>No active decommission requests found in vRA</p>"
-})
-
-<h2>vCenter - Direct VM Deletions</h2>
-$(if($VCenterData.Count -gt 0) {
-"<table>
-<thead>
-<tr>
-<th>VM Name</th>
-<th>Event Type</th>
-<th>Deleted By</th>
-<th>Deleted At</th>
-<th>vCenter</th>
-</tr>
-</thead>
-<tbody>
-$vcRows
-</tbody>
-</table>"
-} else {
-"<p class='no-data'>No direct VM deletions found in vCenter</p>"
+"<p class='no-data'>No deleted VMs found</p>"
 })
 
 </body>
