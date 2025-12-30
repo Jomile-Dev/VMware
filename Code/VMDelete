@@ -285,22 +285,12 @@ function Get-ActiveDeploymentsWithDecommission {
                                 Write-Log "    ║   >>> Hostname found in 'address' property: $hostname <<<" "SUCCESS"
                             }
                             elseif ($props.PSObject.Properties['resourceName']) {
-                                if ($props.resourceName -notmatch "Cloud_vSphere_Machine_\d+") {
-                                    $hostname = $props.resourceName
-                                    Write-Log "    ║   >>> Hostname found in 'resourceName' property: $hostname <<<" "SUCCESS"
-                                }
-                                else {
-                                    Write-Log "    ║   >>> 'resourceName' is generic pattern, skipping: $($props.resourceName) <<<" "DEBUG"
-                                }
+                                $hostname = $props.resourceName
+                                Write-Log "    ║   >>> Hostname found in 'resourceName' property: $hostname <<<" "SUCCESS"
                             }
                             elseif ($props.PSObject.Properties['name']) {
-                                if ($props.name -notmatch "Cloud_vSphere_Machine_\d+") {
-                                    $hostname = $props.name
-                                    Write-Log "    ║   >>> Hostname found in 'name' property: $hostname <<<" "SUCCESS"
-                                }
-                                else {
-                                    Write-Log "    ║   >>> 'name' is generic pattern, skipping: $($props.name) <<<" "DEBUG"
-                                }
+                                $hostname = $props.name
+                                Write-Log "    ║   >>> Hostname found in 'name' property: $hostname <<<" "SUCCESS"
                             }
                             else {
                                 Write-Log "    ║   >>> No hostname found in standard properties <<<" "WARN"
@@ -310,9 +300,14 @@ function Get-ActiveDeploymentsWithDecommission {
                             Write-Log "    ║   >>> Machine has NO properties object <<<" "WARN"
                         }
                         
-                        if (-not $hostname -and $machine.name -and $machine.name -notmatch "Cloud_vSphere_Machine_\d+") {
+                        if (-not $hostname -and $machine.name) {
                             $hostname = $machine.name
                             Write-Log "    ║   >>> Hostname from machine.name: $hostname <<<" "SUCCESS"
+                        }
+                        
+                        if (-not $hostname -and $machine.id) {
+                            $hostname = $machine.id
+                            Write-Log "    ║   >>> Using machine.id as fallback: $hostname <<<" "WARN"
                         }
                         
                         if (-not $hostname) {
