@@ -800,7 +800,17 @@ function Send-DeletedVMReport {
     
     Write-Log "VraDecommissionData count received: $($VraDecommissionData.Count)" "DEBUG"
     if ($VraDecommissionData.Count -gt 0) {
-        Write-Log "First decommission VM: $($VraDecommissionData[0].VMName)" "DEBUG"
+        Write-Log "First decommission VM details:" "DEBUG"
+        $firstVM = $VraDecommissionData[0]
+        Write-Log "  Type: $($firstVM.GetType().Name)" "DEBUG"
+        Write-Log "  VMName: $($firstVM.VMName)" "DEBUG"
+        Write-Log "  vRAServer: $($firstVM.vRAServer)" "DEBUG"
+        Write-Log "  InitiatedAt: $($firstVM.InitiatedAt)" "DEBUG"
+        Write-Log "  ExpirationDate: $($firstVM.ExpirationDate)" "DEBUG"
+        Write-Log "  All Properties:" "DEBUG"
+        foreach ($prop in $firstVM.PSObject.Properties) {
+            Write-Log "    $($prop.Name) = $($prop.Value)" "DEBUG"
+        }
     }
     
     $vraVMNames = @{}
@@ -853,22 +863,41 @@ function Send-DeletedVMReport {
         Write-Log "  Deployment: $($vm.DeploymentName)" "DEBUG"
         Write-Log "  Status: $($vm.RequestStatus)" "DEBUG"
         Write-Log "  Expiration: $($vm.ExpirationDate)" "DEBUG"
+        Write-Log "  InitiatedAt: $($vm.InitiatedAt)" "DEBUG"
+        
+        # Handle both old and new property names
+        $vmName = if ($vm.VMName) { $vm.VMName } elseif ($vm.PSObject.Properties['VMName']) { $vm.VMName } else { "N/A" }
+        $requestedBy = if ($vm.RequestedBy) { $vm.RequestedBy } elseif ($vm.PSObject.Properties['RequestedBy']) { $vm.RequestedBy } else { "N/A" }
+        $initiatedAt = if ($vm.InitiatedAt) { $vm.InitiatedAt } elseif ($vm.PSObject.Properties['InitiatedAt']) { $vm.InitiatedAt } else { "N/A" }
+        $expirationDate = if ($vm.ExpirationDate) { $vm.ExpirationDate } elseif ($vm.PSObject.Properties['ExpirationDate']) { $vm.ExpirationDate } else { "N/A" }
+        $deploymentName = if ($vm.DeploymentName) { $vm.DeploymentName } elseif ($vm.PSObject.Properties['DeploymentName']) { $vm.DeploymentName } else { "N/A" }
+        $requestAction = if ($vm.RequestAction) { $vm.RequestAction } elseif ($vm.PSObject.Properties['RequestAction']) { $vm.RequestAction } else { "N/A" }
+        $requestStatus = if ($vm.RequestStatus) { $vm.RequestStatus } elseif ($vm.PSObject.Properties['RequestStatus']) { $vm.RequestStatus } else { "N/A" }
+        $source = if ($vm.vRAServer) { $vm.vRAServer } elseif ($vm.PSObject.Properties['vRAServer']) { $vm.vRAServer } else { "N/A" }
+        
+        Write-Log "  Adding to report - VMName: $vmName, InitiatedAt: $initiatedAt, ExpirationDate: $expirationDate" "DEBUG"
         
         $decommissionVMs += New-Object PSObject -Property @{
-            VMName = $vm.VMName
-            RequestedBy = $vm.RequestedBy
-            InitiatedAt = $vm.InitiatedAt
-            ExpirationDate = $vm.ExpirationDate
-            DeploymentName = $vm.DeploymentName
-            DeploymentStatus = $vm.DeploymentStatus
-            RequestAction = $vm.RequestAction
-            RequestStatus = $vm.RequestStatus
-            Source = $vm.vRAServer
+            VMName = $vmName
+            RequestedBy = $requestedBy
+            InitiatedAt = $initiatedAt
+            ExpirationDate = $expirationDate
+            DeploymentName = $deploymentName
+            RequestAction = $requestAction
+            RequestStatus = $requestStatus
+            Source = $source
         }
     }
     
     Write-Log "Total Deleted VMs for report: $($deletedVMs.Count)" "DEBUG"
     Write-Log "Total Decommission VMs for report: $($decommissionVMs.Count)" "DEBUG"
+    
+    if ($decommissionVMs.Count -gt 0) {
+        Write-Log "Decommission VMs in report array:" "DEBUG"
+        foreach ($vm in $decommissionVMs) {
+            Write-Log "  - $($vm.VMName): InitiatedAt=$($vm.InitiatedAt), ExpirationDate=$($vm.ExpirationDate)" "DEBUG"
+        }
+    }
     
     $deletedTableRows = ""
     foreach ($vm in ($deletedVMs | Sort-Object VMName)) {
