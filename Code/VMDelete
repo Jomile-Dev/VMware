@@ -285,12 +285,18 @@ function Get-ActiveDeploymentsWithDecommission {
                             Write-Log "      >>> VM in Decommission: $hostname <<<" "WARN"
                             Write-Log "      >>> Matched decommission by: $matchedBy <<<" "DEBUG"
                             Write-Log "      >>> Deployment will expire: $expirationDate <<<" "WARN"
+                            Write-Log "      >>> Deployment Name: $($deployment.name) <<<" "DEBUG"
+                            Write-Log "      >>> Deployment Status: $($deployment.status) <<<" "DEBUG"
+                            Write-Log "      >>> Request Action: $($request.name) <<<" "DEBUG"
+                            Write-Log "      >>> Requested By: $($request.requestedBy) <<<" "DEBUG"
                             
                             $vraServerShort = ($VraServer -split '\.')[0]
                             $catalogItem = if ($deployment.inputs._catalogItemName) { $deployment.inputs._catalogItemName } else { "N/A" }
                             
                             $initiatedAtValue = if ($request.initiatedAt) { $request.initiatedAt } else { "N/A" }
                             $completedAtValue = if ($request.completedAt) { $request.completedAt } else { "N/A" }
+                            
+                            Write-Log "      >>> Creating decommission object... <<<" "DEBUG"
                             
                             $vmObject = New-Object PSObject -Property @{
                                 VMName = $hostname
@@ -312,9 +318,16 @@ function Get-ActiveDeploymentsWithDecommission {
                                 IsStillActive = $true
                             }
                             
+                            Write-Log "      >>> Object created. Properties: <<<" "DEBUG"
+                            Write-Log "          VMName: $($vmObject.VMName)" "DEBUG"
+                            Write-Log "          DeploymentName: $($vmObject.DeploymentName)" "DEBUG"
+                            Write-Log "          ExpirationDate: $($vmObject.ExpirationDate)" "DEBUG"
+                            Write-Log "          Source: $($vmObject.Source)" "DEBUG"
+                            Write-Log "          vRAServer: $($vmObject.vRAServer)" "DEBUG"
+                            
                             [void]$decommissionData.Add($vmObject)
                             
-                            Write-Log "      >>> Added to decommission list successfully <<<" "SUCCESS"
+                            Write-Log "      >>> Added to decommission list successfully. Total count: $($decommissionData.Count) <<<" "SUCCESS"
                         }
                     }
                 }
@@ -799,8 +812,7 @@ function Send-DeletedVMReport {
 <body>
 <h1>VM Deletion and Decommission Report</h1>
 
-<h2>Section 1: Deleted Virtual Machines</h2>
-<p><em>VMs that have been completely deleted from vRA and/or vCenter</em></p>
+<h2>Deleted Virtual Machines</h2>
 $(if($deletedVMs.Count -gt 0) {
 "<table>
 <thead>
@@ -822,8 +834,7 @@ $deletedTableRows
 "<p class='no-data'>No deleted VMs found in this time period</p>"
 })
 
-<h2>Section 2: Decommissions In Progress</h2>
-<p><em>VMs scheduled for decommission (lease expiration)</em></p>
+<h2>Decommissions In Progress</h2>
 $(if($decommissionVMs.Count -gt 0) {
 "<div class='decom-warning'>
 <strong>Warning:</strong> These VMs are scheduled for decommission. The expiration date shows when the deployment will be automatically deleted.
