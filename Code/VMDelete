@@ -249,36 +249,76 @@ function Get-ActiveDeploymentsWithDecommission {
                 }
                 
                 if ($isDecommission) {
+                    Write-Log "    ║   >>> DECOMMISSION CONFIRMED - Extracting VM details <<<" "WARN"
+                    
                     $vSphereMachines = $deployment.resources | Where-Object { 
                         $_.type -eq "Cloud.vSphere.Machine"
                     }
                     
+                    Write-Log "    ║   >>> Found $($vSphereMachines.Count) vSphere machines in deployment <<<" "DEBUG"
+                    
                     foreach ($machine in $vSphereMachines) {
+                        Write-Log "    ║" "DEBUG"
+                        Write-Log "    ║   >>> Processing Machine: $($machine.name) <<<" "DEBUG"
+                        Write-Log "    ║   >>> Machine Type: $($machine.type) <<<" "DEBUG"
+                        Write-Log "    ║   >>> Machine ID: $($machine.id) <<<" "DEBUG"
+                        
                         $hostname = $null
                         
+                        Write-Log "    ║   >>> Attempting to extract hostname... <<<" "DEBUG"
+                        
                         if ($machine.properties) {
+                            Write-Log "    ║   >>> Machine has properties object <<<" "DEBUG"
                             $props = $machine.properties
+                            
+                            Write-Log "    ║   >>> Available properties: <<<" "DEBUG"
+                            foreach ($prop in $props.PSObject.Properties) {
+                                Write-Log "    ║       Property: $($prop.Name) = $($prop.Value)" "DEBUG"
+                            }
                             
                             if ($props.PSObject.Properties['hostname']) {
                                 $hostname = $props.hostname
+                                Write-Log "    ║   >>> Hostname found in 'hostname' property: $hostname <<<" "SUCCESS"
                             }
                             elseif ($props.PSObject.Properties['address']) {
                                 $hostname = $props.address
+                                Write-Log "    ║   >>> Hostname found in 'address' property: $hostname <<<" "SUCCESS"
                             }
                             elseif ($props.PSObject.Properties['resourceName']) {
                                 if ($props.resourceName -notmatch "Cloud_vSphere_Machine_\d+") {
                                     $hostname = $props.resourceName
+                                    Write-Log "    ║   >>> Hostname found in 'resourceName' property: $hostname <<<" "SUCCESS"
+                                }
+                                else {
+                                    Write-Log "    ║   >>> 'resourceName' is generic pattern, skipping: $($props.resourceName) <<<" "DEBUG"
                                 }
                             }
                             elseif ($props.PSObject.Properties['name']) {
                                 if ($props.name -notmatch "Cloud_vSphere_Machine_\d+") {
                                     $hostname = $props.name
+                                    Write-Log "    ║   >>> Hostname found in 'name' property: $hostname <<<" "SUCCESS"
+                                }
+                                else {
+                                    Write-Log "    ║   >>> 'name' is generic pattern, skipping: $($props.name) <<<" "DEBUG"
                                 }
                             }
+                            else {
+                                Write-Log "    ║   >>> No hostname found in standard properties <<<" "WARN"
+                            }
+                        }
+                        else {
+                            Write-Log "    ║   >>> Machine has NO properties object <<<" "WARN"
                         }
                         
                         if (-not $hostname -and $machine.name -and $machine.name -notmatch "Cloud_vSphere_Machine_\d+") {
                             $hostname = $machine.name
+                            Write-Log "    ║   >>> Hostname from machine.name: $hostname <<<" "SUCCESS"
+                        }
+                        
+                        if (-not $hostname) {
+                            Write-Log "    ║   >>> ERROR: Could not extract hostname from machine! <<<" "ERROR"
+                            Write-Log "    ║   >>> Machine object dump: <<<" "ERROR"
+                            Write-Log "    ║   >>> $($machine | ConvertTo-Json -Depth 3 -Compress) <<<" "ERROR"
                         }
                         
                         if ($hostname) {
