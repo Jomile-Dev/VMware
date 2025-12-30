@@ -271,46 +271,84 @@ function Get-ActiveDeploymentsWithDecommission {
                 }
                 
                 if ($isDecommission) {
-                    Write-Log "    ║   >>> DECOMMISSION CONFIRMED - Fetching events to extract VM details <<<" "WARN"
+                    Write-Log "    ║   >>> DECOMMISSION CONFIRMED - Extracting VM details from deployment resources <<<" "WARN"
                     
-                    # Fetch events for this request to get actual VM names
-                    $eventPage = 0
-                    $allEvents = @()
-                    
-                    do {
-                        $eventsUri = "https://$VraServer/deployment/api/deployments/$($deployment.id)/requests/$($request.id)/events?page=$eventPage&size=$eventsPageSize&apiVersion=2020-08-25"
-                        
-                        try {
-                            $eventsResponse = Invoke-RestMethod -Uri $eventsUri -Method Get -Headers $Headers -ErrorAction Stop
-                            $events = if ($eventsResponse.content) { $eventsResponse.content } else { $eventsResponse }
-                            
-                            if ($events -and $events.Count -gt 0) {
-                                $allEvents += $events
-                                $eventPage++
-                                if ($events.Count -lt $eventsPageSize) { break }
-                            }
-                            else {
-                                break
-                            }
-                        }
-                        catch {
-                            Write-Log "      Error fetching events: $($_.Exception.Message)" "ERROR"
-                            break
-                        }
-                        
-                        if ($eventPage -ge 20) { break }
-                        
-                    } while ($true)
-                    
-                    Write-Log "    ║   >>> Found $($allEvents.Count) events for this decommission request <<<" "DEBUG"
-                    
-                    # Process events to find vSphere Machine resources
+                    # FIRST: Try to get VM names from deployment resources (more reliable)
                     $foundVMs = @{}
                     
+                    if ($deployment.resources) {
+                        Write-Log "    ║   >>> Checking deployment resources for VMs <<<" "DEBUG"
+                        foreach ($resource in $deployment.resources) {
+                            if ($resource.type -eq "Cloud.vSphere.Machine") {
+                                Write-Log "    ║   >>> Found vSphere Machine resource <<<" "DEBUG"
+                                Write-Log "    ║   >>> Resource ID: $($resource.id) <<<" "DEBUG"
+                                Write-Log "    ║   >>> Resource Name: $($resource.name) <<<" "DEBUG"
+                                
+                                $hostname = $null
+                                
+                                # Try to get from properties.resourceName
+                                if ($resource.properties -and $resource.properties.resourceName) {
+                                    $hostname = $resource.properties.resourceName
+                                    Write-Log "    ║   >>> Found hostname from properties.resourceName: $hostname <<<" "SUCCESS"
+                                }
+                                # Try resource.name if not generic
+                                elseif ($resource.name -and $resource.name -notmatch "Cloud_vSphere_Machine_\d+") {
+                                    $hostname = $resource.name
+                                    Write-Log "    ║   >>> Found hostname from resource.name: $hostname <<<" "SUCCESS"
+                                }
+                                
+                                if ($hostname -and -not $foundVMs.ContainsKey($hostname.ToLower())) {
+                                    $foundVMs[$hostname.ToLower()] = $hostname
+                                    Write-Log "    ║   >>> Added VM to decommission list: $hostname <<<" "SUCCESS"
+                                }
+                            }
+                        }
+                    }
+                    
+                    # SECOND: If no VMs found in resources, fall back to events
+                    if ($foundVMs.Count -eq 0) {
+                        Write-Log "    ║   >>> No VMs found in resources, fetching events as fallback <<<" "WARN"
+                        
+                        $eventPage = 0
+                        $allEvents = @()
+                        
+                        do {
+                            $eventsUri = "https://$VraServer/deployment/api/deployments/$($deployment.id)/requests/$($request.id)/events?page=$eventPage&size=$eventsPageSize&apiVersion=2020-08-25"
+                            
+                            try {
+                                $eventsResponse = Invoke-RestMethod -Uri $eventsUri -Method Get -Headers $Headers -ErrorAction Stop
+                                $events = if ($eventsResponse.content) { $eventsResponse.content } else { $eventsResponse }
+                                
+                                if ($events -and $events.Count -gt 0) {
+                                    $allEvents += $events
+                                    $eventPage++
+                                    if ($events.Count -lt $eventsPageSize) { break }
+                                }
+                                else {
+                                    break
+                                }
+                            }
+                            catch {
+                                Write-Log "      Error fetching events: $($_.Exception.Message)" "ERROR"
+                                break
+                            }
+                            
+                            if ($eventPage -ge 20) { break }
+                            
+                        } while ($true)
+                        
+                        Write-Log "    ║   >>> Found $($allEvents.Count) events for this decommission request <<<" "DEBUG"
+                    }
+                    else {
+                        Write-Log "    ║   >>> Found $($foundVMs.Count) VMs from deployment resources <<<" "SUCCESS"
+                        $allEvents = @() # Skip event processing if we found VMs
+                    }
+                    
+                    # Process events (only if we didn't find VMs in resources)
                     foreach ($event in $allEvents) {
                         if ($event.resourceType -eq "Cloud.vSphere.Machine") {
                             Write-Log "    ║" "DEBUG"
-                            Write-Log "    ║   >>> Processing Event for vSphere Machine <<<" "DEBUG"
+                            Write-Log "    ║   >>> Processing Event for vSphere Machine (fallback) <<<" "DEBUG"
                             Write-Log "    ║   >>> Event Type: $($event.eventType) <<<" "DEBUG"
                             Write-Log "    ║   >>> Resource Name: $($event.resourceName) <<<" "DEBUG"
                             
@@ -371,69 +409,76 @@ function Get-ActiveDeploymentsWithDecommission {
                             # Store unique VMs (avoid duplicates from multiple events)
                             if ($hostname -and -not $foundVMs.ContainsKey($hostname.ToLower())) {
                                 $foundVMs[$hostname.ToLower()] = $hostname
-                                
-                                Write-Log "      >>> VM in Decommission: $hostname <<<" "WARN"
-                                Write-Log "      >>> Matched decommission by: $matchedBy <<<" "DEBUG"
-                                Write-Log "      >>> Deployment will expire: $expirationDate <<<" "WARN"
-                                Write-Log "      >>> Deployment Name: $($deployment.name) <<<" "DEBUG"
-                                Write-Log "      >>> Deployment Status: $($deployment.status) <<<" "DEBUG"
-                                Write-Log "      >>> Request Action: $($request.name) <<<" "DEBUG"
-                                Write-Log "      >>> Requested By: $($request.requestedBy) <<<" "DEBUG"
-                                
-                                $vraServerShort = ($VraServer -split '\.')[0]
-                                $catalogItem = if ($deployment.inputs._catalogItemName) { $deployment.inputs._catalogItemName } else { "N/A" }
-                                
-                                # Convert times to Sydney timezone
-                                $initiatedAtValue = if ($request.initiatedAt) { 
-                                    Convert-ToSydneyTime -DateTimeString $request.initiatedAt
-                                } else { 
-                                    "N/A" 
-                                }
-                                
-                                $expirationDateValue = if ($expirationDate -and $expirationDate -ne "N/A") {
-                                    Convert-ToSydneyTime -DateTimeString $expirationDate
-                                } else {
-                                    "N/A"
-                                }
-                                
-                                Write-Log "      >>> Creating decommission object... <<<" "DEBUG"
-                                
-                                $vmObject = New-Object PSObject -Property @{
-                                    VMName = $hostname
-                                    ResourceType = $event.resourceType
-                                    DeploymentName = $deployment.name
-                                    DeploymentID = $deployment.id
-                                    DeploymentStatus = $deployment.status
-                                    RequestID = $request.id
-                                    RequestAction = $request.name
-                                    RequestStatus = $request.status
-                                    RequestedBy = $request.requestedBy
-                                    Requestor = if ($deployment.ownedBy) { $deployment.ownedBy } else { $request.requestedBy }
-                                    CatalogItem = $catalogItem
-                                    InitiatedAt = $initiatedAtValue
-                                    CompletedAt = if ($request.completedAt) { Convert-ToSydneyTime -DateTimeString $request.completedAt } else { "N/A" }
-                                    ExpirationDate = $expirationDateValue
-                                    vRAServer = $vraServerShort
-                                    Source = "vRA-Decommission-InProgress"
-                                    IsStillActive = $true
-                                }
-                                
-                                Write-Log "      >>> Object created. Properties: <<<" "DEBUG"
-                                Write-Log "          VMName: $($vmObject.VMName)" "DEBUG"
-                                Write-Log "          DeploymentName: $($vmObject.DeploymentName)" "DEBUG"
-                                Write-Log "          InitiatedAt: $($vmObject.InitiatedAt)" "DEBUG"
-                                Write-Log "          ExpirationDate: $($vmObject.ExpirationDate)" "DEBUG"
-                                Write-Log "          Source: $($vmObject.Source)" "DEBUG"
-                                Write-Log "          vRAServer: $($vmObject.vRAServer)" "DEBUG"
-                                
-                                [void]$decommissionData.Add($vmObject)
-                                
-                                Write-Log "      >>> Added to decommission list successfully. Total count: $($decommissionData.Count) <<<" "SUCCESS"
                             }
                         }
                     }
                     
-                    Write-Log "    ║   >>> Total unique VMs found in events: $($foundVMs.Count) <<<" "SUCCESS"
+                    # Now create the decommission objects for all found VMs
+                    Write-Log "    ║   >>> Total unique VMs found: $($foundVMs.Count) <<<" "SUCCESS"
+                    
+                    foreach ($vmEntry in $foundVMs.GetEnumerator()) {
+                        $hostname = $vmEntry.Value
+                        
+                        Write-Log "      >>> VM in Decommission: $hostname <<<" "WARN"
+                        Write-Log "      >>> Matched decommission by: $matchedBy <<<" "DEBUG"
+                        Write-Log "      >>> Deployment will expire: $expirationDate <<<" "WARN"
+                        Write-Log "      >>> Deployment Name: $($deployment.name) <<<" "DEBUG"
+                        Write-Log "      >>> Deployment Status: $($deployment.status) <<<" "DEBUG"
+                        Write-Log "      >>> Request Action: $($request.name) <<<" "DEBUG"
+                        Write-Log "      >>> Requested By: $($request.requestedBy) <<<" "DEBUG"
+                        
+                        $vraServerShort = ($VraServer -split '\.')[0]
+                        $catalogItem = if ($deployment.inputs._catalogItemName) { $deployment.inputs._catalogItemName } else { "N/A" }
+                        
+                        # Convert times to Sydney timezone
+                        $initiatedAtValue = if ($request.initiatedAt) { 
+                            Convert-ToSydneyTime -DateTimeString $request.initiatedAt
+                        } else { 
+                            "N/A" 
+                        }
+                        
+                        $expirationDateValue = if ($expirationDate -and $expirationDate -ne "N/A") {
+                            Convert-ToSydneyTime -DateTimeString $expirationDate
+                        } else {
+                            "N/A"
+                        }
+                        
+                        Write-Log "      >>> Creating decommission object... <<<" "DEBUG"
+                        
+                        $vmObject = New-Object PSObject -Property @{
+                            VMName = $hostname
+                            ResourceType = "Cloud.vSphere.Machine"
+                            DeploymentName = $deployment.name
+                            DeploymentID = $deployment.id
+                            DeploymentStatus = $deployment.status
+                            RequestID = $request.id
+                            RequestAction = $request.name
+                            RequestStatus = $request.status
+                            RequestedBy = $request.requestedBy
+                            Requestor = if ($deployment.ownedBy) { $deployment.ownedBy } else { $request.requestedBy }
+                            CatalogItem = $catalogItem
+                            InitiatedAt = $initiatedAtValue
+                            CompletedAt = if ($request.completedAt) { Convert-ToSydneyTime -DateTimeString $request.completedAt } else { "N/A" }
+                            ExpirationDate = $expirationDateValue
+                            vRAServer = $vraServerShort
+                            Source = "vRA-Decommission-InProgress"
+                            IsStillActive = $true
+                        }
+                        
+                        Write-Log "      >>> Object created. Properties: <<<" "DEBUG"
+                        Write-Log "          VMName: $($vmObject.VMName)" "DEBUG"
+                        Write-Log "          DeploymentName: $($vmObject.DeploymentName)" "DEBUG"
+                        Write-Log "          InitiatedAt: $($vmObject.InitiatedAt)" "DEBUG"
+                        Write-Log "          ExpirationDate: $($vmObject.ExpirationDate)" "DEBUG"
+                        Write-Log "          Source: $($vmObject.Source)" "DEBUG"
+                        Write-Log "          vRAServer: $($vmObject.vRAServer)" "DEBUG"
+                        
+                        [void]$decommissionData.Add($vmObject)
+                        
+                        Write-Log "      >>> Added to decommission list successfully. Total count: $($decommissionData.Count) <<<" "SUCCESS"
+                    }
+                    
+                    Write-Log "    ║   >>> Processing complete for this decommission request <<<" "SUCCESS"
                 }
                 Write-Log "    ╚══════════════════════════════════════════════════════════════" "DEBUG"
             }
