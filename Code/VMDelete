@@ -100,7 +100,7 @@ function Get-ActiveDeploymentsWithDecommission {
     
     Write-DebugSection "Checking Active Deployments with Decommission Requests: $VraServer"
     
-    $decommissionData = @()
+    $decommissionData = New-Object System.Collections.ArrayList
     
     Write-Log "Fetching ALL active deployments..." "DEBUG"
     
@@ -292,7 +292,7 @@ function Get-ActiveDeploymentsWithDecommission {
                             $initiatedAtValue = if ($request.initiatedAt) { $request.initiatedAt } else { "N/A" }
                             $completedAtValue = if ($request.completedAt) { $request.completedAt } else { "N/A" }
                             
-                            $decommissionData += New-Object PSObject -Property @{
+                            $vmObject = New-Object PSObject -Property @{
                                 VMName = $hostname
                                 ResourceType = $machine.type
                                 DeploymentName = $deployment.name
@@ -311,6 +311,10 @@ function Get-ActiveDeploymentsWithDecommission {
                                 Source = "vRA-Decommission-InProgress"
                                 IsStillActive = $true
                             }
+                            
+                            [void]$decommissionData.Add($vmObject)
+                            
+                            Write-Log "      >>> Added to decommission list successfully <<<" "SUCCESS"
                         }
                     }
                 }
@@ -337,11 +341,11 @@ function Get-ActiveDeploymentsWithDecommission {
         }
     }
     else {
-        Write-Log "║ ⚠ WARNING: No VMs with decommission requests found!" "WARN"
+        Write-Log "║ WARNING: No VMs with decommission requests found!" "WARN"
     }
     Write-Log "╚════════════════════════════════════════════════════════════════════════════════" "SUCCESS"
     
-    return $decommissionData
+    return @($decommissionData)
 }
 
 function Get-DeletedVMsFromVRA {
@@ -678,6 +682,11 @@ function Send-DeletedVMReport {
     
     Write-Log "Building HTML email report..." "DEBUG"
     
+    Write-Log "VraDecommissionData count received: $($VraDecommissionData.Count)" "DEBUG"
+    if ($VraDecommissionData.Count -gt 0) {
+        Write-Log "First decommission VM: $($VraDecommissionData[0].VMName)" "DEBUG"
+    }
+    
     $vraVMNames = @{}
     foreach ($vm in $VraDeletedData) {
         $vraVMNames[$vm.VMName.ToLower()] = $true
@@ -724,7 +733,11 @@ function Send-DeletedVMReport {
     }
     
     foreach ($vm in $VraDecommissionData) {
-        Write-Log "Adding decommission VM to report: $($vm.VMName) from $($vm.vRAServer)" "DEBUG"
+        Write-Log "Processing decommission VM: $($vm.VMName) from $($vm.vRAServer)" "DEBUG"
+        Write-Log "  Deployment: $($vm.DeploymentName)" "DEBUG"
+        Write-Log "  Status: $($vm.RequestStatus)" "DEBUG"
+        Write-Log "  Expiration: $($vm.ExpirationDate)" "DEBUG"
+        
         $decommissionVMs += New-Object PSObject -Property @{
             VMName = $vm.VMName
             RequestedBy = $vm.RequestedBy
