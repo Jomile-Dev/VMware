@@ -467,7 +467,7 @@ function Get-DeletedVMsFromVRA {
         return $deletedVMData
     }
     
-    # Fetch additional pages with date filtering for past 24 hours
+    # Fetch additional pages with STRICT date filtering for past 24 hours
     $page = 1
     $maxPages = 25  # Limit pages for efficiency
     
@@ -478,36 +478,36 @@ function Get-DeletedVMsFromVRA {
             $deployments = if ($response.content) { $response.content } else { $response }
             
             if ($deployments -and $deployments.Count -gt 0) {
-                # OPTIMIZATION: Filter by date for DELETED VMs (past 24 hours only)
-                if ($script:enableDateFilterForDeleted) {
-                    $recentDeployments = $deployments | Where-Object {
-                        try {
-                            $updateDate = [DateTime]$_.lastUpdatedAt
-                            $updateDate -ge $cutoffDate
+                # STRICT FILTER: Only include deployments deleted in past 24 hours
+                $recentDeployments = $deployments | Where-Object {
+                    try {
+                        if ($_.lastUpdatedAt) {
+                            $updateDate = [DateTime]::Parse($_.lastUpdatedAt)
+                            $withinWindow = $updateDate -ge $cutoffDate
+                            if ($withinWindow) {
+                                Write-Log "    Including: $($_.name) - Updated: $updateDate" "DEBUG"
+                            }
+                            return $withinWindow
                         }
-                        catch {
-                            $true
+                        else {
+                            Write-Log "    Excluding: $($_.name) - No lastUpdatedAt" "DEBUG"
+                            return $false
                         }
                     }
+                    catch {
+                        Write-Log "    Excluding: $($_.name) - Error parsing date" "DEBUG"
+                        return $false
+                    }
+                }
                 
-                    if ($recentDeployments.Count -gt 0) {
-                        $allDeletedDeployments += $recentDeployments
-                        Write-Log "  Page $page : Found $($recentDeployments.Count) recent deployments (deleted in past 24h)" "DEBUG"
-                    }
-                    else {
-                        Write-Log "  Page $page : No recent deployments in past 24h, stopping." "DEBUG"
-                        break
-                    }
-                    
+                if ($recentDeployments.Count -gt 0) {
+                    $allDeletedDeployments += $recentDeployments
+                    Write-Log "  Page $page : Found $($recentDeployments.Count) deployments within 24h window" "DEBUG"
                     $page++
                 }
                 else {
-                    # No date filter - get all deleted deployments
-                    if ($deployments.Count -gt 0) {
-                        $allDeletedDeployments += $deployments
-                        Write-Log "  Page $page : Found $($deployments.Count) deployments" "DEBUG"
-                    }
-                    $page++
+                    Write-Log "  Page $page : No deployments within 24h window, stopping pagination." "DEBUG"
+                    break
                 }
             }
             else {
@@ -519,18 +519,37 @@ function Get-DeletedVMsFromVRA {
             break
         }
         
-        if ($page -ge $maxPages) { break }
+        if ($page -ge $maxPages) { 
+            Write-Log "  Reached max pages limit" "WARN"
+            break 
+        }
         
     } while ($true)
     
     Write-Log "Total deleted deployments retrieved (past 24 hours): $($allDeletedDeployments.Count)" "SUCCESS"
     
-    # Filter for VM deployments
+    # STRICT FILTER: Only VM deployments deleted within 24 hours
     $vmDeployments = $allDeletedDeployments | Where-Object {
-        $_.name -match "VM|Virtual|Server|Machine"
+        $isVM = $_.name -match "VM|Virtual|Server|Machine"
+        $withinTime = $true
+        
+        if ($_.lastUpdatedAt) {
+            try {
+                $updateDate = [DateTime]::Parse($_.lastUpdatedAt)
+                $withinTime = $updateDate -ge $cutoffDate
+            }
+            catch {
+                $withinTime = $false
+            }
+        }
+        else {
+            $withinTime = $false
+        }
+        
+        return ($isVM -and $withinTime)
     }
     
-    Write-Log "VM-related deleted deployments: $($vmDeployments.Count)" "SUCCESS"
+    Write-Log "VM-related deleted deployments (within 24h): $($vmDeployments.Count)" "SUCCESS"
     
     # Process each deployment
     foreach ($deployment in $vmDeployments) {
@@ -604,6 +623,23 @@ function Get-DeletedVMsFromVRA {
                             $existingVM = $deletedVMData | Where-Object { $_.VMName.ToLower() -eq $vmKey }
                             
                             if (-not $existingVM) {
+                                # FINAL CHECK: Verify deletion date is within 24 hours
+                                $deletionDate = $null
+                                try {
+                                    $deletionDate = [DateTime]::Parse($deployment.lastUpdatedAt)
+                                }
+                                catch {
+                                    Write-Log "    Skipping $serverName - Cannot parse deletion date" "WARN"
+                                    continue
+                                }
+                                
+                                if ($deletionDate -lt $cutoffDate) {
+                                    Write-Log "    Skipping $serverName - Deleted on $deletionDate (before cutoff: $cutoffDate)" "WARN"
+                                    continue
+                                }
+                                
+                                Write-Log "    Adding $serverName - Deleted: $deletionDate (within 24h)" "SUCCESS"
+                                
                                 $vraServerShort = ($VraServer -split '\.')[0]
                                 
                                 $deletedVMData += New-Object PSObject -Property @{
@@ -760,14 +796,38 @@ function Send-DeletedVMReport {
     
     foreach ($vm in $VCenterData) {
         if (-not $vraVMNames.ContainsKey($vm.VMName.ToLower())) {
-            $deletedVMs += New-Object PSObject -Property @{
-                VMName = $vm.VMName
-                RequestedBy = $vm.DeletedBy
-                DeletedAt = $vm.DeletedAt
-                DeploymentName = "N/A"
-                RequestAction = $vm.EventType
-                RequestStatus = "Deleted"
-                Source = $vm.vCenter
+            # VERIFY: vCenter deletion is within 24 hours
+            $deletionWithin24h = $false
+            try {
+                if ($vm.DeletedAt -and $vm.DeletedAt -ne "N/A") {
+                    # Parse Sydney time back to compare
+                    $deletedDate = [DateTime]::Parse($vm.DeletedAt)
+                    $now = Get-Date
+                    $hoursDiff = ($now - $deletedDate).TotalHours
+                    
+                    if ($hoursDiff -le 24) {
+                        $deletionWithin24h = $true
+                        Write-Log "vCenter VM $($vm.VMName) deleted $([Math]::Round($hoursDiff, 1))h ago - INCLUDED" "DEBUG"
+                    }
+                    else {
+                        Write-Log "vCenter VM $($vm.VMName) deleted $([Math]::Round($hoursDiff, 1))h ago - EXCLUDED" "WARN"
+                    }
+                }
+            }
+            catch {
+                Write-Log "vCenter VM $($vm.VMName) - Error parsing date, EXCLUDING" "WARN"
+            }
+            
+            if ($deletionWithin24h) {
+                $deletedVMs += New-Object PSObject -Property @{
+                    VMName = $vm.VMName
+                    RequestedBy = $vm.DeletedBy
+                    DeletedAt = $vm.DeletedAt
+                    DeploymentName = "N/A"
+                    RequestAction = $vm.EventType
+                    RequestStatus = "Deleted"
+                    Source = $vm.vCenter
+                }
             }
         }
     }
@@ -806,26 +866,30 @@ table { border-collapse: collapse; width: 100%; margin-top: 10px; margin-bottom:
 th { background-color: #2196F3; color: white; padding: 12px; text-align: left; font-weight: bold; }
 td { border: 1px solid #ddd; padding: 10px; }
 .no-data { padding: 15px; background-color: #e8f5e9; color: #2e7d32; border-left: 4px solid #4caf50; }
-.warning-banner { padding: 15px; background-color: #fff3cd; color: #856404; border-left: 4px solid #ffc107; margin-bottom: 20px; }
 </style>
 </head>
 <body>
 <h1>VM Deletion and Decommission Report</h1>
-<div class="warning-banner">
-<strong>Note:</strong> Deleted VMs show past 24 hours only. Decommissions show ALL active requests (no time limit).
-</div>
 <h2>Deleted Virtual Machines (Past 24 Hours)</h2>
-$(if($deletedVMs.Count -gt 0) {
-"<table><thead><tr><th>VM Name</th><th>Deployment Name</th><th>Action</th><th>Status</th><th>Requested/Deleted By</th><th>Deleted At</th><th>Source</th></tr></thead><tbody>$deletedTableRows</tbody></table>"
-} else {
-"<p class='no-data'>No deleted VMs found in the past 24 hours</p>"
-})
+"@
+
+    if($deletedVMs.Count -gt 0) {
+        $htmlBody += "<table><thead><tr><th>VM Name</th><th>Deployment Name</th><th>Action</th><th>Status</th><th>Requested/Deleted By</th><th>Deleted At</th><th>Source</th></tr></thead><tbody>$deletedTableRows</tbody></table>"
+    } else {
+        $htmlBody += "<p class='no-data'>No deleted VMs found in the past 24 hours</p>"
+    }
+
+    $htmlBody += @"
 <h2>Decommissions In Progress (All Active)</h2>
-$(if($decommissionVMs.Count -gt 0) {
-"<table><thead><tr style='background-color: #ff9800;'><th>VM Name</th><th>Deployment Name</th><th>Request Action</th><th>Request Status</th><th>Requested By</th><th>Initiated At</th><th>Expiration Date</th><th>Source</th></tr></thead><tbody>$decommissionTableRows</tbody></table>"
-} else {
-"<p class='no-data'>No decommissions currently scheduled</p>"
-})
+"@
+
+    if($decommissionVMs.Count -gt 0) {
+        $htmlBody += "<table><thead><tr style='background-color: #ff9800;'><th>VM Name</th><th>Deployment Name</th><th>Request Action</th><th>Request Status</th><th>Requested By</th><th>Initiated At</th><th>Expiration Date</th><th>Source</th></tr></thead><tbody>$decommissionTableRows</tbody></table>"
+    } else {
+        $htmlBody += "<p class='no-data'>No decommissions currently scheduled</p>"
+    }
+
+    $htmlBody += @"
 </body>
 </html>
 "@
