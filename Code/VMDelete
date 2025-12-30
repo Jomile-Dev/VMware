@@ -223,8 +223,10 @@ function Get-ActiveDeploymentsWithDecommission {
                 Write-Log "    ║ Action ID: $($request.actionId)" "DEBUG"
                 Write-Log "    ║ Status: $($request.status)" "DEBUG"
                 Write-Log "    ║ Requested By: $($request.requestedBy)" "DEBUG"
-                Write-Log "    ║ Initiated At: $($request.initiatedAt)" "DEBUG"
-                Write-Log "    ║ Completed At: $($request.completedAt)" "DEBUG"
+                Write-Log "    ║ Initiated At (RAW UTC): $($request.initiatedAt)" "DEBUG"
+                Write-Log "    ║ Initiated At (Sydney Time): $(if ($request.initiatedAt) { Convert-ToSydneyTime -DateTimeString $request.initiatedAt } else { 'N/A' })" "WARN"
+                Write-Log "    ║ Completed At (RAW UTC): $($request.completedAt)" "DEBUG"
+                Write-Log "    ║ Completed At (Sydney Time): $(if ($request.completedAt) { Convert-ToSydneyTime -DateTimeString $request.completedAt } else { 'N/A' })" "DEBUG"
                 
                 $isDecommission = $false
                 $matchedBy = "None"
@@ -257,14 +259,22 @@ function Get-ActiveDeploymentsWithDecommission {
                     $isDecommission = $true
                     $matchedBy = if ($nameMatch) { "Request Name" } else { "Action ID" }
                     
+                    Write-Log "    ║" "WARN"
+                    Write-Log "    ║   ╔════════════════ DECOMMISSION TIMING INFO ════════════════╗" "WARN"
+                    Write-Log "    ║   ║ Request Initiated At (UTC): $($request.initiatedAt)" "WARN"
+                    Write-Log "    ║   ║ Request Initiated At (Sydney): $(if ($request.initiatedAt) { Convert-ToSydneyTime -DateTimeString $request.initiatedAt } else { 'N/A' })" "WARN"
+                    
                     if ($deployment.leaseExpireAt) {
                         $expirationDate = $deployment.leaseExpireAt
-                        Write-Log "    ║   >>> Deployment expires at: $expirationDate <<<" "WARN"
+                        Write-Log "    ║   ║ Deployment Expires At (UTC): $expirationDate" "WARN"
+                        Write-Log "    ║   ║ Deployment Expires At (Sydney): $(Convert-ToSydneyTime -DateTimeString $expirationDate)" "WARN"
                     }
                     else {
-                        Write-Log "    ║   >>> WARNING: No lease expiration date found <<<" "WARN"
+                        Write-Log "    ║   ║ WARNING: No lease expiration date found" "WARN"
                         $expirationDate = "N/A"
                     }
+                    Write-Log "    ║   ╚═══════════════════════════════════════════════════════════╝" "WARN"
+                    Write-Log "    ║" "WARN"
                 }
                 else {
                     Write-Log "    ║   >>> NOT a decommission request (no pattern match)" "DEBUG"
@@ -421,11 +431,17 @@ function Get-ActiveDeploymentsWithDecommission {
                         
                         Write-Log "      >>> VM in Decommission: $hostname <<<" "WARN"
                         Write-Log "      >>> Matched decommission by: $matchedBy <<<" "DEBUG"
-                        Write-Log "      >>> Deployment will expire: $expirationDate <<<" "WARN"
                         Write-Log "      >>> Deployment Name: $($deployment.name) <<<" "DEBUG"
                         Write-Log "      >>> Deployment Status: $($deployment.status) <<<" "DEBUG"
                         Write-Log "      >>> Request Action: $($request.name) <<<" "DEBUG"
                         Write-Log "      >>> Requested By: $($request.requestedBy) <<<" "DEBUG"
+                        Write-Log "      >>>" "WARN"
+                        Write-Log "      >>> ⏰ TIMING INFORMATION ⏰" "WARN"
+                        Write-Log "      >>> Request Initiated At (RAW): $($request.initiatedAt)" "WARN"
+                        Write-Log "      >>> Request Initiated At (Sydney): $(if ($request.initiatedAt) { Convert-ToSydneyTime -DateTimeString $request.initiatedAt } else { 'N/A' })" "WARN"
+                        Write-Log "      >>> Deployment Expires At (RAW): $expirationDate" "WARN"
+                        Write-Log "      >>> Deployment Expires At (Sydney): $(if ($expirationDate -and $expirationDate -ne 'N/A') { Convert-ToSydneyTime -DateTimeString $expirationDate } else { 'N/A' })" "WARN"
+                        Write-Log "      >>>" "WARN"
                         
                         $vraServerShort = ($VraServer -split '\.')[0]
                         $catalogItem = if ($deployment.inputs._catalogItemName) { $deployment.inputs._catalogItemName } else { "N/A" }
@@ -444,6 +460,8 @@ function Get-ActiveDeploymentsWithDecommission {
                         }
                         
                         Write-Log "      >>> Creating decommission object... <<<" "DEBUG"
+                        Write-Log "      >>> RAW initiatedAt from request: '$($request.initiatedAt)'" "DEBUG"
+                        Write-Log "      >>> RAW expirationDate: '$expirationDate'" "DEBUG"
                         
                         $vmObject = New-Object PSObject -Property @{
                             VMName = $hostname
@@ -466,10 +484,12 @@ function Get-ActiveDeploymentsWithDecommission {
                         }
                         
                         Write-Log "      >>> Object created. Properties: <<<" "DEBUG"
-                        Write-Log "          VMName: $($vmObject.VMName)" "DEBUG"
+                        Write-Log "          VMName: $($vmObject.VMName)" "SUCCESS"
                         Write-Log "          DeploymentName: $($vmObject.DeploymentName)" "DEBUG"
-                        Write-Log "          InitiatedAt: $($vmObject.InitiatedAt)" "DEBUG"
-                        Write-Log "          ExpirationDate: $($vmObject.ExpirationDate)" "DEBUG"
+                        Write-Log "          RequestAction: $($vmObject.RequestAction)" "DEBUG"
+                        Write-Log "          RequestStatus: $($vmObject.RequestStatus)" "DEBUG"
+                        Write-Log "          InitiatedAt (CONVERTED): $($vmObject.InitiatedAt)" "WARN"
+                        Write-Log "          ExpirationDate (CONVERTED): $($vmObject.ExpirationDate)" "WARN"
                         Write-Log "          Source: $($vmObject.Source)" "DEBUG"
                         Write-Log "          vRAServer: $($vmObject.vRAServer)" "DEBUG"
                         
