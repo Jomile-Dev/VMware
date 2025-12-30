@@ -675,7 +675,11 @@ function Get-DeletedVMsFromVRA {
                             }
                         }
                         
-                        if ($serverName) {
+                        if (-not $serverName) {
+                            Write-Log "    ║     >>> WARNING: Could not extract hostname from event! <<<" "WARN"
+                            Write-Log "    ║     >>> Event dump: $($event | ConvertTo-Json -Depth 2 -Compress) <<<" "DEBUG"
+                        }
+                        else {
                             Write-Log "    ║     >>> FOUND DELETED VM: $serverName <<<" "SUCCESS"
                             
                             $vmKey = $serverName.ToLower()
@@ -714,9 +718,6 @@ function Get-DeletedVMsFromVRA {
                                 
                                 Write-Log "    ║     >>> Successfully added VM '$serverName' <<<" "SUCCESS"
                             }
-                        }
-                        else {
-                            Write-Log "    ║     >>> WARNING: Could not extract hostname from event! <<<" "WARN"
                         }
                     }
                 }
@@ -952,6 +953,9 @@ function Send-DeletedVMReport {
         $decommissionTableRows += "<td>$($vm.ExpirationDate)</td>"
         $decommissionTableRows += "<td>$($vm.Source)</td>"
         $decommissionTableRows += "</tr>"
+        
+        # Also add to debug file for visibility
+        Add-Content -Path $debugOutputFile -Value "DECOMMISSION EMAIL ENTRY: VM=$($vm.VMName), Deployment=$($vm.DeploymentName), InitiatedAt=$($vm.InitiatedAt), ExpirationDate=$($vm.ExpirationDate), Source=$($vm.Source)"
     }
     
     $htmlBody = @"
