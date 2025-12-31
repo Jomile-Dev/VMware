@@ -1,7 +1,7 @@
 # ============================================================================
 # DELETED VM TRACKER - ARIA OPERATIONS + MULTI-VRA + VCENTER
-# Version 2.1.3 - PowerShell 5.1 Compatible
-# Fixed: Consistent "Cloud Resource Name:" pattern extraction
+# Version 2.2.0 - Enhanced Debugging for InitiatedAt Issues
+# Added: Complete object dumps and property listings for troubleshooting
 # ============================================================================
 
 # ============================================================================
@@ -68,7 +68,186 @@ function Write-DebugSection {
     Add-Content -Path $debugOutputFile -Value $header
 }
 
-function Disable-SSLValidation {
+function Disable-SSLValidation
+
+Write-Log "Requesting credentials..." "DEBUG"
+$credential = Get-Credential -Message "Enter credentials for Aria Operations, vRA, and vCenter"
+if (-not $credential) {
+    Write-Log "Credentials not provided. Exiting." "ERROR"
+    exit
+}
+$username = $credential.UserName
+$password = $credential.GetNetworkCredential().Password
+
+# ============================================================================
+# VRA - GET ACTIVE DEPLOYMENTS WITH DECOMMISSION REQUESTS
+# ============================================================================
+
+Write-DebugSection "vRA - PROCESSING ACTIVE DEPLOYMENTS WITH DECOMMISSION REQUESTS"
+
+$allVraDecommissionVMs = @()
+
+foreach ($vraServer in $vraServers) {
+    try {
+        Write-Log "`nConnecting to vRA: $vraServer" "DEBUG"
+        
+        $vraAuthUri = "https://$vraServer/csp/gateway/am/api/login"
+        $vraAuthBody = @{
+            username = $username
+            password = $password
+        } | ConvertTo-Json
+        
+        $vraAuthResponse = Invoke-RestMethod -Uri $vraAuthUri -Method Post -Headers @{
+            "Content-Type" = "application/json"
+        } -Body $vraAuthBody -ErrorAction Stop
+        
+        $vraHeaders = @{
+            "Authorization" = "Bearer $($vraAuthResponse.cspAuthToken)"
+            "Content-Type" = "application/json"
+        }
+        
+        Write-Log "Authenticated successfully" "SUCCESS"
+        
+        $decommVMs = Get-ActiveDeploymentsWithDecommission -VraServer $vraServer -Headers $vraHeaders
+        $allVraDecommissionVMs += $decommVMs
+        
+    }
+    catch {
+        Write-Log "Error with vRA server $vraServer : $($_.Exception.Message)" "ERROR"
+    }
+}
+
+Write-Log "`nvRA Decommission Total: Found $($allVraDecommissionVMs.Count) VMs with active decommission requests" "SUCCESS"
+
+# ============================================================================
+# VRA - GET DELETED DEPLOYMENTS
+# ============================================================================
+
+Write-DebugSection "vRA - PROCESSING DELETED DEPLOYMENTS"
+
+$allVraDeletedVMs = @()
+
+foreach ($vraServer in $vraServers) {
+    try {
+        Write-Log "`nConnecting to vRA: $vraServer" "DEBUG"
+        
+        $vraAuthUri = "https://$vraServer/csp/gateway/am/api/login"
+        $vraAuthBody = @{
+            username = $username
+            password = $password
+        } | ConvertTo-Json
+        
+        $vraAuthResponse = Invoke-RestMethod -Uri $vraAuthUri -Method Post -Headers @{
+            "Content-Type" = "application/json"
+        } -Body $vraAuthBody -ErrorAction Stop
+        
+        $vraHeaders = @{
+            "Authorization" = "Bearer $($vraAuthResponse.cspAuthToken)"
+            "Content-Type" = "application/json"
+        }
+        
+        Write-Log "Authenticated successfully" "SUCCESS"
+        
+        $deletedVMs = Get-DeletedVMsFromVRA -VraServer $vraServer -Headers $vraHeaders -DaysBack $daysBack
+        $allVraDeletedVMs += $deletedVMs
+        
+    }
+    catch {
+        Write-Log "Error with vRA server $vraServer : $($_.Exception.Message)" "ERROR"
+    }
+}
+
+Write-Log "`nvRA Deleted Total: Found $($allVraDeletedVMs.Count) deleted VMs across all servers" "SUCCESS"
+
+# ============================================================================
+# VCENTER - GET DIRECT DELETIONS
+# ============================================================================
+
+Write-DebugSection "vCENTER - CHECKING DIRECT VM DELETIONS"
+
+$allVCenterDeletedVMs = @()
+
+foreach ($vCenter in $vCenters) {
+    $deletedVMs = Get-DeletedVMsFromVCenter -VCenter $vCenter -Credential $credential -DaysBack $daysBack
+    $allVCenterDeletedVMs += $deletedVMs
+}
+
+Write-Log "`nvCenter Total: Found $($allVCenterDeletedVMs.Count) deleted VMs across all servers" "SUCCESS"
+
+# ============================================================================
+# SUMMARY AND REPORT
+# ============================================================================
+
+Write-DebugSection "SUMMARY AND REPORTING"
+
+Write-Log "vRA Decommission In Progress: $($allVraDecommissionVMs.Count)" "SUCCESS"
+Write-Log "vRA Deleted Deployments: $($allVraDeletedVMs.Count)" "SUCCESS"
+Write-Log "vCenter Direct Deletions: $($allVCenterDeletedVMs.Count)" "SUCCESS"
+
+$vraVCenterTotal = $allVraDeletedVMs.Count + $allVraDecommissionVMs.Count + $allVCenterDeletedVMs.Count
+
+Write-Log "Total (vRA + vCenter): $vraVCenterTotal" "DEBUG"
+
+if ($vraVCenterTotal -eq 0) {
+    Write-Log "No deleted or decommissioned VMs found. Sending notification email..." "WARN"
+    
+    $noDeletedVMsHtml = @"
+<html>
+<head>
+<style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    .info-box { background-color: #e8f5e9; padding: 20px; border-left: 4px solid #4caf50; margin: 20px 0; }
+    .info-box h2 { margin-top: 0; color: #2e7d32; }
+    .info-box p { color: #424242; font-size: 14px; line-height: 1.6; }
+</style>
+</head>
+<body>
+<div class="info-box">
+    <h2>No VM Deletions Detected</h2>
+    <p>No virtual machines were deleted or decommissioned in the last $daysBack day(s).</p>
+</div>
+</body>
+</html>
+"@
+    
+    $noVMSubject = "No VM Deletions - $(Get-Date -Format 'yyyy-MM-dd')"
+    
+    try {
+        if ($smtpCc -and $smtpCc.Count -gt 0) {
+            Send-MailMessage -To $smtpTo -From $smtpFrom -Subject $noVMSubject -Body $noDeletedVMsHtml -BodyAsHtml -SmtpServer $smtpServer -Port $smtpPort -UseSsl -Cc $smtpCc
+        }
+        else {
+            Send-MailMessage -To $smtpTo -From $smtpFrom -Subject $noVMSubject -Body $noDeletedVMsHtml -BodyAsHtml -SmtpServer $smtpServer -Port $smtpPort -UseSsl
+        }
+        Write-Log "Notification email sent successfully!" "SUCCESS"
+    }
+    catch {
+        Write-Log "Failed to send notification email: $($_.Exception.Message)" "ERROR"
+    }
+}
+else {
+    Write-Log "Found VMs to report. Sending detailed report..." "DEBUG"
+    Send-DeletedVMReport `
+        -VraDeletedData $allVraDeletedVMs `
+        -VraDecommissionData $allVraDecommissionVMs `
+        -VCenterData $allVCenterDeletedVMs `
+        -SmtpServer $smtpServer `
+        -SmtpPort $smtpPort `
+        -From $smtpFrom `
+        -To $smtpTo `
+        -Cc $smtpCc `
+        -Subject $smtpSubject
+}
+
+Write-DebugSection "SCRIPT COMPLETED"
+Write-Log "Script Version: 2.2.0 - Enhanced Debug Mode" "SUCCESS"
+Write-Log "Debug log saved to: $debugOutputFile" "SUCCESS"
+Write-Log "`nScript finished. Check the debug file for detailed logs." "SUCCESS"
+Write-Log "`nLook for these debug sections to troubleshoot InitiatedAt issues:" "WARN"
+Write-Log "  - >>> FULL REQUEST OBJECT DUMP <<<" "WARN"
+Write-Log "  - >>> ALL REQUEST PROPERTIES <<<" "WARN"
+Write-Log "  - >>> FULL DEPLOYMENT OBJECT DUMP <<<" "WARN"
+Write-Log "  - >>> ALL DEPLOYMENT PROPERTIES <<<" "WARN"SSLValidation {
     if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
         Add-Type @"
 using System.Net;
@@ -197,6 +376,15 @@ function Get-ActiveDeploymentsWithDecommission {
         Write-Log "  Owned By: $($deployment.ownedBy)" "DEBUG"
         Write-Log "  Created By: $($deployment.createdBy)" "DEBUG"
         Write-Log "  Project: $($deployment.projectId)" "DEBUG"
+        Write-Log "" "DEBUG"
+        Write-Log "  >>> FULL DEPLOYMENT OBJECT DUMP <<<" "WARN"
+        Write-Log "  $($deployment | ConvertTo-Json -Depth 5 -Compress)" "WARN"
+        Write-Log "" "DEBUG"
+        Write-Log "  >>> ALL DEPLOYMENT PROPERTIES <<<" "WARN"
+        foreach ($prop in $deployment.PSObject.Properties) {
+            Write-Log "    $($prop.Name) = $($prop.Value)" "WARN"
+        }
+        Write-Log "" "DEBUG"
         
         if ($deployment.resources) {
             Write-Log "  Resources in deployment:" "DEBUG"
@@ -223,6 +411,15 @@ function Get-ActiveDeploymentsWithDecommission {
                 Write-Log "    ║ Action ID: $($request.actionId)" "DEBUG"
                 Write-Log "    ║ Status: $($request.status)" "DEBUG"
                 Write-Log "    ║ Requested By: $($request.requestedBy)" "DEBUG"
+                Write-Log "    ║" "DEBUG"
+                Write-Log "    ║ >>> FULL REQUEST OBJECT DUMP <<<" "WARN"
+                Write-Log "    ║ $($request | ConvertTo-Json -Depth 5 -Compress)" "WARN"
+                Write-Log "    ║" "DEBUG"
+                Write-Log "    ║ >>> ALL REQUEST PROPERTIES <<<" "WARN"
+                foreach ($prop in $request.PSObject.Properties) {
+                    Write-Log "    ║   $($prop.Name) = $($prop.Value)" "WARN"
+                }
+                Write-Log "    ║" "DEBUG"
                 Write-Log "    ║ Initiated At (RAW UTC): $($request.initiatedAt)" "DEBUG"
                 Write-Log "    ║ Initiated At (Sydney Time): $(if ($request.initiatedAt) { Convert-ToSydneyTime -DateTimeString $request.initiatedAt } else { 'N/A' })" "WARN"
                 Write-Log "    ║ Completed At (RAW UTC): $($request.completedAt)" "DEBUG"
@@ -361,6 +558,15 @@ function Get-ActiveDeploymentsWithDecommission {
                             Write-Log "    ║   >>> Processing Event for vSphere Machine (fallback) <<<" "DEBUG"
                             Write-Log "    ║   >>> Event Type: $($event.eventType) <<<" "DEBUG"
                             Write-Log "    ║   >>> Resource Name: $($event.resourceName) <<<" "DEBUG"
+                            Write-Log "    ║" "DEBUG"
+                            Write-Log "    ║   >>> FULL EVENT OBJECT DUMP <<<" "WARN"
+                            Write-Log "    ║   $($event | ConvertTo-Json -Depth 5 -Compress)" "WARN"
+                            Write-Log "    ║" "DEBUG"
+                            Write-Log "    ║   >>> ALL EVENT PROPERTIES <<<" "WARN"
+                            foreach ($prop in $event.PSObject.Properties) {
+                                Write-Log "    ║     $($prop.Name) = $($prop.Value)" "WARN"
+                            }
+                            Write-Log "    ║" "DEBUG"
                             
                             $hostname = $null
                             
@@ -638,6 +844,15 @@ function Get-DeletedVMsFromVRA {
         Write-Log "  Status: $($deployment.status)" "DEBUG"
         Write-Log "  Last Updated: $($deployment.lastUpdatedAt)" "DEBUG"
         Write-Log "  Owned By: $($deployment.ownedBy)" "DEBUG"
+        Write-Log "" "DEBUG"
+        Write-Log "  >>> FULL DELETED DEPLOYMENT OBJECT DUMP <<<" "WARN"
+        Write-Log "  $($deployment | ConvertTo-Json -Depth 5 -Compress)" "WARN"
+        Write-Log "" "DEBUG"
+        Write-Log "  >>> ALL DELETED DEPLOYMENT PROPERTIES <<<" "WARN"
+        foreach ($prop in $deployment.PSObject.Properties) {
+            Write-Log "    $($prop.Name) = $($prop.Value)" "WARN"
+        }
+        Write-Log "" "DEBUG"
         
         try {
             $requestsUri = "https://$VraServer/deployment/api/deployments/$($deployment.id)/requests?apiVersion=2020-08-25&deleted=true"
@@ -653,6 +868,15 @@ function Get-DeletedVMsFromVRA {
                 Write-Log "    ║ Request ID: $($request.id)" "DEBUG"
                 Write-Log "    ║ Action: $($request.name)" "DEBUG"
                 Write-Log "    ║ Status: $($request.status)" "DEBUG"
+                Write-Log "    ║" "DEBUG"
+                Write-Log "    ║ >>> FULL DELETED REQUEST OBJECT DUMP <<<" "WARN"
+                Write-Log "    ║ $($request | ConvertTo-Json -Depth 5 -Compress)" "WARN"
+                Write-Log "    ║" "DEBUG"
+                Write-Log "    ║ >>> ALL DELETED REQUEST PROPERTIES <<<" "WARN"
+                foreach ($prop in $request.PSObject.Properties) {
+                    Write-Log "    ║   $($prop.Name) = $($prop.Value)" "WARN"
+                }
+                Write-Log "    ║" "DEBUG"
                 
                 $eventPage = 0
                 $allEvents = @()
@@ -690,6 +914,15 @@ function Get-DeletedVMsFromVRA {
                         Write-Log "    ║     >>> Processing Deleted VM Event <<<" "DEBUG"
                         Write-Log "    ║     >>> Event Type: $($event.eventType) <<<" "DEBUG"
                         Write-Log "    ║     >>> Resource Name: $($event.resourceName) <<<" "DEBUG"
+                        Write-Log "    ║" "DEBUG"
+                        Write-Log "    ║     >>> FULL DELETED EVENT OBJECT DUMP <<<" "WARN"
+                        Write-Log "    ║     $($event | ConvertTo-Json -Depth 5 -Compress)" "WARN"
+                        Write-Log "    ║" "DEBUG"
+                        Write-Log "    ║     >>> ALL DELETED EVENT PROPERTIES <<<" "WARN"
+                        foreach ($prop in $event.PSObject.Properties) {
+                            Write-Log "    ║       $($prop.Name) = $($prop.Value)" "WARN"
+                        }
+                        Write-Log "    ║" "DEBUG"
                         
                         $serverName = $null
                         
@@ -1111,7 +1344,7 @@ $decommissionTableRows
 # ============================================================================
 
 Write-DebugSection "DELETED VM TRACKER - STARTED"
-Write-Log "Script Version: 2.1.3" "SUCCESS"
+Write-Log "Script Version: 2.2.0 - Enhanced Debug Mode" "SUCCESS"
 Write-Log "PowerShell Version: $($PSVersionTable.PSVersion)"
 Write-Log "Debug output file: $debugOutputFile" "SUCCESS"
 
@@ -1126,178 +1359,4 @@ catch {
     exit
 }
 
-Disable-SSLValidation
-
-Write-Log "Requesting credentials..." "DEBUG"
-$credential = Get-Credential -Message "Enter credentials for Aria Operations, vRA, and vCenter"
-if (-not $credential) {
-    Write-Log "Credentials not provided. Exiting." "ERROR"
-    exit
-}
-$username = $credential.UserName
-$password = $credential.GetNetworkCredential().Password
-
-# ============================================================================
-# VRA - GET ACTIVE DEPLOYMENTS WITH DECOMMISSION REQUESTS
-# ============================================================================
-
-Write-DebugSection "vRA - PROCESSING ACTIVE DEPLOYMENTS WITH DECOMMISSION REQUESTS"
-
-$allVraDecommissionVMs = @()
-
-foreach ($vraServer in $vraServers) {
-    try {
-        Write-Log "`nConnecting to vRA: $vraServer" "DEBUG"
-        
-        $vraAuthUri = "https://$vraServer/csp/gateway/am/api/login"
-        $vraAuthBody = @{
-            username = $username
-            password = $password
-        } | ConvertTo-Json
-        
-        $vraAuthResponse = Invoke-RestMethod -Uri $vraAuthUri -Method Post -Headers @{
-            "Content-Type" = "application/json"
-        } -Body $vraAuthBody -ErrorAction Stop
-        
-        $vraHeaders = @{
-            "Authorization" = "Bearer $($vraAuthResponse.cspAuthToken)"
-            "Content-Type" = "application/json"
-        }
-        
-        Write-Log "Authenticated successfully" "SUCCESS"
-        
-        $decommVMs = Get-ActiveDeploymentsWithDecommission -VraServer $vraServer -Headers $vraHeaders
-        $allVraDecommissionVMs += $decommVMs
-        
-    }
-    catch {
-        Write-Log "Error with vRA server $vraServer : $($_.Exception.Message)" "ERROR"
-    }
-}
-
-Write-Log "`nvRA Decommission Total: Found $($allVraDecommissionVMs.Count) VMs with active decommission requests" "SUCCESS"
-
-# ============================================================================
-# VRA - GET DELETED DEPLOYMENTS
-# ============================================================================
-
-Write-DebugSection "vRA - PROCESSING DELETED DEPLOYMENTS"
-
-$allVraDeletedVMs = @()
-
-foreach ($vraServer in $vraServers) {
-    try {
-        Write-Log "`nConnecting to vRA: $vraServer" "DEBUG"
-        
-        $vraAuthUri = "https://$vraServer/csp/gateway/am/api/login"
-        $vraAuthBody = @{
-            username = $username
-            password = $password
-        } | ConvertTo-Json
-        
-        $vraAuthResponse = Invoke-RestMethod -Uri $vraAuthUri -Method Post -Headers @{
-            "Content-Type" = "application/json"
-        } -Body $vraAuthBody -ErrorAction Stop
-        
-        $vraHeaders = @{
-            "Authorization" = "Bearer $($vraAuthResponse.cspAuthToken)"
-            "Content-Type" = "application/json"
-        }
-        
-        Write-Log "Authenticated successfully" "SUCCESS"
-        
-        $deletedVMs = Get-DeletedVMsFromVRA -VraServer $vraServer -Headers $vraHeaders -DaysBack $daysBack
-        $allVraDeletedVMs += $deletedVMs
-        
-    }
-    catch {
-        Write-Log "Error with vRA server $vraServer : $($_.Exception.Message)" "ERROR"
-    }
-}
-
-Write-Log "`nvRA Deleted Total: Found $($allVraDeletedVMs.Count) deleted VMs across all servers" "SUCCESS"
-
-# ============================================================================
-# VCENTER - GET DIRECT DELETIONS
-# ============================================================================
-
-Write-DebugSection "vCENTER - CHECKING DIRECT VM DELETIONS"
-
-$allVCenterDeletedVMs = @()
-
-foreach ($vCenter in $vCenters) {
-    $deletedVMs = Get-DeletedVMsFromVCenter -VCenter $vCenter -Credential $credential -DaysBack $daysBack
-    $allVCenterDeletedVMs += $deletedVMs
-}
-
-Write-Log "`nvCenter Total: Found $($allVCenterDeletedVMs.Count) deleted VMs across all servers" "SUCCESS"
-
-# ============================================================================
-# SUMMARY AND REPORT
-# ============================================================================
-
-Write-DebugSection "SUMMARY AND REPORTING"
-
-Write-Log "vRA Decommission In Progress: $($allVraDecommissionVMs.Count)" "SUCCESS"
-Write-Log "vRA Deleted Deployments: $($allVraDeletedVMs.Count)" "SUCCESS"
-Write-Log "vCenter Direct Deletions: $($allVCenterDeletedVMs.Count)" "SUCCESS"
-
-$vraVCenterTotal = $allVraDeletedVMs.Count + $allVraDecommissionVMs.Count + $allVCenterDeletedVMs.Count
-
-Write-Log "Total (vRA + vCenter): $vraVCenterTotal" "DEBUG"
-
-if ($vraVCenterTotal -eq 0) {
-    Write-Log "No deleted or decommissioned VMs found. Sending notification email..." "WARN"
-    
-    $noDeletedVMsHtml = @"
-<html>
-<head>
-<style>
-    body { font-family: Arial, sans-serif; margin: 20px; }
-    .info-box { background-color: #e8f5e9; padding: 20px; border-left: 4px solid #4caf50; margin: 20px 0; }
-    .info-box h2 { margin-top: 0; color: #2e7d32; }
-    .info-box p { color: #424242; font-size: 14px; line-height: 1.6; }
-</style>
-</head>
-<body>
-<div class="info-box">
-    <h2>No VM Deletions Detected</h2>
-    <p>No virtual machines were deleted or decommissioned in the last $daysBack day(s).</p>
-</div>
-</body>
-</html>
-"@
-    
-    $noVMSubject = "No VM Deletions - $(Get-Date -Format 'yyyy-MM-dd')"
-    
-    try {
-        if ($smtpCc -and $smtpCc.Count -gt 0) {
-            Send-MailMessage -To $smtpTo -From $smtpFrom -Subject $noVMSubject -Body $noDeletedVMsHtml -BodyAsHtml -SmtpServer $smtpServer -Port $smtpPort -UseSsl -Cc $smtpCc
-        }
-        else {
-            Send-MailMessage -To $smtpTo -From $smtpFrom -Subject $noVMSubject -Body $noDeletedVMsHtml -BodyAsHtml -SmtpServer $smtpServer -Port $smtpPort -UseSsl
-        }
-        Write-Log "Notification email sent successfully!" "SUCCESS"
-    }
-    catch {
-        Write-Log "Failed to send notification email: $($_.Exception.Message)" "ERROR"
-    }
-}
-else {
-    Write-Log "Found VMs to report. Sending detailed report..." "DEBUG"
-    Send-DeletedVMReport `
-        -VraDeletedData $allVraDeletedVMs `
-        -VraDecommissionData $allVraDecommissionVMs `
-        -VCenterData $allVCenterDeletedVMs `
-        -SmtpServer $smtpServer `
-        -SmtpPort $smtpPort `
-        -From $smtpFrom `
-        -To $smtpTo `
-        -Cc $smtpCc `
-        -Subject $smtpSubject
-}
-
-Write-DebugSection "SCRIPT COMPLETED"
-Write-Log "Script Version: 2.1.3" "SUCCESS"
-Write-Log "Debug log saved to: $debugOutputFile" "SUCCESS"
-Write-Log "`nScript finished. Check the debug file for detailed logs." "SUCCESS"
+Disable-
