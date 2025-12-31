@@ -463,6 +463,17 @@ function Get-ActiveDeploymentsWithDecommission {
                         Write-Log "      >>> RAW initiatedAt from request: '$($request.initiatedAt)'" "DEBUG"
                         Write-Log "      >>> RAW expirationDate: '$expirationDate'" "DEBUG"
                         
+                        # Get the actual deletion date from deployment
+                        $deletionDate = "N/A"
+                        if ($deployment.lastUpdatedAt) {
+                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deployment.lastUpdatedAt
+                            Write-Log "      >>> Found deletion date from lastUpdatedAt: $deletionDate <<<" "DEBUG"
+                        }
+                        elseif ($deployment.deletedAt) {
+                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deployment.deletedAt
+                            Write-Log "      >>> Found deletion date from deletedAt: $deletionDate <<<" "DEBUG"
+                        }
+
                         $vmObject = New-Object PSObject -Property @{
                             VMName = $hostname
                             ResourceType = "Cloud.vSphere.Machine"
@@ -475,9 +486,9 @@ function Get-ActiveDeploymentsWithDecommission {
                             RequestedBy = $request.requestedBy
                             Requestor = if ($deployment.ownedBy) { $deployment.ownedBy } else { $request.requestedBy }
                             CatalogItem = $catalogItem
-                            InitiatedAt = $initiatedAtValue
+                            InitiatedAt = $expirationDateValue  # SWAPPED: Now shows expiration date
                             CompletedAt = if ($request.completedAt) { Convert-ToSydneyTime -DateTimeString $request.completedAt } else { "N/A" }
-                            ExpirationDate = $expirationDateValue
+                            DeletionDate = $deletionDate  # RENAMED: Now shows actual deletion/update date
                             vRAServer = $vraServerShort
                             Source = "vRA-Decommission-InProgress"
                             IsStillActive = $true
@@ -956,26 +967,26 @@ function Send-DeletedVMReport {
         Write-Log "Processing decommission VM: $($vm.VMName) from $($vm.vRAServer)" "DEBUG"
         Write-Log "  Deployment: $($vm.DeploymentName)" "DEBUG"
         Write-Log "  Status: $($vm.RequestStatus)" "DEBUG"
-        Write-Log "  Expiration: $($vm.ExpirationDate)" "DEBUG"
+        Write-Log "  DeletionDate: $($vm.DeletionDate)" "DEBUG"
         Write-Log "  InitiatedAt: $($vm.InitiatedAt)" "DEBUG"
         
         # Handle both old and new property names
         $vmName = if ($vm.VMName) { $vm.VMName } elseif ($vm.PSObject.Properties['VMName']) { $vm.VMName } else { "N/A" }
         $requestedBy = if ($vm.RequestedBy) { $vm.RequestedBy } elseif ($vm.PSObject.Properties['RequestedBy']) { $vm.RequestedBy } else { "N/A" }
         $initiatedAt = if ($vm.InitiatedAt) { $vm.InitiatedAt } elseif ($vm.PSObject.Properties['InitiatedAt']) { $vm.InitiatedAt } else { "N/A" }
-        $expirationDate = if ($vm.ExpirationDate) { $vm.ExpirationDate } elseif ($vm.PSObject.Properties['ExpirationDate']) { $vm.ExpirationDate } else { "N/A" }
+        $deletionDate = if ($vm.DeletionDate) { $vm.DeletionDate } elseif ($vm.PSObject.Properties['DeletionDate']) { $vm.DeletionDate } else { "N/A" }
         $deploymentName = if ($vm.DeploymentName) { $vm.DeploymentName } elseif ($vm.PSObject.Properties['DeploymentName']) { $vm.DeploymentName } else { "N/A" }
         $requestAction = if ($vm.RequestAction) { $vm.RequestAction } elseif ($vm.PSObject.Properties['RequestAction']) { $vm.RequestAction } else { "N/A" }
         $requestStatus = if ($vm.RequestStatus) { $vm.RequestStatus } elseif ($vm.PSObject.Properties['RequestStatus']) { $vm.RequestStatus } else { "N/A" }
         $source = if ($vm.vRAServer) { $vm.vRAServer } elseif ($vm.PSObject.Properties['vRAServer']) { $vm.vRAServer } else { "N/A" }
         
-        Write-Log "  Adding to report - VMName: $vmName, InitiatedAt: $initiatedAt, ExpirationDate: $expirationDate" "DEBUG"
+        Write-Log "  Adding to report - VMName: $vmName, InitiatedAt: $initiatedAt, DeletionDate: $deletionDate" "DEBUG"
         
         $decommissionVMs += New-Object PSObject -Property @{
             VMName = $vmName
             RequestedBy = $requestedBy
             InitiatedAt = $initiatedAt
-            ExpirationDate = $expirationDate
+            DeletionDate = $deletionDate
             DeploymentName = $deploymentName
             RequestAction = $requestAction
             RequestStatus = $requestStatus
@@ -1015,9 +1026,13 @@ function Send-DeletedVMReport {
         $decommissionTableRows += "<td>$($vm.RequestStatus)</td>"
         $decommissionTableRows += "<td>$($vm.RequestedBy)</td>"
         $decommissionTableRows += "<td>$($vm.InitiatedAt)</td>"
-        $decommissionTableRows += "<td>$($vm.ExpirationDate)</td>"
+        $decommissionTableRows += "<td>$($vm.DeletionDate)</td>"
         $decommissionTableRows += "<td>$($vm.Source)</td>"
         $decommissionTableRows += "</tr>"
+        
+        # Also add to debug file for visibility
+        Add-Content -Path $debugOutputFile -Value "DECOMMISSION EMAIL ENTRY: VM=$($vm.VMName), Deployment=$($vm.DeploymentName), InitiatedAt=$($vm.InitiatedAt), DeletionDate=$($vm.DeletionDate), Source=$($vm.Source)"
+    }
         
         # Also add to debug file for visibility
         Add-Content -Path $debugOutputFile -Value "DECOMMISSION EMAIL ENTRY: VM=$($vm.VMName), Deployment=$($vm.DeploymentName), InitiatedAt=$($vm.InitiatedAt), ExpirationDate=$($vm.ExpirationDate), Source=$($vm.Source)"
