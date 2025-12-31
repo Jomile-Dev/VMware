@@ -1,8 +1,8 @@
 # ============================================================================
 # DELETED VM TRACKER - ARIA OPERATIONS + MULTI-VRA + VCENTER
-# Version 2.2.2 - SEPARATE TIME WINDOWS FOR DELETED vs DECOMMISSION
+# Version 2.2.1 - OPTIMIZED + FIXED DECOMMISSION DETECTION
 # PowerShell 5.1 Compatible
-# Changes: Deleted VMs = 24hrs, Decommissions = ALL active
+# Fixed: Restored working decommission logic, kept optimizations
 # ============================================================================
 
 # ============================================================================
@@ -31,14 +31,13 @@ $smtpTo = @("admin@yourdomain.com")
 $smtpCc = @("manager@yourdomain.com")
 $smtpSubject = "Deleted VM Report - $(Get-Date -Format 'yyyy-MM-dd')"
 
-$daysBack = 1  # Only affects deleted VMs (24 hours)
+$daysBack = 1
 $eventsPageSize = 200
 
 # OPTIMIZATION SETTINGS
 $pageSize = 500  # Increased from 1000 for better balance
 $maxDeploymentsToCheck = 10000  # Configurable limit
-$enableDateFilterForDeleted = $true  # Filter deleted VMs by date
-$enableDateFilterForDecommission = $false  # Get ALL active decommissions
+$enableDateFilter = $true  # Filter by date for efficiency
 
 $debugOutputFile = "DeletedVMs_Debug_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
 
@@ -115,7 +114,7 @@ function Convert-ToSydneyTime {
 }
 
 # ============================================================================
-# DECOMMISSION FUNCTION - ALL ACTIVE (NO TIME LIMIT)
+# OPTIMIZED DECOMMISSION FUNCTION (RESTORED ORIGINAL LOGIC)
 # ============================================================================
 
 function Get-ActiveDeploymentsWithDecommission {
@@ -130,9 +129,10 @@ function Get-ActiveDeploymentsWithDecommission {
     Write-DebugSection "Checking Active Deployments with Decommission Requests: $VraServer"
     
     $decommissionData = New-Object System.Collections.ArrayList
+    $cutoffDate = (Get-Date).AddDays(-$script:daysBack)
     
-    Write-Log "Fetching ALL active deployments with decommission requests (no date filtering)..." "DEBUG"
-    Write-Log "NOTE: This will check ALL active decommissions regardless of date" "WARN"
+    Write-Log "Cutoff date for filtering: $cutoffDate" "DEBUG"
+    Write-Log "Fetching active deployments (optimized with larger pages)..." "DEBUG"
     
     $vraUri = "https://$VraServer/deployment/api/deployments"
     $page = 0
@@ -148,10 +148,32 @@ function Get-ActiveDeploymentsWithDecommission {
             $deployments = if ($vraResponse.content) { $vraResponse.content } else { $vraResponse }
             
             if ($deployments -and $deployments.Count -gt 0) {
-                # NO DATE FILTERING for decommissions - we want ALL active decomms
-                $allDeployments += $deployments
-                $totalFetched += $deployments.Count
-                Write-Log "  Page $page : Found $($deployments.Count) deployments (Total: $totalFetched)" "DEBUG"
+                # OPTIMIZATION: Filter by date if enabled
+                if ($script:enableDateFilter) {
+                    $recentDeployments = $deployments | Where-Object {
+                        try {
+                            if ($_.lastUpdatedAt) {
+                                $updateDate = [DateTime]::Parse($_.lastUpdatedAt)
+                                return ($updateDate -ge $cutoffDate)
+                            }
+                            return $true
+                        }
+                        catch {
+                            return $true
+                        }
+                    }
+                    
+                    if ($recentDeployments.Count -lt $deployments.Count) {
+                        Write-Log "  Filtered out $($deployments.Count - $recentDeployments.Count) old deployments" "DEBUG"
+                    }
+                    $deployments = $recentDeployments
+                }
+                
+                if ($deployments.Count -gt 0) {
+                    $allDeployments += $deployments
+                    $totalFetched += $deployments.Count
+                    Write-Log "  Page $page : Found $($deployments.Count) deployments (Total: $totalFetched)" "DEBUG"
+                }
                 
                 $page++
                 
@@ -200,7 +222,7 @@ function Get-ActiveDeploymentsWithDecommission {
     Write-Log "Deployments containing VMs: $($vmDeployments.Count)" "SUCCESS"
     Write-Log "Deployments filtered out (no VMs): $(($allDeployments.Count - $vmDeployments.Count))" "DEBUG"
     
-    # NOW PROCESS ONLY VM DEPLOYMENTS
+    # NOW PROCESS ONLY VM DEPLOYMENTS (ORIGINAL LOGIC RESTORED)
     foreach ($deployment in $vmDeployments) {
         Write-Log "`n--- Active Deployment: $($deployment.name) (ID: $($deployment.id)) ---" "DEBUG"
         
@@ -414,7 +436,7 @@ function Get-ActiveDeploymentsWithDecommission {
 }
 
 # ============================================================================
-# DELETED VMs FUNCTION - PAST 24 HOURS ONLY
+# OPTIMIZED DELETED VMs FUNCTION
 # ============================================================================
 
 function Get-DeletedVMsFromVRA {
@@ -434,7 +456,7 @@ function Get-DeletedVMsFromVRA {
     $deletedVMData = @()
     $cutoffDate = (Get-Date).AddDays(-$DaysBack)
     
-    Write-Log "Cutoff date for DELETED VMs (past 24 hours): $cutoffDate" "DEBUG"
+    Write-Log "Cutoff date: $cutoffDate" "DEBUG"
     
     $urlVariations = @(
         "https://$VraServer/deployment/api/deployments?deleted=true&apiVersion=2020-08-25&page={0}&size=$eventsPageSize",
@@ -467,7 +489,7 @@ function Get-DeletedVMsFromVRA {
         return $deletedVMData
     }
     
-    # Fetch additional pages with STRICT date filtering for past 24 hours
+    # Fetch additional pages with optimizations
     $page = 1
     $maxPages = 25  # Limit pages for efficiency
     
@@ -478,37 +500,27 @@ function Get-DeletedVMsFromVRA {
             $deployments = if ($response.content) { $response.content } else { $response }
             
             if ($deployments -and $deployments.Count -gt 0) {
-                # STRICT FILTER: Only include deployments deleted in past 24 hours
+                # OPTIMIZATION: Filter by date immediately
                 $recentDeployments = $deployments | Where-Object {
                     try {
-                        if ($_.lastUpdatedAt) {
-                            $updateDate = [DateTime]::Parse($_.lastUpdatedAt)
-                            $withinWindow = $updateDate -ge $cutoffDate
-                            if ($withinWindow) {
-                                Write-Log "    Including: $($_.name) - Updated: $updateDate" "DEBUG"
-                            }
-                            return $withinWindow
-                        }
-                        else {
-                            Write-Log "    Excluding: $($_.name) - No lastUpdatedAt" "DEBUG"
-                            return $false
-                        }
+                        $updateDate = [DateTime]$_.lastUpdatedAt
+                        $updateDate -ge $cutoffDate
                     }
                     catch {
-                        Write-Log "    Excluding: $($_.name) - Error parsing date" "DEBUG"
-                        return $false
+                        $true
                     }
                 }
                 
                 if ($recentDeployments.Count -gt 0) {
                     $allDeletedDeployments += $recentDeployments
-                    Write-Log "  Page $page : Found $($recentDeployments.Count) deployments within 24h window" "DEBUG"
-                    $page++
+                    Write-Log "  Page $page : Found $($recentDeployments.Count) recent deployments" "DEBUG"
                 }
                 else {
-                    Write-Log "  Page $page : No deployments within 24h window, stopping pagination." "DEBUG"
+                    Write-Log "  Page $page : No recent deployments, stopping." "DEBUG"
                     break
                 }
+                
+                $page++
             }
             else {
                 break
@@ -519,39 +531,20 @@ function Get-DeletedVMsFromVRA {
             break
         }
         
-        if ($page -ge $maxPages) { 
-            Write-Log "  Reached max pages limit" "WARN"
-            break 
-        }
+        if ($page -ge $maxPages) { break }
         
     } while ($true)
     
-    Write-Log "Total deleted deployments retrieved (past 24 hours): $($allDeletedDeployments.Count)" "SUCCESS"
+    Write-Log "Total deleted deployments retrieved: $($allDeletedDeployments.Count)" "SUCCESS"
     
-    # STRICT FILTER: Only VM deployments deleted within 24 hours
+    # Filter for VM deployments
     $vmDeployments = $allDeletedDeployments | Where-Object {
-        $isVM = $_.name -match "VM|Virtual|Server|Machine"
-        $withinTime = $true
-        
-        if ($_.lastUpdatedAt) {
-            try {
-                $updateDate = [DateTime]::Parse($_.lastUpdatedAt)
-                $withinTime = $updateDate -ge $cutoffDate
-            }
-            catch {
-                $withinTime = $false
-            }
-        }
-        else {
-            $withinTime = $false
-        }
-        
-        return ($isVM -and $withinTime)
+        $_.name -match "VM|Virtual|Server|Machine"
     }
     
-    Write-Log "VM-related deleted deployments (within 24h): $($vmDeployments.Count)" "SUCCESS"
+    Write-Log "VM-related deleted deployments: $($vmDeployments.Count)" "SUCCESS"
     
-    # Process each deployment
+    # Process each deployment (ORIGINAL LOGIC)
     foreach ($deployment in $vmDeployments) {
         try {
             $requestsUri = "https://$VraServer/deployment/api/deployments/$($deployment.id)/requests?apiVersion=2020-08-25&deleted=true"
@@ -623,23 +616,6 @@ function Get-DeletedVMsFromVRA {
                             $existingVM = $deletedVMData | Where-Object { $_.VMName.ToLower() -eq $vmKey }
                             
                             if (-not $existingVM) {
-                                # FINAL CHECK: Verify deletion date is within 24 hours
-                                $deletionDate = $null
-                                try {
-                                    $deletionDate = [DateTime]::Parse($deployment.lastUpdatedAt)
-                                }
-                                catch {
-                                    Write-Log "    Skipping $serverName - Cannot parse deletion date" "WARN"
-                                    continue
-                                }
-                                
-                                if ($deletionDate -lt $cutoffDate) {
-                                    Write-Log "    Skipping $serverName - Deleted on $deletionDate (before cutoff: $cutoffDate)" "WARN"
-                                    continue
-                                }
-                                
-                                Write-Log "    Adding $serverName - Deleted: $deletionDate (within 24h)" "SUCCESS"
-                                
                                 $vraServerShort = ($VraServer -split '\.')[0]
                                 
                                 $deletedVMData += New-Object PSObject -Property @{
@@ -674,12 +650,12 @@ function Get-DeletedVMsFromVRA {
         }
     }
     
-    Write-Log "Extracted $($deletedVMData.Count) deleted VMs (past 24 hours)" "SUCCESS"
+    Write-Log "Extracted $($deletedVMData.Count) deleted VMs" "SUCCESS"
     return $deletedVMData
 }
 
 # ============================================================================
-# VCENTER FUNCTION - PAST 24 HOURS
+# VCENTER FUNCTION (UNCHANGED)
 # ============================================================================
 
 function Get-DeletedVMsFromVCenter {
@@ -704,13 +680,12 @@ function Get-DeletedVMsFromVCenter {
         Write-Log "Connected successfully" "SUCCESS"
         
         $cutoffDate = (Get-Date).AddDays(-$DaysBack)
-        Write-Log "Looking for deletions since: $cutoffDate" "DEBUG"
         
         $events = Get-VIEvent -Server $VCenter -Start $cutoffDate -MaxSamples 50000 | Where-Object {
             $_.GetType().Name -in @('VmRemovedEvent', 'VmBeingDeletedEvent', 'VmUnregisteredEvent')
         }
         
-        Write-Log "Found $($events.Count) deletion events in past 24 hours" "SUCCESS"
+        Write-Log "Found $($events.Count) deletion events" "SUCCESS"
         
         foreach ($event in $events) {
             $vCenterShort = ($VCenter -split '\.')[0]
@@ -734,10 +709,6 @@ function Get-DeletedVMsFromVCenter {
     
     return $deletedVMs
 }
-
-# ============================================================================
-# EMAIL REPORT FUNCTION
-# ============================================================================
 
 function Send-DeletedVMReport {
     param(
@@ -796,38 +767,14 @@ function Send-DeletedVMReport {
     
     foreach ($vm in $VCenterData) {
         if (-not $vraVMNames.ContainsKey($vm.VMName.ToLower())) {
-            # VERIFY: vCenter deletion is within 24 hours
-            $deletionWithin24h = $false
-            try {
-                if ($vm.DeletedAt -and $vm.DeletedAt -ne "N/A") {
-                    # Parse Sydney time back to compare
-                    $deletedDate = [DateTime]::Parse($vm.DeletedAt)
-                    $now = Get-Date
-                    $hoursDiff = ($now - $deletedDate).TotalHours
-                    
-                    if ($hoursDiff -le 24) {
-                        $deletionWithin24h = $true
-                        Write-Log "vCenter VM $($vm.VMName) deleted $([Math]::Round($hoursDiff, 1))h ago - INCLUDED" "DEBUG"
-                    }
-                    else {
-                        Write-Log "vCenter VM $($vm.VMName) deleted $([Math]::Round($hoursDiff, 1))h ago - EXCLUDED" "WARN"
-                    }
-                }
-            }
-            catch {
-                Write-Log "vCenter VM $($vm.VMName) - Error parsing date, EXCLUDING" "WARN"
-            }
-            
-            if ($deletionWithin24h) {
-                $deletedVMs += New-Object PSObject -Property @{
-                    VMName = $vm.VMName
-                    RequestedBy = $vm.DeletedBy
-                    DeletedAt = $vm.DeletedAt
-                    DeploymentName = "N/A"
-                    RequestAction = $vm.EventType
-                    RequestStatus = "Deleted"
-                    Source = $vm.vCenter
-                }
+            $deletedVMs += New-Object PSObject -Property @{
+                VMName = $vm.VMName
+                RequestedBy = $vm.DeletedBy
+                DeletedAt = $vm.DeletedAt
+                DeploymentName = "N/A"
+                RequestAction = $vm.EventType
+                RequestStatus = "Deleted"
+                Source = $vm.vCenter
             }
         }
     }
@@ -870,26 +817,18 @@ td { border: 1px solid #ddd; padding: 10px; }
 </head>
 <body>
 <h1>VM Deletion and Decommission Report</h1>
-<h2>Deleted Virtual Machines (Past 24 Hours)</h2>
-"@
-
-    if($deletedVMs.Count -gt 0) {
-        $htmlBody += "<table><thead><tr><th>VM Name</th><th>Deployment Name</th><th>Action</th><th>Status</th><th>Requested/Deleted By</th><th>Deleted At</th><th>Source</th></tr></thead><tbody>$deletedTableRows</tbody></table>"
-    } else {
-        $htmlBody += "<p class='no-data'>No deleted VMs found in the past 24 hours</p>"
-    }
-
-    $htmlBody += @"
-<h2>Decommissions In Progress (All Active)</h2>
-"@
-
-    if($decommissionVMs.Count -gt 0) {
-        $htmlBody += "<table><thead><tr style='background-color: #ff9800;'><th>VM Name</th><th>Deployment Name</th><th>Request Action</th><th>Request Status</th><th>Requested By</th><th>Initiated At</th><th>Expiration Date</th><th>Source</th></tr></thead><tbody>$decommissionTableRows</tbody></table>"
-    } else {
-        $htmlBody += "<p class='no-data'>No decommissions currently scheduled</p>"
-    }
-
-    $htmlBody += @"
+<h2>Deleted Virtual Machines</h2>
+$(if($deletedVMs.Count -gt 0) {
+"<table><thead><tr><th>VM Name</th><th>Deployment Name</th><th>Action</th><th>Status</th><th>Requested/Deleted By</th><th>Deleted At</th><th>Source</th></tr></thead><tbody>$deletedTableRows</tbody></table>"
+} else {
+"<p class='no-data'>No deleted VMs found in this time period</p>"
+})
+<h2>Decommissions In Progress</h2>
+$(if($decommissionVMs.Count -gt 0) {
+"<table><thead><tr style='background-color: #ff9800;'><th>VM Name</th><th>Deployment Name</th><th>Request Action</th><th>Request Status</th><th>Requested By</th><th>Initiated At</th><th>Expiration Date</th><th>Source</th></tr></thead><tbody>$decommissionTableRows</tbody></table>"
+} else {
+"<p class='no-data'>No decommissions currently scheduled</p>"
+})
 </body>
 </html>
 "@
@@ -912,9 +851,8 @@ td { border: 1px solid #ddd; padding: 10px; }
 # MAIN SCRIPT
 # ============================================================================
 
-Write-DebugSection "DELETED VM TRACKER - STARTED (OPTIMIZED v2.2.2)"
-Write-Log "Script Version: 2.2.2 - Separate time windows for deleted vs decommission" "SUCCESS"
-Write-Log "Deleted VMs: Past 24 hours | Decommissions: ALL active (no time limit)" "SUCCESS"
+Write-DebugSection "DELETED VM TRACKER - STARTED (OPTIMIZED v2.2.1)"
+Write-Log "Script Version: 2.2.1 - Optimized + Fixed" "SUCCESS"
 Write-Log "Max Deployments: $maxDeploymentsToCheck, Page Size: $pageSize" "SUCCESS"
 
 try {
@@ -934,8 +872,8 @@ if (-not $credential) { exit }
 $username = $credential.UserName
 $password = $credential.GetNetworkCredential().Password
 
-# VRA DECOMMISSION - ALL ACTIVE (NO TIME LIMIT)
-Write-DebugSection "vRA - PROCESSING DECOMMISSION REQUESTS (ALL ACTIVE)"
+# VRA DECOMMISSION
+Write-DebugSection "vRA - PROCESSING DECOMMISSION REQUESTS"
 $allVraDecommissionVMs = @()
 
 foreach ($vraServer in $vraServers) {
@@ -953,10 +891,10 @@ foreach ($vraServer in $vraServers) {
     }
 }
 
-Write-Log "`nvRA Decommission Total (ALL active): $($allVraDecommissionVMs.Count) VMs" "SUCCESS"
+Write-Log "`nvRA Decommission Total: $($allVraDecommissionVMs.Count) VMs" "SUCCESS"
 
-# VRA DELETED - PAST 24 HOURS ONLY
-Write-DebugSection "vRA - PROCESSING DELETED DEPLOYMENTS (PAST 24 HOURS)"
+# VRA DELETED
+Write-DebugSection "vRA - PROCESSING DELETED DEPLOYMENTS"
 $allVraDeletedVMs = @()
 
 foreach ($vraServer in $vraServers) {
@@ -974,10 +912,10 @@ foreach ($vraServer in $vraServers) {
     }
 }
 
-Write-Log "`nvRA Deleted Total (past 24 hours): $($allVraDeletedVMs.Count) VMs" "SUCCESS"
+Write-Log "`nvRA Deleted Total: $($allVraDeletedVMs.Count) VMs" "SUCCESS"
 
-# VCENTER - PAST 24 HOURS
-Write-DebugSection "vCENTER - CHECKING DIRECT VM DELETIONS (PAST 24 HOURS)"
+# VCENTER
+Write-DebugSection "vCENTER - CHECKING DIRECT VM DELETIONS"
 $allVCenterDeletedVMs = @()
 
 foreach ($vCenter in $vCenters) {
@@ -985,7 +923,7 @@ foreach ($vCenter in $vCenters) {
     $allVCenterDeletedVMs += $deletedVMs
 }
 
-Write-Log "`nvCenter Total (past 24 hours): $($allVCenterDeletedVMs.Count) VMs" "SUCCESS"
+Write-Log "`nvCenter Total: $($allVCenterDeletedVMs.Count) VMs" "SUCCESS"
 
 # SUMMARY
 Write-DebugSection "SUMMARY AND REPORTING"
@@ -993,21 +931,7 @@ $vraVCenterTotal = $allVraDeletedVMs.Count + $allVraDecommissionVMs.Count + $all
 
 if ($vraVCenterTotal -eq 0) {
     Write-Log "No deleted or decommissioned VMs found." "WARN"
-    $noVMHtml = @"
-<html>
-<body>
-<div style='background-color:#e8f5e9;padding:20px;border-left:4px solid #4caf50;'>
-<h2 style='color:#2e7d32;'>No VM Deletions Detected</h2>
-<p>No virtual machines were deleted in the past 24 hours and no active decommissions are in progress.</p>
-<p><strong>Scope:</strong></p>
-<ul>
-<li>Deleted VMs: Past 24 hours</li>
-<li>Decommissions: All active (no time limit)</li>
-</ul>
-</div>
-</body>
-</html>
-"@
+    $noVMHtml = "<html><body><div style='background-color:#e8f5e9;padding:20px;border-left:4px solid #4caf50;'><h2 style='color:#2e7d32;'>No VM Deletions Detected</h2><p>No virtual machines were deleted or decommissioned in the last $daysBack day(s).</p></div></body></html>"
     try {
         if ($smtpCc -and $smtpCc.Count -gt 0) {
             Send-MailMessage -To $smtpTo -From $smtpFrom -Subject "No VM Deletions - $(Get-Date -Format 'yyyy-MM-dd')" -Body $noVMHtml -BodyAsHtml -SmtpServer $smtpServer -Port $smtpPort -UseSsl -Cc $smtpCc
@@ -1024,8 +948,3 @@ else {
 
 Write-DebugSection "SCRIPT COMPLETED"
 Write-Log "Debug log: $debugOutputFile" "SUCCESS"
-Write-Log "" "SUCCESS"
-Write-Log "SUMMARY:" "SUCCESS"
-Write-Log "  - Deleted VMs (24h): $($allVraDeletedVMs.Count + $allVCenterDeletedVMs.Count)" "SUCCESS"
-Write-Log "  - Active Decommissions (all): $($allVraDecommissionVMs.Count)" "SUCCESS"
-Write-Log "  - Total: $vraVCenterTotal" "SUCCESS"
