@@ -1,7 +1,7 @@
 # ============================================================================
 # DELETED VM TRACKER - ARIA OPERATIONS + MULTI-VRA + VCENTER
-# Version 2.1.3 - PowerShell 5.1 Compatible
-# Fixed: Consistent "Cloud Resource Name:" pattern extraction
+# Version 2.1.4 - Enhanced Debug for Timestamp Detection
+# Added: Comprehensive timestamp debugging to identify correct time fields
 # ============================================================================
 
 # ============================================================================
@@ -198,6 +198,14 @@ function Get-ActiveDeploymentsWithDecommission {
         Write-Log "  Created By: $($deployment.createdBy)" "DEBUG"
         Write-Log "  Project: $($deployment.projectId)" "DEBUG"
         
+        # DEBUG: Dump ALL deployment properties
+        Write-Log "  ========== FULL DEPLOYMENT OBJECT ==========" "WARN"
+        foreach ($prop in $deployment.PSObject.Properties) {
+            $propValue = if ($prop.Value) { $prop.Value } else { "<NULL>" }
+            Write-Log "  DEPLOYMENT.$($prop.Name) = $propValue" "WARN"
+        }
+        Write-Log "  ============================================" "WARN"
+        
         if ($deployment.resources) {
             Write-Log "  Resources in deployment:" "DEBUG"
             foreach ($resource in $deployment.resources) {
@@ -223,26 +231,25 @@ function Get-ActiveDeploymentsWithDecommission {
                 Write-Log "    ║ Action ID: $($request.actionId)" "DEBUG"
                 Write-Log "    ║ Status: $($request.status)" "DEBUG"
                 Write-Log "    ║ Requested By: $($request.requestedBy)" "DEBUG"
-                Write-Log "    ║ Initiated At (RAW UTC): $($request.initiatedAt)" "DEBUG"
-                Write-Log "    ║ Initiated At (Sydney Time): $(if ($request.initiatedAt) { Convert-ToSydneyTime -DateTimeString $request.initiatedAt } else { 'N/A' })" "WARN"
-                Write-Log "    ║ Completed At (RAW UTC): $($request.completedAt)" "DEBUG"
-                Write-Log "    ║ Completed At (Sydney Time): $(if ($request.completedAt) { Convert-ToSydneyTime -DateTimeString $request.completedAt } else { 'N/A' })" "DEBUG"
+                
+                # DEBUG: Dump ALL request properties
+                Write-Log "    ║ ========== FULL REQUEST OBJECT ==========" "WARN"
+                foreach ($prop in $request.PSObject.Properties) {
+                    $propValue = if ($prop.Value) { $prop.Value } else { "<NULL>" }
+                    Write-Log "    ║ REQUEST.$($prop.Name) = $propValue" "WARN"
+                }
+                Write-Log "    ║ ==========================================" "WARN"
                 
                 $isDecommission = $false
                 $matchedBy = "None"
                 $expirationDate = $null
                 
                 Write-Log "    ║ Checking if this is a decommission request..." "DEBUG"
-                Write-Log "    ║   Request Name: '$($request.name)'" "DEBUG"
-                Write-Log "    ║   Action ID: '$($request.actionId)'" "DEBUG"
                 
                 $nameMatch = $false
                 if ($request.name -match "Initiate server decommission|decommission") {
                     $nameMatch = $true
                     Write-Log "    ║   ✓ Name matches decommission pattern" "WARN"
-                }
-                else {
-                    Write-Log "    ║   ✗ Name does NOT match decommission pattern" "DEBUG"
                 }
                 
                 $actionMatch = $false
@@ -250,40 +257,23 @@ function Get-ActiveDeploymentsWithDecommission {
                     $actionMatch = $true
                     Write-Log "    ║   ✓ Action ID matches decommission pattern" "WARN"
                 }
-                else {
-                    Write-Log "    ║   ✗ Action ID does NOT match decommission pattern" "DEBUG"
-                }
                 
                 if ($nameMatch -or $actionMatch) {
                     Write-Log "    ║   >>> Pattern matched! This is a decommission request <<<" "WARN"
                     $isDecommission = $true
                     $matchedBy = if ($nameMatch) { "Request Name" } else { "Action ID" }
                     
-                    Write-Log "    ║" "WARN"
-                    Write-Log "    ║   ╔════════════════ DECOMMISSION TIMING INFO ════════════════╗" "WARN"
-                    Write-Log "    ║   ║ Request Initiated At (UTC): $($request.initiatedAt)" "WARN"
-                    Write-Log "    ║   ║ Request Initiated At (Sydney): $(if ($request.initiatedAt) { Convert-ToSydneyTime -DateTimeString $request.initiatedAt } else { 'N/A' })" "WARN"
-                    
                     if ($deployment.leaseExpireAt) {
                         $expirationDate = $deployment.leaseExpireAt
-                        Write-Log "    ║   ║ Deployment Expires At (UTC): $expirationDate" "WARN"
-                        Write-Log "    ║   ║ Deployment Expires At (Sydney): $(Convert-ToSydneyTime -DateTimeString $expirationDate)" "WARN"
                     }
                     else {
-                        Write-Log "    ║   ║ WARNING: No lease expiration date found" "WARN"
                         $expirationDate = "N/A"
                     }
-                    Write-Log "    ║   ╚═══════════════════════════════════════════════════════════╝" "WARN"
-                    Write-Log "    ║" "WARN"
-                }
-                else {
-                    Write-Log "    ║   >>> NOT a decommission request (no pattern match)" "DEBUG"
                 }
                 
                 if ($isDecommission) {
-                    Write-Log "    ║   >>> DECOMMISSION CONFIRMED - Extracting VM details from deployment resources <<<" "WARN"
+                    Write-Log "    ║   >>> DECOMMISSION CONFIRMED - Extracting VM details <<<" "WARN"
                     
-                    # FIRST: Try to get VM names from deployment resources (more reliable)
                     $foundVMs = @{}
                     
                     if ($deployment.resources) {
@@ -291,17 +281,13 @@ function Get-ActiveDeploymentsWithDecommission {
                         foreach ($resource in $deployment.resources) {
                             if ($resource.type -eq "Cloud.vSphere.Machine") {
                                 Write-Log "    ║   >>> Found vSphere Machine resource <<<" "DEBUG"
-                                Write-Log "    ║   >>> Resource ID: $($resource.id) <<<" "DEBUG"
-                                Write-Log "    ║   >>> Resource Name: $($resource.name) <<<" "DEBUG"
                                 
                                 $hostname = $null
                                 
-                                # Try to get from properties.resourceName
                                 if ($resource.properties -and $resource.properties.resourceName) {
                                     $hostname = $resource.properties.resourceName
                                     Write-Log "    ║   >>> Found hostname from properties.resourceName: $hostname <<<" "SUCCESS"
                                 }
-                                # Try resource.name if not generic
                                 elseif ($resource.name -and $resource.name -notmatch "Cloud_vSphere_Machine_\d+") {
                                     $hostname = $resource.name
                                     Write-Log "    ║   >>> Found hostname from resource.name: $hostname <<<" "SUCCESS"
@@ -309,13 +295,11 @@ function Get-ActiveDeploymentsWithDecommission {
                                 
                                 if ($hostname -and -not $foundVMs.ContainsKey($hostname.ToLower())) {
                                     $foundVMs[$hostname.ToLower()] = $hostname
-                                    Write-Log "    ║   >>> Added VM to decommission list: $hostname <<<" "SUCCESS"
                                 }
                             }
                         }
                     }
                     
-                    # SECOND: If no VMs found in resources, fall back to events
                     if ($foundVMs.Count -eq 0) {
                         Write-Log "    ║   >>> No VMs found in resources, fetching events as fallback <<<" "WARN"
                         
@@ -351,20 +335,24 @@ function Get-ActiveDeploymentsWithDecommission {
                     }
                     else {
                         Write-Log "    ║   >>> Found $($foundVMs.Count) VMs from deployment resources <<<" "SUCCESS"
-                        $allEvents = @() # Skip event processing if we found VMs
+                        $allEvents = @()
                     }
                     
-                    # Process events (only if we didn't find VMs in resources)
                     foreach ($event in $allEvents) {
                         if ($event.resourceType -eq "Cloud.vSphere.Machine") {
                             Write-Log "    ║" "DEBUG"
                             Write-Log "    ║   >>> Processing Event for vSphere Machine (fallback) <<<" "DEBUG"
-                            Write-Log "    ║   >>> Event Type: $($event.eventType) <<<" "DEBUG"
-                            Write-Log "    ║   >>> Resource Name: $($event.resourceName) <<<" "DEBUG"
+                            
+                            # *** EXTENSIVE DEBUG: Dump ALL event properties ***
+                            Write-Log "    ║   >>> ========== FULL DECOMMISSION EVENT OBJECT DUMP ==========" "WARN"
+                            foreach ($prop in $event.PSObject.Properties) {
+                                $propValue = if ($prop.Value) { $prop.Value } else { "<NULL>" }
+                                Write-Log "    ║   >>> EVENT.$($prop.Name) = $propValue" "WARN"
+                            }
+                            Write-Log "    ║   >>> ============================================================" "WARN"
                             
                             $hostname = $null
                             
-                            # PRIORITY 1: Parse event details for Cloud Resource Name
                             if ($event.details) {
                                 $detailsText = if ($event.details -is [string]) { 
                                     $event.details 
@@ -372,81 +360,71 @@ function Get-ActiveDeploymentsWithDecommission {
                                     ($event.details | ConvertTo-Json -Compress -Depth 5)
                                 }
                                 
-                                Write-Log "    ║   >>> Event Details: $($detailsText.Substring(0, [Math]::Min(200, $detailsText.Length)))... <<<" "DEBUG"
-                                
-                                # Look for "Cloud Resource Name:" pattern (PRIORITY 1)
                                 if ($detailsText -match "Cloud Resource Name:\s*([^\s,;]+)") {
                                     $hostname = $matches[1].Trim()
                                     Write-Log "    ║   >>> Found hostname via 'Cloud Resource Name:' pattern: $hostname <<<" "SUCCESS"
                                 }
-                                # Look for JSON cloudResourceName property
                                 elseif ($detailsText -match '"cloudResourceName"\s*:\s*"([^"]+)"') {
                                     $potentialName = $matches[1].Trim()
-                                    # Skip generic Cloud_vSphere_Machine_ IDs
                                     if ($potentialName -notmatch "Cloud_vSphere_Machine_\d+") {
                                         $hostname = $potentialName
                                         Write-Log "    ║   >>> Found hostname via 'cloudResourceName' JSON: $hostname <<<" "SUCCESS"
                                     }
                                 }
-                                # Look for hostname in details
                                 elseif ($detailsText -match '"hostname"\s*:\s*"([^"]+)"') {
                                     $hostname = $matches[1].Trim()
                                     Write-Log "    ║   >>> Found hostname via 'hostname' JSON: $hostname <<<" "SUCCESS"
                                 }
-                                # Look for address in details
                                 elseif ($detailsText -match '"address"\s*:\s*"([^"]+)"') {
                                     $hostname = $matches[1].Trim()
                                     Write-Log "    ║   >>> Found hostname via 'address' JSON: $hostname <<<" "SUCCESS"
                                 }
                             }
                             
-                            # PRIORITY 2: Use resourceName from event if it's not a generic ID
                             if (-not $hostname -and $event.resourceName) {
                                 if ($event.resourceName -notmatch "Cloud_vSphere_Machine_\d+") {
                                     $hostname = $event.resourceName
                                     Write-Log "    ║   >>> Hostname from event.resourceName: $hostname <<<" "SUCCESS"
                                 }
-                                else {
-                                    Write-Log "    ║   >>> Skipping generic resourceName: $($event.resourceName) <<<" "DEBUG"
-                                }
                             }
                             
-                            if (-not $hostname) {
-                                Write-Log "    ║   >>> WARNING: Could not extract hostname from event! <<<" "WARN"
-                                Write-Log "    ║   >>> Event dump: $($event | ConvertTo-Json -Depth 2 -Compress) <<<" "DEBUG"
-                            }
-                            
-                            # Store unique VMs (avoid duplicates from multiple events)
                             if ($hostname -and -not $foundVMs.ContainsKey($hostname.ToLower())) {
                                 $foundVMs[$hostname.ToLower()] = $hostname
+                                
+                                # *** EXTENSIVE TIMESTAMP DEBUG ***
+                                Write-Log "    ║   >>> ========== TIMESTAMP DEBUG FOR DECOMMISSION VM: $hostname ==========" "WARN"
+                                Write-Log "    ║   >>> event.timestamp = $($event.timestamp)" "WARN"
+                                Write-Log "    ║   >>> event.createdTime = $($event.createdTime)" "WARN"
+                                Write-Log "    ║   >>> event.lastUpdateTime = $($event.lastUpdateTime)" "WARN"
+                                Write-Log "    ║   >>> event.startTime = $($event.startTime)" "WARN"
+                                Write-Log "    ║   >>> event.endTime = $($event.endTime)" "WARN"
+                                Write-Log "    ║   >>> event.eventTimestamp = $($event.eventTimestamp)" "WARN"
+                                Write-Log "    ║   >>> event.loggedAt = $($event.loggedAt)" "WARN"
+                                Write-Log "    ║   >>> event.occurred = $($event.occurred)" "WARN"
+                                Write-Log "    ║   >>> event.createDate = $($event.createDate)" "WARN"
+                                Write-Log "    ║   >>> event.date = $($event.date)" "WARN"
+                                Write-Log "    ║   >>> deployment.lastUpdatedAt = $($deployment.lastUpdatedAt)" "WARN"
+                                Write-Log "    ║   >>> deployment.leaseExpireAt = $($deployment.leaseExpireAt)" "WARN"
+                                Write-Log "    ║   >>> deployment.createdAt = $($deployment.createdAt)" "WARN"
+                                Write-Log "    ║   >>> request.initiatedAt = $($request.initiatedAt)" "WARN"
+                                Write-Log "    ║   >>> request.completedAt = $($request.completedAt)" "WARN"
+                                Write-Log "    ║   >>> request.createdAt = $($request.createdAt)" "WARN"
+                                Write-Log "    ║   >>> request.lastUpdated = $($request.lastUpdated)" "WARN"
+                                Write-Log "    ║   >>> ============================================================================" "WARN"
                             }
                         }
                     }
                     
-                    # Now create the decommission objects for all found VMs
                     Write-Log "    ║   >>> Total unique VMs found: $($foundVMs.Count) <<<" "SUCCESS"
                     
                     foreach ($vmEntry in $foundVMs.GetEnumerator()) {
                         $hostname = $vmEntry.Value
                         
                         Write-Log "      >>> VM in Decommission: $hostname <<<" "WARN"
-                        Write-Log "      >>> Matched decommission by: $matchedBy <<<" "DEBUG"
-                        Write-Log "      >>> Deployment Name: $($deployment.name) <<<" "DEBUG"
-                        Write-Log "      >>> Deployment Status: $($deployment.status) <<<" "DEBUG"
-                        Write-Log "      >>> Request Action: $($request.name) <<<" "DEBUG"
-                        Write-Log "      >>> Requested By: $($request.requestedBy) <<<" "DEBUG"
-                        Write-Log "      >>>" "WARN"
-                        Write-Log "      >>> ⏰ TIMING INFORMATION ⏰" "WARN"
-                        Write-Log "      >>> Request Initiated At (RAW): $($request.initiatedAt)" "WARN"
-                        Write-Log "      >>> Request Initiated At (Sydney): $(if ($request.initiatedAt) { Convert-ToSydneyTime -DateTimeString $request.initiatedAt } else { 'N/A' })" "WARN"
-                        Write-Log "      >>> Deployment Expires At (RAW): $expirationDate" "WARN"
-                        Write-Log "      >>> Deployment Expires At (Sydney): $(if ($expirationDate -and $expirationDate -ne 'N/A') { Convert-ToSydneyTime -DateTimeString $expirationDate } else { 'N/A' })" "WARN"
-                        Write-Log "      >>>" "WARN"
                         
                         $vraServerShort = ($VraServer -split '\.')[0]
                         $catalogItem = if ($deployment.inputs._catalogItemName) { $deployment.inputs._catalogItemName } else { "N/A" }
                         
-                        # Convert times to Sydney timezone
                         $initiatedAtValue = if ($request.initiatedAt) { 
                             Convert-ToSydneyTime -DateTimeString $request.initiatedAt
                         } else { 
@@ -458,10 +436,6 @@ function Get-ActiveDeploymentsWithDecommission {
                         } else {
                             "N/A"
                         }
-                        
-                        Write-Log "      >>> Creating decommission object... <<<" "DEBUG"
-                        Write-Log "      >>> RAW initiatedAt from request: '$($request.initiatedAt)'" "DEBUG"
-                        Write-Log "      >>> RAW expirationDate: '$expirationDate'" "DEBUG"
                         
                         $vmObject = New-Object PSObject -Property @{
                             VMName = $hostname
@@ -483,29 +457,14 @@ function Get-ActiveDeploymentsWithDecommission {
                             IsStillActive = $true
                         }
                         
-                        Write-Log "      >>> Object created. Properties: <<<" "DEBUG"
-                        Write-Log "          VMName: $($vmObject.VMName)" "SUCCESS"
-                        Write-Log "          DeploymentName: $($vmObject.DeploymentName)" "DEBUG"
-                        Write-Log "          RequestAction: $($vmObject.RequestAction)" "DEBUG"
-                        Write-Log "          RequestStatus: $($vmObject.RequestStatus)" "DEBUG"
-                        Write-Log "          InitiatedAt (CONVERTED): $($vmObject.InitiatedAt)" "WARN"
-                        Write-Log "          ExpirationDate (CONVERTED): $($vmObject.ExpirationDate)" "WARN"
-                        Write-Log "          Source: $($vmObject.Source)" "DEBUG"
-                        Write-Log "          vRAServer: $($vmObject.vRAServer)" "DEBUG"
-                        
                         [void]$decommissionData.Add($vmObject)
-                        
-                        Write-Log "      >>> Added to decommission list successfully. Total count: $($decommissionData.Count) <<<" "SUCCESS"
                     }
-                    
-                    Write-Log "    ║   >>> Processing complete for this decommission request <<<" "SUCCESS"
                 }
                 Write-Log "    ╚══════════════════════════════════════════════════════════════" "DEBUG"
             }
         }
         catch {
             Write-Log "  Error processing deployment requests: $($_.Exception.Message)" "ERROR"
-            Write-Log "  Full error: $($_.Exception)" "ERROR"
         }
     }
     
@@ -514,17 +473,6 @@ function Get-ActiveDeploymentsWithDecommission {
     Write-Log "╠════════════════════════════════════════════════════════════════════════════════" "SUCCESS"
     Write-Log "║ Total Active Deployments Checked: $($allDeployments.Count)" "SUCCESS"
     Write-Log "║ VMs with Decommission Requests Found: $($decommissionData.Count)" "SUCCESS"
-    if ($decommissionData.Count -gt 0) {
-        Write-Log "║" "SUCCESS"
-        Write-Log "║ VMs Found in Decommission:" "SUCCESS"
-        foreach ($vm in $decommissionData) {
-            Write-Log "║   - $($vm.VMName) (Deployment: $($vm.DeploymentName))" "SUCCESS"
-            Write-Log "║     Status: $($vm.RequestStatus), Expires: $($vm.ExpirationDate)" "SUCCESS"
-        }
-    }
-    else {
-        Write-Log "║ WARNING: No VMs with decommission requests found!" "WARN"
-    }
     Write-Log "╚════════════════════════════════════════════════════════════════════════════════" "SUCCESS"
     
     return @($decommissionData)
@@ -548,7 +496,6 @@ function Get-DeletedVMsFromVRA {
     $cutoffDate = (Get-Date).AddDays(-$DaysBack)
     
     Write-Log "Cutoff date: $cutoffDate" "DEBUG"
-    Write-Log "Searching for deleted deployments..." "DEBUG"
     
     $urlVariations = @(
         "https://$VraServer/deployment/api/deployments?deleted=true&apiVersion=2020-08-25&page={0}&size=$eventsPageSize",
@@ -635,9 +582,14 @@ function Get-DeletedVMsFromVRA {
     
     foreach ($deployment in $filteredDeployments) {
         Write-Log "`n--- Deleted Deployment: $($deployment.name) (ID: $($deployment.id)) ---" "DEBUG"
-        Write-Log "  Status: $($deployment.status)" "DEBUG"
-        Write-Log "  Last Updated: $($deployment.lastUpdatedAt)" "DEBUG"
-        Write-Log "  Owned By: $($deployment.ownedBy)" "DEBUG"
+        
+        # DEBUG: Dump ALL deleted deployment properties
+        Write-Log "  ========== FULL DELETED DEPLOYMENT OBJECT ==========" "WARN"
+        foreach ($prop in $deployment.PSObject.Properties) {
+            $propValue = if ($prop.Value) { $prop.Value } else { "<NULL>" }
+            Write-Log "  DELETED_DEPLOYMENT.$($prop.Name) = $propValue" "WARN"
+        }
+        Write-Log "  ====================================================" "WARN"
         
         try {
             $requestsUri = "https://$VraServer/deployment/api/deployments/$($deployment.id)/requests?apiVersion=2020-08-25&deleted=true"
@@ -652,7 +604,14 @@ function Get-DeletedVMsFromVRA {
                 Write-Log "    ╔══════════════════════════════════════════════════════════════" "DEBUG"
                 Write-Log "    ║ Request ID: $($request.id)" "DEBUG"
                 Write-Log "    ║ Action: $($request.name)" "DEBUG"
-                Write-Log "    ║ Status: $($request.status)" "DEBUG"
+                
+                # DEBUG: Dump ALL deleted request properties
+                Write-Log "    ║ ========== FULL DELETED REQUEST OBJECT ==========" "WARN"
+                foreach ($prop in $request.PSObject.Properties) {
+                    $propValue = if ($prop.Value) { $prop.Value } else { "<NULL>" }
+                    Write-Log "    ║ DELETED_REQUEST.$($prop.Name) = $propValue" "WARN"
+                }
+                Write-Log "    ║ ==================================================" "WARN"
                 
                 $eventPage = 0
                 $allEvents = @()
@@ -688,6 +647,15 @@ function Get-DeletedVMsFromVRA {
                 foreach ($event in $allEvents) {
                     if ($event.resourceType -eq "Cloud.vSphere.Machine") {
                         Write-Log "    ║     >>> Processing Deleted VM Event <<<" "DEBUG"
+                        
+                        # *** EXTENSIVE DEBUG: Dump ALL event properties ***
+                        Write-Log "    ║     >>> ========== FULL DELETED VM EVENT OBJECT DUMP ==========" "WARN"
+                        foreach ($prop in $event.PSObject.Properties) {
+                            $propValue = if ($prop.Value) { $prop.Value } else { "<NULL>" }
+                            Write-Log "    ║     >>> DELETED_EVENT.$($prop.Name) = $propValue" "WARN"
+                        }
+                        Write-Log "    ║     >>> ============================================================" "WARN"
+                        
                         Write-Log "    ║     >>> Event Type: $($event.eventType) <<<" "DEBUG"
                         Write-Log "    ║     >>> Resource Name: $($event.resourceName) <<<" "DEBUG"
                         
@@ -703,7 +671,7 @@ function Get-DeletedVMsFromVRA {
                             
                             Write-Log "    ║     >>> Event Details: $($detailsText.Substring(0, [Math]::Min(200, $detailsText.Length)))... <<<" "DEBUG"
                             
-                            # Look for "Cloud Resource Name:" pattern (PRIORITY 1 - ADDED)
+                            # Look for "Cloud Resource Name:" pattern (PRIORITY 1)
                             if ($detailsText -match "Cloud Resource Name:\s*([^\s,;]+)") {
                                 $serverName = $matches[1].Trim()
                                 Write-Log "    ║     >>> Found hostname via 'Cloud Resource Name:' pattern: $serverName <<<" "SUCCESS"
@@ -746,6 +714,30 @@ function Get-DeletedVMsFromVRA {
                         }
                         else {
                             Write-Log "    ║     >>> FOUND DELETED VM: $serverName <<<" "SUCCESS"
+                            
+                            # *** EXTENSIVE TIMESTAMP DEBUG ***
+                            Write-Log "    ║     >>> ========== TIMESTAMP DEBUG FOR DELETED VM: $serverName ==========" "WARN"
+                            Write-Log "    ║     >>> event.timestamp = $($event.timestamp)" "WARN"
+                            Write-Log "    ║     >>> event.createdTime = $($event.createdTime)" "WARN"
+                            Write-Log "    ║     >>> event.lastUpdateTime = $($event.lastUpdateTime)" "WARN"
+                            Write-Log "    ║     >>> event.startTime = $($event.startTime)" "WARN"
+                            Write-Log "    ║     >>> event.endTime = $($event.endTime)" "WARN"
+                            Write-Log "    ║     >>> event.eventTimestamp = $($event.eventTimestamp)" "WARN"
+                            Write-Log "    ║     >>> event.loggedAt = $($event.loggedAt)" "WARN"
+                            Write-Log "    ║     >>> event.occurred = $($event.occurred)" "WARN"
+                            Write-Log "    ║     >>> event.createDate = $($event.createDate)" "WARN"
+                            Write-Log "    ║     >>> event.date = $($event.date)" "WARN"
+                            Write-Log "    ║     >>> event.time = $($event.time)" "WARN"
+                            Write-Log "    ║     >>> deployment.lastUpdatedAt = $($deployment.lastUpdatedAt)" "WARN"
+                            Write-Log "    ║     >>> deployment.createdAt = $($deployment.createdAt)" "WARN"
+                            Write-Log "    ║     >>> deployment.lastModified = $($deployment.lastModified)" "WARN"
+                            Write-Log "    ║     >>> deployment.deletedAt = $($deployment.deletedAt)" "WARN"
+                            Write-Log "    ║     >>> request.initiatedAt = $($request.initiatedAt)" "WARN"
+                            Write-Log "    ║     >>> request.completedAt = $($request.completedAt)" "WARN"
+                            Write-Log "    ║     >>> request.createdAt = $($request.createdAt)" "WARN"
+                            Write-Log "    ║     >>> request.lastUpdated = $($request.lastUpdated)" "WARN"
+                            Write-Log "    ║     >>> request.updatedAt = $($request.updatedAt)" "WARN"
+                            Write-Log "    ║     >>> ============================================================================" "WARN"
                             
                             $vmKey = $serverName.ToLower()
                             $existingVM = $deletedVMData | Where-Object { $_.VMName.ToLower() -eq $vmKey }
@@ -1111,7 +1103,7 @@ $decommissionTableRows
 # ============================================================================
 
 Write-DebugSection "DELETED VM TRACKER - STARTED"
-Write-Log "Script Version: 2.1.3" "SUCCESS"
+Write-Log "Script Version: 2.1.4 - Enhanced Debug" "SUCCESS"
 Write-Log "PowerShell Version: $($PSVersionTable.PSVersion)"
 Write-Log "Debug output file: $debugOutputFile" "SUCCESS"
 
@@ -1298,6 +1290,6 @@ else {
 }
 
 Write-DebugSection "SCRIPT COMPLETED"
-Write-Log "Script Version: 2.1.3" "SUCCESS"
+Write-Log "Script Version: 2.1.4" "SUCCESS"
 Write-Log "Debug log saved to: $debugOutputFile" "SUCCESS"
 Write-Log "`nScript finished. Check the debug file for detailed logs." "SUCCESS"
