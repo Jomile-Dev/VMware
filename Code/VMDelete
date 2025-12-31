@@ -1,7 +1,8 @@
 # ============================================================================
 # DELETED VM TRACKER - ARIA OPERATIONS + MULTI-VRA + VCENTER
-# Version 2.1.4 - Enhanced Debug for Timestamp Detection
-# Added: Comprehensive timestamp debugging to identify correct time fields
+# Version 2.2.0 - Fixed Timestamp Mapping
+# Fixed: InitiatedAt now uses leaseExpireAt (when decommission was initiated)
+# Added: DeletionScheduled column (when VM will actually be deleted)
 # ============================================================================
 
 # ============================================================================
@@ -206,6 +207,14 @@ function Get-ActiveDeploymentsWithDecommission {
         }
         Write-Log "  ============================================" "WARN"
         
+        # Check for scheduled deletion date fields
+        Write-Log "  >>> CHECKING FOR SCHEDULED DELETION DATE FIELDS <<<" "WARN"
+        Write-Log "  >>> deployment.expireAt = $($deployment.expireAt)" "WARN"
+        Write-Log "  >>> deployment.scheduledDeletionDate = $($deployment.scheduledDeletionDate)" "WARN"
+        Write-Log "  >>> deployment.deletionScheduledDate = $($deployment.deletionScheduledDate)" "WARN"
+        Write-Log "  >>> deployment.leaseExpirationDate = $($deployment.leaseExpirationDate)" "WARN"
+        Write-Log "  >>> deployment.leaseExpireAt = $($deployment.leaseExpireAt)" "WARN"
+        
         if ($deployment.resources) {
             Write-Log "  Resources in deployment:" "DEBUG"
             foreach ($resource in $deployment.resources) {
@@ -263,11 +272,43 @@ function Get-ActiveDeploymentsWithDecommission {
                     $isDecommission = $true
                     $matchedBy = if ($nameMatch) { "Request Name" } else { "Action ID" }
                     
+                    # IMPORTANT: expirationDate is when decommission was INITIATED
+                    $initiatedAtDate = $null
                     if ($deployment.leaseExpireAt) {
-                        $expirationDate = $deployment.leaseExpireAt
+                        $initiatedAtDate = $deployment.leaseExpireAt
+                        Write-Log "    ║   >>> Decommission Initiated At (from leaseExpireAt): $initiatedAtDate <<<" "WARN"
                     }
                     else {
-                        $expirationDate = "N/A"
+                        $initiatedAtDate = "N/A"
+                        Write-Log "    ║   >>> WARNING: No leaseExpireAt found for initiated date <<<" "WARN"
+                    }
+                    
+                    # Find the actual scheduled deletion date from deployment
+                    $scheduledDeletionDate = "N/A"
+                    
+                    # Check multiple possible fields for scheduled deletion
+                    if ($deployment.expireAt) {
+                        $scheduledDeletionDate = $deployment.expireAt
+                        Write-Log "    ║   >>> Deletion Scheduled At (from expireAt): $scheduledDeletionDate <<<" "WARN"
+                    }
+                    elseif ($deployment.scheduledDeletionDate) {
+                        $scheduledDeletionDate = $deployment.scheduledDeletionDate
+                        Write-Log "    ║   >>> Deletion Scheduled At (from scheduledDeletionDate): $scheduledDeletionDate <<<" "WARN"
+                    }
+                    elseif ($deployment.deletionScheduledDate) {
+                        $scheduledDeletionDate = $deployment.deletionScheduledDate
+                        Write-Log "    ║   >>> Deletion Scheduled At (from deletionScheduledDate): $scheduledDeletionDate <<<" "WARN"
+                    }
+                    elseif ($deployment.leaseExpirationDate) {
+                        $scheduledDeletionDate = $deployment.leaseExpirationDate
+                        Write-Log "    ║   >>> Deletion Scheduled At (from leaseExpirationDate): $scheduledDeletionDate <<<" "WARN"
+                    }
+                    elseif ($request.scheduledFor) {
+                        $scheduledDeletionDate = $request.scheduledFor
+                        Write-Log "    ║   >>> Deletion Scheduled At (from request.scheduledFor): $scheduledDeletionDate <<<" "WARN"
+                    }
+                    else {
+                        Write-Log "    ║   >>> WARNING: No scheduled deletion date found in deployment <<<" "WARN"
                     }
                 }
                 
@@ -425,17 +466,22 @@ function Get-ActiveDeploymentsWithDecommission {
                         $vraServerShort = ($VraServer -split '\.')[0]
                         $catalogItem = if ($deployment.inputs._catalogItemName) { $deployment.inputs._catalogItemName } else { "N/A" }
                         
-                        $initiatedAtValue = if ($request.initiatedAt) { 
-                            Convert-ToSydneyTime -DateTimeString $request.initiatedAt
+                        # InitiatedAt = when decommission was initiated (from leaseExpireAt)
+                        $initiatedAtValue = if ($initiatedAtDate -and $initiatedAtDate -ne "N/A") { 
+                            Convert-ToSydneyTime -DateTimeString $initiatedAtDate
                         } else { 
                             "N/A" 
                         }
                         
-                        $expirationDateValue = if ($expirationDate -and $expirationDate -ne "N/A") {
-                            Convert-ToSydneyTime -DateTimeString $expirationDate
+                        # DeletionScheduled = when VM is scheduled to be deleted
+                        $deletionScheduledValue = if ($scheduledDeletionDate -and $scheduledDeletionDate -ne "N/A") {
+                            Convert-ToSydneyTime -DateTimeString $scheduledDeletionDate
                         } else {
                             "N/A"
                         }
+                        
+                        Write-Log "      >>> InitiatedAt (converted): $initiatedAtValue <<<" "WARN"
+                        Write-Log "      >>> DeletionScheduled (converted): $deletionScheduledValue <<<" "WARN"
                         
                         $vmObject = New-Object PSObject -Property @{
                             VMName = $hostname
@@ -451,7 +497,7 @@ function Get-ActiveDeploymentsWithDecommission {
                             CatalogItem = $catalogItem
                             InitiatedAt = $initiatedAtValue
                             CompletedAt = if ($request.completedAt) { Convert-ToSydneyTime -DateTimeString $request.completedAt } else { "N/A" }
-                            ExpirationDate = $expirationDateValue
+                            DeletionScheduled = $deletionScheduledValue
                             vRAServer = $vraServerShort
                             Source = "vRA-Decommission-InProgress"
                             IsStillActive = $true
@@ -892,7 +938,7 @@ function Send-DeletedVMReport {
         Write-Log "  VMName: $($firstVM.VMName)" "DEBUG"
         Write-Log "  vRAServer: $($firstVM.vRAServer)" "DEBUG"
         Write-Log "  InitiatedAt: $($firstVM.InitiatedAt)" "DEBUG"
-        Write-Log "  ExpirationDate: $($firstVM.ExpirationDate)" "DEBUG"
+        Write-Log "  DeletionScheduled: $($firstVM.DeletionScheduled)" "DEBUG"
         Write-Log "  All Properties:" "DEBUG"
         foreach ($prop in $firstVM.PSObject.Properties) {
             Write-Log "    $($prop.Name) = $($prop.Value)" "DEBUG"
@@ -948,26 +994,26 @@ function Send-DeletedVMReport {
         Write-Log "Processing decommission VM: $($vm.VMName) from $($vm.vRAServer)" "DEBUG"
         Write-Log "  Deployment: $($vm.DeploymentName)" "DEBUG"
         Write-Log "  Status: $($vm.RequestStatus)" "DEBUG"
-        Write-Log "  Expiration: $($vm.ExpirationDate)" "DEBUG"
+        Write-Log "  DeletionScheduled: $($vm.DeletionScheduled)" "DEBUG"
         Write-Log "  InitiatedAt: $($vm.InitiatedAt)" "DEBUG"
         
         # Handle both old and new property names
         $vmName = if ($vm.VMName) { $vm.VMName } elseif ($vm.PSObject.Properties['VMName']) { $vm.VMName } else { "N/A" }
         $requestedBy = if ($vm.RequestedBy) { $vm.RequestedBy } elseif ($vm.PSObject.Properties['RequestedBy']) { $vm.RequestedBy } else { "N/A" }
         $initiatedAt = if ($vm.InitiatedAt) { $vm.InitiatedAt } elseif ($vm.PSObject.Properties['InitiatedAt']) { $vm.InitiatedAt } else { "N/A" }
-        $expirationDate = if ($vm.ExpirationDate) { $vm.ExpirationDate } elseif ($vm.PSObject.Properties['ExpirationDate']) { $vm.ExpirationDate } else { "N/A" }
+        $deletionScheduled = if ($vm.DeletionScheduled) { $vm.DeletionScheduled } elseif ($vm.PSObject.Properties['DeletionScheduled']) { $vm.DeletionScheduled } else { "N/A" }
         $deploymentName = if ($vm.DeploymentName) { $vm.DeploymentName } elseif ($vm.PSObject.Properties['DeploymentName']) { $vm.DeploymentName } else { "N/A" }
         $requestAction = if ($vm.RequestAction) { $vm.RequestAction } elseif ($vm.PSObject.Properties['RequestAction']) { $vm.RequestAction } else { "N/A" }
         $requestStatus = if ($vm.RequestStatus) { $vm.RequestStatus } elseif ($vm.PSObject.Properties['RequestStatus']) { $vm.RequestStatus } else { "N/A" }
         $source = if ($vm.vRAServer) { $vm.vRAServer } elseif ($vm.PSObject.Properties['vRAServer']) { $vm.vRAServer } else { "N/A" }
         
-        Write-Log "  Adding to report - VMName: $vmName, InitiatedAt: $initiatedAt, ExpirationDate: $expirationDate" "DEBUG"
+        Write-Log "  Adding to report - VMName: $vmName, InitiatedAt: $initiatedAt, DeletionScheduled: $deletionScheduled" "DEBUG"
         
         $decommissionVMs += New-Object PSObject -Property @{
             VMName = $vmName
             RequestedBy = $requestedBy
             InitiatedAt = $initiatedAt
-            ExpirationDate = $expirationDate
+            DeletionScheduled = $deletionScheduled
             DeploymentName = $deploymentName
             RequestAction = $requestAction
             RequestStatus = $requestStatus
@@ -981,7 +1027,7 @@ function Send-DeletedVMReport {
     if ($decommissionVMs.Count -gt 0) {
         Write-Log "Decommission VMs in report array:" "DEBUG"
         foreach ($vm in $decommissionVMs) {
-            Write-Log "  - $($vm.VMName): InitiatedAt=$($vm.InitiatedAt), ExpirationDate=$($vm.ExpirationDate)" "DEBUG"
+            Write-Log "  - $($vm.VMName): InitiatedAt=$($vm.InitiatedAt), DeletionScheduled=$($vm.DeletionScheduled)" "DEBUG"
         }
     }
     
@@ -1007,12 +1053,12 @@ function Send-DeletedVMReport {
         $decommissionTableRows += "<td>$($vm.RequestStatus)</td>"
         $decommissionTableRows += "<td>$($vm.RequestedBy)</td>"
         $decommissionTableRows += "<td>$($vm.InitiatedAt)</td>"
-        $decommissionTableRows += "<td>$($vm.ExpirationDate)</td>"
+        $decommissionTableRows += "<td>$($vm.DeletionScheduled)</td>"
         $decommissionTableRows += "<td>$($vm.Source)</td>"
         $decommissionTableRows += "</tr>"
         
         # Also add to debug file for visibility
-        Add-Content -Path $debugOutputFile -Value "DECOMMISSION EMAIL ENTRY: VM=$($vm.VMName), Deployment=$($vm.DeploymentName), InitiatedAt=$($vm.InitiatedAt), ExpirationDate=$($vm.ExpirationDate), Source=$($vm.Source)"
+        Add-Content -Path $debugOutputFile -Value "DECOMMISSION EMAIL ENTRY: VM=$($vm.VMName), Deployment=$($vm.DeploymentName), InitiatedAt=$($vm.InitiatedAt), DeletionScheduled=$($vm.DeletionScheduled), Source=$($vm.Source)"
     }
     
     $htmlBody = @"
@@ -1064,7 +1110,7 @@ $(if($decommissionVMs.Count -gt 0) {
 <th>Request Status</th>
 <th>Requested By</th>
 <th>Initiated At</th>
-<th>Expiration Date</th>
+<th>Deletion Scheduled</th>
 <th>Source</th>
 </tr>
 </thead>
@@ -1103,7 +1149,7 @@ $decommissionTableRows
 # ============================================================================
 
 Write-DebugSection "DELETED VM TRACKER - STARTED"
-Write-Log "Script Version: 2.1.4 - Enhanced Debug" "SUCCESS"
+Write-Log "Script Version: 2.2.0 - Fixed Timestamp Mapping" "SUCCESS"
 Write-Log "PowerShell Version: $($PSVersionTable.PSVersion)"
 Write-Log "Debug output file: $debugOutputFile" "SUCCESS"
 
@@ -1290,6 +1336,6 @@ else {
 }
 
 Write-DebugSection "SCRIPT COMPLETED"
-Write-Log "Script Version: 2.1.4" "SUCCESS"
+Write-Log "Script Version: 2.2.0" "SUCCESS"
 Write-Log "Debug log saved to: $debugOutputFile" "SUCCESS"
 Write-Log "`nScript finished. Check the debug file for detailed logs." "SUCCESS"
