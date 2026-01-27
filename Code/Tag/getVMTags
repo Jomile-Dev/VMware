@@ -1,124 +1,19 @@
-# Requires: VMware.PowerCLI
+# Replace section 7 and 9 with this:
 
-# Email Configuration
-$SendEmail = $true
-$EmailTo = "admin@example.com"
-$EmailFrom = "vcenter-reports@example.com"
-$EmailSubject = "vCenter VEEAM Tags Report - $(Get-Date -Format 'yyyy-MM-dd')"
-$SMTPServer = "smtp.example.com"
-$SMTPPort = 25
-$UseSSL = $false
-$SMTPCredentials = $null
-
-# 1. Prompt once for credentials
-$cred = Get-Credential -Message "Enter vCenter credentials"
-
-# 2. List all vCenters you want to connect to
-$vcenters = @(
-    "vcsa1.example.local",
-    "vcsa2.example.local",
-    "vcsa3.example.local"
-)
-
-# 3. Connect to each vCenter and store connections
-$connectedServers = @()
-
-foreach ($vc in $vcenters) {
-    Write-Host "Connecting to $vc..." -ForegroundColor Cyan
-    try {
-        $connection = Connect-VIServer -Server $vc -Credential $cred -WarningAction SilentlyContinue -ErrorAction Stop
-        $connectedServers += $connection
-        Write-Host "✅ Connected to $vc" -ForegroundColor Green
-    }
-    catch {
-        Write-Host "❌ Failed to connect to ${vc}: $_" -ForegroundColor Red
-    }
-}
-
-# 4. Get all VMs and their VEEAM category tags
-$results = @()
-
-Write-Host "`nRetrieving VMs and VEEAM tags from $($connectedServers.Count) vCenter(s)..." -ForegroundColor Cyan
-
-foreach ($vcServer in $connectedServers) {
-    Write-Host "`nProcessing VMs from $($vcServer.Name)..." -ForegroundColor Yellow
-    
-    # Get VMs from this specific vCenter
-    $vms = Get-VM -Server $vcServer
-    Write-Host "  Found $($vms.Count) VMs" -ForegroundColor Gray
-    
-    foreach ($vm in $vms) {
-        # Get tag assignments for this VM
-        $tagAssignments = Get-TagAssignment -Entity $vm -ErrorAction SilentlyContinue
-        
-        # Filter only tags from VEEAM category
-        $veeamTags = if ($tagAssignments) {
-            $tagAssignments | Where-Object { 
-                $_.Tag.Category.Name -eq "VEEAM" 
-            } | Select-Object -ExpandProperty Tag | Select-Object -ExpandProperty Name
-        } else {
-            $null
-        }
-        
-        $veeamTagNames = if ($veeamTags) {
-            $veeamTags -join ", "
-        } else {
-            ""
-        }
-
-        # Build result object
-        $results += [PSCustomObject]@{
-            VMName       = $vm.Name
-            PowerState   = $vm.PowerState
-            Cluster      = $vm.VMHost.Parent.Name
-            vCenter      = $vcServer.Name
-            VEEAM_Tags   = $veeamTagNames
-        }
-    }
-}
-
-# 5. Output results
-Write-Host "`nAll VMs with VEEAM Category Tags:" -ForegroundColor Yellow
-$results | Format-Table -AutoSize
-
-# 6. Show summary
-$taggedCount = ($results | Where-Object { $_.VEEAM_Tags -ne "" }).Count
-$totalCount = $results.Count
-Write-Host "`nSummary: $taggedCount out of $totalCount VMs have VEEAM tags" -ForegroundColor Cyan
-
-# 6a. Count VMs per tag
-Write-Host "`nVMs per VEEAM Tag:" -ForegroundColor Yellow
-$tagCounts = @{}
-foreach ($result in $results) {
-    if ($result.VEEAM_Tags -ne "") {
-        $tags = $result.VEEAM_Tags -split ", "
-        foreach ($tag in $tags) {
-            if ($tagCounts.ContainsKey($tag)) {
-                $tagCounts[$tag]++
-            } else {
-                $tagCounts[$tag] = 1
-            }
-        }
-    }
-}
-
-# Display tag counts
-$tagCountsSorted = $tagCounts.GetEnumerator() | Sort-Object Value -Descending
-$tagCountsSorted | ForEach-Object {
-    Write-Host "  $($_.Key): $($_.Value) VMs" -ForegroundColor Gray
-}
-
-# 7. Export to CSV with timestamp
+# 7. Create CSV in memory
+$csvContent = $results | ConvertTo-Csv -NoTypeInformation | Out-String
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$csvPath = ".\VMs_VEEAM_Tags_$timestamp.csv"
-$results | Export-Csv -Path $csvPath -NoTypeInformation
-Write-Host "`n✅ Exported to $csvPath" -ForegroundColor Green
+$tempCsvPath = [System.IO.Path]::GetTempFileName()
+$csvFileName = "VMs_VEEAM_Tags_$timestamp.csv"
+
+# Write CSV content to temp file for email attachment
+[System.IO.File]::WriteAllText($tempCsvPath, $csvContent)
 
 # 8. Disconnect from all vCenters
 Write-Host "`nDisconnecting from vCenters..." -ForegroundColor Cyan
 Disconnect-VIServer -Server * -Confirm:$false
 
-# 9. Send email report
+# 9. Send email report with CSV attachment
 if ($SendEmail) {
     Write-Host "`nSending email report..." -ForegroundColor Cyan
 
@@ -149,7 +44,7 @@ Full details are available in the attached CSV file.
             To = $EmailTo
             Subject = $EmailSubject
             Body = $emailBody
-            Attachments = $csvPath
+            Attachments = $tempCsvPath
         }
         
         if ($UseSSL) {
@@ -162,10 +57,19 @@ Full details are available in the attached CSV file.
         
         Send-MailMessage @mailParams
         Write-Host "✅ Email sent successfully to $EmailTo" -ForegroundColor Green
+        
+        # Clean up temp file
+        Remove-Item -Path $tempCsvPath -Force
     }
     catch {
         Write-Host "❌ Failed to send email: $_" -ForegroundColor Red
+        # Clean up temp file even on error
+        if (Test-Path $tempCsvPath) {
+            Remove-Item -Path $tempCsvPath -Force
+        }
     }
 } else {
     Write-Host "`nEmail sending is disabled" -ForegroundColor Yellow
+    # Clean up temp file if email is disabled
+    Remove-Item -Path $tempCsvPath -Force
 }
