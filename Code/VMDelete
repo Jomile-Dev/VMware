@@ -1,6 +1,9 @@
 # ============================================================================
 # DELETED VM TRACKER - ARIA OPERATIONS + MULTI-VRA + VCENTER
-# Version 2.1.4 - PowerShell 5.1 Compatible
+# Version 2.2.0 - PowerShell 5.1 Compatible
+# New: Performance optimizations for 10k+ deployments
+# New: DD-MM-YYYY date format (Sydney time)
+# New: VCF PowerCLI support with legacy fallback
 # Fixed: Email parameter scoping and validation
 # Fixed: Consistent "Cloud Resource Name:" pattern extraction
 # ============================================================================
@@ -30,10 +33,16 @@ $script:smtpPort = 587
 $script:smtpFrom = "vra-reports@yourdomain.com"  # CHANGE THIS
 $script:smtpTo = @("test.test@email.com")  # CHANGE THIS - Must be an array with at least one email
 $script:smtpCc = @("manager@yourdomain.com")  # CHANGE THIS or use @() for none
-$script:smtpSubject = "Deleted VM Report - $(Get-Date -Format 'yyyy-MM-dd')"
+$script:smtpSubject = "Deleted VM Report - $(Get-Date -Format 'dd-MM-yyyy')"
 
 $daysBack = 1
 $eventsPageSize = 200
+
+# PERFORMANCE TUNING: Days to look back for deployment updates (reduces dataset for 10k+ deployments)
+# Only deployments updated within this window will be checked for decommissions
+# Recommended: 30 days (checks deployments updated in last month)
+# Set to 365 to check all deployments from the last year (slower but more thorough)
+$deploymentLookbackDays = 30
 
 $debugOutputFile = "DeletedVMs_Debug_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
 
@@ -129,7 +138,7 @@ function Convert-ToSydneyTime {
         $utcTime = [DateTime]::Parse($DateTimeString).ToUniversalTime()
         $sydneyTZ = [System.TimeZoneInfo]::FindSystemTimeZoneById("AUS Eastern Standard Time")
         $sydneyTime = [System.TimeZoneInfo]::ConvertTimeFromUtc($utcTime, $sydneyTZ)
-        return $sydneyTime.ToString("yyyy-MM-dd HH:mm:ss")
+        return $sydneyTime.ToString("dd-MM-yyyy HH:mm:ss")
     }
     catch {
         Write-Log "Error converting time '$DateTimeString': $($_.Exception.Message)" "WARN"
@@ -154,7 +163,11 @@ function Get-ActiveDeploymentsWithDecommission {
     
     $decommissionData = New-Object System.Collections.ArrayList
     
-    Write-Log "Fetching ALL active deployments..." "DEBUG"
+    Write-Log "Fetching ACTIVE deployments with recent updates (performance optimized)..." "DEBUG"
+    
+    # PERFORMANCE OPTIMIZATION: Filter by lastUpdated date to reduce dataset
+    $cutoffDate = (Get-Date).AddDays(-$deploymentLookbackDays).ToString("yyyy-MM-dd")
+    Write-Log "Only checking deployments updated since: $cutoffDate (last $deploymentLookbackDays days)" "DEBUG"
     
     $vraUri = "https://$VraServer/deployment/api/deployments"
     $page = 0
@@ -162,7 +175,8 @@ function Get-ActiveDeploymentsWithDecommission {
     $allDeployments = @()
     
     do {
-        $pagedUri = "$vraUri`?page=$page&size=$size&expand=resources"
+        # Add filter for recently updated deployments to reduce API load
+        $pagedUri = "$vraUri`?page=$page&size=$size&expand=resources&`$filter=lastUpdatedAt ge '$cutoffDate'"
         Write-Log "  Fetching page $page from: $pagedUri" "DEBUG"
         
         try {
@@ -188,6 +202,31 @@ function Get-ActiveDeploymentsWithDecommission {
         }
         catch {
             Write-Log "  Error fetching page $page : $($_.Exception.Message)" "ERROR"
+            Write-Log "  Falling back to unfiltered query..." "WARN"
+            
+            # Fallback: Try without filter if filtered query fails
+            try {
+                $pagedUri = "$vraUri`?page=$page&size=$size&expand=resources"
+                $vraResponse = Invoke-RestMethod -Uri $pagedUri -Method Get -Headers $Headers -ErrorAction Stop
+                $deployments = if ($vraResponse.content) { $vraResponse.content } else { $vraResponse }
+                
+                if ($deployments -and $deployments.Count -gt 0) {
+                    $allDeployments += $deployments
+                    $page++
+                }
+                else {
+                    break
+                }
+            }
+            catch {
+                Write-Log "  Fallback also failed. Moving to next page." "ERROR"
+                break
+            }
+        }
+        
+        # PERFORMANCE: Limit to 20 pages (20k deployments) to prevent excessive API calls
+        if ($page -ge 20) {
+            Write-Log "  WARNING: Reached 20 page limit (20,000 deployments). Consider narrowing date range." "WARN"
             break
         }
         
@@ -195,31 +234,45 @@ function Get-ActiveDeploymentsWithDecommission {
     
     Write-Log "Total active deployments retrieved: $($allDeployments.Count)" "DEBUG"
     
-    Write-Log "`n--- Filtering for VM-containing deployments ---" "DEBUG"
-    $filteredDeployments = $allDeployments | Where-Object {
-        $hasVM = $false
-        if ($_.resources) {
-            foreach ($resource in $_.resources) {
-                if ($resource.type -eq "Cloud.vSphere.Machine") {
-                    $hasVM = $true
-                    break
-                }
-            }
-        }
-        if ($hasVM) {
-            Write-Log "  ✓ Deployment '$($_.name)' has VMs - KEEPING" "DEBUG"
-        }
-        else {
-            Write-Log "  ✗ Deployment '$($_.name)' has NO VMs - FILTERING OUT" "DEBUG"
-        }
-        $hasVM
-    }
+    Write-Log "`n--- PERFORMANCE: Quick-filtering for VM-containing deployments ---" "DEBUG"
+    
+    # PERFORMANCE OPTIMIZATION: Use faster array filtering
+    $filteredDeployments = @($allDeployments | Where-Object {
+        $_.resources -and ($_.resources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" })
+    })
     
     Write-Log "`nDeployments containing VMs: $($filteredDeployments.Count)" "SUCCESS"
     Write-Log "Deployments filtered out (no VMs): $(($allDeployments.Count - $filteredDeployments.Count))" "WARN"
-    $allDeployments = $filteredDeployments
+    
+    # PERFORMANCE OPTIMIZATION: Process only deployments with decommission-related status or recent updates
+    Write-Log "`n--- Pre-filtering for likely decommission candidates ---" "DEBUG"
+    $candidateDeployments = @($filteredDeployments | Where-Object {
+        # Include deployments that are:
+        # 1. In a deleting/decommissioning state
+        # 2. Have been updated in the last 30 days
+        # 3. Have specific status indicators
+        $_.status -match "DELETE|DELETING|DECOMMISSION" -or
+        $_.lastUpdatedAt -ge $cutoffDate
+    })
+    
+    if ($candidateDeployments.Count -lt $filteredDeployments.Count) {
+        Write-Log "Narrowed to $($candidateDeployments.Count) candidate deployments (skipped $($filteredDeployments.Count - $candidateDeployments.Count) unlikely candidates)" "SUCCESS"
+        $allDeployments = $candidateDeployments
+    }
+    else {
+        Write-Log "No filtering applied - checking all $($filteredDeployments.Count) deployments" "DEBUG"
+        $allDeployments = $filteredDeployments
+    }
     
     foreach ($deployment in $allDeployments) {
+        $deploymentIndex = [array]::IndexOf($allDeployments, $deployment) + 1
+        $percentComplete = [math]::Round(($deploymentIndex / $allDeployments.Count) * 100, 1)
+        
+        # Show progress every 10 deployments
+        if ($deploymentIndex % 10 -eq 0 -or $deploymentIndex -eq 1 -or $deploymentIndex -eq $allDeployments.Count) {
+            Write-Log "Progress: Processing deployment $deploymentIndex of $($allDeployments.Count) ($percentComplete%)" "DEBUG"
+        }
+        
         Write-Log "`n--- Active Deployment: $($deployment.name) (ID: $($deployment.id)) ---" "DEBUG"
         Write-Log "  Status: $($deployment.status)" "DEBUG"
         Write-Log "  Created: $($deployment.createdAt)" "DEBUG"
@@ -1176,18 +1229,44 @@ $decommissionTableRows
 # ============================================================================
 
 Write-DebugSection "DELETED VM TRACKER - STARTED"
-Write-Log "Script Version: 2.1.4 - Fixed Email Parameters" "SUCCESS"
+Write-Log "Script Version: 2.2.0 - Performance Optimized + DD-MM-YYYY Format" "SUCCESS"
 Write-Log "PowerShell Version: $($PSVersionTable.PSVersion)"
 Write-Log "Debug output file: $debugOutputFile" "SUCCESS"
 
 try {
-    Import-Module VMware.PowerCLI -ErrorAction Stop
-    Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session | Out-Null
-    Write-Log "VMware PowerCLI loaded" "SUCCESS"
+    # NOTE: VMware PowerCLI is being transitioned to VMware.VCF.PowerCLI
+    # For now, VMware.PowerCLI still works but consider migrating to VMware.VCF.PowerCLI in the future
+    # To install VCF module: Install-Module -Name VMware.VCF.PowerCLI -Scope CurrentUser
+    
+    Write-Log "Attempting to load VMware PowerCLI module..." "DEBUG"
+    
+    # Try to import the newer VCF module first, fall back to traditional PowerCLI
+    $moduleLoaded = $false
+    
+    if (Get-Module -ListAvailable -Name VMware.VCF.PowerCLI) {
+        Import-Module VMware.VCF.PowerCLI -ErrorAction Stop
+        Write-Log "VMware.VCF.PowerCLI loaded (newer module)" "SUCCESS"
+        $moduleLoaded = $true
+    }
+    elseif (Get-Module -ListAvailable -Name VMware.PowerCLI) {
+        Import-Module VMware.PowerCLI -ErrorAction Stop
+        Write-Log "VMware.PowerCLI loaded (legacy module - consider upgrading to VMware.VCF.PowerCLI)" "SUCCESS"
+        $moduleLoaded = $true
+    }
+    else {
+        throw "Neither VMware.VCF.PowerCLI nor VMware.PowerCLI modules are installed"
+    }
+    
+    if ($moduleLoaded) {
+        Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session | Out-Null
+        Write-Log "PowerCLI configuration set" "SUCCESS"
+    }
 }
 catch {
     Write-Log "Failed to load VMware PowerCLI: $($_.Exception.Message)" "ERROR"
-    Write-Log "Please install VMware PowerCLI: Install-Module -Name VMware.PowerCLI -Scope CurrentUser" "ERROR"
+    Write-Log "Please install VMware PowerCLI or VMware.VCF.PowerCLI:" "ERROR"
+    Write-Log "  Option 1 (Recommended): Install-Module -Name VMware.VCF.PowerCLI -Scope CurrentUser" "ERROR"
+    Write-Log "  Option 2 (Legacy): Install-Module -Name VMware.PowerCLI -Scope CurrentUser" "ERROR"
     exit
 }
 
@@ -1342,7 +1421,7 @@ if ($vraVCenterTotal -eq 0) {
 </html>
 "@
     
-    $noVMSubject = "No VM Deletions - $(Get-Date -Format 'yyyy-MM-dd')"
+    $noVMSubject = "No VM Deletions - $(Get-Date -Format 'dd-MM-yyyy')"
     
     try {
         $mailParams = @{
@@ -1383,6 +1462,6 @@ else {
 }
 
 Write-DebugSection "SCRIPT COMPLETED"
-Write-Log "Script Version: 2.1.4" "SUCCESS"
+Write-Log "Script Version: 2.2.0" "SUCCESS"
 Write-Log "Debug log saved to: $debugOutputFile" "SUCCESS"
 Write-Log "`nScript finished. Check the debug file for detailed logs." "SUCCESS"
