@@ -1,6 +1,7 @@
 # ============================================================================
 # DELETED VM TRACKER - ARIA OPERATIONS + MULTI-VRA + VCENTER
-# Version 2.2.2 - PowerShell 5.1 Compatible
+# Version 2.2.3 - PowerShell 5.1 Compatible
+# Fixed: Shows actual deleter username instead of deployment owner
 # Fixed: Deleted VM extraction from deployment resources (not just events)
 # Fixed: Date filtering to include today's deletions properly
 # Fixed: Removed overly restrictive VM name filtering
@@ -1029,13 +1030,63 @@ function Get-DeletedVMsFromVRA {
             }
         }
         
-        # NOW: Create VM objects for all found VMs
+        # NOW: Create VM objects for all found VMs - WITH FIX TO GET ACTUAL DELETER
         Write-Log "  Total unique VMs found for this deployment: $($foundVMs.Count)" "SUCCESS"
+        
+        # ========================================================================
+        # CRITICAL FIX: Get the actual deleter from deletion request
+        # ========================================================================
+        $deletedBy = "N/A"
+        $deletionRequestId = "N/A"
+        $deletionRequestStatus = "Deleted"
+        
+        try {
+            $requestsUri = "https://$VraServer/deployment/api/deployments/$($deployment.id)/requests?apiVersion=2020-08-25&deleted=true"
+            Write-Log "  Fetching deletion requests to find who deleted it..." "DEBUG"
+            
+            $requestsResponse = Invoke-RestMethod -Uri $requestsUri -Method Get -Headers $Headers -ErrorAction Stop
+            $requests = if ($requestsResponse.content) { $requestsResponse.content } else { $requestsResponse }
+            
+            Write-Log "  Found $($requests.Count) requests for this deleted deployment" "DEBUG"
+            
+            # Look for the deletion request
+            foreach ($request in $requests) {
+                Write-Log "    Checking request: $($request.name) (Action: $($request.actionId))" "DEBUG"
+                
+                if ($request.actionId -match "Deployment.Delete|Resource.Delete" -or 
+                    $request.name -match "Delete|Remove") {
+                    $deletedBy = if ($request.requestedBy) { $request.requestedBy } else { "N/A" }
+                    $deletionRequestId = $request.id
+                    $deletionRequestStatus = $request.status
+                    Write-Log "    ✓ Found deletion request by: $deletedBy (Request ID: $deletionRequestId)" "SUCCESS"
+                    break  # Use the first deletion request found
+                }
+            }
+            
+            # If no specific deletion request found, fall back to deployment owner
+            if ($deletedBy -eq "N/A" -and $deployment.ownedBy) {
+                $deletedBy = "$($deployment.ownedBy) (deployment owner - actual deleter unknown)"
+                Write-Log "    No deletion request found, using deployment owner: $deletedBy" "WARN"
+            }
+        }
+        catch {
+            Write-Log "  Error fetching deletion requests: $($_.Exception.Message)" "ERROR"
+            # Fall back to deployment owner if request fetch fails
+            $deletedBy = if ($deployment.ownedBy) { 
+                "$($deployment.ownedBy) (deployment owner - request fetch failed)" 
+            } else { 
+                "N/A" 
+            }
+        }
+        # ========================================================================
+        # END OF FIX
+        # ========================================================================
         
         foreach ($vmEntry in $foundVMs.GetEnumerator()) {
             $serverName = $vmEntry.Value
             
             Write-Log "    ║     >>> FOUND DELETED VM: $serverName <<<" "SUCCESS"
+            Write-Log "    ║     >>> Deleted By: $deletedBy <<<" "SUCCESS"
             
             $vmKey = $serverName.ToLower()
             $existingVM = $deletedVMData | Where-Object { $_.VMName.ToLower() -eq $vmKey }
@@ -1045,7 +1096,6 @@ function Get-DeletedVMsFromVRA {
             }
             else {
                 $vraServerShort = ($VraServer -split '\.')[0]
-                $requestedBy = if ($deployment.ownedBy) { $deployment.ownedBy } else { "N/A" }
                 $catalogItem = if ($deployment.inputs._catalogItemName) { $deployment.inputs._catalogItemName } else { "N/A" }
                 
                 $deletedVMData += New-Object PSObject -Property @{
@@ -1054,18 +1104,18 @@ function Get-DeletedVMsFromVRA {
                     DeploymentName = $deployment.name
                     DeploymentID = $deployment.id
                     DeploymentStatus = $deployment.status
-                    RequestID = "N/A"
+                    RequestID = $deletionRequestId  # ✅ FIXED - Actual deletion request ID
                     RequestAction = "Deployment.Delete"
-                    RequestStatus = "Deleted"
-                    RequestedBy = $requestedBy
-                    Requestor = $requestedBy
+                    RequestStatus = $deletionRequestStatus  # ✅ FIXED - Actual request status
+                    RequestedBy = $deletedBy  # ✅ FIXED - Who actually deleted it
+                    Requestor = $deletedBy    # ✅ FIXED - Who actually deleted it
                     CatalogItem = $catalogItem
                     DeletedAt = Convert-ToSydneyTime -DateTimeString $deployment.lastUpdatedAt
                     InitiatedAt = if ($deployment.createdAt) { Convert-ToSydneyTime -DateTimeString $deployment.createdAt } else { "N/A" }
                     vRAServer = $vraServerShort
                     EventType = "Deployment.Delete"
-                    EventStatus = "Deleted"
-                    EventMessage = "Deleted via deployment"
+                    EventStatus = $deletionRequestStatus
+                    EventMessage = "Deleted by $deletedBy"
                     Source = "vRA-Deleted"
                     IsStillActive = $false
                 }
@@ -1415,7 +1465,7 @@ $decommissionTableRows
 # ============================================================================
 
 Write-DebugSection "DELETED VM TRACKER - STARTED"
-Write-Log "Script Version: 2.2.2 - Fixed Deleted VM Extraction + Date Filtering" "SUCCESS"
+Write-Log "Script Version: 2.2.3 - Fixed Who Deleted + Deleted VM Extraction + Date Filtering" "SUCCESS"
 Write-Log "PowerShell Version: $($PSVersionTable.PSVersion)"
 Write-Log "Debug output file: $debugOutputFile" "SUCCESS"
 
@@ -1648,6 +1698,6 @@ else {
 }
 
 Write-DebugSection "SCRIPT COMPLETED"
-Write-Log "Script Version: 2.2.2" "SUCCESS"
+Write-Log "Script Version: 2.2.3" "SUCCESS"
 Write-Log "Debug log saved to: $debugOutputFile" "SUCCESS"
 Write-Log "`nScript finished. Check the debug file for detailed logs." "SUCCESS"
