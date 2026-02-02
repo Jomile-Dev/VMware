@@ -23,17 +23,33 @@ $vCenters = @(
     "vcenter3.domain.com"
 )
 
-$smtpServer = "smtp.yourdomain.com"
-$smtpPort = 587
-$smtpFrom = "vra-reports@yourdomain.com"
-$smtpTo = @("admin@yourdomain.com")
-$smtpCc = @("manager@yourdomain.com")
-$smtpSubject = "Deleted VM Report - $(Get-Date -Format 'yyyy-MM-dd')"
+# EMAIL CONFIGURATION - Use proper scope
+$script:smtpServer = "smtp.yourdomain.com"  # CHANGE THIS
+$script:smtpPort = 587
+$script:smtpFrom = "vra-reports@yourdomain.com"  # CHANGE THIS
+$script:smtpTo = @("test.test@email.com")  # CHANGE THIS
+$script:smtpCc = @("manager@yourdomain.com")  # CHANGE THIS or use @() for none
+$script:smtpSubject = "Deleted VM Report - $(Get-Date -Format 'yyyy-MM-dd')"
 
 $daysBack = 1
 $eventsPageSize = 200
 
 $debugOutputFile = "DeletedVMs_Debug_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
+
+# VERIFY EMAIL CONFIGURATION
+Write-Host "=== EMAIL CONFIGURATION CHECK ===" -ForegroundColor Cyan
+Write-Host "smtpServer: $script:smtpServer" -ForegroundColor Yellow
+Write-Host "smtpPort: $script:smtpPort" -ForegroundColor Yellow
+Write-Host "smtpFrom: $script:smtpFrom" -ForegroundColor Yellow
+Write-Host "smtpTo: $($script:smtpTo -join ', ')" -ForegroundColor Yellow
+Write-Host "smtpCc: $($script:smtpCc -join ', ')" -ForegroundColor Yellow
+Write-Host "=================================" -ForegroundColor Cyan
+
+if (-not $script:smtpTo -or $script:smtpTo.Count -eq 0) {
+    Write-Host "ERROR: Email recipient (smtpTo) is not configured!" -ForegroundColor Red
+    Write-Host "Please edit the configuration section at the top of the script." -ForegroundColor Red
+    exit
+}
 
 # ============================================================================
 # HELPER FUNCTIONS
@@ -1316,12 +1332,12 @@ else {
         -VraDeletedData $allVraDeletedVMs `
         -VraDecommissionData $allVraDecommissionVMs `
         -VCenterData $allVCenterDeletedVMs `
-        -SmtpServer $smtpServer `
-        -SmtpPort $smtpPort `
-        -From $smtpFrom `
-        -To $smtpTo `
-        -Cc $smtpCc `
-        -Subject $smtpSubject
+        -SmtpServer $script:smtpServer `
+        -SmtpPort $script:smtpPort `
+        -From $script:smtpFrom `
+        -To $script:smtpTo `
+        -Cc $script:smtpCc `
+        -Subject $script:smtpSubject
 }
 
 Write-DebugSection "SCRIPT COMPLETED"
