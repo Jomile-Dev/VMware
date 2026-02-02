@@ -1,6 +1,9 @@
 # ============================================================================
 # DELETED VM TRACKER - ARIA OPERATIONS + MULTI-VRA + VCENTER
-# Version 2.2.7 - PowerShell 5.1 Compatible
+# Version 2.2.8 - PowerShell 5.1 Compatible
+# Fixed: Extract VM names from CREATE_FAILED events using "Cloud Resource Name"
+# Fixed: Parse Cloud.vSphere.Machine events for failed deployments
+# Fixed: Much more reliable VM name extraction for failed deployments
 # Fixed: NEW Get-FailedDeploymentsFromVRA function to find failed deployments
 # Fixed: Matches failed vRA deployments with vCenter cleanup events by VM name
 # Fixed: Shows failed deployments even without vRA deletion events
@@ -12,6 +15,7 @@
 # Fixed: Date filtering to include today's deletions properly
 # Fixed: Removed overly restrictive VM name filtering
 # Fixed: Duplicate VMs in decommission report (prefers "Initiate" over "Delete")
+# New: Dedicated event parsing for Cloud.vSphere.Machine in failed CREATE requests
 # New: Dedicated function for failed deployments (not relying on deletion events)
 # New: Detailed logging shows matching process for failed deployments
 # New: "Failed in vRA" indicator for VMs deleted in vCenter after vRA failure
@@ -1302,46 +1306,174 @@ function Get-FailedDeploymentsFromVRA {
     
     Write-Log "`nTotal FAILED deployments (including failed requests): $($failedDeployments.Count)" "SUCCESS"
     
-    # Extract VMs from failed deployments
+    # Extract VMs from failed deployments by checking EVENTS for Cloud Resource Name
     foreach ($deployment in $failedDeployments) {
         Write-Log "`n--- FAILED Deployment: $($deployment.name) (ID: $($deployment.id)) ---" "WARN"
         Write-Log "  Status: $($deployment.status)" "WARN"
         Write-Log "  Last Updated: $($deployment.lastUpdatedAt)" "DEBUG"
         Write-Log "  Owned By: $($deployment.ownedBy)" "DEBUG"
         
-        # Extract VM names from deployment resources
+        # FIRST: Try to extract VM names from deployment resources (may not work for failed deployments)
         $foundVMs = @{}
         
         if ($deployment.resources) {
             Write-Log "  Checking deployment resources for VM names..." "DEBUG"
             foreach ($resource in $deployment.resources) {
                 if ($resource.type -eq "Cloud.vSphere.Machine") {
-                    Write-Log "    Found vSphere Machine resource" "DEBUG"
+                    Write-Log "    Found vSphere Machine resource in deployment" "DEBUG"
                     
                     $serverName = $null
                     
                     if ($resource.properties -and $resource.properties.resourceName) {
                         $serverName = $resource.properties.resourceName
+                        Write-Log "    Found VM from resource.properties.resourceName: $serverName" "SUCCESS"
                     }
                     elseif ($resource.name -and $resource.name -notmatch "Cloud_vSphere_Machine_\d+") {
                         $serverName = $resource.name
+                        Write-Log "    Found VM from resource.name: $serverName" "SUCCESS"
                     }
                     elseif ($resource.properties -and $resource.properties.address) {
                         $serverName = $resource.properties.address
+                        Write-Log "    Found VM from resource.properties.address: $serverName" "SUCCESS"
                     }
                     
                     if ($serverName) {
                         $vmKey = $serverName.ToLower()
                         if (-not $foundVMs.ContainsKey($vmKey)) {
                             $foundVMs[$vmKey] = $serverName
-                            Write-Log "    Added FAILED deployment VM: $serverName" "WARN"
                         }
                     }
                 }
             }
         }
         
-        Write-Log "  VMs found in failed deployment: $($foundVMs.Count)" "WARN"
+        Write-Log "  VMs found from deployment resources: $($foundVMs.Count)" "DEBUG"
+        
+        # SECOND: Check EVENTS for Cloud.vSphere.Machine with Cloud Resource Name (more reliable for failed deployments)
+        Write-Log "  Checking deployment EVENTS for Cloud.vSphere.Machine with Cloud Resource Name..." "DEBUG"
+        
+        try {
+            $requestsUri = "https://$VraServer/deployment/api/deployments/$($deployment.id)/requests?apiVersion=2020-08-25"
+            $requestsResponse = Invoke-RestMethod -Uri $requestsUri -Method Get -Headers $Headers -ErrorAction Stop
+            $requests = if ($requestsResponse.content) { $requestsResponse.content } else { $requestsResponse }
+            
+            Write-Log "  Found $($requests.Count) requests for this deployment" "DEBUG"
+            
+            foreach ($request in $requests) {
+                Write-Log "    Checking request: $($request.name) (Action: $($request.actionId), Status: $($request.status))" "DEBUG"
+                
+                # Look for CREATE or PROVISION requests
+                if ($request.actionId -match "Deployment.Create|Cloud.vSphere.Machine.Provision|Deployment.Provision") {
+                    Write-Log "    This is a CREATE/PROVISION request - fetching events..." "DEBUG"
+                    
+                    $eventPage = 0
+                    $allEvents = @()
+                    
+                    do {
+                        $eventsUri = "https://$VraServer/deployment/api/deployments/$($deployment.id)/requests/$($request.id)/events?page=$eventPage&size=$eventsPageSize&apiVersion=2020-08-25"
+                        
+                        try {
+                            $eventsResponse = Invoke-RestMethod -Uri $eventsUri -Method Get -Headers $Headers -ErrorAction Stop
+                            $events = if ($eventsResponse.content) { $eventsResponse.content } else { $eventsResponse }
+                            
+                            if ($events -and $events.Count -gt 0) {
+                                $allEvents += $events
+                                $eventPage++
+                                if ($events.Count -lt $eventsPageSize) { break }
+                            }
+                            else {
+                                break
+                            }
+                        }
+                        catch {
+                            Write-Log "      Error fetching events: $($_.Exception.Message)" "ERROR"
+                            break
+                        }
+                        
+                        if ($eventPage -ge 20) { break }
+                        
+                    } while ($true)
+                    
+                    Write-Log "    Found $($allEvents.Count) events for this request" "DEBUG"
+                    
+                    # Process events looking for Cloud.vSphere.Machine with Cloud Resource Name
+                    foreach ($event in $allEvents) {
+                        if ($event.resourceType -eq "Cloud.vSphere.Machine") {
+                            Write-Log "      Processing Cloud.vSphere.Machine event: $($event.eventType)" "DEBUG"
+                            
+                            $serverName = $null
+                            
+                            # PRIORITY 1: Parse event details for Cloud Resource Name
+                            if ($event.details) {
+                                $detailsText = if ($event.details -is [string]) { 
+                                    $event.details 
+                                } else { 
+                                    ($event.details | ConvertTo-Json -Compress -Depth 5)
+                                }
+                                
+                                Write-Log "      Event Details (first 300 chars): $($detailsText.Substring(0, [Math]::Min(300, $detailsText.Length)))..." "DEBUG"
+                                
+                                # Look for "Cloud Resource Name:" pattern (PRIORITY 1)
+                                if ($detailsText -match "Cloud Resource Name:\s*([^\s,;]+)") {
+                                    $serverName = $matches[1].Trim()
+                                    Write-Log "      ✓✓✓ Found VM via 'Cloud Resource Name:' pattern: $serverName ✓✓✓" "SUCCESS"
+                                }
+                                # Look for JSON cloudResourceName property
+                                elseif ($detailsText -match '"cloudResourceName"\s*:\s*"([^"]+)"') {
+                                    $potentialName = $matches[1].Trim()
+                                    if ($potentialName -notmatch "Cloud_vSphere_Machine_\d+") {
+                                        $serverName = $potentialName
+                                        Write-Log "      ✓✓✓ Found VM via 'cloudResourceName' JSON: $serverName ✓✓✓" "SUCCESS"
+                                    }
+                                }
+                                # Look for hostname in details
+                                elseif ($detailsText -match '"hostname"\s*:\s*"([^"]+)"') {
+                                    $serverName = $matches[1].Trim()
+                                    Write-Log "      ✓✓✓ Found VM via 'hostname' JSON: $serverName ✓✓✓" "SUCCESS"
+                                }
+                                # Look for address in details
+                                elseif ($detailsText -match '"address"\s*:\s*"([^"]+)"') {
+                                    $serverName = $matches[1].Trim()
+                                    Write-Log "      ✓✓✓ Found VM via 'address' JSON: $serverName ✓✓✓" "SUCCESS"
+                                }
+                            }
+                            
+                            # PRIORITY 2: Use resourceName from event if it's not a generic ID
+                            if (-not $serverName -and $event.resourceName) {
+                                if ($event.resourceName -notmatch "Cloud_vSphere_Machine_\d+") {
+                                    $serverName = $event.resourceName
+                                    Write-Log "      Found VM from event.resourceName: $serverName" "SUCCESS"
+                                }
+                                else {
+                                    Write-Log "      Skipping generic resourceName: $($event.resourceName)" "DEBUG"
+                                }
+                            }
+                            
+                            if ($serverName) {
+                                $vmKey = $serverName.ToLower()
+                                if (-not $foundVMs.ContainsKey($vmKey)) {
+                                    $foundVMs[$vmKey] = $serverName
+                                    Write-Log "      Added FAILED deployment VM from event: $serverName" "WARN"
+                                }
+                            }
+                            else {
+                                Write-Log "      WARNING: Could not extract VM name from this event" "WARN"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        catch {
+            Write-Log "  Error processing deployment requests/events: $($_.Exception.Message)" "ERROR"
+        }
+        
+        Write-Log "  Total VMs found in failed deployment: $($foundVMs.Count)" "WARN"
+        
+        if ($foundVMs.Count -eq 0) {
+            Write-Log "  WARNING: No VMs found for this failed deployment - skipping" "WARN"
+            continue
+        }
         
         # Get who initiated the failed deployment
         $initiatedBy = "N/A"
@@ -1388,7 +1520,7 @@ function Get-FailedDeploymentsFromVRA {
                 Source = "vRA-Failed"
             }
             
-            Write-Log "    Added FAILED deployment VM: $serverName" "SUCCESS"
+            Write-Log "    ✓✓✓ Added FAILED deployment VM to report: $serverName ✓✓✓" "SUCCESS"
         }
     }
     
@@ -1775,7 +1907,7 @@ $decommissionTableRows
 # ============================================================================
 
 Write-DebugSection "DELETED VM TRACKER - STARTED"
-Write-Log "Script Version: 2.2.7 - Complete Failed Deployment Detection & Matching" "SUCCESS"
+Write-Log "Script Version: 2.2.8 - Event-Based VM Extraction for Failed Deployments" "SUCCESS"
 Write-Log "PowerShell Version: $($PSVersionTable.PSVersion)"
 Write-Log "Debug output file: $debugOutputFile" "SUCCESS"
 
@@ -2050,6 +2182,6 @@ else {
 }
 
 Write-DebugSection "SCRIPT COMPLETED"
-Write-Log "Script Version: 2.2.7" "SUCCESS"
+Write-Log "Script Version: 2.2.8" "SUCCESS"
 Write-Log "Debug log saved to: $debugOutputFile" "SUCCESS"
 Write-Log "`nScript finished. Check the debug file for detailed logs." "SUCCESS"
