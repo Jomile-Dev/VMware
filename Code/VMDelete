@@ -1281,22 +1281,67 @@ function Get-FailedDeploymentsFromVRA {
             }
         }
         
-        # ---- MAIN: fetch ALL requests (the full history) ----
-        Write-Log "  Fetching FULL request history..." "DEBUG"
+        # ---- MAIN: fetch ALL requests (the full history)
+        # Use &deleted=true first (same pattern as Get-DeletedVMsFromVRA) — vRA
+        # marks request records as deleted after a failed deployment is cleaned up,
+        # so without this flag the VM name inside those events is invisible.
+        # Then merge in the non-deleted query to catch anything still live.
+        # ----
+        Write-Log "  Fetching FULL request history (trying &deleted=true first, like deleted deployments do)..." "DEBUG"
+        
+        $requests = @()
         
         try {
-            $requestsUri = "https://$VraServer/deployment/api/deployments/$($deployment.id)/requests?apiVersion=2020-08-25"
+            # ATTEMPT 1: with &deleted=true  — picks up requests vRA already cleaned up
+            $requestsUri = "https://$VraServer/deployment/api/deployments/$($deployment.id)/requests?apiVersion=2020-08-25&deleted=true"
+            Write-Log "    Trying: $requestsUri" "DEBUG"
             $requestsResponse = Invoke-RestMethod -Uri $requestsUri -Method Get -Headers $Headers -ErrorAction Stop
             $requests = if ($requestsResponse.content) { $requestsResponse.content } else { $requestsResponse }
+            Write-Log "    &deleted=true returned $($requests.Count) requests" "DEBUG"
+        }
+        catch {
+            Write-Log "    &deleted=true failed: $($_.Exception.Message) — trying without it" "WARN"
+        }
+        
+        # ATTEMPT 2: without &deleted=true  — always run and merge in anything new
+        try {
+            $requestsUri2 = "https://$VraServer/deployment/api/deployments/$($deployment.id)/requests?apiVersion=2020-08-25"
+            Write-Log "    Trying: $requestsUri2" "DEBUG"
+            $requestsResponse2 = Invoke-RestMethod -Uri $requestsUri2 -Method Get -Headers $Headers -ErrorAction Stop
+            $requests2 = if ($requestsResponse2.content) { $requestsResponse2.content } else { $requestsResponse2 }
+            Write-Log "    without &deleted=true returned $($requests2.Count) requests" "DEBUG"
             
-            Write-Log "  Total requests in history: $($requests.Count)" "DEBUG"
-            
+            # Merge: add any request IDs from attempt 2 that aren't already in attempt 1
+            $existingIds = @{}
+            foreach ($r in $requests) { $existingIds[$r.id] = $true }
+            foreach ($r in $requests2) {
+                if (-not $existingIds.ContainsKey($r.id)) {
+                    $requests += $r
+                    Write-Log "    Merged in request from non-deleted query: $($r.id) ($($r.name))" "DEBUG"
+                }
+            }
+        }
+        catch {
+            Write-Log "    Non-deleted request fetch failed: $($_.Exception.Message)" "WARN"
+        }
+        
+        Write-Log "  Total requests in history (merged): $($requests.Count)" "DEBUG"
+        
+        try {
             foreach ($request in $requests) {
                 Write-Log "    ┌── Request: $($request.name)  |  ActionId: $($request.actionId)  |  Status: $($request.status)  |  By: $($request.requestedBy)" "DEBUG"
                 Write-Log "    │   InitiatedAt: $($request.initiatedAt)  |  CompletedAt: $($request.completedAt)" "DEBUG"
                 
-                # ---- fetch every event for THIS request ----
-                $allEvents = Get-AllEventsForRequest -VraServer $VraServer -Headers $Headers -DeploymentId $deployment.id -RequestId $request.id
+                # ---- fetch every event for THIS request
+                # Use &deleted=true here too — events inside a failed-then-cleaned-up
+                # request disappear without it.  Retry without the flag if empty.
+                # ----
+                $allEvents = Get-AllEventsForRequest -VraServer $VraServer -Headers $Headers -DeploymentId $deployment.id -RequestId $request.id -IncludeDeleted
+                
+                if ($allEvents.Count -eq 0) {
+                    Write-Log "    │   &deleted=true events empty, retrying without..." "DEBUG"
+                    $allEvents = Get-AllEventsForRequest -VraServer $VraServer -Headers $Headers -DeploymentId $deployment.id -RequestId $request.id
+                }
                 
                 Write-Log "    │   Events fetched: $($allEvents.Count)" "DEBUG"
                 
@@ -1608,42 +1653,61 @@ function Send-DeletedVMReport {
     }
     
     # ---- 2. Failed vRA deployments (already enriched with vCenter match) ----
+    # Build an explicit set of all failed-VM names (lowercase) so the vCenter
+    # section can skip them reliably — even if extraction partially failed and
+    # the name never made it into $vraVMNames.
+    $failedVMNames = @{}
+    
     Write-Log "Processing enriched failed vRA deployments..." "DEBUG"
     foreach ($vm in $VraFailedData) {
+        $vmLower = $vm.VMName.ToLower()
+        $failedVMNames[$vmLower] = $true   # always register, matched or not
+        
         $deletionTime = "N/A"
-        $source       = "vRA: $($vm.vRAServer)"
+        $source       = $vm.vRAServer      # just the vRA server short name
         $status       = $vm.RequestStatus
         
         if ($vm.MatchedVCenterEvent) {
-            # We have a confirmed vCenter cleanup event
+            # Confirmed: vRA CREATE_FAILED → partial VM built in vCenter → vCenter cleaned it up
             $deletionTime = $vm.MatchedVCenterEvent.DeletedAt
-            $source       = "vRA: $($vm.vRAServer) → Cleaned in vCenter: $($vm.MatchedVCenterEvent.vCenter)"
-            Write-Log "  [failed] $($vm.VMName): matched vCenter event on $($vm.MatchedVCenterEvent.vCenter)" "SUCCESS"
+            $source       = $vm.vRAServer
+            $status       = "Create Failed (cleaned up in vCenter)"
+            Write-Log "  [failed+matched] $($vm.VMName): vRA=$($vm.vRAServer) → vCenter=$($vm.MatchedVCenterEvent.vCenter)" "SUCCESS"
         }
         else {
-            # No vCenter event – use the vRA failure timestamp
+            # Failed in vRA, no vCenter cleanup event found in the time window
             $deletionTime = $vm.FailedAt
-            $status       = "$($vm.RequestStatus) (No vCenter cleanup found)"
-            Write-Log "  [failed] $($vm.VMName): no vCenter match" "WARN"
+            $status       = "$($vm.RequestStatus) (no vCenter cleanup found)"
+            Write-Log "  [failed, no match] $($vm.VMName): vRA=$($vm.vRAServer)" "WARN"
         }
         
         $deletedVMs += New-Object PSObject -Property @{
             VMName         = $vm.VMName
             RequestedBy    = $vm.RequestedBy
             DeletedAt      = $deletionTime
-            DeploymentName = $vm.DeploymentName
-            RequestAction  = "vRA Deployment Failed"
+            DeploymentName = "$($vm.DeploymentName) (Create Failed)"
+            RequestAction  = "Deployment (Create Failed)"
             RequestStatus  = $status
             Source         = $source
         }
     }
     
+    Write-Log "  failedVMNames set built: $($failedVMNames.Count) names" "DEBUG"
+    
     # ---- 3. Pure vCenter deletions (not already covered by vRA) ----
+    # Skip if the name is in $vraVMNames (deleted/decommission) OR $failedVMNames
+    # (CREATE_FAILED partial builds).  The $failedVMNames check is the critical
+    # one: it prevents the false-info scenario where vCenter cleans up a VM that
+    # vRA partially built during a failed deployment, and it shows up here as
+    # "who deleted this random VM?"
     foreach ($vm in $VCenterData) {
         $vmLower = $vm.VMName.ToLower()
         
         if ($vraVMNames.ContainsKey($vmLower)) {
-            Write-Log "SKIPPING vCenter VM (already in vRA data): $($vm.VMName)" "WARN"
+            Write-Log "SKIPPING vCenter VM (already in vRA deleted/decommission): $($vm.VMName)" "WARN"
+        }
+        elseif ($failedVMNames.ContainsKey($vmLower)) {
+            Write-Log "SKIPPING vCenter VM (matched to CREATE_FAILED deployment): $($vm.VMName)" "WARN"
         }
         else {
             Write-Log "Adding pure vCenter deletion: $($vm.VMName) from $($vm.vCenter)" "DEBUG"
