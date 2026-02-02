@@ -1,6 +1,7 @@
 # ============================================================================
 # DELETED VM TRACKER - ARIA OPERATIONS + MULTI-VRA + VCENTER
-# Version 2.2.0 - PowerShell 5.1 Compatible
+# Version 2.2.1 - PowerShell 5.1 Compatible
+# Fixed: Duplicate VMs in decommission report (prefers "Initiate" over "Delete")
 # New: Performance optimizations for 10k+ deployments
 # New: DD-MM-YYYY date format (Sydney time)
 # New: VCF PowerCLI support with legacy fallback
@@ -512,6 +513,33 @@ function Get-ActiveDeploymentsWithDecommission {
                     foreach ($vmEntry in $foundVMs.GetEnumerator()) {
                         $hostname = $vmEntry.Value
                         
+                        # DEDUPLICATION CHECK: Skip if this VM is already in the decommission list
+                        $existingVM = $decommissionData | Where-Object { 
+                            $_.VMName.ToLower() -eq $hostname.ToLower() -and 
+                            $_.DeploymentID -eq $deployment.id 
+                        }
+                        
+                        if ($existingVM) {
+                            Write-Log "      >>> DUPLICATE DETECTED: VM '$hostname' already exists in decommission list for this deployment <<<" "WARN"
+                            Write-Log "      >>> Existing request: $($existingVM.RequestAction)" "WARN"
+                            Write-Log "      >>> Current request: $($request.name)" "WARN"
+                            
+                            # Only keep the most relevant request (prefer "Initiate server decommission" over generic "Delete")
+                            if ($request.name -match "Initiate server decommission" -and $existingVM.RequestAction -notmatch "Initiate server decommission") {
+                                Write-Log "      >>> Updating to use more specific 'Initiate server decommission' request <<<" "WARN"
+                                # Remove the old entry
+                                $decommissionData.Remove($existingVM)
+                            }
+                            elseif ($existingVM.RequestAction -match "Initiate server decommission" -and $request.name -notmatch "Initiate server decommission") {
+                                Write-Log "      >>> Keeping existing 'Initiate server decommission' request, skipping generic delete <<<" "WARN"
+                                continue  # Skip this duplicate
+                            }
+                            else {
+                                Write-Log "      >>> Skipping duplicate - keeping first occurrence <<<" "WARN"
+                                continue  # Skip this duplicate
+                            }
+                        }
+                        
                         Write-Log "      >>> VM in Decommission: $hostname <<<" "WARN"
                         Write-Log "      >>> Matched decommission by: $matchedBy <<<" "DEBUG"
                         Write-Log "      >>> Deployment Name: $($deployment.name) <<<" "DEBUG"
@@ -607,13 +635,54 @@ function Get-ActiveDeploymentsWithDecommission {
     Write-Log "║ DECOMMISSION SUMMARY for $VraServer" "SUCCESS"
     Write-Log "╠════════════════════════════════════════════════════════════════════════════════" "SUCCESS"
     Write-Log "║ Total Active Deployments Checked: $($allDeployments.Count)" "SUCCESS"
-    Write-Log "║ VMs with Decommission Requests Found: $($decommissionData.Count)" "SUCCESS"
-    if ($decommissionData.Count -gt 0) {
+    Write-Log "║ VMs with Decommission Requests Found (before dedup): $($decommissionData.Count)" "SUCCESS"
+    
+    # FINAL DEDUPLICATION PASS: Remove any duplicates that might have slipped through
+    Write-Log "║" "SUCCESS"
+    Write-Log "║ Running final deduplication check..." "DEBUG"
+    
+    $uniqueVMs = @{}
+    $finalDecommissionData = New-Object System.Collections.ArrayList
+    
+    foreach ($vm in $decommissionData) {
+        $vmKey = "$($vm.VMName.ToLower())_$($vm.DeploymentID)"
+        
+        if ($uniqueVMs.ContainsKey($vmKey)) {
+            $existingVM = $uniqueVMs[$vmKey]
+            Write-Log "║   DUPLICATE FOUND: $($vm.VMName) in deployment $($vm.DeploymentName)" "WARN"
+            Write-Log "║     Existing: $($existingVM.RequestAction)" "DEBUG"
+            Write-Log "║     Duplicate: $($vm.RequestAction)" "DEBUG"
+            
+            # Prefer "Initiate server decommission" over generic "Delete"
+            if ($vm.RequestAction -match "Initiate server decommission" -and $existingVM.RequestAction -notmatch "Initiate server decommission") {
+                Write-Log "║     Replacing with more specific 'Initiate server decommission' request" "WARN"
+                $finalDecommissionData.Remove($existingVM)
+                [void]$finalDecommissionData.Add($vm)
+                $uniqueVMs[$vmKey] = $vm
+            }
+            else {
+                Write-Log "║     Keeping first occurrence, skipping duplicate" "DEBUG"
+            }
+        }
+        else {
+            $uniqueVMs[$vmKey] = $vm
+            [void]$finalDecommissionData.Add($vm)
+        }
+    }
+    
+    $duplicatesRemoved = $decommissionData.Count - $finalDecommissionData.Count
+    if ($duplicatesRemoved -gt 0) {
+        Write-Log "║ Duplicates removed: $duplicatesRemoved" "WARN"
+    }
+    
+    Write-Log "║ VMs with Decommission Requests Found (after dedup): $($finalDecommissionData.Count)" "SUCCESS"
+    
+    if ($finalDecommissionData.Count -gt 0) {
         Write-Log "║" "SUCCESS"
         Write-Log "║ VMs Found in Decommission:" "SUCCESS"
-        foreach ($vm in $decommissionData) {
+        foreach ($vm in $finalDecommissionData) {
             Write-Log "║   - $($vm.VMName) (Deployment: $($vm.DeploymentName))" "SUCCESS"
-            Write-Log "║     Status: $($vm.RequestStatus), Initiated: $($vm.InitiatedAt)" "SUCCESS"
+            Write-Log "║     Action: $($vm.RequestAction), Status: $($vm.RequestStatus)" "SUCCESS"
         }
     }
     else {
@@ -621,7 +690,7 @@ function Get-ActiveDeploymentsWithDecommission {
     }
     Write-Log "╚════════════════════════════════════════════════════════════════════════════════" "SUCCESS"
     
-    return @($decommissionData)
+    return @($finalDecommissionData)
 }
 
 function Get-DeletedVMsFromVRA {
@@ -1229,7 +1298,7 @@ $decommissionTableRows
 # ============================================================================
 
 Write-DebugSection "DELETED VM TRACKER - STARTED"
-Write-Log "Script Version: 2.2.0 - Performance Optimized + DD-MM-YYYY Format" "SUCCESS"
+Write-Log "Script Version: 2.2.1 - Duplicate Fix + Performance + DD-MM-YYYY" "SUCCESS"
 Write-Log "PowerShell Version: $($PSVersionTable.PSVersion)"
 Write-Log "Debug output file: $debugOutputFile" "SUCCESS"
 
@@ -1462,6 +1531,6 @@ else {
 }
 
 Write-DebugSection "SCRIPT COMPLETED"
-Write-Log "Script Version: 2.2.0" "SUCCESS"
+Write-Log "Script Version: 2.2.1" "SUCCESS"
 Write-Log "Debug log saved to: $debugOutputFile" "SUCCESS"
 Write-Log "`nScript finished. Check the debug file for detailed logs." "SUCCESS"
