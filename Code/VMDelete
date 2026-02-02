@@ -1,11 +1,13 @@
 # ============================================================================
 # DELETED VM TRACKER - ARIA OPERATIONS + MULTI-VRA + VCENTER
-# Version 2.2.3 - PowerShell 5.1 Compatible
+# Version 2.2.4 - PowerShell 5.1 Compatible
 # Fixed: Shows actual deleter username instead of deployment owner
+# Fixed: Detects failed vRA deployments and shows vCenter cleanup context
 # Fixed: Deleted VM extraction from deployment resources (not just events)
 # Fixed: Date filtering to include today's deletions properly
 # Fixed: Removed overly restrictive VM name filtering
 # Fixed: Duplicate VMs in decommission report (prefers "Initiate" over "Delete")
+# New: "Failed in vRA" indicator for VMs deleted in vCenter after vRA failure
 # New: Performance optimizations for 10k+ deployments
 # New: DD-MM-YYYY date format (Sydney time)
 # New: VCF PowerCLI support with legacy fallback
@@ -1287,21 +1289,51 @@ function Send-DeletedVMReport {
         }
     }
     
+    # Build a lookup of failed vRA deployments for cross-reference
+    $failedVraDeployments = @{}
+    foreach ($vm in $VraDecommissionData) {
+        if ($vm.RequestStatus -match "FAILED|ABORTED|REJECTED") {
+            $vmLower = $vm.VMName.ToLower()
+            $failedVraDeployments[$vmLower] = @{
+                DeploymentName = $vm.DeploymentName
+                RequestStatus = $vm.RequestStatus
+                vRAServer = $vm.vRAServer
+            }
+            Write-Log "Marking failed vRA deployment: $($vm.VMName) - Status: $($vm.RequestStatus)" "DEBUG"
+        }
+    }
+    
     foreach ($vm in $VCenterData) {
         $vmLower = $vm.VMName.ToLower()
         if ($vraVMNames.ContainsKey($vmLower)) {
             Write-Log "SKIPPING vCenter VM (already in vRA): $($vm.VMName) from $($vm.vCenter)" "WARN"
         }
         else {
-            Write-Log "Adding vCenter deleted VM to report: $($vm.VMName) from $($vm.vCenter)" "DEBUG"
-            $deletedVMs += New-Object PSObject -Property @{
-                VMName = $vm.VMName
-                RequestedBy = $vm.DeletedBy
-                DeletedAt = $vm.DeletedAt
-                DeploymentName = "N/A"
-                RequestAction = $vm.EventType
-                RequestStatus = "Deleted"
-                Source = $vm.vCenter
+            # Check if this VM had a failed deployment in vRA
+            if ($failedVraDeployments.ContainsKey($vmLower)) {
+                $failedInfo = $failedVraDeployments[$vmLower]
+                Write-Log "Adding vCenter deleted VM with FAILED vRA deployment context: $($vm.VMName)" "WARN"
+                $deletedVMs += New-Object PSObject -Property @{
+                    VMName = $vm.VMName
+                    RequestedBy = $vm.DeletedBy
+                    DeletedAt = $vm.DeletedAt
+                    DeploymentName = "$($failedInfo.DeploymentName) (Failed in vRA)"
+                    RequestAction = "Failed in vRA - Deleted in vCenter"
+                    RequestStatus = $failedInfo.RequestStatus
+                    Source = "$($vm.vCenter) (vRA: $($failedInfo.vRAServer))"
+                }
+            }
+            else {
+                Write-Log "Adding vCenter deleted VM to report: $($vm.VMName) from $($vm.vCenter)" "DEBUG"
+                $deletedVMs += New-Object PSObject -Property @{
+                    VMName = $vm.VMName
+                    RequestedBy = $vm.DeletedBy
+                    DeletedAt = $vm.DeletedAt
+                    DeploymentName = "N/A"
+                    RequestAction = $vm.EventType
+                    RequestStatus = "Deleted"
+                    Source = $vm.vCenter
+                }
             }
         }
     }
@@ -1387,7 +1419,7 @@ $(if($deletedVMs.Count -gt 0) {
 <th>Deployment Name</th>
 <th>Action</th>
 <th>Status</th>
-<th>Requested/Deleted By</th>
+<th>Deleted By</th>
 <th>Deleted At</th>
 <th>Source</th>
 </tr>
@@ -1465,7 +1497,7 @@ $decommissionTableRows
 # ============================================================================
 
 Write-DebugSection "DELETED VM TRACKER - STARTED"
-Write-Log "Script Version: 2.2.3 - Fixed Who Deleted + Deleted VM Extraction + Date Filtering" "SUCCESS"
+Write-Log "Script Version: 2.2.4 - Fixed Who Deleted + Failed vRA Detection + Deleted VM Extraction" "SUCCESS"
 Write-Log "PowerShell Version: $($PSVersionTable.PSVersion)"
 Write-Log "Debug output file: $debugOutputFile" "SUCCESS"
 
@@ -1698,6 +1730,6 @@ else {
 }
 
 Write-DebugSection "SCRIPT COMPLETED"
-Write-Log "Script Version: 2.2.3" "SUCCESS"
+Write-Log "Script Version: 2.2.4" "SUCCESS"
 Write-Log "Debug log saved to: $debugOutputFile" "SUCCESS"
 Write-Log "`nScript finished. Check the debug file for detailed logs." "SUCCESS"
