@@ -1,6 +1,9 @@
 # ============================================================================
 # DELETED VM TRACKER - ARIA OPERATIONS + MULTI-VRA + VCENTER
-# Version 2.2.6 - PowerShell 5.1 Compatible
+# Version 2.2.7 - PowerShell 5.1 Compatible
+# Fixed: NEW Get-FailedDeploymentsFromVRA function to find failed deployments
+# Fixed: Matches failed vRA deployments with vCenter cleanup events by VM name
+# Fixed: Shows failed deployments even without vRA deletion events
 # Fixed: Improved matching of failed deployments (checks both deleted & decommission data)
 # Fixed: Shows failed vRA deployments as vRA failures (not vCenter deletions)
 # Fixed: Shows actual deleter username instead of deployment owner
@@ -9,6 +12,7 @@
 # Fixed: Date filtering to include today's deletions properly
 # Fixed: Removed overly restrictive VM name filtering
 # Fixed: Duplicate VMs in decommission report (prefers "Initiate" over "Delete")
+# New: Dedicated function for failed deployments (not relying on deletion events)
 # New: Detailed logging shows matching process for failed deployments
 # New: "Failed in vRA" indicator for VMs deleted in vCenter after vRA failure
 # New: Performance optimizations for 10k+ deployments
@@ -1195,6 +1199,203 @@ function Get-DeletedVMsFromVCenter {
     return $deletedVMs
 }
 
+function Get-FailedDeploymentsFromVRA {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$VraServer,
+        
+        [Parameter(Mandatory=$true)]
+        [hashtable]$Headers,
+        
+        [Parameter(Mandatory=$true)]
+        [int]$DaysBack
+    )
+    
+    Write-DebugSection "Processing FAILED Deployments from vRA: $VraServer"
+    
+    $failedDeploymentData = @()
+    $cutoffDate = (Get-Date).AddDays(-$DaysBack).ToString("yyyy-MM-dd")
+    
+    Write-Log "Cutoff date: $cutoffDate" "DEBUG"
+    Write-Log "Searching for FAILED deployments (not deleted, still active with FAILED status)..." "DEBUG"
+    
+    $vraUri = "https://$VraServer/deployment/api/deployments"
+    $page = 0
+    $size = 1000
+    $allDeployments = @()
+    
+    do {
+        $pagedUri = "$vraUri`?page=$page&size=$size&expand=resources&`$filter=lastUpdatedAt ge '$cutoffDate'"
+        Write-Log "  Fetching page $page from: $pagedUri" "DEBUG"
+        
+        try {
+            $vraResponse = Invoke-RestMethod -Uri $pagedUri -Method Get -Headers $Headers -ErrorAction Stop
+            $deployments = if ($vraResponse.content) { $vraResponse.content } else { $vraResponse }
+            
+            if ($deployments -and $deployments.Count -gt 0) {
+                $allDeployments += $deployments
+                Write-Log "  Page $page : Found $($deployments.Count) deployments" "DEBUG"
+                $page++
+            }
+            else {
+                break
+            }
+            
+            $hasMore = if ($vraResponse.totalPages) {
+                $page -lt $vraResponse.totalPages
+            } elseif ($vraResponse.totalElements) { 
+                ($page * $size) -lt $vraResponse.totalElements
+            } else { 
+                $deployments.Count -eq $size
+            }
+        }
+        catch {
+            Write-Log "  Error fetching page $page : $($_.Exception.Message)" "ERROR"
+            break
+        }
+        
+        if ($page -ge 20) {
+            Write-Log "  WARNING: Reached 20 page limit" "WARN"
+            break
+        }
+        
+    } while ($hasMore)
+    
+    Write-Log "Total deployments retrieved: $($allDeployments.Count)" "DEBUG"
+    
+    # Filter for deployments with FAILED status
+    Write-Log "`n--- Filtering for FAILED deployments ---" "DEBUG"
+    
+    $failedDeployments = $allDeployments | Where-Object {
+        $_.status -match "FAILED|CREATE_FAILED|UPDATE_FAILED"
+    }
+    
+    Write-Log "Deployments with FAILED status: $($failedDeployments.Count)" "SUCCESS"
+    
+    # Also check for deployments with failed requests
+    foreach ($deployment in $allDeployments) {
+        # Skip if already marked as failed
+        if ($deployment.status -match "FAILED|CREATE_FAILED|UPDATE_FAILED") {
+            continue
+        }
+        
+        try {
+            $requestsUri = "https://$VraServer/deployment/api/deployments/$($deployment.id)/requests?apiVersion=2020-08-25"
+            $requestsResponse = Invoke-RestMethod -Uri $requestsUri -Method Get -Headers $Headers -ErrorAction Stop
+            $requests = if ($requestsResponse.content) { $requestsResponse.content } else { $requestsResponse }
+            
+            foreach ($request in $requests) {
+                if ($request.status -match "FAILED|ABORTED|REJECTED") {
+                    # Check if this is a create/provision request that failed
+                    if ($request.actionId -match "Deployment.Create|Cloud.vSphere.Machine.Provision|Deployment.Provision") {
+                        Write-Log "  Found deployment with FAILED create request: $($deployment.name)" "WARN"
+                        $failedDeployments += $deployment
+                        break
+                    }
+                }
+            }
+        }
+        catch {
+            # Silently continue if we can't fetch requests
+        }
+    }
+    
+    Write-Log "`nTotal FAILED deployments (including failed requests): $($failedDeployments.Count)" "SUCCESS"
+    
+    # Extract VMs from failed deployments
+    foreach ($deployment in $failedDeployments) {
+        Write-Log "`n--- FAILED Deployment: $($deployment.name) (ID: $($deployment.id)) ---" "WARN"
+        Write-Log "  Status: $($deployment.status)" "WARN"
+        Write-Log "  Last Updated: $($deployment.lastUpdatedAt)" "DEBUG"
+        Write-Log "  Owned By: $($deployment.ownedBy)" "DEBUG"
+        
+        # Extract VM names from deployment resources
+        $foundVMs = @{}
+        
+        if ($deployment.resources) {
+            Write-Log "  Checking deployment resources for VM names..." "DEBUG"
+            foreach ($resource in $deployment.resources) {
+                if ($resource.type -eq "Cloud.vSphere.Machine") {
+                    Write-Log "    Found vSphere Machine resource" "DEBUG"
+                    
+                    $serverName = $null
+                    
+                    if ($resource.properties -and $resource.properties.resourceName) {
+                        $serverName = $resource.properties.resourceName
+                    }
+                    elseif ($resource.name -and $resource.name -notmatch "Cloud_vSphere_Machine_\d+") {
+                        $serverName = $resource.name
+                    }
+                    elseif ($resource.properties -and $resource.properties.address) {
+                        $serverName = $resource.properties.address
+                    }
+                    
+                    if ($serverName) {
+                        $vmKey = $serverName.ToLower()
+                        if (-not $foundVMs.ContainsKey($vmKey)) {
+                            $foundVMs[$vmKey] = $serverName
+                            Write-Log "    Added FAILED deployment VM: $serverName" "WARN"
+                        }
+                    }
+                }
+            }
+        }
+        
+        Write-Log "  VMs found in failed deployment: $($foundVMs.Count)" "WARN"
+        
+        # Get who initiated the failed deployment
+        $initiatedBy = "N/A"
+        $failureReason = $deployment.status
+        
+        try {
+            $requestsUri = "https://$VraServer/deployment/api/deployments/$($deployment.id)/requests?apiVersion=2020-08-25"
+            $requestsResponse = Invoke-RestMethod -Uri $requestsUri -Method Get -Headers $Headers -ErrorAction Stop
+            $requests = if ($requestsResponse.content) { $requestsResponse.content } else { $requestsResponse }
+            
+            foreach ($request in $requests) {
+                if ($request.status -match "FAILED|ABORTED|REJECTED") {
+                    $initiatedBy = if ($request.requestedBy) { $request.requestedBy } else { $deployment.ownedBy }
+                    $failureReason = $request.status
+                    Write-Log "    Found failed request by: $initiatedBy (Status: $failureReason)" "DEBUG"
+                    break
+                }
+            }
+        }
+        catch {
+            # Fallback to deployment owner
+            $initiatedBy = if ($deployment.ownedBy) { $deployment.ownedBy } else { "N/A" }
+        }
+        
+        # Create entries for all VMs in this failed deployment
+        foreach ($vmEntry in $foundVMs.GetEnumerator()) {
+            $serverName = $vmEntry.Value
+            
+            $vraServerShort = ($VraServer -split '\.')[0]
+            $catalogItem = if ($deployment.inputs._catalogItemName) { $deployment.inputs._catalogItemName } else { "N/A" }
+            
+            $failedDeploymentData += New-Object PSObject -Property @{
+                VMName = $serverName
+                ResourceType = "Cloud.vSphere.Machine"
+                DeploymentName = $deployment.name
+                DeploymentID = $deployment.id
+                DeploymentStatus = $deployment.status
+                RequestStatus = $failureReason
+                RequestedBy = $initiatedBy
+                Requestor = $initiatedBy
+                CatalogItem = $catalogItem
+                FailedAt = Convert-ToSydneyTime -DateTimeString $deployment.lastUpdatedAt
+                vRAServer = $vraServerShort
+                Source = "vRA-Failed"
+            }
+            
+            Write-Log "    Added FAILED deployment VM: $serverName" "SUCCESS"
+        }
+    }
+    
+    Write-Log "`nExtracted $($failedDeploymentData.Count) VMs from FAILED deployments on vRA server $VraServer" "SUCCESS"
+    return $failedDeploymentData
+}
+
 function Send-DeletedVMReport {
     param(
         [Parameter(Mandatory=$false)]
@@ -1202,6 +1403,9 @@ function Send-DeletedVMReport {
         
         [Parameter(Mandatory=$false)]
         [Array]$VraDecommissionData = @(),
+        
+        [Parameter(Mandatory=$false)]
+        [Array]$VraFailedData = @(),
         
         [Parameter(Mandatory=$false)]
         [Array]$VCenterData = @(),
@@ -1255,6 +1459,7 @@ function Send-DeletedVMReport {
     
     Write-Log "Building HTML email report..." "DEBUG"
     
+    Write-Log "VraFailedData count received: $($VraFailedData.Count)" "DEBUG"
     Write-Log "VraDecommissionData count received: $($VraDecommissionData.Count)" "DEBUG"
     if ($VraDecommissionData.Count -gt 0) {
         Write-Log "First decommission VM details:" "DEBUG"
@@ -1271,6 +1476,9 @@ function Send-DeletedVMReport {
         $vraVMNames[$vm.VMName.ToLower()] = $true
     }
     foreach ($vm in $VraDecommissionData) {
+        $vraVMNames[$vm.VMName.ToLower()] = $true
+    }
+    foreach ($vm in $VraFailedData) {
         $vraVMNames[$vm.VMName.ToLower()] = $true
     }
     
@@ -1300,45 +1508,23 @@ function Send-DeletedVMReport {
     }
     
     # ============================================================================
-    # ✅ FIXED SECTION: Process failed vRA deployments FIRST
+    # ✅ FIXED SECTION: Process failed vRA deployments using dedicated failed data
     # ============================================================================
     
     # Build a lookup of failed vRA deployments for cross-reference
-    # Check BOTH deleted deployments AND active decommission requests for failures
     $failedVraDeployments = @{}
     
-    Write-Log "Searching for failed vRA deployments in deleted data..." "DEBUG"
-    foreach ($vm in $VraDeletedData) {
-        Write-Log "  Checking VM: $($vm.VMName) - Status: $($vm.RequestStatus)" "DEBUG"
-        if ($vm.RequestStatus -match "FAILED|ABORTED|REJECTED|FAILURE") {
-            $vmLower = $vm.VMName.ToLower()
-            $failedVraDeployments[$vmLower] = @{
-                DeploymentName = $vm.DeploymentName
-                RequestStatus = $vm.RequestStatus
-                vRAServer = $vm.vRAServer
-                RequestedBy = $vm.RequestedBy
-                InitiatedAt = if ($vm.InitiatedAt) { $vm.InitiatedAt } else { $vm.DeletedAt }
-            }
-            Write-Log "  ✓ FOUND FAILED vRA deployment in deleted data: $($vm.VMName) - Status: $($vm.RequestStatus)" "WARN"
-        }
-    }
-    
-    Write-Log "Searching for failed vRA deployments in decommission data..." "DEBUG"
-    foreach ($vm in $VraDecommissionData) {
-        Write-Log "  Checking VM: $($vm.VMName) - Status: $($vm.RequestStatus)" "DEBUG"
-        if ($vm.RequestStatus -match "FAILED|ABORTED|REJECTED|FAILURE") {
-            $vmLower = $vm.VMName.ToLower()
-            # Only add if not already found (deleted data takes precedence)
-            if (-not $failedVraDeployments.ContainsKey($vmLower)) {
-                $failedVraDeployments[$vmLower] = @{
-                    DeploymentName = $vm.DeploymentName
-                    RequestStatus = $vm.RequestStatus
-                    vRAServer = $vm.vRAServer
-                    RequestedBy = $vm.RequestedBy
-                    InitiatedAt = $vm.InitiatedAt
-                }
-                Write-Log "  ✓ FOUND FAILED vRA deployment in decommission data: $($vm.VMName) - Status: $($vm.RequestStatus)" "WARN"
-            }
+    Write-Log "Processing failed vRA deployments from VraFailedData..." "DEBUG"
+    foreach ($vm in $VraFailedData) {
+        $vmLower = $vm.VMName.ToLower()
+        Write-Log "  Adding failed deployment: $($vm.VMName) - Status: $($vm.RequestStatus) from $($vm.vRAServer)" "DEBUG"
+        
+        $failedVraDeployments[$vmLower] = @{
+            DeploymentName = $vm.DeploymentName
+            RequestStatus = $vm.RequestStatus
+            vRAServer = $vm.vRAServer
+            RequestedBy = $vm.RequestedBy
+            FailedAt = $vm.FailedAt
         }
     }
     
@@ -1377,22 +1563,22 @@ function Send-DeletedVMReport {
                 DeletedAt = $vcenterEvent.DeletedAt
                 DeploymentName = "$($failedInfo.DeploymentName)"
                 RequestAction = "vRA Deployment Failed"
-                RequestStatus = "$($failedInfo.RequestStatus) - Cleaned up in vCenter"
-                Source = "vRA: $($failedInfo.vRAServer) → vCenter: $($vcenterEvent.vCenter)"
+                RequestStatus = "$($failedInfo.RequestStatus)"
+                Source = "vRA: $($failedInfo.vRAServer) → Cleaned in vCenter: $($vcenterEvent.vCenter)"
             }
         }
         else {
-            # Failed in vRA but no vCenter event found (shouldn't happen but handle it)
+            # Failed in vRA but no vCenter event found (VM may still exist or deleted outside time window)
             Write-Log "  ✗ NO MATCH: Failed vRA deployment but no vCenter cleanup event found for: $vmLower" "WARN"
-            Write-Log "    This VM may have been deleted outside the time window or manually." "DEBUG"
+            Write-Log "    This VM may still exist in vCenter or was deleted outside the time window." "DEBUG"
             
             $deletedVMs += New-Object PSObject -Property @{
                 VMName = $vmLower
                 RequestedBy = if ($failedInfo.RequestedBy) { $failedInfo.RequestedBy } else { "N/A" }
-                DeletedAt = if ($failedInfo.InitiatedAt) { $failedInfo.InitiatedAt } else { "N/A" }
+                DeletedAt = if ($failedInfo.FailedAt) { $failedInfo.FailedAt } else { "N/A" }
                 DeploymentName = "$($failedInfo.DeploymentName)"
                 RequestAction = "vRA Deployment Failed"
-                RequestStatus = $failedInfo.RequestStatus
+                RequestStatus = "$($failedInfo.RequestStatus) (No vCenter cleanup found)"
                 Source = "vRA: $($failedInfo.vRAServer)"
             }
         }
@@ -1589,7 +1775,7 @@ $decommissionTableRows
 # ============================================================================
 
 Write-DebugSection "DELETED VM TRACKER - STARTED"
-Write-Log "Script Version: 2.2.6 - Fixed Failed vRA Deployment Matching" "SUCCESS"
+Write-Log "Script Version: 2.2.7 - Complete Failed Deployment Detection & Matching" "SUCCESS"
 Write-Log "PowerShell Version: $($PSVersionTable.PSVersion)"
 Write-Log "Debug output file: $debugOutputFile" "SUCCESS"
 
@@ -1682,6 +1868,46 @@ foreach ($vraServer in $vraServers) {
 Write-Log "`nvRA Decommission Total: Found $($allVraDecommissionVMs.Count) VMs with active decommission requests" "SUCCESS"
 
 # ============================================================================
+# VRA - GET FAILED DEPLOYMENTS
+# ============================================================================
+
+Write-DebugSection "vRA - PROCESSING FAILED DEPLOYMENTS"
+
+$allVraFailedVMs = @()
+
+foreach ($vraServer in $vraServers) {
+    try {
+        Write-Log "`nConnecting to vRA: $vraServer" "DEBUG"
+        
+        $vraAuthUri = "https://$vraServer/csp/gateway/am/api/login"
+        $vraAuthBody = @{
+            username = $username
+            password = $password
+        } | ConvertTo-Json
+        
+        $vraAuthResponse = Invoke-RestMethod -Uri $vraAuthUri -Method Post -Headers @{
+            "Content-Type" = "application/json"
+        } -Body $vraAuthBody -ErrorAction Stop
+        
+        $vraHeaders = @{
+            "Authorization" = "Bearer $($vraAuthResponse.cspAuthToken)"
+            "Content-Type" = "application/json"
+        }
+        
+        Write-Log "Authenticated successfully" "SUCCESS"
+        
+        $failedVMs = Get-FailedDeploymentsFromVRA -VraServer $vraServer -Headers $vraHeaders -DaysBack $daysBack
+        $allVraFailedVMs += $failedVMs
+        
+    }
+    catch {
+        Write-Log "Error with vRA server $vraServer : $($_.Exception.Message)" "ERROR"
+    }
+}
+
+Write-Log "`nvRA Failed Deployments Total: Found $($allVraFailedVMs.Count) VMs from failed deployments across all servers" "SUCCESS"
+
+# ============================================================================
 # VRA - GET DELETED DEPLOYMENTS
 # ============================================================================
 
@@ -1743,10 +1969,11 @@ Write-Log "`nvCenter Total: Found $($allVCenterDeletedVMs.Count) deleted VMs acr
 Write-DebugSection "SUMMARY AND REPORTING"
 
 Write-Log "vRA Decommission In Progress: $($allVraDecommissionVMs.Count)" "SUCCESS"
+Write-Log "vRA Failed Deployments: $($allVraFailedVMs.Count)" "SUCCESS"
 Write-Log "vRA Deleted Deployments: $($allVraDeletedVMs.Count)" "SUCCESS"
 Write-Log "vCenter Direct Deletions: $($allVCenterDeletedVMs.Count)" "SUCCESS"
 
-$vraVCenterTotal = $allVraDeletedVMs.Count + $allVraDecommissionVMs.Count + $allVCenterDeletedVMs.Count
+$vraVCenterTotal = $allVraDeletedVMs.Count + $allVraDecommissionVMs.Count + $allVraFailedVMs.Count + $allVCenterDeletedVMs.Count
 
 Write-Log "Total (vRA + vCenter): $vraVCenterTotal" "DEBUG"
 
@@ -1812,6 +2039,7 @@ else {
     Send-DeletedVMReport `
         -VraDeletedData $allVraDeletedVMs `
         -VraDecommissionData $allVraDecommissionVMs `
+        -VraFailedData $allVraFailedVMs `
         -VCenterData $allVCenterDeletedVMs `
         -SmtpServer $script:smtpServer `
         -SmtpPort $script:smtpPort `
@@ -1822,6 +2050,6 @@ else {
 }
 
 Write-DebugSection "SCRIPT COMPLETED"
-Write-Log "Script Version: 2.2.6" "SUCCESS"
+Write-Log "Script Version: 2.2.7" "SUCCESS"
 Write-Log "Debug log saved to: $debugOutputFile" "SUCCESS"
 Write-Log "`nScript finished. Check the debug file for detailed logs." "SUCCESS"
