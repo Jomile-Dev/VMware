@@ -1,6 +1,7 @@
 # ============================================================================
 # DELETED VM TRACKER - ARIA OPERATIONS + MULTI-VRA + VCENTER
-# Version 2.1.3 - PowerShell 5.1 Compatible
+# Version 2.1.4 - PowerShell 5.1 Compatible
+# Fixed: Email parameter scoping and validation
 # Fixed: Consistent "Cloud Resource Name:" pattern extraction
 # ============================================================================
 
@@ -23,11 +24,11 @@ $vCenters = @(
     "vcenter3.domain.com"
 )
 
-# EMAIL CONFIGURATION - Use proper scope
+# EMAIL CONFIGURATION - CRITICAL: Update these values!
 $script:smtpServer = "smtp.yourdomain.com"  # CHANGE THIS
 $script:smtpPort = 587
 $script:smtpFrom = "vra-reports@yourdomain.com"  # CHANGE THIS
-$script:smtpTo = @("test.test@email.com")  # CHANGE THIS
+$script:smtpTo = @("test.test@email.com")  # CHANGE THIS - Must be an array with at least one email
 $script:smtpCc = @("manager@yourdomain.com")  # CHANGE THIS or use @() for none
 $script:smtpSubject = "Deleted VM Report - $(Get-Date -Format 'yyyy-MM-dd')"
 
@@ -42,13 +43,26 @@ Write-Host "smtpServer: $script:smtpServer" -ForegroundColor Yellow
 Write-Host "smtpPort: $script:smtpPort" -ForegroundColor Yellow
 Write-Host "smtpFrom: $script:smtpFrom" -ForegroundColor Yellow
 Write-Host "smtpTo: $($script:smtpTo -join ', ')" -ForegroundColor Yellow
+Write-Host "smtpTo Type: $($script:smtpTo.GetType().Name)" -ForegroundColor Yellow
+Write-Host "smtpTo Count: $($script:smtpTo.Count)" -ForegroundColor Yellow
 Write-Host "smtpCc: $($script:smtpCc -join ', ')" -ForegroundColor Yellow
 Write-Host "=================================" -ForegroundColor Cyan
 
 if (-not $script:smtpTo -or $script:smtpTo.Count -eq 0) {
     Write-Host "ERROR: Email recipient (smtpTo) is not configured!" -ForegroundColor Red
     Write-Host "Please edit the configuration section at the top of the script." -ForegroundColor Red
+    Write-Host "The smtpTo variable must be an array with at least one email address." -ForegroundColor Red
+    Write-Host "Example: `$script:smtpTo = @('your.email@domain.com')" -ForegroundColor Red
     exit
+}
+
+# Validate email addresses have proper format
+foreach ($email in $script:smtpTo) {
+    if ($email -notmatch '^[\w\.-]+@[\w\.-]+\.\w+$') {
+        Write-Host "ERROR: Invalid email format detected: $email" -ForegroundColor Red
+        Write-Host "Please use valid email addresses in the smtpTo array." -ForegroundColor Red
+        exit
+    }
 }
 
 # ============================================================================
@@ -502,9 +516,9 @@ function Get-ActiveDeploymentsWithDecommission {
                             RequestedBy = $request.requestedBy
                             Requestor = if ($deployment.ownedBy) { $deployment.ownedBy } else { $request.requestedBy }
                             CatalogItem = $catalogItem
-                            InitiatedAt = $expirationDateValue  # SWAPPED: Now shows expiration date
+                            InitiatedAt = $expirationDateValue  # Shows expiration date
                             CompletedAt = if ($request.completedAt) { Convert-ToSydneyTime -DateTimeString $request.completedAt } else { "N/A" }
-                            DeletionDate = $deletionDate  # RENAMED: Now shows actual deletion/update date
+                            DeletionDate = $deletionDate  # Shows actual deletion/update date
                             vRAServer = $vraServerShort
                             Source = "vRA-Decommission-InProgress"
                             IsStillActive = $true
@@ -516,7 +530,7 @@ function Get-ActiveDeploymentsWithDecommission {
                         Write-Log "          RequestAction: $($vmObject.RequestAction)" "DEBUG"
                         Write-Log "          RequestStatus: $($vmObject.RequestStatus)" "DEBUG"
                         Write-Log "          InitiatedAt (CONVERTED): $($vmObject.InitiatedAt)" "WARN"
-                        Write-Log "          ExpirationDate (CONVERTED): $($vmObject.ExpirationDate)" "WARN"
+                        Write-Log "          DeletionDate (CONVERTED): $($vmObject.DeletionDate)" "WARN"
                         Write-Log "          Source: $($vmObject.Source)" "DEBUG"
                         Write-Log "          vRAServer: $($vmObject.vRAServer)" "DEBUG"
                         
@@ -546,7 +560,7 @@ function Get-ActiveDeploymentsWithDecommission {
         Write-Log "║ VMs Found in Decommission:" "SUCCESS"
         foreach ($vm in $decommissionData) {
             Write-Log "║   - $($vm.VMName) (Deployment: $($vm.DeploymentName))" "SUCCESS"
-            Write-Log "║     Status: $($vm.RequestStatus), Expires: $($vm.ExpirationDate)" "SUCCESS"
+            Write-Log "║     Status: $($vm.RequestStatus), Initiated: $($vm.InitiatedAt)" "SUCCESS"
         }
     }
     else {
@@ -730,7 +744,7 @@ function Get-DeletedVMsFromVRA {
                             
                             Write-Log "    ║     >>> Event Details: $($detailsText.Substring(0, [Math]::Min(200, $detailsText.Length)))... <<<" "DEBUG"
                             
-                            # Look for "Cloud Resource Name:" pattern (PRIORITY 1 - ADDED)
+                            # Look for "Cloud Resource Name:" pattern (PRIORITY 1)
                             if ($detailsText -match "Cloud Resource Name:\s*([^\s,;]+)") {
                                 $serverName = $matches[1].Trim()
                                 Write-Log "    ║     >>> Found hostname via 'Cloud Resource Name:' pattern: $serverName <<<" "SUCCESS"
@@ -911,11 +925,39 @@ function Send-DeletedVMReport {
         [Array]$To,
         
         [Parameter(Mandatory=$false)]
-        [Array]$Cc,
+        [Array]$Cc = @(),
         
         [Parameter(Mandatory=$true)]
         [string]$Subject
     )
+    
+    Write-Log "=== EMAIL FUNCTION - PARAMETER VALIDATION ===" "DEBUG"
+    Write-Log "SmtpServer: $SmtpServer" "DEBUG"
+    Write-Log "SmtpPort: $SmtpPort" "DEBUG"
+    Write-Log "From: $From" "DEBUG"
+    Write-Log "To: $($To -join ', ')" "DEBUG"
+    Write-Log "To Type: $($To.GetType().Name)" "DEBUG"
+    Write-Log "To Count: $($To.Count)" "DEBUG"
+    Write-Log "Cc: $($Cc -join ', ')" "DEBUG"
+    Write-Log "Subject: $Subject" "DEBUG"
+    Write-Log "=============================================" "DEBUG"
+    
+    # Validate email parameters
+    if (-not $To -or $To.Count -eq 0) {
+        Write-Log "CRITICAL ERROR: Email To parameter is null or empty!" "ERROR"
+        Write-Log "Cannot send email without recipient address." "ERROR"
+        return
+    }
+    
+    if ([string]::IsNullOrWhiteSpace($From)) {
+        Write-Log "CRITICAL ERROR: Email From parameter is null or empty!" "ERROR"
+        return
+    }
+    
+    if ([string]::IsNullOrWhiteSpace($SmtpServer)) {
+        Write-Log "CRITICAL ERROR: SMTP Server parameter is null or empty!" "ERROR"
+        return
+    }
     
     Write-Log "Building HTML email report..." "DEBUG"
     
@@ -927,11 +969,7 @@ function Send-DeletedVMReport {
         Write-Log "  VMName: $($firstVM.VMName)" "DEBUG"
         Write-Log "  vRAServer: $($firstVM.vRAServer)" "DEBUG"
         Write-Log "  InitiatedAt: $($firstVM.InitiatedAt)" "DEBUG"
-        Write-Log "  ExpirationDate: $($firstVM.ExpirationDate)" "DEBUG"
-        Write-Log "  All Properties:" "DEBUG"
-        foreach ($prop in $firstVM.PSObject.Properties) {
-            Write-Log "    $($prop.Name) = $($prop.Value)" "DEBUG"
-        }
+        Write-Log "  DeletionDate: $($firstVM.DeletionDate)" "DEBUG"
     }
     
     $vraVMNames = @{}
@@ -981,20 +1019,15 @@ function Send-DeletedVMReport {
     
     foreach ($vm in $VraDecommissionData) {
         Write-Log "Processing decommission VM: $($vm.VMName) from $($vm.vRAServer)" "DEBUG"
-        Write-Log "  Deployment: $($vm.DeploymentName)" "DEBUG"
-        Write-Log "  Status: $($vm.RequestStatus)" "DEBUG"
-        Write-Log "  DeletionDate: $($vm.DeletionDate)" "DEBUG"
-        Write-Log "  InitiatedAt: $($vm.InitiatedAt)" "DEBUG"
         
-        # Handle both old and new property names
-        $vmName = if ($vm.VMName) { $vm.VMName } elseif ($vm.PSObject.Properties['VMName']) { $vm.VMName } else { "N/A" }
-        $requestedBy = if ($vm.RequestedBy) { $vm.RequestedBy } elseif ($vm.PSObject.Properties['RequestedBy']) { $vm.RequestedBy } else { "N/A" }
-        $initiatedAt = if ($vm.InitiatedAt) { $vm.InitiatedAt } elseif ($vm.PSObject.Properties['InitiatedAt']) { $vm.InitiatedAt } else { "N/A" }
-        $deletionDate = if ($vm.DeletionDate) { $vm.DeletionDate } elseif ($vm.PSObject.Properties['DeletionDate']) { $vm.DeletionDate } else { "N/A" }
-        $deploymentName = if ($vm.DeploymentName) { $vm.DeploymentName } elseif ($vm.PSObject.Properties['DeploymentName']) { $vm.DeploymentName } else { "N/A" }
-        $requestAction = if ($vm.RequestAction) { $vm.RequestAction } elseif ($vm.PSObject.Properties['RequestAction']) { $vm.RequestAction } else { "N/A" }
-        $requestStatus = if ($vm.RequestStatus) { $vm.RequestStatus } elseif ($vm.PSObject.Properties['RequestStatus']) { $vm.RequestStatus } else { "N/A" }
-        $source = if ($vm.vRAServer) { $vm.vRAServer } elseif ($vm.PSObject.Properties['vRAServer']) { $vm.vRAServer } else { "N/A" }
+        $vmName = if ($vm.VMName) { $vm.VMName } else { "N/A" }
+        $requestedBy = if ($vm.RequestedBy) { $vm.RequestedBy } else { "N/A" }
+        $initiatedAt = if ($vm.InitiatedAt) { $vm.InitiatedAt } else { "N/A" }
+        $deletionDate = if ($vm.DeletionDate) { $vm.DeletionDate } else { "N/A" }
+        $deploymentName = if ($vm.DeploymentName) { $vm.DeploymentName } else { "N/A" }
+        $requestAction = if ($vm.RequestAction) { $vm.RequestAction } else { "N/A" }
+        $requestStatus = if ($vm.RequestStatus) { $vm.RequestStatus } else { "N/A" }
+        $source = if ($vm.vRAServer) { $vm.vRAServer } else { "N/A" }
         
         Write-Log "  Adding to report - VMName: $vmName, InitiatedAt: $initiatedAt, DeletionDate: $deletionDate" "DEBUG"
         
@@ -1012,13 +1045,6 @@ function Send-DeletedVMReport {
     
     Write-Log "Total Deleted VMs for report: $($deletedVMs.Count)" "DEBUG"
     Write-Log "Total Decommission VMs for report: $($decommissionVMs.Count)" "DEBUG"
-    
-    if ($decommissionVMs.Count -gt 0) {
-        Write-Log "Decommission VMs in report array:" "DEBUG"
-        foreach ($vm in $decommissionVMs) {
-            Write-Log "  - $($vm.VMName): InitiatedAt=$($vm.InitiatedAt), ExpirationDate=$($vm.ExpirationDate)" "DEBUG"
-        }
-    }
     
     $deletedTableRows = ""
     foreach ($vm in ($deletedVMs | Sort-Object VMName)) {
@@ -1045,13 +1071,6 @@ function Send-DeletedVMReport {
         $decommissionTableRows += "<td>$($vm.DeletionDate)</td>"
         $decommissionTableRows += "<td>$($vm.Source)</td>"
         $decommissionTableRows += "</tr>"
-        
-        # Also add to debug file for visibility
-        Add-Content -Path $debugOutputFile -Value "DECOMMISSION EMAIL ENTRY: VM=$($vm.VMName), Deployment=$($vm.DeploymentName), InitiatedAt=$($vm.InitiatedAt), DeletionDate=$($vm.DeletionDate), Source=$($vm.Source)"
-    }
-        
-        # Also add to debug file for visibility
-        Add-Content -Path $debugOutputFile -Value "DECOMMISSION EMAIL ENTRY: VM=$($vm.VMName), Deployment=$($vm.DeploymentName), InitiatedAt=$($vm.InitiatedAt), ExpirationDate=$($vm.ExpirationDate), Source=$($vm.Source)"
     }
     
     $htmlBody = @"
@@ -1103,7 +1122,7 @@ $(if($decommissionVMs.Count -gt 0) {
 <th>Request Status</th>
 <th>Requested By</th>
 <th>Initiated At</th>
-<th>Expiration Date</th>
+<th>Deletion Date</th>
 <th>Source</th>
 </tr>
 </thead>
@@ -1123,26 +1142,41 @@ $decommissionTableRows
     Write-Log "Email subject: $Subject" "DEBUG"
     
     try {
+        # Build Send-MailMessage parameters explicitly
+        $mailParams = @{
+            To = $To
+            From = $From
+            Subject = $Subject
+            Body = $htmlBody
+            BodyAsHtml = $true
+            SmtpServer = $SmtpServer
+            Port = $SmtpPort
+            UseSsl = $true
+        }
+        
+        # Only add Cc if it has values
         if ($Cc -and $Cc.Count -gt 0) {
-            Send-MailMessage -To $To -From $From -Subject $Subject -Body $htmlBody -BodyAsHtml -SmtpServer $SmtpServer -Port $SmtpPort -UseSsl -Cc $Cc
+            $mailParams['Cc'] = $Cc
+            Write-Log "Adding Cc recipients: $($Cc -join ', ')" "DEBUG"
         }
-        else {
-            Send-MailMessage -To $To -From $From -Subject $Subject -Body $htmlBody -BodyAsHtml -SmtpServer $SmtpServer -Port $SmtpPort -UseSsl
-        }
+        
+        Write-Log "Calling Send-MailMessage with parameters..." "DEBUG"
+        Send-MailMessage @mailParams
         Write-Log "Email sent successfully!" "SUCCESS"
     }
     catch {
         Write-Log "Failed to send email: $($_.Exception.Message)" "ERROR"
         Write-Log "Full error details: $($_.Exception)" "ERROR"
+        Write-Log "Error type: $($_.Exception.GetType().FullName)" "ERROR"
     }
-
+}
 
 # ============================================================================
 # MAIN SCRIPT EXECUTION
 # ============================================================================
 
 Write-DebugSection "DELETED VM TRACKER - STARTED"
-Write-Log "Script Version: 2.1.3" "SUCCESS"
+Write-Log "Script Version: 2.1.4 - Fixed Email Parameters" "SUCCESS"
 Write-Log "PowerShell Version: $($PSVersionTable.PSVersion)"
 Write-Log "Debug output file: $debugOutputFile" "SUCCESS"
 
@@ -1277,19 +1311,17 @@ $vraVCenterTotal = $allVraDeletedVMs.Count + $allVraDecommissionVMs.Count + $all
 
 Write-Log "Total (vRA + vCenter): $vraVCenterTotal" "DEBUG"
 
+# Validate email configuration before attempting to send
+Write-Log "=== PRE-SEND EMAIL VALIDATION ===" "DEBUG"
+Write-Log "script:smtpTo = $($script:smtpTo -join ', ')" "DEBUG"
+Write-Log "script:smtpTo Type = $($script:smtpTo.GetType().Name)" "DEBUG"
+Write-Log "script:smtpTo Count = $($script:smtpTo.Count)" "DEBUG"
+Write-Log "script:smtpFrom = $script:smtpFrom" "DEBUG"
+Write-Log "script:smtpServer = $script:smtpServer" "DEBUG"
+Write-Log "=================================" "DEBUG"
+
 if ($vraVCenterTotal -eq 0) {
     Write-Log "No deleted or decommissioned VMs found. Sending notification email..." "WARN"
-    
-    # Debug: Check variables before sending
-    Write-Log "DEBUG - smtpTo value: $($smtpTo -join ', ')" "DEBUG"
-    Write-Log "DEBUG - smtpFrom value: $smtpFrom" "DEBUG"
-    Write-Log "DEBUG - smtpServer value: $smtpServer" "DEBUG"
-    
-    if (-not $smtpTo -or $smtpTo.Count -eq 0) {
-        Write-Log "ERROR: smtpTo variable is NULL or EMPTY. Check configuration section at top of script." "ERROR"
-        Write-Log "Script cannot continue without valid recipient email address." "ERROR"
-        exit
-    }
     
     $noDeletedVMsHtml = @"
 <html>
@@ -1313,12 +1345,22 @@ if ($vraVCenterTotal -eq 0) {
     $noVMSubject = "No VM Deletions - $(Get-Date -Format 'yyyy-MM-dd')"
     
     try {
-        if ($smtpCc -and $smtpCc.Count -gt 0) {
-            Send-MailMessage -To $smtpTo -From $smtpFrom -Subject $noVMSubject -Body $noDeletedVMsHtml -BodyAsHtml -SmtpServer $smtpServer -Port $smtpPort -UseSsl -Cc $smtpCc
+        $mailParams = @{
+            To = $script:smtpTo
+            From = $script:smtpFrom
+            Subject = $noVMSubject
+            Body = $noDeletedVMsHtml
+            BodyAsHtml = $true
+            SmtpServer = $script:smtpServer
+            Port = $script:smtpPort
+            UseSsl = $true
         }
-        else {
-            Send-MailMessage -To $smtpTo -From $smtpFrom -Subject $noVMSubject -Body $noDeletedVMsHtml -BodyAsHtml -SmtpServer $smtpServer -Port $smtpPort -UseSsl
+        
+        if ($script:smtpCc -and $script:smtpCc.Count -gt 0) {
+            $mailParams['Cc'] = $script:smtpCc
         }
+        
+        Send-MailMessage @mailParams
         Write-Log "Notification email sent successfully!" "SUCCESS"
     }
     catch {
@@ -1341,6 +1383,6 @@ else {
 }
 
 Write-DebugSection "SCRIPT COMPLETED"
-Write-Log "Script Version: 2.1.3" "SUCCESS"
+Write-Log "Script Version: 2.1.4" "SUCCESS"
 Write-Log "Debug log saved to: $debugOutputFile" "SUCCESS"
 Write-Log "`nScript finished. Check the debug file for detailed logs." "SUCCESS"
