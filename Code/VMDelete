@@ -1119,7 +1119,7 @@ $decommissionTableRows
         Write-Log "Failed to send email: $($_.Exception.Message)" "ERROR"
         Write-Log "Full error details: $($_.Exception)" "ERROR"
     }
-}
+
 
 # ============================================================================
 # MAIN SCRIPT EXECUTION
@@ -1264,6 +1264,17 @@ Write-Log "Total (vRA + vCenter): $vraVCenterTotal" "DEBUG"
 if ($vraVCenterTotal -eq 0) {
     Write-Log "No deleted or decommissioned VMs found. Sending notification email..." "WARN"
     
+    # Debug: Check variables before sending
+    Write-Log "DEBUG - smtpTo value: $($smtpTo -join ', ')" "DEBUG"
+    Write-Log "DEBUG - smtpFrom value: $smtpFrom" "DEBUG"
+    Write-Log "DEBUG - smtpServer value: $smtpServer" "DEBUG"
+    
+    if (-not $smtpTo -or $smtpTo.Count -eq 0) {
+        Write-Log "ERROR: smtpTo variable is NULL or EMPTY. Check configuration section at top of script." "ERROR"
+        Write-Log "Script cannot continue without valid recipient email address." "ERROR"
+        exit
+    }
+    
     $noDeletedVMsHtml = @"
 <html>
 <head>
@@ -1296,6 +1307,7 @@ if ($vraVCenterTotal -eq 0) {
     }
     catch {
         Write-Log "Failed to send notification email: $($_.Exception.Message)" "ERROR"
+        Write-Log "Full error details: $($_.Exception)" "ERROR"
     }
 }
 else {
