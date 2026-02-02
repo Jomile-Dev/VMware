@@ -1,6 +1,7 @@
 # ============================================================================
 # DELETED VM TRACKER - ARIA OPERATIONS + MULTI-VRA + VCENTER
-# Version 2.2.4 - PowerShell 5.1 Compatible
+# Version 2.2.5 - PowerShell 5.1 Compatible
+# Fixed: Shows failed vRA deployments as vRA failures (not vCenter deletions)
 # Fixed: Shows actual deleter username instead of deployment owner
 # Fixed: Detects failed vRA deployments and shows vCenter cleanup context
 # Fixed: Deleted VM extraction from deployment resources (not just events)
@@ -1289,6 +1290,10 @@ function Send-DeletedVMReport {
         }
     }
     
+    # ============================================================================
+    # ✅ FIXED SECTION: Process failed vRA deployments FIRST
+    # ============================================================================
+    
     # Build a lookup of failed vRA deployments for cross-reference
     $failedVraDeployments = @{}
     foreach ($vm in $VraDecommissionData) {
@@ -1298,45 +1303,77 @@ function Send-DeletedVMReport {
                 DeploymentName = $vm.DeploymentName
                 RequestStatus = $vm.RequestStatus
                 vRAServer = $vm.vRAServer
+                RequestedBy = $vm.RequestedBy
+                InitiatedAt = $vm.InitiatedAt
             }
             Write-Log "Marking failed vRA deployment: $($vm.VMName) - Status: $($vm.RequestStatus)" "DEBUG"
         }
     }
     
-    foreach ($vm in $VCenterData) {
-        $vmLower = $vm.VMName.ToLower()
-        if ($vraVMNames.ContainsKey($vmLower)) {
-            Write-Log "SKIPPING vCenter VM (already in vRA): $($vm.VMName) from $($vm.vCenter)" "WARN"
+    # Process failed vRA deployments FIRST (before regular vCenter deletions)
+    foreach ($vmEntry in $failedVraDeployments.GetEnumerator()) {
+        $vmLower = $vmEntry.Key
+        $failedInfo = $vmEntry.Value
+        
+        # Find matching vCenter deletion event (if any)
+        $vcenterEvent = $VCenterData | Where-Object { $_.VMName.ToLower() -eq $vmLower } | Select-Object -First 1
+        
+        if ($vcenterEvent) {
+            Write-Log "Adding FAILED vRA deployment with vCenter cleanup: $($vcenterEvent.VMName)" "WARN"
+            $deletedVMs += New-Object PSObject -Property @{
+                VMName = $vcenterEvent.VMName
+                RequestedBy = if ($failedInfo.RequestedBy) { $failedInfo.RequestedBy } else { "N/A" }
+                DeletedAt = $vcenterEvent.DeletedAt
+                DeploymentName = "$($failedInfo.DeploymentName)"
+                RequestAction = "vRA Deployment Failed"
+                RequestStatus = "$($failedInfo.RequestStatus) - Cleaned up in vCenter"
+                Source = "vRA: $($failedInfo.vRAServer) → vCenter: $($vcenterEvent.vCenter)"
+            }
         }
         else {
-            # Check if this VM had a failed deployment in vRA
-            if ($failedVraDeployments.ContainsKey($vmLower)) {
-                $failedInfo = $failedVraDeployments[$vmLower]
-                Write-Log "Adding vCenter deleted VM with FAILED vRA deployment context: $($vm.VMName)" "WARN"
-                $deletedVMs += New-Object PSObject -Property @{
-                    VMName = $vm.VMName
-                    RequestedBy = $vm.DeletedBy
-                    DeletedAt = $vm.DeletedAt
-                    DeploymentName = "$($failedInfo.DeploymentName) (Failed in vRA)"
-                    RequestAction = "Failed in vRA - Deleted in vCenter"
-                    RequestStatus = $failedInfo.RequestStatus
-                    Source = "$($vm.vCenter) (vRA: $($failedInfo.vRAServer))"
-                }
-            }
-            else {
-                Write-Log "Adding vCenter deleted VM to report: $($vm.VMName) from $($vm.vCenter)" "DEBUG"
-                $deletedVMs += New-Object PSObject -Property @{
-                    VMName = $vm.VMName
-                    RequestedBy = $vm.DeletedBy
-                    DeletedAt = $vm.DeletedAt
-                    DeploymentName = "N/A"
-                    RequestAction = $vm.EventType
-                    RequestStatus = "Deleted"
-                    Source = $vm.vCenter
-                }
+            # Failed in vRA but no vCenter event found (shouldn't happen but handle it)
+            Write-Log "Adding FAILED vRA deployment (no vCenter cleanup event found): $vmLower" "WARN"
+            $deletedVMs += New-Object PSObject -Property @{
+                VMName = $vmLower
+                RequestedBy = if ($failedInfo.RequestedBy) { $failedInfo.RequestedBy } else { "N/A" }
+                DeletedAt = if ($failedInfo.InitiatedAt) { $failedInfo.InitiatedAt } else { "N/A" }
+                DeploymentName = "$($failedInfo.DeploymentName)"
+                RequestAction = "vRA Deployment Failed"
+                RequestStatus = $failedInfo.RequestStatus
+                Source = "vRA: $($failedInfo.vRAServer)"
             }
         }
     }
+    
+    # Then process remaining vCenter deletions (excluding those already handled above)
+    foreach ($vm in $VCenterData) {
+        $vmLower = $vm.VMName.ToLower()
+        
+        # Skip if already in vRA data OR if it's a failed deployment we already processed
+        if ($vraVMNames.ContainsKey($vmLower)) {
+            Write-Log "SKIPPING vCenter VM (already in vRA): $($vm.VMName) from $($vm.vCenter)" "WARN"
+        }
+        elseif ($failedVraDeployments.ContainsKey($vmLower)) {
+            Write-Log "SKIPPING vCenter VM (already processed as failed vRA deployment): $($vm.VMName)" "WARN"
+        }
+        else {
+            # Pure vCenter deletion (no vRA involvement)
+            Write-Log "Adding vCenter deleted VM to report: $($vm.VMName) from $($vm.vCenter)" "DEBUG"
+            $deletedVMs += New-Object PSObject -Property @{
+                VMName = $vm.VMName
+                RequestedBy = $vm.DeletedBy
+                DeletedAt = $vm.DeletedAt
+                DeploymentName = "N/A"
+                RequestAction = $vm.EventType
+                RequestStatus = "Deleted"
+                Source = $vm.vCenter
+            }
+        }
+    }
+    
+    # ============================================================================
+    # ✅ END OF FIXED SECTION
+    # ============================================================================
     
     foreach ($vm in $VraDecommissionData) {
         Write-Log "Processing decommission VM: $($vm.VMName) from $($vm.vRAServer)" "DEBUG"
@@ -1497,7 +1534,7 @@ $decommissionTableRows
 # ============================================================================
 
 Write-DebugSection "DELETED VM TRACKER - STARTED"
-Write-Log "Script Version: 2.2.4 - Fixed Who Deleted + Failed vRA Detection + Deleted VM Extraction" "SUCCESS"
+Write-Log "Script Version: 2.2.5 - Fixed Failed vRA Deployment Reporting" "SUCCESS"
 Write-Log "PowerShell Version: $($PSVersionTable.PSVersion)"
 Write-Log "Debug output file: $debugOutputFile" "SUCCESS"
 
@@ -1730,6 +1767,6 @@ else {
 }
 
 Write-DebugSection "SCRIPT COMPLETED"
-Write-Log "Script Version: 2.2.4" "SUCCESS"
+Write-Log "Script Version: 2.2.5" "SUCCESS"
 Write-Log "Debug log saved to: $debugOutputFile" "SUCCESS"
 Write-Log "`nScript finished. Check the debug file for detailed logs." "SUCCESS"
