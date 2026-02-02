@@ -1,6 +1,7 @@
 # ============================================================================
 # DELETED VM TRACKER - ARIA OPERATIONS + MULTI-VRA + VCENTER
-# Version 2.2.8 - PowerShell 5.1 Compatible
+# Version 2.2.9 - PowerShell 5.1 Compatible
+# New: Full event details logging showing complete Cloud Resource Name data
 # Fixed: Extract VM names from CREATE_FAILED events using "Cloud Resource Name"
 # Fixed: Parse Cloud.vSphere.Machine events for failed deployments
 # Fixed: Much more reliable VM name extraction for failed deployments
@@ -15,6 +16,7 @@
 # Fixed: Date filtering to include today's deletions properly
 # Fixed: Removed overly restrictive VM name filtering
 # Fixed: Duplicate VMs in decommission report (prefers "Initiate" over "Delete")
+# New: Detailed event boxes showing full event details for Cloud.vSphere.Machine
 # New: Dedicated event parsing for Cloud.vSphere.Machine in failed CREATE requests
 # New: Dedicated function for failed deployments (not relying on deletion events)
 # New: Detailed logging shows matching process for failed deployments
@@ -1399,7 +1401,13 @@ function Get-FailedDeploymentsFromVRA {
                     # Process events looking for Cloud.vSphere.Machine with Cloud Resource Name
                     foreach ($event in $allEvents) {
                         if ($event.resourceType -eq "Cloud.vSphere.Machine") {
-                            Write-Log "      Processing Cloud.vSphere.Machine event: $($event.eventType)" "DEBUG"
+                            Write-Log "      ╔════════════════════════════════════════════════════════════════" "DEBUG"
+                            Write-Log "      ║ Processing Cloud.vSphere.Machine event" "DEBUG"
+                            Write-Log "      ║ Event Type: $($event.eventType)" "DEBUG"
+                            Write-Log "      ║ Event Status: $($event.eventStatus)" "DEBUG"
+                            Write-Log "      ║ Resource Name: $($event.resourceName)" "DEBUG"
+                            Write-Log "      ║ Resource ID: $($event.resourceId)" "DEBUG"
+                            Write-Log "      ╠════════════════════════════════════════════════════════════════" "DEBUG"
                             
                             $serverName = $null
                             
@@ -1411,41 +1419,55 @@ function Get-FailedDeploymentsFromVRA {
                                     ($event.details | ConvertTo-Json -Compress -Depth 5)
                                 }
                                 
-                                Write-Log "      Event Details (first 300 chars): $($detailsText.Substring(0, [Math]::Min(300, $detailsText.Length)))..." "DEBUG"
+                                Write-Log "      ║ === FULL EVENT DETAILS ===" "DEBUG"
+                                Write-Log "      ║ $detailsText" "DEBUG"
+                                Write-Log "      ║ === END EVENT DETAILS ===" "DEBUG"
+                                Write-Log "      ╠════════════════════════════════════════════════════════════════" "DEBUG"
                                 
                                 # Look for "Cloud Resource Name:" pattern (PRIORITY 1)
                                 if ($detailsText -match "Cloud Resource Name:\s*([^\s,;]+)") {
                                     $serverName = $matches[1].Trim()
-                                    Write-Log "      ✓✓✓ Found VM via 'Cloud Resource Name:' pattern: $serverName ✓✓✓" "SUCCESS"
+                                    Write-Log "      ║ ✓✓✓ EXTRACTED via 'Cloud Resource Name:' pattern: $serverName ✓✓✓" "SUCCESS"
                                 }
                                 # Look for JSON cloudResourceName property
                                 elseif ($detailsText -match '"cloudResourceName"\s*:\s*"([^"]+)"') {
                                     $potentialName = $matches[1].Trim()
                                     if ($potentialName -notmatch "Cloud_vSphere_Machine_\d+") {
                                         $serverName = $potentialName
-                                        Write-Log "      ✓✓✓ Found VM via 'cloudResourceName' JSON: $serverName ✓✓✓" "SUCCESS"
+                                        Write-Log "      ║ ✓✓✓ EXTRACTED via 'cloudResourceName' JSON: $serverName ✓✓✓" "SUCCESS"
+                                    }
+                                    else {
+                                        Write-Log "      ║ Skipping generic cloudResourceName: $potentialName" "DEBUG"
                                     }
                                 }
                                 # Look for hostname in details
                                 elseif ($detailsText -match '"hostname"\s*:\s*"([^"]+)"') {
                                     $serverName = $matches[1].Trim()
-                                    Write-Log "      ✓✓✓ Found VM via 'hostname' JSON: $serverName ✓✓✓" "SUCCESS"
+                                    Write-Log "      ║ ✓✓✓ EXTRACTED via 'hostname' JSON: $serverName ✓✓✓" "SUCCESS"
                                 }
                                 # Look for address in details
                                 elseif ($detailsText -match '"address"\s*:\s*"([^"]+)"') {
                                     $serverName = $matches[1].Trim()
-                                    Write-Log "      ✓✓✓ Found VM via 'address' JSON: $serverName ✓✓✓" "SUCCESS"
+                                    Write-Log "      ║ ✓✓✓ EXTRACTED via 'address' JSON: $serverName ✓✓✓" "SUCCESS"
+                                }
+                                else {
+                                    Write-Log "      ║ ✗ No Cloud Resource Name pattern found in details" "WARN"
                                 }
                             }
+                            else {
+                                Write-Log "      ║ ✗ No event details available" "WARN"
+                            }
+                            
+                            Write-Log "      ╠════════════════════════════════════════════════════════════════" "DEBUG"
                             
                             # PRIORITY 2: Use resourceName from event if it's not a generic ID
                             if (-not $serverName -and $event.resourceName) {
                                 if ($event.resourceName -notmatch "Cloud_vSphere_Machine_\d+") {
                                     $serverName = $event.resourceName
-                                    Write-Log "      Found VM from event.resourceName: $serverName" "SUCCESS"
+                                    Write-Log "      ║ Found VM from event.resourceName: $serverName" "SUCCESS"
                                 }
                                 else {
-                                    Write-Log "      Skipping generic resourceName: $($event.resourceName)" "DEBUG"
+                                    Write-Log "      ║ Skipping generic resourceName: $($event.resourceName)" "DEBUG"
                                 }
                             }
                             
@@ -1453,12 +1475,17 @@ function Get-FailedDeploymentsFromVRA {
                                 $vmKey = $serverName.ToLower()
                                 if (-not $foundVMs.ContainsKey($vmKey)) {
                                     $foundVMs[$vmKey] = $serverName
-                                    Write-Log "      Added FAILED deployment VM from event: $serverName" "WARN"
+                                    Write-Log "      ║ ✓✓✓ ADDED to failed deployment VM list: $serverName ✓✓✓" "WARN"
+                                }
+                                else {
+                                    Write-Log "      ║ VM already in list: $serverName" "DEBUG"
                                 }
                             }
                             else {
-                                Write-Log "      WARNING: Could not extract VM name from this event" "WARN"
+                                Write-Log "      ║ ✗✗✗ WARNING: Could not extract VM name from this event ✗✗✗" "WARN"
                             }
+                            
+                            Write-Log "      ╚════════════════════════════════════════════════════════════════" "DEBUG"
                         }
                     }
                 }
@@ -1907,7 +1934,7 @@ $decommissionTableRows
 # ============================================================================
 
 Write-DebugSection "DELETED VM TRACKER - STARTED"
-Write-Log "Script Version: 2.2.8 - Event-Based VM Extraction for Failed Deployments" "SUCCESS"
+Write-Log "Script Version: 2.2.9 - Full Event Details Logging for Failed Deployments" "SUCCESS"
 Write-Log "PowerShell Version: $($PSVersionTable.PSVersion)"
 Write-Log "Debug output file: $debugOutputFile" "SUCCESS"
 
@@ -2182,6 +2209,6 @@ else {
 }
 
 Write-DebugSection "SCRIPT COMPLETED"
-Write-Log "Script Version: 2.2.8" "SUCCESS"
+Write-Log "Script Version: 2.2.9" "SUCCESS"
 Write-Log "Debug log saved to: $debugOutputFile" "SUCCESS"
 Write-Log "`nScript finished. Check the debug file for detailed logs." "SUCCESS"
