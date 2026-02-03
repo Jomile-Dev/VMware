@@ -1,11 +1,12 @@
 # ============================================================================
 # DELETED VM TRACKER - ARIA OPERATIONS + MULTI-VRA + VCENTER
-# Version 2.3.5 - Decommission Date Fix
-# Changed: Fixed decommission "Deletion Date" to use leaseExpireAt (scheduled deletion)
-# Changed: Fixed decommission "Initiated At" to use request.initiatedAt (when decommission started)
+# Version 2.3.6 - Enhanced Decommission Debugging
+# Changed: Reverted InitiatedAt back to leaseExpireAt (correct as before)
+# Changed: Added comprehensive debugging output for decommission deployments
+# Changed: DeletionDate now tries multiple fields (customProperties, inputs, request.scheduledFor)
 # Previous: Removed "(Failed)" suffix from deployment names
-# Previous: "Manually cleaned from vCenter" to "Object deleted in vCenter"
-# Previous: Source field now extracts text from brackets in RequestStatus
+# Previous: "Object deleted in vCenter" cleanup message
+# Previous: Source field extracts text from brackets
 # ============================================================================
 
 # ============================================================================
@@ -404,18 +405,84 @@ function Get-ActiveDeploymentsWithDecommission {
                         $vraServerShort = ($VraServer -split '\.')[0]
                         $catalogItem = if ($deployment.inputs._catalogItemName) { $deployment.inputs._catalogItemName } else { "N/A" }
                         
-                        # InitiatedAt should be when the request was started
-                        $initiatedAt = if ($request.initiatedAt) {
-                            Convert-ToSydneyTime -DateTimeString $request.initiatedAt
+                        # DEBUG: Log all available date fields for analysis
+                        Write-Log "    === DECOMMISSION DATE DEBUGGING ===" "DEBUG"
+                        Write-Log "    Deployment Name: $($deployment.name)" "DEBUG"
+                        Write-Log "    Deployment ID: $($deployment.id)" "DEBUG"
+                        Write-Log "    deployment.leaseExpireAt: $($deployment.leaseExpireAt)" "DEBUG"
+                        Write-Log "    deployment.createdAt: $($deployment.createdAt)" "DEBUG"
+                        Write-Log "    deployment.lastUpdatedAt: $($deployment.lastUpdatedAt)" "DEBUG"
+                        Write-Log "    deployment.status: $($deployment.status)" "DEBUG"
+                        Write-Log "    request.initiatedAt: $($request.initiatedAt)" "DEBUG"
+                        Write-Log "    request.completedAt: $($request.completedAt)" "DEBUG"
+                        Write-Log "    request.name: $($request.name)" "DEBUG"
+                        Write-Log "    request.status: $($request.status)" "DEBUG"
+                        
+                        # Check for custom properties that might contain scheduled deletion date
+                        if ($deployment.customProperties) {
+                            Write-Log "    Custom Properties:" "DEBUG"
+                            $deployment.customProperties.PSObject.Properties | ForEach-Object {
+                                if ($_.Name -match "delete|schedule|date|expir") {
+                                    Write-Log "      $($_.Name): $($_.Value)" "DEBUG"
+                                }
+                            }
+                        }
+                        
+                        # Check deployment inputs for any date-related fields
+                        if ($deployment.inputs) {
+                            Write-Log "    Deployment Inputs:" "DEBUG"
+                            $deployment.inputs.PSObject.Properties | ForEach-Object {
+                                if ($_.Name -match "delete|schedule|date|expir") {
+                                    Write-Log "      $($_.Name): $($_.Value)" "DEBUG"
+                                }
+                            }
+                        }
+                        
+                        Write-Log "    === END DEBUGGING ===" "DEBUG"
+                        
+                        # InitiatedAt should be the lease expiration (when decommission was initiated)
+                        $initiatedAt = if ($deployment.leaseExpireAt) {
+                            Convert-ToSydneyTime -DateTimeString $deployment.leaseExpireAt
                         } else {
                             "N/A"
                         }
                         
-                        # DeletionDate should be the scheduled deletion date (leaseExpireAt)
-                        $deletionDate = if ($deployment.leaseExpireAt) {
-                            Convert-ToSydneyTime -DateTimeString $deployment.leaseExpireAt
-                        } else {
-                            "N/A"
+                        # DeletionDate should be the scheduled deletion date
+                        # Try multiple possible fields in order of preference
+                        $deletionDate = "N/A"
+                        
+                        # First, check if there's a custom property for scheduled deletion
+                        if ($deployment.customProperties -and $deployment.customProperties.scheduledDeletionDate) {
+                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deployment.customProperties.scheduledDeletionDate
+                            Write-Log "    Using customProperties.scheduledDeletionDate: $deletionDate" "SUCCESS"
+                        }
+                        # Check for deleteScheduledDate
+                        elseif ($deployment.customProperties -and $deployment.customProperties.deleteScheduledDate) {
+                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deployment.customProperties.deleteScheduledDate
+                            Write-Log "    Using customProperties.deleteScheduledDate: $deletionDate" "SUCCESS"
+                        }
+                        # Check for destroyDate
+                        elseif ($deployment.customProperties -and $deployment.customProperties.destroyDate) {
+                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deployment.customProperties.destroyDate
+                            Write-Log "    Using customProperties.destroyDate: $deletionDate" "SUCCESS"
+                        }
+                        # Check inputs for scheduled date
+                        elseif ($deployment.inputs -and $deployment.inputs.scheduledDeletionDate) {
+                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deployment.inputs.scheduledDeletionDate
+                            Write-Log "    Using inputs.scheduledDeletionDate: $deletionDate" "SUCCESS"
+                        }
+                        # Check if request has a scheduledFor field
+                        elseif ($request.scheduledFor) {
+                            $deletionDate = Convert-ToSydneyTime -DateTimeString $request.scheduledFor
+                            Write-Log "    Using request.scheduledFor: $deletionDate" "SUCCESS"
+                        }
+                        # Fall back to lease expiration as best guess
+                        elseif ($deployment.leaseExpireAt) {
+                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deployment.leaseExpireAt
+                            Write-Log "    Using deployment.leaseExpireAt as fallback: $deletionDate" "WARN"
+                        }
+                        else {
+                            Write-Log "    No scheduled deletion date found" "WARN"
                         }
 
                         $vmObject = New-Object PSObject -Property @{
@@ -1345,7 +1412,7 @@ $decommissionTableRows
 # ============================================================================
 
 Write-DebugSection "DELETED VM TRACKER - STARTED"
-Write-Log "Script Version: 2.3.5 - Decommission Date Fix" "SUCCESS"
+Write-Log "Script Version: 2.3.6 - Enhanced Decommission Debugging" "SUCCESS"
 Write-Log "PowerShell Version: $($PSVersionTable.PSVersion)"
 
 try {
@@ -1584,5 +1651,5 @@ else {
 }
 
 Write-DebugSection "SCRIPT COMPLETED"
-Write-Log "Script Version: 2.3.5 - Decommission Date Fix" "SUCCESS"
+Write-Log "Script Version: 2.3.6 - Enhanced Decommission Debugging" "SUCCESS"
 Write-Log "Debug log saved to: $debugOutputFile" "SUCCESS"
