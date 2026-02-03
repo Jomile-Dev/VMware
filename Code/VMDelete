@@ -1155,15 +1155,15 @@ function Get-FailedDeploymentsFromVRA {
     
     $failedDeploymentData = New-Object System.Collections.ArrayList
     
-    # 1. Fetch all deployments that might have failed
-    # We filter for 'CREATE_FAILED' specifically as requested
+    # 1. Fetch all deployments that have failed creation
+    # We filter specifically for 'CREATE_FAILED' as these are active objects that failed to provision
     $vraUri = "https://$VraServer/deployment/api/deployments"
     $page = 0
-    $size = 200 # Larger page size for efficiency
+    $size = 200
     $allFailedDeployments = @()
     
     do {
-        # Filter for CREATE_FAILED status
+        # API Filter: Status equals CREATE_FAILED
         $pagedUri = "$vraUri`?page=$page&size=$size&`$filter=status eq 'CREATE_FAILED'"
         Write-Log "  Fetching failed deployments page $page..." "DEBUG"
         
@@ -1199,16 +1199,16 @@ function Get-FailedDeploymentsFromVRA {
     foreach ($deployment in $allFailedDeployments) {
         Write-Log "  Processing Failed Deployment: $($deployment.name) ($($deployment.id))" "DEBUG"
         
-        # Get all requests for this deployment to find the creation attempt and history
+        # Get all requests for this deployment to find the history
         try {
             $requestsUri = "https://$VraServer/deployment/api/deployments/$($deployment.id)/requests?apiVersion=2020-08-25"
             $requestsResponse = Invoke-RestMethod -Uri $requestsUri -Method Get -Headers $Headers -ErrorAction Stop
             $requests = if ($requestsResponse.content) { $requestsResponse.content } else { $requestsResponse }
             
-            # Sort requests by initiatedAt to get the timeline correct
+            # Sort by initiatedAt to interpret the timeline correctly
             $requests = $requests | Sort-Object initiatedAt
             
-            # Find the failed creation request (usually the first one, or one with action Deployment.Create)
+            # Find the failed creation request (Look for Create or Provision actions that Failed)
             $createRequest = $requests | Where-Object { 
                 ($_.actionId -eq "Deployment.Create" -or $_.actionId -eq "Cloud.vSphere.Machine.Provision") -and 
                 ($_.status -match "FAILED|ABORTED")
@@ -1217,12 +1217,14 @@ function Get-FailedDeploymentsFromVRA {
             if ($createRequest) {
                 Write-Log "    Found failed create request: $($createRequest.id)" "DEBUG"
                 
-                # Fetch full event history for this request to dig for the VM Name
+                # Fetch full event history for this request
+                # We use the shared helper 'Get-AllEventsForRequest' assumed to be in the script
                 $requestEvents = Get-AllEventsForRequest -VraServer $VraServer -Headers $Headers -DeploymentId $deployment.id -RequestId $createRequest.id
                 
-                # Use the extracted history to find the Cloud Resource Name
+                # Attempt to extract the VM Name (Cloud Resource Name) from the event history
                 $serverName = $null
                 foreach ($event in $requestEvents) {
+                    # Use the shared helper 'Extract-CloudResourceName'
                     $extractedName = Extract-CloudResourceName -Event $event
                     if ($extractedName) {
                         $serverName = $extractedName
@@ -1233,17 +1235,17 @@ function Get-FailedDeploymentsFromVRA {
                 if ($serverName) {
                     Write-Log "    Identified VM Name from history: $serverName" "SUCCESS"
                     
-                    # Store the data
+                    # Store the data required for matching later
                     $failedDeploymentData.Add([PSCustomObject]@{
                         VMName         = $serverName
                         DeploymentId   = $deployment.id
                         DeploymentName = $deployment.name
-                        RequestStatus  = "CREATE_FAILED" # Explicitly set as requested
+                        RequestStatus  = "CREATE_FAILED"
                         RequestedBy    = $deployment.createdBy
                         InitiatedAt    = $deployment.createdAt
                         vRAServer      = ($VraServer -split '\.')[0]
-                        Source         = "vRA" # Will be updated to vRA-Failed if matched
-                        RequestHistory = $requestEvents # Store history as requested
+                        Source         = "vRA" 
+                        RequestHistory = $requestEvents # Storing history as requested
                     }) | Out-Null
                 }
                 else {
@@ -1307,34 +1309,29 @@ function Match-FailedVMsWithVCenter {
             Write-Log "  -> vCenter Event: Deleted by $($matchedVCRecord.DeletedBy) at $($matchedVCRecord.DeletedAt)" "SUCCESS"
             
             # 3. Create the Combined Object
-            # We prioritize vRA data (Deployment Name, Status) but pull deletion details from vCenter
+            # We use vRA data for the deployment info, but fill the deletion info from vCenter
             $enrichedVM = [PSCustomObject]@{
                 VMName         = $failedVM.VMName
                 DeploymentName = $failedVM.DeploymentName
-                RequestStatus  = "CREATE_FAILED"       # As requested
-                Source         = "vRA ($($failedVM.vRAServer))" # Identify it came from vRA
+                RequestStatus  = "CREATE_FAILED"
+                Source         = "vRA ($($failedVM.vRAServer))"
                 
-                # Data from vCenter Event
+                # Data filled from vCenter Event
                 DeletedBy      = $matchedVCRecord.DeletedBy
                 DeletedAt      = $matchedVCRecord.DeletedAt
-                RequestAction  = "Create Failed & Deleted" # Descriptive action
+                RequestAction  = "Create Failed & Deleted" # Descriptive status
                 
-                # Keep original tracking info
+                # Original tracking info
                 RequestedBy    = $failedVM.RequestedBy
                 InitiatedAt    = $failedVM.InitiatedAt
                 RequestHistory = $failedVM.RequestHistory
             }
             
             $enrichedList.Add($enrichedVM) | Out-Null
-            
-            # Optional: Remove from vCenterLookup if you want to prevent it appearing twice in the final report
-            # $vCenterLookup.Remove($vmNameKey) 
         }
         else {
             Write-Log "No vCenter deletion record found for failed VM: $($failedVM.VMName)" "DEBUG"
-            # Decide if you want to include unmatched failed VMs. 
-            # Usually, if it's not in vCenter deleted list, it might still be there or wasn't created.
-            # Adding it here ensures we track it regardless.
+            # We still include it, but mark it as having no vCenter trace
             $failedVM.Source = "vRA-Failed (No VC Trace)"
             $enrichedList.Add($failedVM) | Out-Null
         }
@@ -1343,7 +1340,6 @@ function Match-FailedVMsWithVCenter {
     Write-Log "Total Matched/Processed Failed VMs: $($enrichedList.Count)" "SUCCESS"
     return $enrichedList
 }
-
 
 function Send-DeletedVMReport {
     param(
