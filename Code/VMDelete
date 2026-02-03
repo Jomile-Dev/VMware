@@ -98,7 +98,7 @@ function Write-DebugSection {
     param([string]$Title)
     
     $separator = "`n" + ("=" * 80) + "`n"
-    $header = "$separator$Title$separator"
+    $header = "${separator}${Title}${separator}"
     Write-Host $header -ForegroundColor Cyan
     Add-Content -Path $debugOutputFile -Value $header
 }
@@ -228,7 +228,7 @@ function Get-AllEventsForRequest {
             else { break }
         }
         catch {
-            Write-Log "      Error fetching events (page $eventPage): $($_.Exception.Message)" "ERROR"
+            Write-Log "      Error fetching events (page ${eventPage}): $($_.Exception.Message)" "ERROR"
             break
         }
 
@@ -268,7 +268,7 @@ function Get-ActiveDeploymentsWithDecommission {
     
     do {
         $pagedUri = "$vraUri`?page=$page&size=$size&expand=resources"
-        Write-Log "  Fetching page $page from: $pagedUri" "DEBUG"
+        Write-Log "  Fetching page ${page} from: $pagedUri" "DEBUG"
         
         try {
             $vraResponse = Invoke-RestMethod -Uri $pagedUri -Method Get -Headers $Headers -ErrorAction Stop
@@ -276,7 +276,7 @@ function Get-ActiveDeploymentsWithDecommission {
             
             if ($deployments -and $deployments.Count -gt 0) {
                 $allDeployments += $deployments
-                Write-Log "  Page $page : Found $($deployments.Count) deployments" "DEBUG"
+                Write-Log "  Page ${page}: Found $($deployments.Count) deployments" "DEBUG"
                 $page = $page + 1
             }
             else {
@@ -292,7 +292,7 @@ function Get-ActiveDeploymentsWithDecommission {
             }
         }
         catch {
-            Write-Log "  Error fetching page $page : $($_.Exception.Message)" "ERROR"
+            Write-Log "  Error fetching page ${page}: $($_.Exception.Message)" "ERROR"
             break
         }
         
@@ -803,7 +803,7 @@ function Get-FailedDeploymentsFromVRA {
             
             if ($deployments -and $deployments.Count -gt 0) {
                 $allDeployments += $deployments
-                Write-Log "    Page $page: Found $($deployments.Count) deployments" "DEBUG"
+                Write-Log "    Page ${page}: Found $($deployments.Count) deployments" "DEBUG"
                 $page = $page + 1
             }
             else {
