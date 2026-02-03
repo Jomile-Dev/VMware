@@ -1,10 +1,10 @@
 # ============================================================================
 # DELETED VM TRACKER - ARIA OPERATIONS + MULTI-VRA + VCENTER
-# Version 2.3.7 - Full Object Dump for Debugging
-# Changed: Added complete dump of all deployment and request properties
-# Changed: Added checks for deployment.destroyDate, scheduledForDeletion, deletionScheduled
-# Changed: Added checks for metadata and request.inputs fields
-# Note: Run this version and check debug log to find the actual field name for "Deletion Scheduled"
+# Version 2.3.8 - Deep API Calls for Full Data
+# Changed: Added separate API calls to fetch FULL deployment and request objects
+# Changed: Expands complex objects to show nested properties
+# Changed: Added checks for deployment.expireAt field
+# Note: This version makes individual API calls per decommission to get complete data
 # ============================================================================
 
 # ============================================================================
@@ -403,13 +403,46 @@ function Get-ActiveDeploymentsWithDecommission {
                         $vraServerShort = ($VraServer -split '\.')[0]
                         $catalogItem = if ($deployment.inputs._catalogItemName) { $deployment.inputs._catalogItemName } else { "N/A" }
                         
-                        # DEBUG: Log all available date fields for analysis
+                        # DEBUG: Fetch FULL deployment details with all expansions
                         Write-Log "    === DECOMMISSION DATE DEBUGGING ===" "DEBUG"
                         Write-Log "    Deployment Name: $($deployment.name)" "DEBUG"
                         Write-Log "    Deployment ID: $($deployment.id)" "DEBUG"
                         
-                        # Dump ALL deployment properties
-                        Write-Log "    --- ALL DEPLOYMENT PROPERTIES ---" "DEBUG"
+                        # Make a separate API call to get the FULL deployment with all possible expansions
+                        try {
+                            Write-Log "    Fetching FULL deployment details from API..." "DEBUG"
+                            $fullDeploymentUri = "https://$VraServer/deployment/api/deployments/$($deployment.id)?apiVersion=2020-08-25"
+                            $fullDeployment = Invoke-RestMethod -Uri $fullDeploymentUri -Method Get -Headers $Headers -ErrorAction Stop
+                            
+                            Write-Log "    --- FULL DEPLOYMENT OBJECT (Direct API Call) ---" "DEBUG"
+                            $fullDeployment.PSObject.Properties | ForEach-Object {
+                                $propName = $_.Name
+                                $propValue = $_.Value
+                                if ($propValue -is [string] -or $propValue -is [int] -or $propValue -is [bool] -or $null -eq $propValue) {
+                                    Write-Log "    deployment.$propName = $propValue" "DEBUG"
+                                }
+                                elseif ($propValue -is [DateTime]) {
+                                    Write-Log "    deployment.$propName = $($propValue.ToString('yyyy-MM-ddTHH:mm:ss'))" "DEBUG"
+                                }
+                                else {
+                                    Write-Log "    deployment.$propName = [Complex Object: $($propValue.GetType().Name)]" "DEBUG"
+                                    # If it's a complex object, try to show its properties
+                                    if ($propValue.PSObject.Properties) {
+                                        $propValue.PSObject.Properties | ForEach-Object {
+                                            $subName = $_.Name
+                                            $subValue = $_.Value
+                                            Write-Log "      deployment.$propName.$subName = $subValue" "DEBUG"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        catch {
+                            Write-Log "    Error fetching full deployment: $($_.Exception.Message)" "ERROR"
+                        }
+                        
+                        # Dump ALL deployment properties from the list response
+                        Write-Log "    --- DEPLOYMENT PROPERTIES (from list) ---" "DEBUG"
                         $deployment.PSObject.Properties | ForEach-Object {
                             $propName = $_.Name
                             $propValue = $_.Value
@@ -425,7 +458,7 @@ function Get-ActiveDeploymentsWithDecommission {
                         }
                         
                         # Dump ALL request properties
-                        Write-Log "    --- ALL REQUEST PROPERTIES ---" "DEBUG"
+                        Write-Log "    --- REQUEST PROPERTIES ---" "DEBUG"
                         $request.PSObject.Properties | ForEach-Object {
                             $propName = $_.Name
                             $propValue = $_.Value
@@ -438,6 +471,39 @@ function Get-ActiveDeploymentsWithDecommission {
                             else {
                                 Write-Log "    request.$propName = [Complex Object: $($propValue.GetType().Name)]" "DEBUG"
                             }
+                        }
+                        
+                        # Try to get the decommission request specifically and dump it
+                        Write-Log "    --- FETCHING DECOMMISSION REQUEST DETAILS ---" "DEBUG"
+                        try {
+                            $decommRequestUri = "https://$VraServer/deployment/api/deployments/$($deployment.id)/requests/$($request.id)?apiVersion=2020-08-25"
+                            $fullRequest = Invoke-RestMethod -Uri $decommRequestUri -Method Get -Headers $Headers -ErrorAction Stop
+                            
+                            Write-Log "    --- FULL REQUEST OBJECT ---" "DEBUG"
+                            $fullRequest.PSObject.Properties | ForEach-Object {
+                                $propName = $_.Name
+                                $propValue = $_.Value
+                                if ($propValue -is [string] -or $propValue -is [int] -or $propValue -is [bool] -or $null -eq $propValue) {
+                                    Write-Log "    request.$propName = $propValue" "DEBUG"
+                                }
+                                elseif ($propValue -is [DateTime]) {
+                                    Write-Log "    request.$propName = $($propValue.ToString('yyyy-MM-ddTHH:mm:ss'))" "DEBUG"
+                                }
+                                else {
+                                    Write-Log "    request.$propName = [Complex Object: $($propValue.GetType().Name)]" "DEBUG"
+                                    # Try to expand complex objects
+                                    if ($propValue.PSObject.Properties) {
+                                        $propValue.PSObject.Properties | ForEach-Object {
+                                            $subName = $_.Name
+                                            $subValue = $_.Value
+                                            Write-Log "      request.$propName.$subName = $subValue" "DEBUG"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        catch {
+                            Write-Log "    Error fetching full request: $($_.Exception.Message)" "ERROR"
                         }
                         
                         # Check for custom properties
@@ -491,45 +557,58 @@ function Get-ActiveDeploymentsWithDecommission {
                         # Try multiple possible fields in order of preference
                         $deletionDate = "N/A"
                         
+                        # Try to use the full deployment object if we got it
+                        $deploymentToCheck = if ($fullDeployment) { $fullDeployment } else { $deployment }
+                        
                         # First, check if there's a destroyDate field directly on deployment
-                        if ($deployment.destroyDate) {
-                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deployment.destroyDate
+                        if ($deploymentToCheck.destroyDate) {
+                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deploymentToCheck.destroyDate
                             Write-Log "    Using deployment.destroyDate: $deletionDate" "SUCCESS"
                         }
                         # Check for scheduledForDeletion
-                        elseif ($deployment.scheduledForDeletion) {
-                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deployment.scheduledForDeletion
+                        elseif ($deploymentToCheck.scheduledForDeletion) {
+                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deploymentToCheck.scheduledForDeletion
                             Write-Log "    Using deployment.scheduledForDeletion: $deletionDate" "SUCCESS"
                         }
                         # Check for deletionScheduled
-                        elseif ($deployment.deletionScheduled) {
-                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deployment.deletionScheduled
+                        elseif ($deploymentToCheck.deletionScheduled) {
+                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deploymentToCheck.deletionScheduled
                             Write-Log "    Using deployment.deletionScheduled: $deletionDate" "SUCCESS"
                         }
+                        # Check for expireAt (different from leaseExpireAt)
+                        elseif ($deploymentToCheck.expireAt) {
+                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deploymentToCheck.expireAt
+                            Write-Log "    Using deployment.expireAt: $deletionDate" "SUCCESS"
+                        }
                         # Check metadata
-                        elseif ($deployment.metadata -and $deployment.metadata.deletionScheduled) {
-                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deployment.metadata.deletionScheduled
+                        elseif ($deploymentToCheck.metadata -and $deploymentToCheck.metadata.deletionScheduled) {
+                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deploymentToCheck.metadata.deletionScheduled
                             Write-Log "    Using metadata.deletionScheduled: $deletionDate" "SUCCESS"
                         }
                         # Check if there's a custom property for scheduled deletion
-                        elseif ($deployment.customProperties -and $deployment.customProperties.scheduledDeletionDate) {
-                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deployment.customProperties.scheduledDeletionDate
+                        elseif ($deploymentToCheck.customProperties -and $deploymentToCheck.customProperties.scheduledDeletionDate) {
+                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deploymentToCheck.customProperties.scheduledDeletionDate
                             Write-Log "    Using customProperties.scheduledDeletionDate: $deletionDate" "SUCCESS"
                         }
                         # Check for deleteScheduledDate
-                        elseif ($deployment.customProperties -and $deployment.customProperties.deleteScheduledDate) {
-                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deployment.customProperties.deleteScheduledDate
+                        elseif ($deploymentToCheck.customProperties -and $deploymentToCheck.customProperties.deleteScheduledDate) {
+                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deploymentToCheck.customProperties.deleteScheduledDate
                             Write-Log "    Using customProperties.deleteScheduledDate: $deletionDate" "SUCCESS"
                         }
-                        # Check for destroyDate
-                        elseif ($deployment.customProperties -and $deployment.customProperties.destroyDate) {
-                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deployment.customProperties.destroyDate
+                        # Check for destroyDate in customProperties
+                        elseif ($deploymentToCheck.customProperties -and $deploymentToCheck.customProperties.destroyDate) {
+                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deploymentToCheck.customProperties.destroyDate
                             Write-Log "    Using customProperties.destroyDate: $deletionDate" "SUCCESS"
                         }
                         # Check inputs for scheduled date
-                        elseif ($deployment.inputs -and $deployment.inputs.scheduledDeletionDate) {
-                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deployment.inputs.scheduledDeletionDate
+                        elseif ($deploymentToCheck.inputs -and $deploymentToCheck.inputs.scheduledDeletionDate) {
+                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deploymentToCheck.inputs.scheduledDeletionDate
                             Write-Log "    Using inputs.scheduledDeletionDate: $deletionDate" "SUCCESS"
+                        }
+                        # Check full request if we have it
+                        elseif ($fullRequest -and $fullRequest.scheduledFor) {
+                            $deletionDate = Convert-ToSydneyTime -DateTimeString $fullRequest.scheduledFor
+                            Write-Log "    Using request.scheduledFor: $deletionDate" "SUCCESS"
                         }
                         # Check if request has a scheduledFor field
                         elseif ($request.scheduledFor) {
@@ -542,8 +621,8 @@ function Get-ActiveDeploymentsWithDecommission {
                             Write-Log "    Using request.inputs.deletionScheduled: $deletionDate" "SUCCESS"
                         }
                         # Fall back to lease expiration as best guess
-                        elseif ($deployment.leaseExpireAt) {
-                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deployment.leaseExpireAt
+                        elseif ($deploymentToCheck.leaseExpireAt) {
+                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deploymentToCheck.leaseExpireAt
                             Write-Log "    Using deployment.leaseExpireAt as fallback: $deletionDate" "WARN"
                         }
                         else {
@@ -1477,7 +1556,7 @@ $decommissionTableRows
 # ============================================================================
 
 Write-DebugSection "DELETED VM TRACKER - STARTED"
-Write-Log "Script Version: 2.3.7 - Full Object Dump for Debugging" "SUCCESS"
+Write-Log "Script Version: 2.3.8 - Deep API Calls for Full Data" "SUCCESS"
 Write-Log "PowerShell Version: $($PSVersionTable.PSVersion)"
 
 try {
@@ -1716,5 +1795,5 @@ else {
 }
 
 Write-DebugSection "SCRIPT COMPLETED"
-Write-Log "Script Version: 2.3.7 - Full Object Dump for Debugging" "SUCCESS"
+Write-Log "Script Version: 2.3.8 - Deep API Calls for Full Data" "SUCCESS"
 Write-Log "Debug log saved to: $debugOutputFile" "SUCCESS"
