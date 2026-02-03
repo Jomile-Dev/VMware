@@ -266,7 +266,7 @@ function Get-ActiveDeploymentsWithDecommission {
     $allDeployments = @()
     
     do {
-        $pagedUri = "$vraUri`?page=$page&size=$size&expand=resources&`$filter=lastUpdatedAt ge '$cutoffDate'"
+        $pagedUri = "$vraUri`?page=$page&size=$size&expand=resources"
         Write-Log "  Fetching page $page from: $pagedUri" "DEBUG"
         
         try {
@@ -784,21 +784,25 @@ function Get-FailedDeploymentsFromVRA {
     $failedDeploymentData = New-Object System.Collections.ArrayList
     $cutoffDate = (Get-Date).AddDays(-$DaysBack)
     
-    # Fetch all deployments with CREATE_FAILED status
+    # Fetch all deployments and filter for CREATE_FAILED status
+    # Note: Using client-side filtering as some vRA versions don't support $filter for status
     $vraUri = "https://$VraServer/deployment/api/deployments"
     $page = 0
     $size = 200
-    $allFailedDeployments = @()
+    $allDeployments = @()
+    
+    Write-Log "  Fetching all deployments (will filter for CREATE_FAILED)..." "DEBUG"
     
     do {
-        $pagedUri = "$vraUri`?page=$page&size=$size&`$filter=status eq 'CREATE_FAILED'"
+        $pagedUri = "$vraUri`?page=$page&size=$size&expand=resources"
         
         try {
             $vraResponse = Invoke-RestMethod -Uri $pagedUri -Method Get -Headers $Headers -ErrorAction Stop
             $deployments = if ($vraResponse.content) { $vraResponse.content } else { $vraResponse }
             
             if ($deployments -and $deployments.Count -gt 0) {
-                $allFailedDeployments += $deployments
+                $allDeployments += $deployments
+                Write-Log "    Page $page: Found $($deployments.Count) deployments" "DEBUG"
                 $page++
             }
             else {
@@ -814,10 +818,21 @@ function Get-FailedDeploymentsFromVRA {
             }
         }
         catch {
-            Write-Log "  Error fetching failed deployments: $($_.Exception.Message)" "ERROR"
+            Write-Log "  Error fetching deployments: $($_.Exception.Message)" "ERROR"
+            break
+        }
+        
+        # Safety limit to prevent excessive API calls
+        if ($page -ge 50) {
+            Write-Log "  WARNING: Reached 50 page limit (10,000 deployments). Stopping..." "WARN"
             break
         }
     } while ($hasMore)
+    
+    Write-Log "  Total deployments fetched: $($allDeployments.Count)" "DEBUG"
+    
+    # Client-side filtering for CREATE_FAILED status
+    $allFailedDeployments = @($allDeployments | Where-Object { $_.status -eq 'CREATE_FAILED' })
     
     Write-Log "Found $($allFailedDeployments.Count) deployments with CREATE_FAILED status." "DEBUG"
     
