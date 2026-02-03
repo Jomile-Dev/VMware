@@ -146,8 +146,9 @@ function Convert-ToSydneyTime {
 }
 
 # ============================================================================
-# MODIFIED HELPER: Extract Cloud Resource Name
-# Added more aggressive extraction for partially formed objects
+# SHARED HELPER: Extract Cloud Resource Name from an event's details
+# Centralised so every caller uses the exact same priority chain.
+# Returns $null if nothing usable is found.
 # ============================================================================
 function Extract-CloudResourceName {
     param(
@@ -157,27 +158,44 @@ function Extract-CloudResourceName {
 
     $serverName = $null
 
+    # ---------- PRIORITY 1: parse event.details text/JSON ----------
     if ($Event.details) {
-        $detailsText = if ($Event.details -is [string]) { $Event.details } else { ($Event.details | ConvertTo-Json -Compress -Depth 5) }
+        $detailsText = if ($Event.details -is [string]) {
+            $Event.details
+        } else {
+            ($Event.details | ConvertTo-Json -Compress -Depth 5)
+        }
 
-        # Check for standard CRN labels
+        # 1a  "Cloud Resource Name: <name>"  (plain-text label)
         if ($detailsText -match "Cloud Resource Name:\s*([^\s,;]+)") {
             $serverName = $matches[1].Trim()
+            Write-Log "      [CRN] Extracted via 'Cloud Resource Name:' pattern: $serverName" "SUCCESS"
         }
-        # Check for JSON cloudResourceName
+        # 1b  JSON property  "cloudResourceName":"<name>"
         elseif ($detailsText -match '"cloudResourceName"\s*:\s*"([^"]+)"') {
             $candidate = $matches[1].Trim()
-            if ($candidate -notmatch "Cloud_vSphere_Machine_\d+") { $serverName = $candidate }
+            if ($candidate -notmatch "Cloud_vSphere_Machine_\d+") {
+                $serverName = $candidate
+                Write-Log "      [CRN] Extracted via 'cloudResourceName' JSON: $serverName" "SUCCESS"
+            }
         }
-        # NEW: Look for specific vCenter VM Name in failure details
-        elseif ($detailsText -match '"resourceName"\s*:\s*"([^"]+)"') {
+        # 1c  JSON property  "hostname":"<name>"
+        elseif ($detailsText -match '"hostname"\s*:\s*"([^"]+)"') {
             $serverName = $matches[1].Trim()
+            Write-Log "      [CRN] Extracted via 'hostname' JSON: $serverName" "SUCCESS"
+        }
+        # 1d  JSON property  "address":"<name>"
+        elseif ($detailsText -match '"address"\s*:\s*"([^"]+)"') {
+            $serverName = $matches[1].Trim()
+            Write-Log "      [CRN] Extracted via 'address' JSON: $serverName" "SUCCESS"
         }
     }
 
+    # ---------- PRIORITY 2: event.resourceName (if not a generic vRA ID) ----------
     if (-not $serverName -and $Event.resourceName) {
         if ($Event.resourceName -notmatch "Cloud_vSphere_Machine_\d+") {
             $serverName = $Event.resourceName
+            Write-Log "      [CRN] Extracted via event.resourceName: $serverName" "SUCCESS"
         }
     }
 
@@ -696,63 +714,364 @@ function Get-ActiveDeploymentsWithDecommission {
     return @($finalDecommissionData)
 }
 
-# ============================================================================
-# MODIFIED MAIN FUNCTION: Get-DeletedVMsFromVRA
-# Logic updated to capture 'CREATE_FAILED' deployments specifically
-# ============================================================================
 function Get-DeletedVMsFromVRA {
     param(
+        [Parameter(Mandatory=$true)]
         [string]$VraServer,
+        
+        [Parameter(Mandatory=$true)]
         [hashtable]$Headers,
+        
+        [Parameter(Mandatory=$true)]
         [int]$DaysBack
     )
-
+    
+    Write-DebugSection "Processing Deleted Deployments from vRA: $VraServer"
+    
     $deletedVMData = @()
     $cutoffDate = (Get-Date).AddDays(-$DaysBack)
     
-    # Requesting deleted deployments specifically
-    $uri = "https://$VraServer/deployment/api/deployments?deleted=true&expand=resources&apiVersion=2020-08-25"
+    Write-Log "Cutoff date: $cutoffDate" "DEBUG"
+    Write-Log "Searching for deleted deployments..." "DEBUG"
     
-    try {
-        $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $Headers
-        $deployments = if ($response.content) { $response.content } else { $response }
-
-        foreach ($deployment in $deployments) {
-            # Capture both intentional deletions and deployment failures
-            $isFailure = $deployment.status -eq "CREATE_FAILED"
+    $urlVariations = @(
+        "https://$VraServer/deployment/api/deployments?deleted=true&expand=resources&apiVersion=2020-08-25&page={0}&size=$eventsPageSize",
+        "https://$VraServer/deployment/api/deployments?deleted=%5Btrue%5D&expand=resources&apiVersion=2020-08-25&page={0}&size=$eventsPageSize"
+    )
+    
+    $workingUrl = $null
+    $allDeletedDeployments = @()
+    
+    foreach ($urlTemplate in $urlVariations) {
+        try {
+            $testUrl = $urlTemplate -f 0
+            Write-Log "  Testing URL: $testUrl" "DEBUG"
+            $response = Invoke-RestMethod -Uri $testUrl -Method Get -Headers $Headers -ErrorAction Stop
+            $deployments = if ($response.content) { $response.content } else { $response }
             
-            # Fetch all requests to distinguish vRA-led failure vs external delete
-            $reqUri = "https://$VraServer/deployment/api/deployments/$($deployment.id)/requests"
-            $requests = (Invoke-RestMethod -Uri $reqUri -Method Get -Headers $Headers).content
-
-            foreach ($request in $requests) {
-                # Logic: If it's a failed create, vRA is the source of the cleanup
-                if ($request.actionId -eq "Deployment.Create" -and $request.status -eq "FAILED") {
-                    $matchedBy = "vRA Deployment Failure"
+            if ($deployments -and $deployments.Count -gt 0) {
+                $workingUrl = $urlTemplate
+                $allDeletedDeployments += $deployments
+                Write-Log "  URL works! Found $($deployments.Count) deployments on page 0" "SUCCESS"
+                break
+            }
+        }
+        catch {
+            Write-Log "  URL failed: $($_.Exception.Message)" "DEBUG"
+            continue
+        }
+    }
+    
+    if (-not $workingUrl) {
+        Write-Log "No deleted deployments found or API not supported" "WARN"
+        return $deletedVMData
+    }
+    
+    $page = 1
+    do {
+        try {
+            $uri = $workingUrl -f $page
+            $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $Headers -ErrorAction Stop
+            $deployments = if ($response.content) { $response.content } else { $response }
+            
+            if ($deployments -and $deployments.Count -gt 0) {
+                $allDeletedDeployments += $deployments
+                Write-Log "  Page $page : Found $($deployments.Count) deployments" "DEBUG"
+                $page++
+            }
+            else {
+                break
+            }
+        }
+        catch {
+            Write-Log "  Error on page $page : $($_.Exception.Message)" "DEBUG"
+            break
+        }
+        
+        if ($allDeletedDeployments.Count -ge 5000) { break }
+        
+    } while ($true)
+    
+    Write-Log "Total deleted deployments retrieved: $($allDeletedDeployments.Count)" "SUCCESS"
+    
+    Write-Log "`n--- Filtering by date range ---" "DEBUG"
+    Write-Log "Cutoff date (UTC): $cutoffDate" "DEBUG"
+    Write-Log "Current date (UTC): $(Get-Date -Format 'yyyy-MM-ddTHH:mm:ss')" "DEBUG"
+    
+    $filteredDeployments = $allDeletedDeployments | Where-Object {
+        try {
+            if ($_.lastUpdatedAt) {
+                $updateDate = [DateTime]::Parse($_.lastUpdatedAt)
+                $updateDateUTC = $updateDate.ToUniversalTime()
+                $cutoffDateUTC = $cutoffDate.ToUniversalTime()
+                
+                $isInRange = $updateDateUTC -ge $cutoffDateUTC
+                
+                if ($isInRange) {
+                    Write-Log "  ✓ Including: $($_.name) - Updated: $($_.lastUpdatedAt) (within range)" "DEBUG"
+                }
+                else {
+                    Write-Log "  ✗ Excluding: $($_.name) - Updated: $($_.lastUpdatedAt) (too old)" "DEBUG"
+                }
+                
+                return $isInRange
+            }
+            else {
+                Write-Log "  ⚠ Including: $($_.name) - No lastUpdatedAt (including by default)" "WARN"
+                return $true
+            }
+        }
+        catch {
+            Write-Log "  ⚠ Including: $($_.name) - Date parse error (including by default)" "WARN"
+            return $true
+        }
+    }
+    
+    Write-Log "Deployments within time range: $($filteredDeployments.Count)" "SUCCESS"
+    
+    # Log some examples of what was filtered
+    if ($filteredDeployments.Count -gt 0) {
+        Write-Log "`nSample of deployments in range:" "DEBUG"
+        $sampleCount = [Math]::Min(5, $filteredDeployments.Count)
+        for ($i = 0; $i -lt $sampleCount; $i++) {
+            $dep = $filteredDeployments[$i]
+            Write-Log "  - $($dep.name) (Updated: $($dep.lastUpdatedAt))" "DEBUG"
+        }
+    }
+    
+    Write-Log "`n--- Checking for VM resources in deployments ---" "DEBUG"
+    
+    # Don't filter by name - check actual resources instead
+    $vmDeployments = @()
+    foreach ($dep in $filteredDeployments) {
+        $hasVM = $false
+        
+        # Check if deployment has VM resources
+        if ($dep.resources) {
+            foreach ($resource in $dep.resources) {
+                if ($resource.type -eq "Cloud.vSphere.Machine") {
+                    $hasVM = $true
+                    break
+                }
+            }
+        }
+        
+        # If no resources in deployment object, assume it might have VMs (we'll check later)
+        if (-not $dep.resources) {
+            Write-Log "  Deployment '$($dep.name)' has no resource data - including for inspection" "WARN"
+            $hasVM = $true
+        }
+        
+        if ($hasVM) {
+            $vmDeployments += $dep
+            Write-Log "  ✓ Including deployment: $($dep.name)" "DEBUG"
+        }
+        else {
+            Write-Log "  ✗ Skipping deployment (no VMs): $($dep.name)" "DEBUG"
+        }
+    }
+    
+    Write-Log "`nDeployments with potential VMs: $($vmDeployments.Count)" "SUCCESS"
+    $filteredDeployments = $vmDeployments
+    
+    foreach ($deployment in $filteredDeployments) {
+        Write-Log "`n--- Deleted Deployment: $($deployment.name) (ID: $($deployment.id)) ---" "DEBUG"
+        Write-Log "  Status: $($deployment.status)" "DEBUG"
+        Write-Log "  Last Updated: $($deployment.lastUpdatedAt)" "DEBUG"
+        Write-Log "  Owned By: $($deployment.ownedBy)" "DEBUG"
+        
+        # FIRST: Try to extract VM names directly from deployment resources (more reliable)
+        $foundVMs = @{}
+        
+        if ($deployment.resources) {
+            Write-Log "  Checking deployment resources for VM names..." "DEBUG"
+            foreach ($resource in $deployment.resources) {
+                if ($resource.type -eq "Cloud.vSphere.Machine") {
+                    Write-Log "    Found vSphere Machine resource" "DEBUG"
+                    Write-Log "    Resource ID: $($resource.id)" "DEBUG"
+                    Write-Log "    Resource Name: $($resource.name)" "DEBUG"
                     
-                    # Get events to find the VM name that was briefly in VC
-                    $events = Get-AllEventsForRequest -VraServer $VraServer -Headers $Headers -DeploymentId $deployment.id -RequestId $request.id -IncludeDeleted
+                    $serverName = $null
                     
-                    foreach ($event in $events) {
-                        $hostname = Extract-CloudResourceName -Event $event
-                        if ($hostname) {
-                            $vmObject = New-Object PSObject -Property @{
-                                VMName = $hostname
-                                DeploymentName = $deployment.name
-                                Status = "FAILED_CLEANUP"
-                                RequestAction = "Create (Failed)"
-                                Source = "vRA-Internal-Failure" # Specifically marks vRA as the capture entity
-                                DeletionDate = Convert-ToSydneyTime -DateTimeString $deployment.lastUpdatedAt
-                            }
-                            $deletedVMData += $vmObject
+                    # Try to get from properties.resourceName (most reliable)
+                    if ($resource.properties -and $resource.properties.resourceName) {
+                        $serverName = $resource.properties.resourceName
+                        Write-Log "    Found server name from properties.resourceName: $serverName" "SUCCESS"
+                    }
+                    # Try resource.name if not generic
+                    elseif ($resource.name -and $resource.name -notmatch "Cloud_vSphere_Machine_\d+") {
+                        $serverName = $resource.name
+                        Write-Log "    Found server name from resource.name: $serverName" "SUCCESS"
+                    }
+                    # Try properties.address
+                    elseif ($resource.properties -and $resource.properties.address) {
+                        $serverName = $resource.properties.address
+                        Write-Log "    Found server name from properties.address: $serverName" "SUCCESS"
+                    }
+                    
+                    if ($serverName) {
+                        $vmKey = $serverName.ToLower()
+                        if (-not $foundVMs.ContainsKey($vmKey)) {
+                            $foundVMs[$vmKey] = $serverName
+                            Write-Log "    Added VM to extraction list: $serverName" "SUCCESS"
                         }
                     }
                 }
             }
         }
-    } catch {
-        Write-Log "Error processing failures: $($_.Exception.Message)" "ERROR"
+        
+        Write-Log "  VMs found from deployment resources: $($foundVMs.Count)" "DEBUG"
+        
+        # SECOND: If no VMs found in resources, fall back to events
+        if ($foundVMs.Count -eq 0) {
+            Write-Log "  No VMs in resources, checking deletion events..." "WARN"
+            
+            try {
+                $requestsUri = "https://$VraServer/deployment/api/deployments/$($deployment.id)/requests?apiVersion=2020-08-25&deleted=true"
+                Write-Log "  Fetching requests from: $requestsUri" "DEBUG"
+                
+                $requestsResponse = Invoke-RestMethod -Uri $requestsUri -Method Get -Headers $Headers -ErrorAction Stop
+                $requests = if ($requestsResponse.content) { $requestsResponse.content } else { $requestsResponse }
+                
+                Write-Log "  Found $($requests.Count) requests" "DEBUG"
+                
+                foreach ($request in $requests) {
+                    Write-Log "    ╔══════════════════════════════════════════════════════════════" "DEBUG"
+                    Write-Log "    ║ Request ID: $($request.id)" "DEBUG"
+                    Write-Log "    ║ Action: $($request.name)" "DEBUG"
+                    Write-Log "    ║ Status: $($request.status)" "DEBUG"
+                    
+                    $allEvents = Get-AllEventsForRequest -VraServer $VraServer -Headers $Headers -DeploymentId $deployment.id -RequestId $request.id -IncludeDeleted
+                    
+                    Write-Log "    ║ Total Events: $($allEvents.Count)" "DEBUG"
+                    Write-Log "    ╠══════════════════════════════════════════════════════════════" "DEBUG"
+                    
+                    foreach ($event in $allEvents) {
+                        if ($event.resourceType -eq "Cloud.vSphere.Machine") {
+                            Write-Log "    ║     >>> Processing Deleted VM Event <<<" "DEBUG"
+                            Write-Log "    ║     >>> Event Type: $($event.eventType) <<<" "DEBUG"
+                            Write-Log "    ║     >>> Resource Name: $($event.resourceName) <<<" "DEBUG"
+                            
+                            $serverName = Extract-CloudResourceName -Event $event
+                            
+                            if (-not $serverName) {
+                                Write-Log "    ║     >>> WARNING: Could not extract hostname from event! <<<" "WARN"
+                                Write-Log "    ║     >>> Event dump: $($event | ConvertTo-Json -Depth 2 -Compress) <<<" "DEBUG"
+                            }
+                            else {
+                                $vmKey = $serverName.ToLower()
+                                if (-not $foundVMs.ContainsKey($vmKey)) {
+                                    $foundVMs[$vmKey] = $serverName
+                                    Write-Log "    ║     >>> Added VM from event: $serverName <<<" "SUCCESS"
+                                }
+                            }
+                        }
+                    }
+                    
+                    Write-Log "    ╚══════════════════════════════════════════════════════════════" "DEBUG"
+                }
+            }
+            catch {
+                Write-Log "  Error processing deployment requests: $($_.Exception.Message)" "ERROR"
+            }
+        }
+        
+        # NOW: Create VM objects for all found VMs - WITH FIX TO GET ACTUAL DELETER
+        Write-Log "  Total unique VMs found for this deployment: $($foundVMs.Count)" "SUCCESS"
+        
+        # ========================================================================
+        # CRITICAL FIX: Get the actual deleter from deletion request
+        # ========================================================================
+        $deletedBy = "N/A"
+        $deletionRequestId = "N/A"
+        $deletionRequestStatus = "Deleted"
+        
+        try {
+            $requestsUri = "https://$VraServer/deployment/api/deployments/$($deployment.id)/requests?apiVersion=2020-08-25&deleted=true"
+            Write-Log "  Fetching deletion requests to find who deleted it..." "DEBUG"
+            
+            $requestsResponse = Invoke-RestMethod -Uri $requestsUri -Method Get -Headers $Headers -ErrorAction Stop
+            $requests = if ($requestsResponse.content) { $requestsResponse.content } else { $requestsResponse }
+            
+            Write-Log "  Found $($requests.Count) requests for this deleted deployment" "DEBUG"
+            
+            # Look for the deletion request
+            foreach ($request in $requests) {
+                Write-Log "    Checking request: $($request.name) (Action: $($request.actionId))" "DEBUG"
+                
+                if ($request.actionId -match "Deployment.Delete|Resource.Delete" -or 
+                    $request.name -match "Delete|Remove") {
+                    $deletedBy = if ($request.requestedBy) { $request.requestedBy } else { "N/A" }
+                    $deletionRequestId = $request.id
+                    $deletionRequestStatus = $request.status
+                    Write-Log "    ✓ Found deletion request by: $deletedBy (Request ID: $deletionRequestId)" "SUCCESS"
+                    break  # Use the first deletion request found
+                }
+            }
+            
+            # If no specific deletion request found, fall back to deployment owner
+            if ($deletedBy -eq "N/A" -and $deployment.ownedBy) {
+                $deletedBy = "$($deployment.ownedBy) (deployment owner - actual deleter unknown)"
+                Write-Log "    No deletion request found, using deployment owner: $deletedBy" "WARN"
+            }
+        }
+        catch {
+            Write-Log "  Error fetching deletion requests: $($_.Exception.Message)" "ERROR"
+            # Fall back to deployment owner if request fetch fails
+            $deletedBy = if ($deployment.ownedBy) { 
+                "$($deployment.ownedBy) (deployment owner - request fetch failed)" 
+            } else { 
+                "N/A" 
+            }
+        }
+        # ========================================================================
+        # END OF FIX
+        # ========================================================================
+        
+        foreach ($vmEntry in $foundVMs.GetEnumerator()) {
+            $serverName = $vmEntry.Value
+            
+            Write-Log "    ║     >>> FOUND DELETED VM: $serverName <<<" "SUCCESS"
+            Write-Log "    ║     >>> Deleted By: $deletedBy <<<" "SUCCESS"
+            
+            $vmKey = $serverName.ToLower()
+            $existingVM = $deletedVMData | Where-Object { $_.VMName.ToLower() -eq $vmKey }
+            
+            if ($existingVM) {
+                Write-Log "    ║     >>> WARNING: VM '$serverName' already exists - SKIPPING <<<" "WARN"
+            }
+            else {
+                $vraServerShort = ($VraServer -split '\.')[0]
+                $catalogItem = if ($deployment.inputs._catalogItemName) { $deployment.inputs._catalogItemName } else { "N/A" }
+                
+                $deletedVMData += New-Object PSObject -Property @{
+                    VMName = $serverName
+                    ResourceType = "Cloud.vSphere.Machine"
+                    DeploymentName = $deployment.name
+                    DeploymentID = $deployment.id
+                    DeploymentStatus = $deployment.status
+                    RequestID = $deletionRequestId  # ✅ FIXED - Actual deletion request ID
+                    RequestAction = "Deployment.Delete"
+                    RequestStatus = $deletionRequestStatus  # ✅ FIXED - Actual request status
+                    RequestedBy = $deletedBy  # ✅ FIXED - Who actually deleted it
+                    Requestor = $deletedBy    # ✅ FIXED - Who actually deleted it
+                    CatalogItem = $catalogItem
+                    DeletedAt = Convert-ToSydneyTime -DateTimeString $deployment.lastUpdatedAt
+                    InitiatedAt = if ($deployment.createdAt) { Convert-ToSydneyTime -DateTimeString $deployment.createdAt } else { "N/A" }
+                    vRAServer = $vraServerShort
+                    EventType = "Deployment.Delete"
+                    EventStatus = $deletionRequestStatus
+                    EventMessage = "Deleted by $deletedBy"
+                    Source = "vRA-Deleted"
+                    IsStillActive = $false
+                }
+                
+                Write-Log "    ║     >>> Successfully added VM '$serverName' <<<" "SUCCESS"
+            }
+        }
     }
+    
+    Write-Log "`nExtracted $($deletedVMData.Count) deleted VMs from vRA server $VraServer" "SUCCESS"
     return $deletedVMData
 }
 
