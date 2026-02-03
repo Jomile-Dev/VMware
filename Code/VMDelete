@@ -133,12 +133,15 @@ function Get-AllEventsForRequest {
         [Parameter(Mandatory=$true)][string]$VraServer,
         [Parameter(Mandatory=$true)][hashtable]$Headers,
         [Parameter(Mandatory=$true)][string]$DeploymentId,
-        [Parameter(Mandatory=$true)][string]$RequestId
+        [Parameter(Mandatory=$true)][string]$RequestId,
+        [switch]$IncludeDeleted
     )
     $allEvents = @()
     $eventPage = 0
+    $deletedParam = if ($IncludeDeleted) { "&deleted=true" } else { "" }
+    
     do {
-        $eventsUri = "https://$VraServer/deployment/api/deployments/$DeploymentId/requests/$RequestId/events?page=$eventPage&size=200&apiVersion=2020-08-25"
+        $eventsUri = "https://$VraServer/deployment/api/deployments/$DeploymentId/requests/$RequestId/events?page=$eventPage&size=$eventsPageSize$deletedParam&apiVersion=2020-08-25"
         try {
             $eventsResponse = Invoke-RestMethod -Uri $eventsUri -Method Get -Headers $Headers -ErrorAction Stop
             $events = if ($eventsResponse.content) { $eventsResponse.content } else { $eventsResponse }
@@ -153,7 +156,7 @@ function Get-AllEventsForRequest {
 }
 
 # ============================================================================
-# 1. GET ACTIVE DEPLOYMENTS WITH DECOMMISSION REQUESTS (Original Logic)
+# 1. GET ACTIVE DEPLOYMENTS WITH DECOMMISSION REQUESTS
 # ============================================================================
 function Get-ActiveDeploymentsWithDecommission {
     param(
