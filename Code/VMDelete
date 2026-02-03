@@ -1,9 +1,11 @@
 # ============================================================================
 # DELETED VM TRACKER - ARIA OPERATIONS + MULTI-VRA + VCENTER
-# Version 2.3.3 - Resource Topology Fix for CREATE_FAILED
-# New: Prioritize deployment.resources for VM name extraction (fixes generic Cloud_vSphere_Machine_# names)
-# New: Always check request history for cleanup detection
-# Fix: PowerShell ISE compatible (no ++ operators, proper variable references)
+# Version 2.3.5 - Decommission Date Fix
+# Changed: Fixed decommission "Deletion Date" to use leaseExpireAt (scheduled deletion)
+# Changed: Fixed decommission "Initiated At" to use request.initiatedAt (when decommission started)
+# Previous: Removed "(Failed)" suffix from deployment names
+# Previous: "Manually cleaned from vCenter" to "Object deleted in vCenter"
+# Previous: Source field now extracts text from brackets in RequestStatus
 # ============================================================================
 
 # ============================================================================
@@ -402,14 +404,16 @@ function Get-ActiveDeploymentsWithDecommission {
                         $vraServerShort = ($VraServer -split '\.')[0]
                         $catalogItem = if ($deployment.inputs._catalogItemName) { $deployment.inputs._catalogItemName } else { "N/A" }
                         
-                        $expirationDate = if ($deployment.leaseExpireAt) {
-                            Convert-ToSydneyTime -DateTimeString $deployment.leaseExpireAt
+                        # InitiatedAt should be when the request was started
+                        $initiatedAt = if ($request.initiatedAt) {
+                            Convert-ToSydneyTime -DateTimeString $request.initiatedAt
                         } else {
                             "N/A"
                         }
                         
-                        $deletionDate = if ($deployment.lastUpdatedAt) {
-                            Convert-ToSydneyTime -DateTimeString $deployment.lastUpdatedAt
+                        # DeletionDate should be the scheduled deletion date (leaseExpireAt)
+                        $deletionDate = if ($deployment.leaseExpireAt) {
+                            Convert-ToSydneyTime -DateTimeString $deployment.leaseExpireAt
                         } else {
                             "N/A"
                         }
@@ -426,7 +430,7 @@ function Get-ActiveDeploymentsWithDecommission {
                             RequestedBy = $request.requestedBy
                             Requestor = if ($deployment.ownedBy) { $deployment.ownedBy } else { $request.requestedBy }
                             CatalogItem = $catalogItem
-                            InitiatedAt = $expirationDate
+                            InitiatedAt = $initiatedAt
                             CompletedAt = if ($request.completedAt) { Convert-ToSydneyTime -DateTimeString $request.completedAt } else { "N/A" }
                             DeletionDate = $deletionDate
                             vRAServer = $vraServerShort
@@ -1031,7 +1035,7 @@ function Match-FailedVMsWithVCenter {
             }
             else {
                 Write-Log "MATCH: '$($failedVM.VMName)' - External cleanup detected (no Delete in vRA history)" "WARN"
-                $deletionSource = "External Cleanup (manual removal from vCenter)"
+                $deletionSource = "Object deleted in vCenter"
                 $deletedBy = $matchedVCRecord.DeletedBy
             }
             
@@ -1152,26 +1156,32 @@ function Send-DeletedVMReport {
     # 2. Failed vRA deployments (enriched with vCenter match and cleanup info)
     foreach ($vm in $VraFailedData) {
         $status = "CREATE_FAILED"
+        $sourceValue = $vm.Source
         
-        # Determine appropriate status message
+        # Determine appropriate status message based on DeletionSource
         if ($vm.DeletionSource -match "vRA Cleanup") {
             $status = "CREATE_FAILED (vRA auto-cleanup)"
         }
-        elseif ($vm.DeletionSource -match "External Cleanup") {
-            $status = "CREATE_FAILED (manually cleaned from vCenter)"
+        elseif ($vm.DeletionSource -match "Object deleted in vCenter") {
+            $status = "CREATE_FAILED (Object deleted in vCenter)"
         }
         elseif ($vm.DeletedAt -eq "N/A") {
             $status = "CREATE_FAILED (no cleanup detected)"
+        }
+        
+        # Extract source from brackets if present in Source field
+        if ($vm.Source -match '\(([^)]+)\)') {
+            $sourceValue = $matches[1]
         }
         
         $deletedVMs += New-Object PSObject -Property @{
             VMName = $vm.VMName
             RequestedBy = $vm.RequestedBy
             DeletedAt = if ($vm.DeletedAt -ne "N/A") { $vm.DeletedAt } else { $vm.FailedAt }
-            DeploymentName = "$($vm.DeploymentName) (Failed)"
+            DeploymentName = $vm.DeploymentName
             RequestAction = "Deployment Create (Failed)"
             RequestStatus = $status
-            Source = $vm.Source
+            Source = $sourceValue
         }
     }
     
@@ -1335,7 +1345,7 @@ $decommissionTableRows
 # ============================================================================
 
 Write-DebugSection "DELETED VM TRACKER - STARTED"
-Write-Log "Script Version: 2.3.3 - Resource Topology Fix" "SUCCESS"
+Write-Log "Script Version: 2.3.5 - Decommission Date Fix" "SUCCESS"
 Write-Log "PowerShell Version: $($PSVersionTable.PSVersion)"
 
 try {
@@ -1574,5 +1584,5 @@ else {
 }
 
 Write-DebugSection "SCRIPT COMPLETED"
-Write-Log "Script Version: 2.3.3 - Resource Topology Fix" "SUCCESS"
+Write-Log "Script Version: 2.3.5 - Decommission Date Fix" "SUCCESS"
 Write-Log "Debug log saved to: $debugOutputFile" "SUCCESS"
