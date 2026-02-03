@@ -1,12 +1,10 @@
 # ============================================================================
 # DELETED VM TRACKER - ARIA OPERATIONS + MULTI-VRA + VCENTER
-# Version 2.3.6 - Enhanced Decommission Debugging
-# Changed: Reverted InitiatedAt back to leaseExpireAt (correct as before)
-# Changed: Added comprehensive debugging output for decommission deployments
-# Changed: DeletionDate now tries multiple fields (customProperties, inputs, request.scheduledFor)
-# Previous: Removed "(Failed)" suffix from deployment names
-# Previous: "Object deleted in vCenter" cleanup message
-# Previous: Source field extracts text from brackets
+# Version 2.3.7 - Full Object Dump for Debugging
+# Changed: Added complete dump of all deployment and request properties
+# Changed: Added checks for deployment.destroyDate, scheduledForDeletion, deletionScheduled
+# Changed: Added checks for metadata and request.inputs fields
+# Note: Run this version and check debug log to find the actual field name for "Deletion Scheduled"
 # ============================================================================
 
 # ============================================================================
@@ -409,32 +407,74 @@ function Get-ActiveDeploymentsWithDecommission {
                         Write-Log "    === DECOMMISSION DATE DEBUGGING ===" "DEBUG"
                         Write-Log "    Deployment Name: $($deployment.name)" "DEBUG"
                         Write-Log "    Deployment ID: $($deployment.id)" "DEBUG"
-                        Write-Log "    deployment.leaseExpireAt: $($deployment.leaseExpireAt)" "DEBUG"
-                        Write-Log "    deployment.createdAt: $($deployment.createdAt)" "DEBUG"
-                        Write-Log "    deployment.lastUpdatedAt: $($deployment.lastUpdatedAt)" "DEBUG"
-                        Write-Log "    deployment.status: $($deployment.status)" "DEBUG"
-                        Write-Log "    request.initiatedAt: $($request.initiatedAt)" "DEBUG"
-                        Write-Log "    request.completedAt: $($request.completedAt)" "DEBUG"
-                        Write-Log "    request.name: $($request.name)" "DEBUG"
-                        Write-Log "    request.status: $($request.status)" "DEBUG"
                         
-                        # Check for custom properties that might contain scheduled deletion date
-                        if ($deployment.customProperties) {
-                            Write-Log "    Custom Properties:" "DEBUG"
-                            $deployment.customProperties.PSObject.Properties | ForEach-Object {
-                                if ($_.Name -match "delete|schedule|date|expir") {
-                                    Write-Log "      $($_.Name): $($_.Value)" "DEBUG"
-                                }
+                        # Dump ALL deployment properties
+                        Write-Log "    --- ALL DEPLOYMENT PROPERTIES ---" "DEBUG"
+                        $deployment.PSObject.Properties | ForEach-Object {
+                            $propName = $_.Name
+                            $propValue = $_.Value
+                            if ($propValue -is [string] -or $propValue -is [int] -or $propValue -is [bool] -or $null -eq $propValue) {
+                                Write-Log "    deployment.$propName = $propValue" "DEBUG"
+                            }
+                            elseif ($propValue -is [DateTime]) {
+                                Write-Log "    deployment.$propName = $($propValue.ToString('yyyy-MM-ddTHH:mm:ss'))" "DEBUG"
+                            }
+                            else {
+                                Write-Log "    deployment.$propName = [Complex Object: $($propValue.GetType().Name)]" "DEBUG"
                             }
                         }
                         
-                        # Check deployment inputs for any date-related fields
+                        # Dump ALL request properties
+                        Write-Log "    --- ALL REQUEST PROPERTIES ---" "DEBUG"
+                        $request.PSObject.Properties | ForEach-Object {
+                            $propName = $_.Name
+                            $propValue = $_.Value
+                            if ($propValue -is [string] -or $propValue -is [int] -or $propValue -is [bool] -or $null -eq $propValue) {
+                                Write-Log "    request.$propName = $propValue" "DEBUG"
+                            }
+                            elseif ($propValue -is [DateTime]) {
+                                Write-Log "    request.$propName = $($propValue.ToString('yyyy-MM-ddTHH:mm:ss'))" "DEBUG"
+                            }
+                            else {
+                                Write-Log "    request.$propName = [Complex Object: $($propValue.GetType().Name)]" "DEBUG"
+                            }
+                        }
+                        
+                        # Check for custom properties
+                        if ($deployment.customProperties) {
+                            Write-Log "    --- CUSTOM PROPERTIES ---" "DEBUG"
+                            $deployment.customProperties.PSObject.Properties | ForEach-Object {
+                                Write-Log "    customProperties.$($_.Name) = $($_.Value)" "DEBUG"
+                            }
+                        }
+                        
+                        # Check deployment inputs
                         if ($deployment.inputs) {
-                            Write-Log "    Deployment Inputs:" "DEBUG"
+                            Write-Log "    --- DEPLOYMENT INPUTS ---" "DEBUG"
                             $deployment.inputs.PSObject.Properties | ForEach-Object {
-                                if ($_.Name -match "delete|schedule|date|expir") {
-                                    Write-Log "      $($_.Name): $($_.Value)" "DEBUG"
-                                }
+                                Write-Log "    inputs.$($_.Name) = $($_.Value)" "DEBUG"
+                            }
+                        }
+                        
+                        # Check if there are any metadata fields
+                        if ($deployment.metadata) {
+                            Write-Log "    --- DEPLOYMENT METADATA ---" "DEBUG"
+                            $deployment.metadata.PSObject.Properties | ForEach-Object {
+                                Write-Log "    metadata.$($_.Name) = $($_.Value)" "DEBUG"
+                            }
+                        }
+                        
+                        # Check request details
+                        if ($request.details) {
+                            Write-Log "    --- REQUEST DETAILS ---" "DEBUG"
+                            Write-Log "    request.details = $($request.details)" "DEBUG"
+                        }
+                        
+                        # Check request inputs
+                        if ($request.inputs) {
+                            Write-Log "    --- REQUEST INPUTS ---" "DEBUG"
+                            $request.inputs.PSObject.Properties | ForEach-Object {
+                                Write-Log "    request.inputs.$($_.Name) = $($_.Value)" "DEBUG"
                             }
                         }
                         
@@ -451,8 +491,28 @@ function Get-ActiveDeploymentsWithDecommission {
                         # Try multiple possible fields in order of preference
                         $deletionDate = "N/A"
                         
-                        # First, check if there's a custom property for scheduled deletion
-                        if ($deployment.customProperties -and $deployment.customProperties.scheduledDeletionDate) {
+                        # First, check if there's a destroyDate field directly on deployment
+                        if ($deployment.destroyDate) {
+                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deployment.destroyDate
+                            Write-Log "    Using deployment.destroyDate: $deletionDate" "SUCCESS"
+                        }
+                        # Check for scheduledForDeletion
+                        elseif ($deployment.scheduledForDeletion) {
+                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deployment.scheduledForDeletion
+                            Write-Log "    Using deployment.scheduledForDeletion: $deletionDate" "SUCCESS"
+                        }
+                        # Check for deletionScheduled
+                        elseif ($deployment.deletionScheduled) {
+                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deployment.deletionScheduled
+                            Write-Log "    Using deployment.deletionScheduled: $deletionDate" "SUCCESS"
+                        }
+                        # Check metadata
+                        elseif ($deployment.metadata -and $deployment.metadata.deletionScheduled) {
+                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deployment.metadata.deletionScheduled
+                            Write-Log "    Using metadata.deletionScheduled: $deletionDate" "SUCCESS"
+                        }
+                        # Check if there's a custom property for scheduled deletion
+                        elseif ($deployment.customProperties -and $deployment.customProperties.scheduledDeletionDate) {
                             $deletionDate = Convert-ToSydneyTime -DateTimeString $deployment.customProperties.scheduledDeletionDate
                             Write-Log "    Using customProperties.scheduledDeletionDate: $deletionDate" "SUCCESS"
                         }
@@ -475,6 +535,11 @@ function Get-ActiveDeploymentsWithDecommission {
                         elseif ($request.scheduledFor) {
                             $deletionDate = Convert-ToSydneyTime -DateTimeString $request.scheduledFor
                             Write-Log "    Using request.scheduledFor: $deletionDate" "SUCCESS"
+                        }
+                        # Check request inputs
+                        elseif ($request.inputs -and $request.inputs.deletionScheduled) {
+                            $deletionDate = Convert-ToSydneyTime -DateTimeString $request.inputs.deletionScheduled
+                            Write-Log "    Using request.inputs.deletionScheduled: $deletionDate" "SUCCESS"
                         }
                         # Fall back to lease expiration as best guess
                         elseif ($deployment.leaseExpireAt) {
@@ -1412,7 +1477,7 @@ $decommissionTableRows
 # ============================================================================
 
 Write-DebugSection "DELETED VM TRACKER - STARTED"
-Write-Log "Script Version: 2.3.6 - Enhanced Decommission Debugging" "SUCCESS"
+Write-Log "Script Version: 2.3.7 - Full Object Dump for Debugging" "SUCCESS"
 Write-Log "PowerShell Version: $($PSVersionTable.PSVersion)"
 
 try {
@@ -1651,5 +1716,5 @@ else {
 }
 
 Write-DebugSection "SCRIPT COMPLETED"
-Write-Log "Script Version: 2.3.6 - Enhanced Decommission Debugging" "SUCCESS"
+Write-Log "Script Version: 2.3.7 - Full Object Dump for Debugging" "SUCCESS"
 Write-Log "Debug log saved to: $debugOutputFile" "SUCCESS"
