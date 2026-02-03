@@ -1,10 +1,9 @@
 # ============================================================================
 # DELETED VM TRACKER - ARIA OPERATIONS + MULTI-VRA + VCENTER
-# Version 2.3.2 - PowerShell ISE Compatible
-# New: Fixed all ++ operators for PowerShell ISE compatibility
-# New: Better handling of failed deployments that create partial VMs in vCenter
-# New: Distinguishes between vRA cleanup and external deletions
-# New: Full request history tracking for all deployment states
+# Version 2.3.3 - Resource Topology Fix for CREATE_FAILED
+# New: Prioritize deployment.resources for VM name extraction (fixes generic Cloud_vSphere_Machine_# names)
+# New: Always check request history for cleanup detection
+# Fix: PowerShell ISE compatible (no ++ operators, proper variable references)
 # ============================================================================
 
 # ============================================================================
@@ -857,6 +856,46 @@ function Get-FailedDeploymentsFromVRA {
     foreach ($deployment in $filteredFailedDeployments) {
         Write-Log "  Processing Failed Deployment: $($deployment.name) ($($deployment.id))" "DEBUG"
         
+        $serverName = $null
+        
+        # PRIORITY 1: Try to get VM name from deployment resources (Topology)
+        # This is the most reliable source for active CREATE_FAILED deployments
+        if ($deployment.resources) {
+            Write-Log "    Checking deployment resources/topology for VM name..." "DEBUG"
+            foreach ($resource in $deployment.resources) {
+                if ($resource.type -eq "Cloud.vSphere.Machine") {
+                    Write-Log "      Found vSphere Machine resource" "DEBUG"
+                    Write-Log "      Resource ID: $($resource.id)" "DEBUG"
+                    Write-Log "      Resource Name: $($resource.name)" "DEBUG"
+                    
+                    # Try properties.resourceName first (this is the actual VM name)
+                    if ($resource.properties -and $resource.properties.resourceName) {
+                        $serverName = $resource.properties.resourceName
+                        Write-Log "      ✓ Found VM name from properties.resourceName: $serverName" "SUCCESS"
+                        break
+                    }
+                    # Try resource.name if not generic
+                    elseif ($resource.name -and $resource.name -notmatch "Cloud_vSphere_Machine_\d+") {
+                        $serverName = $resource.name
+                        Write-Log "      ✓ Found VM name from resource.name: $serverName" "SUCCESS"
+                        break
+                    }
+                    # Try properties.address
+                    elseif ($resource.properties -and $resource.properties.address) {
+                        $serverName = $resource.properties.address
+                        Write-Log "      ✓ Found VM name from properties.address: $serverName" "SUCCESS"
+                        break
+                    }
+                    else {
+                        Write-Log "      ⚠ Resource found but no usable name (will check events)" "WARN"
+                    }
+                }
+            }
+        }
+        
+        # ALWAYS get request history for cleanup detection
+        $requestHistory = @()
+        
         try {
             # Get ALL requests for this deployment (not just create/provision)
             $requestsUri = "https://$VraServer/deployment/api/deployments/$($deployment.id)/requests?apiVersion=2020-08-25"
@@ -868,24 +907,21 @@ function Get-FailedDeploymentsFromVRA {
             
             Write-Log "    Found $($requests.Count) total requests for this deployment" "DEBUG"
             
-            # Build complete request history
-            $requestHistory = @()
-            $serverName = $null
-            
-            # Process ALL requests to build history and find VM name
+            # Process ALL requests to build history
             foreach ($request in $requests) {
                 Write-Log "      Request: $($request.actionId) - Status: $($request.status)" "DEBUG"
                 
                 # Fetch all events for this request
                 $requestEvents = Get-AllEventsForRequest -VraServer $VraServer -Headers $Headers -DeploymentId $deployment.id -RequestId $request.id
                 
-                # Try to extract VM name from events
-                foreach ($event in $requestEvents) {
-                    if (-not $serverName) {
+                # If we don't have VM name yet, try to extract from events
+                if (-not $serverName) {
+                    foreach ($event in $requestEvents) {
                         $extractedName = Extract-CloudResourceName -Event $event
                         if ($extractedName) {
                             $serverName = $extractedName
-                            Write-Log "      Found VM Name: $serverName" "SUCCESS"
+                            Write-Log "      ✓ Found VM Name from events: $serverName" "SUCCESS"
+                            break
                         }
                     }
                 }
@@ -903,22 +939,21 @@ function Get-FailedDeploymentsFromVRA {
                 }
             }
             
+            # Check if there's a delete/cleanup action in the history
+            $hasCleanupAction = $requestHistory | Where-Object { 
+                $_.ActionId -match "Delete|Remove|Cleanup" -or 
+                $_.RequestName -match "Delete|Remove|Cleanup" 
+            }
+            
+            $cleanupInfo = if ($hasCleanupAction) {
+                "vRA performed cleanup (Delete request found in history)"
+            } else {
+                "No cleanup action found in vRA history"
+            }
+            
             if ($serverName) {
                 Write-Log "    Successfully identified VM Name: $serverName" "SUCCESS"
                 Write-Log "    Request history contains $($requestHistory.Count) requests" "DEBUG"
-                
-                # Check if there's a delete/cleanup action in the history
-                $hasCleanupAction = $requestHistory | Where-Object { 
-                    $_.ActionId -match "Delete|Remove|Cleanup" -or 
-                    $_.RequestName -match "Delete|Remove|Cleanup" 
-                }
-                
-                $cleanupInfo = if ($hasCleanupAction) {
-                    "vRA performed cleanup (Delete request found in history)"
-                } else {
-                    "No cleanup action found in vRA history"
-                }
-                
                 Write-Log "    Cleanup Status: $cleanupInfo" "DEBUG"
                 
                 $failedDeploymentData.Add([PSCustomObject]@{
@@ -1300,7 +1335,7 @@ $decommissionTableRows
 # ============================================================================
 
 Write-DebugSection "DELETED VM TRACKER - STARTED"
-Write-Log "Script Version: 2.3.2 - PowerShell ISE Compatible" "SUCCESS"
+Write-Log "Script Version: 2.3.3 - Resource Topology Fix" "SUCCESS"
 Write-Log "PowerShell Version: $($PSVersionTable.PSVersion)"
 
 try {
@@ -1539,5 +1574,5 @@ else {
 }
 
 Write-DebugSection "SCRIPT COMPLETED"
-Write-Log "Script Version: 2.3.2 - PowerShell ISE Compatible" "SUCCESS"
+Write-Log "Script Version: 2.3.3 - Resource Topology Fix" "SUCCESS"
 Write-Log "Debug log saved to: $debugOutputFile" "SUCCESS"
