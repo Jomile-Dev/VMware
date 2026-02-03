@@ -1,6 +1,7 @@
 # ============================================================================
 # DELETED VM TRACKER - ARIA OPERATIONS + MULTI-VRA + VCENTER
-# Version 2.3.1 - Enhanced CREATE_FAILED Detection
+# Version 2.3.2 - PowerShell ISE Compatible
+# New: Fixed all ++ operators for PowerShell ISE compatibility
 # New: Better handling of failed deployments that create partial VMs in vCenter
 # New: Distinguishes between vRA cleanup and external deletions
 # New: Full request history tracking for all deployment states
@@ -221,7 +222,7 @@ function Get-AllEventsForRequest {
 
             if ($events -and $events.Count -gt 0) {
                 $allEvents += $events
-                $eventPage++
+                $eventPage = $eventPage + 1
                 if ($events.Count -lt $eventsPageSize) { break }
             }
             else { break }
@@ -276,7 +277,7 @@ function Get-ActiveDeploymentsWithDecommission {
             if ($deployments -and $deployments.Count -gt 0) {
                 $allDeployments += $deployments
                 Write-Log "  Page $page : Found $($deployments.Count) deployments" "DEBUG"
-                $page++
+                $page = $page + 1
             }
             else {
                 break
@@ -528,7 +529,7 @@ function Get-DeletedVMsFromVRA {
             
             if ($deployments -and $deployments.Count -gt 0) {
                 $allDeletedDeployments += $deployments
-                $page++
+                $page = $page + 1
             }
             else {
                 break
@@ -803,7 +804,7 @@ function Get-FailedDeploymentsFromVRA {
             if ($deployments -and $deployments.Count -gt 0) {
                 $allDeployments += $deployments
                 Write-Log "    Page $page: Found $($deployments.Count) deployments" "DEBUG"
-                $page++
+                $page = $page + 1
             }
             else {
                 break
@@ -1299,7 +1300,7 @@ $decommissionTableRows
 # ============================================================================
 
 Write-DebugSection "DELETED VM TRACKER - STARTED"
-Write-Log "Script Version: 2.3.1 - Enhanced CREATE_FAILED Detection" "SUCCESS"
+Write-Log "Script Version: 2.3.2 - PowerShell ISE Compatible" "SUCCESS"
 Write-Log "PowerShell Version: $($PSVersionTable.PSVersion)"
 
 try {
@@ -1538,5 +1539,5 @@ else {
 }
 
 Write-DebugSection "SCRIPT COMPLETED"
-Write-Log "Script Version: 2.3.1" "SUCCESS"
+Write-Log "Script Version: 2.3.2 - PowerShell ISE Compatible" "SUCCESS"
 Write-Log "Debug log saved to: $debugOutputFile" "SUCCESS"
