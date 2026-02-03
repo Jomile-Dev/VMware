@@ -1,6 +1,6 @@
 # ============================================================================
 # DELETED VM TRACKER - ARIA OPERATIONS + MULTI-VRA + VCENTER
-# Version 2.4.2 - FULL VERSION (All Troubleshooting & Enhanced Logic)
+# Version 2.4.3 - ISE Compatible + Full Request History + Internal Cleanup Logic
 # ============================================================================
 
 # ============================================================================
@@ -11,9 +11,9 @@ $ariaOpsDomain = "yourdomain.com"
 $ariaOpsAuthSource = "localos"
 
 $vraServers = @("vra1.yourdomain.com", "vra2.yourdomain.com")
-$vCenters = @("vcenter1.domain.com", "vcenter2.domain.com", "vcenter3.domain.com")
+$vCenters = @("vcenter1.domain.com", "vcenter2.domain.com")
 
-# EMAIL CONFIGURATION
+# EMAIL CONFIGURATION - Update these!
 $script:smtpServer = "smtp.yourdomain.com"
 $script:smtpPort = 587
 $script:smtpFrom = "vra-reports@yourdomain.com"
@@ -27,7 +27,7 @@ $deploymentLookbackDays = 30
 $debugOutputFile = "DeletedVMs_Debug_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
 
 # ============================================================================
-# HELPER FUNCTIONS (RESTORED)
+# HELPER FUNCTIONS (Verbose Troubleshooting Restored)
 # ============================================================================
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
@@ -41,10 +41,17 @@ function Write-Log {
 function Write-DebugSection { param([string]$Title) $sep = "`n" + ("=" * 80) + "`n"; $h = "$sep$Title$sep"; Write-Host $h -ForegroundColor Cyan; Add-Content -Path $debugOutputFile -Value $h }
 
 function Disable-SSLValidation {
+    # ISE Fix: Check if type already exists in session to prevent errors on re-run
     if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
-        Add-Type "using System.Net; using System.Security.Cryptography.X509Certificates; public class TrustAllCertsPolicy : ICertificatePolicy { public bool CheckValidationResult(ServicePoint s, X509Certificate c, WebRequest r, int p) { return true; } }"
-        [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+        Add-Type @"
+            using System.Net;
+            using System.Security.Cryptography.X509Certificates;
+            public class TrustAllCertsPolicy : ICertificatePolicy {
+                public bool CheckValidationResult(ServicePoint s, X509Certificate c, WebRequest r, int p) { return true; }
+            }
+"@
     }
+    [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 }
 
@@ -58,195 +65,152 @@ function Convert-ToSydneyTime {
     } catch { return $DateTimeString }
 }
 
+# ============================================================================
+# EXTRACT NAME PRIORITY (The 1a, 1b, 1c logic you liked)
+# ============================================================================
 function Extract-CloudResourceName {
     param([PSObject]$Event)
     $serverName = $null
     if ($Event.details) {
-        $detailsText = if ($Event.details -is [string]) { $Event.details } else { $Event.details | ConvertTo-Json -Compress -Depth 5 }
-        if ($detailsText -match "Cloud Resource Name:\s*([^\s,;]+)") { $serverName = $matches[1].Trim() }
-        elseif ($detailsText -match '"cloudResourceName"\s*:\s*"([^"]+)"') { $serverName = $matches[1].Trim() }
-        elseif ($detailsText -match '"hostname"\s*:\s*"([^"]+)"') { $serverName = $matches[1].Trim() }
+        $detailsText = if ($Event.details -is [string]) { $Event.details } else { ($Event.details | ConvertTo-Json -Compress -Depth 5) }
+        if ($detailsText -match "Cloud Resource Name:\s*([^\s,;]+)") { 
+            $serverName = $matches[1].Trim(); Write-Log "[CRN] Found via Label: $serverName" "DEBUG"
+        }
+        elseif ($detailsText -match '"cloudResourceName"\s*:\s*"([^"]+)"') { 
+            $serverName = $matches[1].Trim(); Write-Log "[CRN] Found via JSON: $serverName" "DEBUG"
+        }
     }
     if (-not $serverName -and $Event.resourceName -and $Event.resourceName -notmatch "Cloud_vSphere_Machine_") { $serverName = $Event.resourceName }
     return $serverName
 }
 
-function Get-AllEventsForRequest {
-    param($VraServer, $Headers, $DeploymentId, $RequestId, [switch]$IncludeDeleted)
-    $allEvents = @(); $page = 0; $del = if ($IncludeDeleted) { "&deleted=true" } else { "" }
-    do {
-        $uri = "https://$VraServer/deployment/api/deployments/$DeploymentId/requests/$RequestId/events?page=$page&size=$eventsPageSize$del&apiVersion=2020-08-25"
-        try {
-            $res = Invoke-RestMethod -Uri $uri -Method Get -Headers $Headers -ErrorAction Stop
-            $events = if ($res.content) { $res.content } else { $res }
-            if ($events) { $allEvents += $events; $page++; if ($events.Count -lt $eventsPageSize) { break } } else { break }
-        } catch { break }
-    } while ($page -lt 20)
-    return $allEvents
-}
-
 # ============================================================================
-# MAIN DATA FUNCTIONS (RESTORED)
+# MAIN DATA ACQUISITION
 # ============================================================================
-
-function Get-ActiveDeploymentsWithDecommission {
+function Get-VraLifecycleData {
     param($VraServer, $Headers)
-    Write-DebugSection "Checking Active Deployments with Decommission Requests: $VraServer"
-    $decommissionData = New-Object System.Collections.ArrayList
-    $cutoffDate = (Get-Date).AddDays(-$deploymentLookbackDays).ToString("yyyy-MM-dd")
+    $results = @{ Decommissions = @(); FailedBuilds = @() }
+    $cutoff = (Get-Date).AddDays(-$deploymentLookbackDays).ToString("yyyy-MM-dd")
     
-    $page = 0; $size = 1000
-    do {
-        $pagedUri = "https://$VraServer/deployment/api/deployments?page=$page&size=$size&expand=resources&`$filter=lastUpdatedAt ge '$cutoffDate'"
-        try {
-            $response = Invoke-RestMethod -Uri $pagedUri -Method Get -Headers $Headers -ErrorAction Stop
-            $deployments = if ($response.content) { $response.content } else { $response }
-            if (-not $deployments) { break }
-            
-            foreach ($dep in $deployments) {
-                if ($dep.status -match "DELETE|DECOMMISSION") {
-                    # Logic to find the machine name and requestor
-                    $vmName = ($dep.resources | Where-Object {$_.type -eq "Cloud.vSphere.Machine"}).name | Select-Object -First 1
-                    $decommissionData.Add([PSCustomObject]@{
-                        VMName = $vmName; DeploymentName = $dep.name; RequestAction = "Decommission/Delete";
-                        RequestStatus = $dep.status; RequestedBy = $dep.ownedBy;
-                        InitiatedAt = Convert-ToSydneyTime $dep.createdAt; DeletionDate = Convert-ToSydneyTime $dep.lastUpdatedAt;
-                        vRAServer = ($VraServer -split '\.')[0]; DeploymentID = $dep.id; Source = "vRA-Active"
-                    }) | Out-Null
-                }
-            }
-            $page++; $hasMore = ($deployments.Count -eq $size)
-        } catch { break }
-    } while ($hasMore -and $page -lt 20)
-    return $decommissionData
-}
-
-function Get-FailedDeploymentsFromVRA {
-    param($VraServer, $Headers)
-    Write-DebugSection "Identifying Failed Builds (vRA Cleanups): $VraServer"
-    $failedData = New-Object System.Collections.ArrayList
+    Write-Log "Fetching deployments updated since $cutoff" "DEBUG"
+    $uri = "https://$VraServer/deployment/api/deployments?expand=resources&`$filter=lastUpdatedAt ge '$cutoff'"
+    $deps = (Invoke-RestMethod -Uri $uri -Method Get -Headers $Headers).content
     
-    # We specifically look for CREATE_FAILED to find items vRA deleted itself
-    $uri = "https://$VraServer/deployment/api/deployments?expand=resources&`$filter=status eq 'CREATE_FAILED'"
-    try {
-        $res = Invoke-RestMethod -Uri $uri -Method Get -Headers $Headers -ErrorAction Stop
-        $deployments = if ($res.content) { $res.content } else { $res }
-        
-        foreach ($dep in $deployments) {
-            Write-Log "Investigating Failed Deployment: $($dep.name)" "DEBUG"
+    foreach ($dep in $deps) {
+        # 1. PROCESS FAILED BUILDS (To catch vRA internal cleanups)
+        if ($dep.status -eq "CREATE_FAILED") {
+            Write-Log "Analyzing Failed Build: $($dep.name)" "WARN"
             $reqUri = "https://$VraServer/deployment/api/deployments/$($dep.id)/requests?apiVersion=2020-08-25"
-            $requests = (Invoke-RestMethod -Uri $reqUri -Method Get -Headers $Headers).content
-            
-            foreach ($r in $requests) {
-                # Look for the Provision event to find the name vCenter would have seen
-                $events = Get-AllEventsForRequest -VraServer $VraServer -Headers $Headers -DeploymentId $dep.id -RequestId $r.id
-                $extractedName = $null
-                foreach ($evt in $events) { 
-                    $extractedName = Extract-CloudResourceName -Event $evt
-                    if ($extractedName) { break } 
-                }
-                
-                if ($extractedName) {
-                    $failedData.Add([PSCustomObject]@{
-                        VMName = $extractedName; DeploymentName = $dep.name; RequestStatus = "CREATE_FAILED";
-                        RequestedBy = $dep.createdBy; InitiatedAt = Convert-ToSydneyTime $dep.createdAt;
-                        vRAServer = ($VraServer -split '\.')[0]; Source = "vRA-FailedBuild"
-                    }) | Out-Null
-                    break
+            $reqs = (Invoke-RestMethod -Uri $reqUri -Method Get -Headers $Headers).content
+            foreach ($r in $reqs) {
+                # Get the full event history to find the name VC would have seen
+                $history = (Invoke-RestMethod -Uri "https://$VraServer/deployment/api/deployments/$($dep.id)/requests/$($r.id)/events?apiVersion=2020-08-25" -Headers $Headers).content
+                foreach ($evt in $history) {
+                    $foundName = Extract-CloudResourceName -Event $evt
+                    if ($foundName) {
+                        $results.FailedBuilds += [PSCustomObject]@{
+                            VMName = $foundName; DeploymentName = $dep.name; Status = "CREATE_FAILED";
+                            RequestedBy = $dep.createdBy; InitiatedAt = Convert-ToSydneyTime $dep.createdAt;
+                            vRAServer = ($VraServer -split '\.')[0]
+                        }
+                        break
+                    }
                 }
             }
         }
-    } catch { Write-Log "Error fetching failed builds: $($_.Exception.Message)" "ERROR" }
-    return $failedData
-}
-
-function Get-DeletedVMsFromVCenter {
-    param($VCenter, $Credential, $DaysBack)
-    Write-DebugSection "vCENTER - CHECKING DIRECT VM DELETIONS: $VCenter"
-    $deletedVMs = @()
-    try {
-        Connect-VIServer -Server $VCenter -Credential $Credential -ErrorAction Stop | Out-Null
-        $cutoffDate = (Get-Date).AddDays(-$DaysBack)
-        $events = Get-VIEvent -Start $cutoffDate -MaxSamples 20000 | Where-Object { $_.GetType().Name -match 'VmRemovedEvent|VmBeingDeletedEvent' }
         
-        foreach ($event in $events) {
-            $deletedVMs += New-Object PSObject -Property @@{
-                VMName = $event.Vm.Name; DeletedAt = Convert-ToSydneyTime $event.CreatedTime.ToString("yyyy-MM-ddTHH:mm:ss");
-                DeletedBy = $event.UserName; EventType = $event.GetType().Name; 
-                vCenter = ($VCenter -split '\.')[0]; Source = "vCenter-Deleted"
+        # 2. PROCESS DECOMMISSIONS (Existing Pattern Matching)
+        if ($dep.status -match "DELETE|DECOMMISSION") {
+            $vmName = ($dep.resources | Where-Object {$_.type -eq "Cloud.vSphere.Machine"}).name | Select-Object -First 1
+            if ($vmName) {
+                $results.Decommissions += [PSCustomObject]@{
+                    VMName = $vmName; DeploymentName = $dep.name; Status = $dep.status;
+                    RequestedBy = $dep.ownedBy; InitiatedAt = Convert-ToSydneyTime $dep.createdAt;
+                    vRAServer = ($VraServer -split '\.')[0]
+                }
             }
         }
-        Disconnect-VIServer -Server $VCenter -Confirm:$false
-    } catch { Write-Log "vCenter Error: $($_.Exception.Message)" "ERROR" }
-    return $deletedVMs
+    }
+    return $results
 }
 
 # ============================================================================
-# MAIN SCRIPT EXECUTION
+# SCRIPT ENTRY POINT
 # ============================================================================
+Write-DebugSection "DELETED VM TRACKER START"
 Disable-SSLValidation
 $credential = Get-Credential
 $username = $credential.UserName
 $password = $credential.GetNetworkCredential().Password
 
-$allDecomm = @(); $allFailed = @(); $allVC = @()
+$masterDecomm = @(); $masterFailed = @(); $masterVC = @()
 
+# --- vRA Collection ---
 foreach ($srv in $vraServers) {
     try {
-        Write-Log "Connecting to vRA: $srv" "DEBUG"
         $authBody = @{ username = $username; password = $password } | ConvertTo-Json
         $auth = Invoke-RestMethod -Uri "https://$srv/csp/gateway/am/api/login" -Method Post -Headers @{"Content-Type"="application/json"} -Body $authBody
-        $vraHeaders = @{"Authorization"="Bearer $($auth.cspAuthToken)"; "Content-Type"="application/json"}
-        
-        $allDecomm += Get-ActiveDeploymentsWithDecommission -VraServer $srv -Headers $vraHeaders
-        $allFailed += Get-FailedDeploymentsFromVRA -VraServer $srv -Headers $vraHeaders
-    } catch { Write-Log "vRA Connection Failed for $srv" "ERROR" }
+        $h = @{"Authorization"="Bearer $($auth.cspAuthToken)"; "Content-Type"="application/json"}
+        $data = Get-VraLifecycleData -VraServer $srv -Headers $h
+        $masterDecomm += $data.Decommissions
+        $masterFailed += $data.FailedBuilds
+    } catch { Write-Log "Error on vRA $srv : $($_.Exception.Message)" "ERROR" }
 }
 
-foreach ($vc in $vCenters) { $allVC += Get-DeletedVMsFromVCenter -VCenter $vc -Credential $credential -DaysBack $daysBack }
+# --- vCenter Collection ---
+foreach ($vc in $vCenters) {
+    try {
+        Connect-VIServer -Server $vc -Credential $credential -ErrorAction Stop | Out-Null
+        $events = Get-VIEvent -Start (Get-Date).AddDays(-$daysBack) -MaxSamples 5000 | Where-Object { $_.GetType().Name -match "VmRemovedEvent|VmBeingDeletedEvent" }
+        foreach ($e in $events) {
+            $masterVC += [PSCustomObject]@{
+                VMName = $e.Vm.Name; DeletedBy = $e.UserName; 
+                DeletedAt = Convert-ToSydneyTime $e.CreatedTime.ToString("yyyy-MM-ddTHH:mm:ss");
+                vCenter = ($vc -split '\.')[0]
+            }
+        }
+        Disconnect-VIServer -Confirm:$false
+    } catch { Write-Log "VC Error on $vc : $($_.Exception.Message)" "ERROR" }
+}
 
 # ============================================================================
-# MATCHING ENGINE: Link vRA Failed Builds to vCenter Cleanup
+# THE "INTERNAL CLEANUP" MATCHING ENGINE
 # ============================================================================
-Write-DebugSection "MATCHING FAILED vRA VMs vs vCenter DELETIONS"
-$finalReportList = New-Object System.Collections.ArrayList
-$vcMatchedKeys = @{}
+Write-DebugSection "CROSS-REFERENCING FAILURES"
+$reportList = New-Object System.Collections.ArrayList
+$vcUsedNames = @{}
 
-foreach ($fVM in $allFailed) {
-    # If the failed VM name exists in the vCenter deleted list...
-    $match = $allVC | Where-Object { $_.VMName -eq $fVM.VMName } | Select-Object -First 1
+# If a VM failed in vRA and was deleted in VC, mark it as "Internal Cleanup"
+foreach ($fVM in $masterFailed) {
+    $match = $masterVC | Where-Object { $_.VMName -eq $fVM.VMName } | Select-Object -First 1
     if ($match) {
-        Write-Log "MATCH FOUND: vRA Failed Build '$($fVM.VMName)' was deleted by $($match.DeletedBy)" "SUCCESS"
-        $fVM.RequestedBy = "vRA (Internal Cleanup/Failed Build)"
-        $fVM.RequestStatus = "Build Failed & Deleted"
-        $vcMatchedKeys[$match.VMName.ToLower()] = $true
+        $fVM.RequestedBy = "vRA (Internal Cleanup - Failed Build)"
+        $fVM.Status = "CREATE_FAILED (Auto-Deleted)"
+        $vcUsedNames[$match.VMName.ToLower()] = $true
     }
-    $finalReportList.Add($fVM) | Out-Null
+    $reportList.Add($fVM) | Out-Null
 }
 
-# Add pure vCenter deletions that weren't vRA cleanups
-foreach ($vcVM in $allVC) {
-    if (-not $vcMatchedKeys.ContainsKey($vcVM.VMName.ToLower())) {
-        $finalReportList.Add([PSCustomObject]@{
-            VMName = $vcVM.VMName; DeploymentName = "N/A (Direct VC Deletion)";
-            RequestStatus = "Deleted"; RequestedBy = $vcVM.DeletedBy;
-            InitiatedAt = $vcVM.DeletedAt; vRAServer = $vcVM.vCenter
+# Add VC deletes that were NOT vRA cleanups
+foreach ($vVM in $masterVC) {
+    if (-not $vcUsedNames.ContainsKey($vVM.VMName.ToLower())) {
+        $reportList.Add([PSCustomObject]@{
+            VMName = $vVM.VMName; DeploymentName = "N/A (Direct VC Action)";
+            Status = "Deleted"; RequestedBy = $vVM.DeletedBy;
+            InitiatedAt = $vVM.DeletedAt; vRAServer = $vVM.vCenter
         }) | Out-Null
     }
 }
 
 # ============================================================================
-# FINAL REPORTING
+# HTML REPORT & SEND
 # ============================================================================
-# (Standard HTML Generation)
-$tableRows = ""
-foreach ($item in ($finalReportList | Sort-Object VMName)) {
-    $tableRows += "<tr><td>$($item.VMName)</td><td>$($item.DeploymentName)</td><td>$($item.RequestStatus)</td><td>$($item.RequestedBy)</td><td>$($item.InitiatedAt)</td><td>$($item.vRAServer)</td></tr>"
-}
+$rows = ""
+foreach ($i in $reportList) { $rows += "<tr><td>$($i.VMName)</td><td>$($i.DeploymentName)</td><td>$($i.Status)</td><td>$($i.RequestedBy)</td><td>$($i.InitiatedAt)</td><td>$($i.vRAServer)</td></tr>" }
 
-$html = "<html><style>body{font-family:Arial;} table{width:100%;border-collapse:collapse;} th{background:#2196F3;color:white;padding:10px;} td{border:1px solid #ddd;padding:8px;}</style><body>"
+$html = "<html><style>table{width:100%;border-collapse:collapse;font-family:Arial;} th{background:#2196F3;color:white;padding:10px;} td{border:1px solid #ddd;padding:8px;}</style><body>"
 $html += "<h2>VM Deletion & Lifecycle Report</h2><table><thead><tr><th>VM Name</th><th>Deployment</th><th>Status</th><th>Action By</th><th>Timestamp</th><th>Source</th></tr></thead>"
-$html += "<tbody>$tableRows</tbody></table></body></html>"
+$html += "<tbody>$rows</tbody></table></body></html>"
 
 Send-MailMessage -To $script:smtpTo -From $script:smtpFrom -Subject $script:smtpSubject -Body $html -BodyAsHtml -SmtpServer $script:smtpServer -Port $script:smtpPort -UseSsl
-Write-Log "Process Complete." "SUCCESS"
+Write-Log "Report Sent Successfully." "SUCCESS"
