@@ -1,6 +1,6 @@
 # ============================================================================
 # COMPREHENSIVE VM TRACKER - NEW SERVERS + DELETIONS + DECOMMISSIONS
-# Version 4.0.1 - FIXED: Properly shows offline/deleted VMs in new server report
+# Version 4.0.1 - FIXED: Deleted VMs only in Deleted section, failed builds in New Server section
 # ============================================================================
 
 # ============================================================================
@@ -1386,7 +1386,7 @@ $decommissionTableRows
 # ============================================================================
 
 Write-Log "=== COMPREHENSIVE VM TRACKER STARTED ===" "SUCCESS"
-Write-Log "Version: 4.0.1 - FIXED: Properly shows offline/deleted VMs"
+Write-Log "Version: 4.0.1 - FIXED: Deleted VMs only appear in Deleted section, failed builds appear in New Server section"
 Write-Log "PowerShell Version: $($PSVersionTable.PSVersion)"
 
 # Load VMware PowerCLI
@@ -1746,15 +1746,46 @@ foreach ($vCenter in $vCenters) {
 
 # Add VMs from vCenter that weren't in Aria Ops data
 $existingVMNames = $newVMsData | Select-Object -ExpandProperty Name
+$vCenterVMsStillExist = @{}  # Track which vCenter VMs still exist
+
 foreach ($vcVM in $vCenterCreatedVMs.Values) {
     if ($vcVM.Name -notin $existingVMNames) {
-        Write-Log "  Adding VM from vCenter that wasn't in Aria Ops: $($vcVM.Name) (PowerState: $($vcVM.PowerState))" "SUCCESS"
+        # For vCenter-created VMs, we need to verify they still exist
+        # If they were deleted, they should only appear in Deleted section, not New Server section
+        $vmStillExists = $false
         
-        $newVMsData += [PSCustomObject]@{
-            Name = $vcVM.Name
-            Status = $vcVM.Status
-            PowerState = $vcVM.PowerState
-            ResourceId = $vcVM.ResourceId
+        foreach ($vCenter in $vCenters) {
+            try {
+                if (-not $vCenterConnections.ContainsKey($vCenter)) {
+                    Connect-VIServer -Server $vCenter -Credential $credential -ErrorAction Stop | Out-Null
+                    $vCenterConnections[$vCenter] = $true
+                }
+                
+                $vm = Get-VM -Name $vcVM.Name -Server $vCenter -ErrorAction SilentlyContinue
+                if ($vm) {
+                    $vmStillExists = $true
+                    $vCenterVMsStillExist[$vcVM.Name] = $true
+                    break
+                }
+            }
+            catch {
+                # Continue to next vCenter
+            }
+        }
+        
+        # Only add to new server deployments if VM still exists
+        if ($vmStillExists) {
+            Write-Log "  Adding VM from vCenter that wasn't in Aria Ops: $($vcVM.Name) (PowerState: $($vcVM.PowerState))" "SUCCESS"
+            
+            $newVMsData += [PSCustomObject]@{
+                Name = $vcVM.Name
+                Status = $vcVM.Status
+                PowerState = $vcVM.PowerState
+                ResourceId = $vcVM.ResourceId
+            }
+        }
+        else {
+            Write-Log "  Skipping deleted vCenter VM (will appear in Deleted section): $($vcVM.Name)" "SUCCESS"
         }
     }
 }
@@ -1777,21 +1808,19 @@ foreach ($vmData in $newVMsData) {
         $finalStatus = $vmData.Status
         $finalPowerState = $vmData.PowerState
         
-        # FIXED: Check deployment status for failures first
-        if ($depInfo.Status -match "FAILED|ERROR") {
+        # FIXED: Skip VMs that were formally deleted via vRA - they appear in Deleted section
+        if ($depInfo.Status -eq "DELETED" -or $depInfo.DeploymentStatus -eq "Decomm/Offline") {
+            continue  # Skip from new server report - will appear in deleted section instead
+        }
+        # Check deployment status for failures
+        elseif ($depInfo.Status -match "FAILED|ERROR") {
             $finalStatus = "Decomm/Offline"
             $finalPowerState = "NotExisting"
         }
-        # FIXED: Trust Aria Operations if it says VM doesn't exist
+        # Trust Aria Operations if it says VM doesn't exist (failed build)
         elseif ($vmData.Status -eq "Decomm/Offline") {
             $finalStatus = "Decomm/Offline"
             $finalPowerState = "NotExisting"
-        }
-        # FIXED: Check if deployment was deleted
-        elseif ($depInfo.Status -eq "DELETED" -or $depInfo.DeploymentStatus -eq "Decomm/Offline") {
-            $finalStatus = "Decomm/Offline"
-            $finalPowerState = "NotExisting"
-            # REMOVED: The "continue" statement that was skipping these VMs
         }
         elseif ($vmData.Status -eq "Unknown") {
             $finalStatus = "Online"
@@ -1834,9 +1863,17 @@ foreach ($vmData in $newVMsData) {
         }
     }
     else {
+        # VM not in vRA - check vCenter
         $vcInfo = $vCenterLookup[$vmName]
         $finalStatus = $vmData.Status
         $finalPowerState = $vmData.PowerState
+        
+        # FIXED: If this is a vCenter VM that was marked as Decomm/Offline by Aria Ops,
+        # skip it from new server report - it will appear in Deleted section
+        if ($vmData.Status -eq "Decomm/Offline") {
+            Write-Log "  Skipping vCenter VM (deleted, will appear in Deleted section): $vmName"
+            continue
+        }
         
         if ($finalStatus -eq "Unknown") {
             $finalStatus = "Online"
@@ -1861,6 +1898,12 @@ foreach ($vmData in $newVMsData) {
                 catch {
                     # Continue
                 }
+            }
+            
+            # If we still can't find it, skip it from new server report
+            if ($finalPowerState -eq "Unknown") {
+                Write-Log "  Skipping vCenter VM (cannot verify existence): $vmName"
+                continue
             }
         }
         
