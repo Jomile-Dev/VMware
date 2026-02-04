@@ -28,7 +28,7 @@ $script:smtpPort = 587
 $script:smtpFrom = "vra-reports@yourdomain.com"
 $script:smtpTo = @("admin@yourdomain.com")
 $script:smtpCc = @("manager@yourdomain.com")
-$script:smtpSubject = "Comprehensive VM Report - $(Get-Date -Format 'dd-MM-yyyy')"
+$script:smtpSubject = "VMs built/deleted in last 24hrs - $(Get-Date -Format 'dd-MM-yyyy')"
 
 # TIME RANGE CONFIGURATION
 $daysBack = 1
@@ -1127,12 +1127,12 @@ function Send-CombinedVMReport {
         }
         
         $newVMsTableRows += "<td>$($vm.Name)</td>"
+        $newVMsTableRows += "<td>$($vm.DeploymentName)</td>"
         $newVMsTableRows += "<td>$($vm.Status)</td>"
-        $newVMsTableRows += "<td>$($vm.Source)</td>"
         $newVMsTableRows += "<td>$($vm.RequestedBy)</td>"
         $newVMsTableRows += "<td>$($vm.Requestor)</td>"
-        $newVMsTableRows += "<td>$($vm.DeploymentName)</td>"
         $newVMsTableRows += "<td>$($vm.CatalogItem)</td>"
+        $newVMsTableRows += "<td>$($vm.Source)</td>"
         $newVMsTableRows += "</tr>"
     }
     
@@ -1273,9 +1273,9 @@ function Send-CombinedVMReport {
 </style>
 </head>
 <body>
-<h1>Comprehensive VM Tracking Report</h1>
+<h1>VMs Built/Deleted in Last 24hrs - $(Get-Date -Format 'dd-MM-yyyy')</h1>
 
-<h2>New Server Deployments</h2>
+<h2>VMs Built 24 Hrs</h2>
 $(if($NewVMsData.Count -gt 0) {
 "<div class='summary'>
     <p><strong>Total New Servers:</strong> $($NewVMsData.Count)</p>
@@ -1285,12 +1285,12 @@ $(if($NewVMsData.Count -gt 0) {
 <thead>
 <tr>
 <th>Name</th>
+<th>Deployment Name</th>
 <th>Status</th>
-<th>Source</th>
 <th>Requested By</th>
 <th>Requestor</th>
-<th>Deployment Name</th>
 <th>Catalog Item</th>
+<th>Source</th>
 </tr>
 </thead>
 <tbody>
