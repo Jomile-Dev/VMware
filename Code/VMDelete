@@ -1,10 +1,10 @@
 # ============================================================================
 # DELETED VM TRACKER - ARIA OPERATIONS + MULTI-VRA + VCENTER
-# Version 2.3.8 - Deep API Calls for Full Data
-# Changed: Added separate API calls to fetch FULL deployment and request objects
-# Changed: Expands complex objects to show nested properties
-# Changed: Added checks for deployment.expireAt field
-# Note: This version makes individual API calls per decommission to get complete data
+# Version 2.3.9 - Deletion Scheduled Calculation Fix
+# Changed: Deletion Scheduled = leaseExpireAt + leaseGracePeriodDays (Example: 4 Feb + 14 days = 18 Feb)
+# Changed: Filtered out IN_PROGRESS Delete requests (only show scheduled decommissions)
+# Changed: Simplified deletion date logic to use the calculated formula
+# Previous: Added deep API calls to fetch full deployment/request objects
 # ============================================================================
 
 # ============================================================================
@@ -341,7 +341,14 @@ function Get-ActiveDeploymentsWithDecommission {
                     $matchedBy = "Action ID"
                 }
                 
+                # FILTER OUT: Skip "Delete" requests that are IN_PROGRESS
+                # We only want scheduled decommissions, not active deletions
                 if ($isDecommission) {
+                    if ($request.name -match "^Delete" -and $request.status -eq "IN_PROGRESS") {
+                        Write-Log "    Skipping IN_PROGRESS Delete request (not a scheduled decommission)" "DEBUG"
+                        continue
+                    }
+                    
                     Write-Log "    Found decommission request - Matched by: $matchedBy" "WARN"
                     
                     $foundVMs = @{}
@@ -553,80 +560,35 @@ function Get-ActiveDeploymentsWithDecommission {
                             "N/A"
                         }
                         
-                        # DeletionDate should be the scheduled deletion date
-                        # Try multiple possible fields in order of preference
+                        # DeletionDate = leaseExpireAt + leaseGracePeriodDays
+                        # This is the actual scheduled deletion date
                         $deletionDate = "N/A"
                         
-                        # Try to use the full deployment object if we got it
-                        $deploymentToCheck = if ($fullDeployment) { $fullDeployment } else { $deployment }
-                        
-                        # First, check if there's a destroyDate field directly on deployment
-                        if ($deploymentToCheck.destroyDate) {
-                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deploymentToCheck.destroyDate
-                            Write-Log "    Using deployment.destroyDate: $deletionDate" "SUCCESS"
-                        }
-                        # Check for scheduledForDeletion
-                        elseif ($deploymentToCheck.scheduledForDeletion) {
-                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deploymentToCheck.scheduledForDeletion
-                            Write-Log "    Using deployment.scheduledForDeletion: $deletionDate" "SUCCESS"
-                        }
-                        # Check for deletionScheduled
-                        elseif ($deploymentToCheck.deletionScheduled) {
-                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deploymentToCheck.deletionScheduled
-                            Write-Log "    Using deployment.deletionScheduled: $deletionDate" "SUCCESS"
-                        }
-                        # Check for expireAt (different from leaseExpireAt)
-                        elseif ($deploymentToCheck.expireAt) {
-                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deploymentToCheck.expireAt
-                            Write-Log "    Using deployment.expireAt: $deletionDate" "SUCCESS"
-                        }
-                        # Check metadata
-                        elseif ($deploymentToCheck.metadata -and $deploymentToCheck.metadata.deletionScheduled) {
-                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deploymentToCheck.metadata.deletionScheduled
-                            Write-Log "    Using metadata.deletionScheduled: $deletionDate" "SUCCESS"
-                        }
-                        # Check if there's a custom property for scheduled deletion
-                        elseif ($deploymentToCheck.customProperties -and $deploymentToCheck.customProperties.scheduledDeletionDate) {
-                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deploymentToCheck.customProperties.scheduledDeletionDate
-                            Write-Log "    Using customProperties.scheduledDeletionDate: $deletionDate" "SUCCESS"
-                        }
-                        # Check for deleteScheduledDate
-                        elseif ($deploymentToCheck.customProperties -and $deploymentToCheck.customProperties.deleteScheduledDate) {
-                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deploymentToCheck.customProperties.deleteScheduledDate
-                            Write-Log "    Using customProperties.deleteScheduledDate: $deletionDate" "SUCCESS"
-                        }
-                        # Check for destroyDate in customProperties
-                        elseif ($deploymentToCheck.customProperties -and $deploymentToCheck.customProperties.destroyDate) {
-                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deploymentToCheck.customProperties.destroyDate
-                            Write-Log "    Using customProperties.destroyDate: $deletionDate" "SUCCESS"
-                        }
-                        # Check inputs for scheduled date
-                        elseif ($deploymentToCheck.inputs -and $deploymentToCheck.inputs.scheduledDeletionDate) {
-                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deploymentToCheck.inputs.scheduledDeletionDate
-                            Write-Log "    Using inputs.scheduledDeletionDate: $deletionDate" "SUCCESS"
-                        }
-                        # Check full request if we have it
-                        elseif ($fullRequest -and $fullRequest.scheduledFor) {
-                            $deletionDate = Convert-ToSydneyTime -DateTimeString $fullRequest.scheduledFor
-                            Write-Log "    Using request.scheduledFor: $deletionDate" "SUCCESS"
-                        }
-                        # Check if request has a scheduledFor field
-                        elseif ($request.scheduledFor) {
-                            $deletionDate = Convert-ToSydneyTime -DateTimeString $request.scheduledFor
-                            Write-Log "    Using request.scheduledFor: $deletionDate" "SUCCESS"
-                        }
-                        # Check request inputs
-                        elseif ($request.inputs -and $request.inputs.deletionScheduled) {
-                            $deletionDate = Convert-ToSydneyTime -DateTimeString $request.inputs.deletionScheduled
-                            Write-Log "    Using request.inputs.deletionScheduled: $deletionDate" "SUCCESS"
-                        }
-                        # Fall back to lease expiration as best guess
-                        elseif ($deploymentToCheck.leaseExpireAt) {
-                            $deletionDate = Convert-ToSydneyTime -DateTimeString $deploymentToCheck.leaseExpireAt
-                            Write-Log "    Using deployment.leaseExpireAt as fallback: $deletionDate" "WARN"
+                        if ($deployment.leaseExpireAt) {
+                            try {
+                                # Parse the expiration date
+                                $expireDate = [DateTime]::Parse($deployment.leaseExpireAt)
+                                
+                                # Get grace period days (default to 0 if not set)
+                                $gracePeriodDays = 0
+                                if ($deployment.leaseGracePeriodDays) {
+                                    $gracePeriodDays = [int]$deployment.leaseGracePeriodDays
+                                    Write-Log "    Grace Period Days: $gracePeriodDays" "DEBUG"
+                                }
+                                
+                                # Calculate scheduled deletion date
+                                $scheduledDeletionDate = $expireDate.AddDays($gracePeriodDays)
+                                $deletionDate = Convert-ToSydneyTime -DateTimeString $scheduledDeletionDate.ToString("yyyy-MM-ddTHH:mm:ss")
+                                
+                                Write-Log "    Calculated Deletion Scheduled: $($deployment.leaseExpireAt) + $gracePeriodDays days = $deletionDate" "SUCCESS"
+                            }
+                            catch {
+                                Write-Log "    Error calculating deletion date: $($_.Exception.Message)" "ERROR"
+                                $deletionDate = "N/A"
+                            }
                         }
                         else {
-                            Write-Log "    No scheduled deletion date found" "WARN"
+                            Write-Log "    No leaseExpireAt found - cannot calculate deletion scheduled date" "WARN"
                         }
 
                         $vmObject = New-Object PSObject -Property @{
@@ -1556,7 +1518,7 @@ $decommissionTableRows
 # ============================================================================
 
 Write-DebugSection "DELETED VM TRACKER - STARTED"
-Write-Log "Script Version: 2.3.8 - Deep API Calls for Full Data" "SUCCESS"
+Write-Log "Script Version: 2.3.9 - Deletion Scheduled Calculation Fix" "SUCCESS"
 Write-Log "PowerShell Version: $($PSVersionTable.PSVersion)"
 
 try {
@@ -1795,5 +1757,5 @@ else {
 }
 
 Write-DebugSection "SCRIPT COMPLETED"
-Write-Log "Script Version: 2.3.8 - Deep API Calls for Full Data" "SUCCESS"
+Write-Log "Script Version: 2.3.9 - Deletion Scheduled Calculation Fix" "SUCCESS"
 Write-Log "Debug log saved to: $debugOutputFile" "SUCCESS"
