@@ -1667,7 +1667,7 @@ foreach ($vmName in $deletedDeploymentData.Keys) {
 Write-Log "`nTotal deployments found: $($deploymentData.Count) (Active + Deleted)" "SUCCESS"
 
 # ============================================================================
-# SECTION 3: GET VCENTER INFO FOR NON-VRA VMs
+# SECTION 3: GET VCENTER INFO FOR NON-VRA VMs + CATCH OFFLINE VMs
 # ============================================================================
 
 Write-Log "`n=== PROCESSING VCENTER DATA ===" "SUCCESS"
@@ -1677,40 +1677,82 @@ $vmsNeedingVCenterLookup = $newVMsData | Where-Object { -not $deploymentData.Con
 
 Write-Log "VMs needing vCenter lookup: $($vmsNeedingVCenterLookup.Count)"
 
-if ($vmsNeedingVCenterLookup.Count -gt 0) {
-    foreach ($vCenter in $vCenters) {
-        Write-Log "Connecting to: $vCenter"
+# Also check vCenter for VMs created in the last day that might not appear in Aria Ops (offline VMs)
+$vCenterCreatedVMs = @{}
+
+foreach ($vCenter in $vCenters) {
+    Write-Log "Connecting to: $vCenter"
+    
+    try {
+        Connect-VIServer -Server $vCenter -Credential $credential -ErrorAction Stop | Out-Null
         
-        try {
-            Connect-VIServer -Server $vCenter -Credential $credential -ErrorAction Stop | Out-Null
+        $cutoffDate = (Get-Date).AddDays(-$daysBack)
+        
+        # Get ALL VM creation events (not filtered by name)
+        $events = Get-VIEvent -Server $vCenter -Start $cutoffDate -MaxSamples 50000 | Where-Object {
+            $_.GetType().Name -in @('VmCreatedEvent', 'VmBeingDeployedEvent', 'VmRegisteredEvent', 'VmDeployedEvent')
+        }
+        
+        Write-Log "  Found $($events.Count) VM creation events"
+        
+        foreach ($event in $events) {
+            $vmName = $event.Vm.Name
+            $vCenterShort = ($vCenter -split '\.')[0]
             
-            $cutoffDate = (Get-Date).AddDays(-$daysBack)
-            $events = Get-VIEvent -Server $vCenter -Start $cutoffDate -MaxSamples 50000 | Where-Object {
-                $_.GetType().Name -in @('VmCreatedEvent', 'VmBeingDeployedEvent', 'VmRegisteredEvent', 'VmDeployedEvent') -and
-                $_.Vm.Name -in $vmsNeedingVCenterLookup
-            }
-            
-            foreach ($event in $events) {
-                $vmName = $event.Vm.Name
-                
-                if (-not $vCenterLookup.ContainsKey($vmName)) {
-                    $vCenterShort = ($vCenter -split '\.')[0]
-                    
-                    $vCenterLookup[$vmName] = @{
-                        CreatedBy = if ($event.UserName) { $event.UserName } else { "N/A" }
-                        vCenter = $vCenterShort
-                    }
+            # Track for lookup table (for VMs already in newVMsData)
+            if ($vmName -in $vmsNeedingVCenterLookup -and -not $vCenterLookup.ContainsKey($vmName)) {
+                $vCenterLookup[$vmName] = @{
+                    CreatedBy = if ($event.UserName) { $event.UserName } else { "N/A" }
+                    vCenter = $vCenterShort
                 }
             }
             
-            Disconnect-VIServer -Server $vCenter -Confirm:$false -ErrorAction SilentlyContinue
-            Write-Log "Disconnected from $vCenter"
+            # Track ALL created VMs (to catch ones Aria Ops missed)
+            if (-not $vCenterCreatedVMs.ContainsKey($vmName)) {
+                # Get current VM object to check power state
+                $vm = Get-VM -Name $vmName -Server $vCenter -ErrorAction SilentlyContinue
+                
+                if ($vm) {
+                    $powerState = if ($vm.PowerState -eq "PoweredOn") { "PoweredOn" } else { "PoweredOff" }
+                    $status = "Online"  # It exists in vCenter, so it's online even if powered off
+                    
+                    $vCenterCreatedVMs[$vmName] = @{
+                        Name = $vmName
+                        Status = $status
+                        PowerState = $powerState
+                        CreatedBy = if ($event.UserName) { $event.UserName } else { "N/A" }
+                        vCenter = $vCenterShort
+                        ResourceId = "vCenter-$($vm.Id)"
+                        FromVCenter = $true
+                    }
+                }
+            }
         }
-        catch {
-            Write-Log "Error with vCenter $vCenter : $($_.Exception.Message)" "ERROR"
+        
+        Disconnect-VIServer -Server $vCenter -Confirm:$false -ErrorAction SilentlyContinue
+        Write-Log "Disconnected from $vCenter"
+    }
+    catch {
+        Write-Log "Error with vCenter $vCenter : $($_.Exception.Message)" "ERROR"
+    }
+}
+
+# Add VMs from vCenter that weren't in Aria Ops data
+$existingVMNames = $newVMsData | Select-Object -ExpandProperty Name
+foreach ($vcVM in $vCenterCreatedVMs.Values) {
+    if ($vcVM.Name -notin $existingVMNames) {
+        Write-Log "  Adding VM from vCenter that wasn't in Aria Ops: $($vcVM.Name) (PowerState: $($vcVM.PowerState))" "SUCCESS"
+        
+        $newVMsData += [PSCustomObject]@{
+            Name = $vcVM.Name
+            Status = $vcVM.Status
+            PowerState = $vcVM.PowerState
+            ResourceId = $vcVM.ResourceId
         }
     }
 }
+
+Write-Log "Total VMs after vCenter enrichment: $($newVMsData.Count)" "SUCCESS"
 
 # ============================================================================
 # SECTION 4: BUILD FINAL NEW VMs REPORT
