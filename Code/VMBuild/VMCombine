@@ -1117,15 +1117,11 @@ function Send-CombinedVMReport {
     # Build new VMs table
     $newVMsTableRows = ""
     $onlineCount = 0
-    $decommOfflineCount = 0
     
     foreach ($vm in ($NewVMsData | Sort-Object Name)) {
         if ($vm.Status -eq "Online") {
             $onlineCount++
             $newVMsTableRows += "<tr style='background-color: #e8f5e9;'>"
-        } elseif ($vm.Status -eq "Decomm/Offline") {
-            $decommOfflineCount++
-            $newVMsTableRows += "<tr style='background-color: #ffebee;'>"
         } else {
             $newVMsTableRows += "<tr>"
         }
@@ -1284,7 +1280,7 @@ function Send-CombinedVMReport {
 $(if($NewVMsData.Count -gt 0) {
 "<div class='summary'>
     <p><strong>Total New Servers:</strong> $($NewVMsData.Count)</p>
-    <p><strong>Online (Active):</strong> $onlineCount | <strong>Decomm/Offline (Deleted):</strong> $decommOfflineCount</p>
+    <p><strong>Online (Active):</strong> $onlineCount</p>
 </div>
 <table>
 <thead>
