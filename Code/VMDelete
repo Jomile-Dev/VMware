@@ -34,13 +34,6 @@ $daysBack = 1
 $eventsPageSize = 200
 $deploymentLookbackDays = 30
 
-# Log directory
-$logDirectory = "C:\VMDeleteLogs"
-if (-not (Test-Path $logDirectory)) {
-    New-Item -Path $logDirectory -ItemType Directory -Force | Out-Null
-}
-$logFile = Join-Path $logDirectory "VMDelete_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
-
 # ============================================================================
 # HELPER FUNCTIONS
 # ============================================================================
@@ -61,7 +54,6 @@ function Write-Log {
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $logMessage = "[$timestamp] [$Level] $Message"
     Write-Host $logMessage -ForegroundColor $color
-    Add-Content -Path $logFile -Value $logMessage
 }
 
 function Disable-SSLValidation {
@@ -1382,4 +1374,3 @@ else {
 }
 
 Write-Log "=== SCRIPT COMPLETED ===" "SUCCESS"
-Write-Log "Log file: $logFile" "SUCCESS"
