@@ -1,10 +1,10 @@
 # ============================================================================
 # DELETED VM TRACKER - ARIA OPERATIONS + MULTI-VRA + VCENTER
-# Version 2.3.9 - Deletion Scheduled Calculation Fix
-# Changed: Deletion Scheduled = leaseExpireAt + leaseGracePeriodDays (Example: 4 Feb + 14 days = 18 Feb)
-# Changed: Filtered out IN_PROGRESS Delete requests (only show scheduled decommissions)
-# Changed: Simplified deletion date logic to use the calculated formula
-# Previous: Added deep API calls to fetch full deployment/request objects
+# Version 2.4.2 - Cleanup and Filtering
+# Changed: Removed overdue deletion detection (only show positive days remaining)
+# Changed: Simplified color coding to orange (0-3 days) and yellow (4+ days)
+# Changed: Filtered out failed deployments with no cleanup detected from email
+# Previous: Added "Days Until Deletion" column to decommission report
 # ============================================================================
 
 # ============================================================================
@@ -331,24 +331,27 @@ function Get-ActiveDeploymentsWithDecommission {
                 $isDecommission = $false
                 $matchedBy = "None"
                 
-                # Check for decommission patterns
-                if ($request.name -match "Initiate server decommission|decommission") {
+                # ONLY match actual decommission requests
+                # Explicitly exclude Delete/Remove requests - those are deletions, not decommissions
+                if ($request.name -match "Initiate server decommission" -or 
+                    $request.actionId -match "Deployment.custom.initiate_server_decommission") {
+                    # This is a decommission
                     $isDecommission = $true
-                    $matchedBy = "Request Name"
+                    $matchedBy = if ($request.name -match "Initiate server decommission") { "Request Name" } else { "Action ID" }
                 }
-                elseif ($request.actionId -match "Deployment.Delete|Resource.Delete|Cloud.vSphere.Machine.Delete|Deployment.custom.initiate_server_decommission") {
+                elseif ($request.name -match "^(Delete|Remove)" -or 
+                        $request.actionId -match "Deployment.Delete|Resource.Delete|Cloud.vSphere.Machine.Delete") {
+                    # This is a deletion request - SKIP IT
+                    Write-Log "    Skipping Delete/Remove request: $($request.name) (not a decommission)" "DEBUG"
+                    continue
+                }
+                elseif ($request.name -match "decommission" -and $request.name -notmatch "^(Delete|Remove)") {
+                    # Generic decommission match (as fallback)
                     $isDecommission = $true
-                    $matchedBy = "Action ID"
+                    $matchedBy = "Request Name (generic)"
                 }
                 
-                # FILTER OUT: Skip "Delete" requests that are IN_PROGRESS
-                # We only want scheduled decommissions, not active deletions
                 if ($isDecommission) {
-                    if ($request.name -match "^Delete" -and $request.status -eq "IN_PROGRESS") {
-                        Write-Log "    Skipping IN_PROGRESS Delete request (not a scheduled decommission)" "DEBUG"
-                        continue
-                    }
-                    
                     Write-Log "    Found decommission request - Matched by: $matchedBy" "WARN"
                     
                     $foundVMs = @{}
@@ -563,6 +566,7 @@ function Get-ActiveDeploymentsWithDecommission {
                         # DeletionDate = leaseExpireAt + leaseGracePeriodDays
                         # This is the actual scheduled deletion date
                         $deletionDate = "N/A"
+                        $daysUntilDeletion = "N/A"
                         
                         if ($deployment.leaseExpireAt) {
                             try {
@@ -580,11 +584,28 @@ function Get-ActiveDeploymentsWithDecommission {
                                 $scheduledDeletionDate = $expireDate.AddDays($gracePeriodDays)
                                 $deletionDate = Convert-ToSydneyTime -DateTimeString $scheduledDeletionDate.ToString("yyyy-MM-ddTHH:mm:ss")
                                 
+                                # Calculate days until deletion (from current time in Sydney)
+                                $sydneyTZ = [System.TimeZoneInfo]::FindSystemTimeZoneById("AUS Eastern Standard Time")
+                                $currentSydneyTime = [System.TimeZoneInfo]::ConvertTimeFromUtc([DateTime]::UtcNow, $sydneyTZ)
+                                $timeSpan = $scheduledDeletionDate.ToUniversalTime() - $currentSydneyTime.ToUniversalTime()
+                                $daysRemaining = [math]::Ceiling($timeSpan.TotalDays)
+                                
+                                # Only show positive days remaining (ignore overdue)
+                                if ($daysRemaining -le 0) {
+                                    $daysUntilDeletion = "Today"
+                                } elseif ($daysRemaining -eq 1) {
+                                    $daysUntilDeletion = "1 day"
+                                } else {
+                                    $daysUntilDeletion = "$daysRemaining days"
+                                }
+                                
                                 Write-Log "    Calculated Deletion Scheduled: $($deployment.leaseExpireAt) + $gracePeriodDays days = $deletionDate" "SUCCESS"
+                                Write-Log "    Days Until Deletion: $daysUntilDeletion" "SUCCESS"
                             }
                             catch {
                                 Write-Log "    Error calculating deletion date: $($_.Exception.Message)" "ERROR"
                                 $deletionDate = "N/A"
+                                $daysUntilDeletion = "N/A"
                             }
                         }
                         else {
@@ -606,6 +627,7 @@ function Get-ActiveDeploymentsWithDecommission {
                             InitiatedAt = $initiatedAt
                             CompletedAt = if ($request.completedAt) { Convert-ToSydneyTime -DateTimeString $request.completedAt } else { "N/A" }
                             DeletionDate = $deletionDate
+                            DaysUntilDeletion = $daysUntilDeletion
                             vRAServer = $vraServerShort
                             Source = "vRA-Decommission-InProgress"
                             IsStillActive = $true
@@ -1328,6 +1350,13 @@ function Send-DeletedVMReport {
     
     # 2. Failed vRA deployments (enriched with vCenter match and cleanup info)
     foreach ($vm in $VraFailedData) {
+        # Skip failed deployments with no cleanup detected (no vCenter deletion event)
+        # These are just failed attempts with VM names that were never actually created
+        if ($vm.DeletionSource -match "No vCenter deletion event found") {
+            Write-Log "SKIPPING failed deployment with no cleanup: $($vm.VMName) (never created in vCenter)" "DEBUG"
+            continue
+        }
+        
         $status = "CREATE_FAILED"
         $sourceValue = $vm.Source
         
@@ -1389,6 +1418,7 @@ function Send-DeletedVMReport {
             RequestedBy = if ($vm.RequestedBy) { $vm.RequestedBy } else { "N/A" }
             InitiatedAt = if ($vm.InitiatedAt) { $vm.InitiatedAt } else { "N/A" }
             DeletionDate = if ($vm.DeletionDate) { $vm.DeletionDate } else { "N/A" }
+            DaysUntilDeletion = if ($vm.DaysUntilDeletion) { $vm.DaysUntilDeletion } else { "N/A" }
             DeploymentName = if ($vm.DeploymentName) { $vm.DeploymentName } else { "N/A" }
             RequestAction = if ($vm.RequestAction) { $vm.RequestAction } else { "N/A" }
             RequestStatus = if ($vm.RequestStatus) { $vm.RequestStatus } else { "N/A" }
@@ -1412,7 +1442,13 @@ function Send-DeletedVMReport {
     
     $decommissionTableRows = ""
     foreach ($vm in ($decommissionVMs | Sort-Object VMName)) {
-        $decommissionTableRows += "<tr style='background-color: #fff9c4;'>"
+        # Color code based on days remaining
+        $rowColor = "#fff9c4"  # Default yellow (4+ days)
+        if ($vm.DaysUntilDeletion -match "Today|^[1-3] day") {
+            $rowColor = "#ffccbc"  # Orange for 0-3 days
+        }
+        
+        $decommissionTableRows += "<tr style='background-color: $rowColor;'>"
         $decommissionTableRows += "<td>$($vm.VMName)</td>"
         $decommissionTableRows += "<td>$($vm.DeploymentName)</td>"
         $decommissionTableRows += "<td>$($vm.RequestAction)</td>"
@@ -1420,6 +1456,7 @@ function Send-DeletedVMReport {
         $decommissionTableRows += "<td>$($vm.RequestedBy)</td>"
         $decommissionTableRows += "<td>$($vm.InitiatedAt)</td>"
         $decommissionTableRows += "<td>$($vm.DeletionDate)</td>"
+        $decommissionTableRows += "<td><strong>$($vm.DaysUntilDeletion)</strong></td>"
         $decommissionTableRows += "<td>$($vm.Source)</td>"
         $decommissionTableRows += "</tr>"
     }
@@ -1474,6 +1511,7 @@ $(if($decommissionVMs.Count -gt 0) {
 <th>Requested By</th>
 <th>Initiated At</th>
 <th>Deletion Date</th>
+<th>Days Until Deletion</th>
 <th>Source</th>
 </tr>
 </thead>
@@ -1518,7 +1556,7 @@ $decommissionTableRows
 # ============================================================================
 
 Write-DebugSection "DELETED VM TRACKER - STARTED"
-Write-Log "Script Version: 2.3.9 - Deletion Scheduled Calculation Fix" "SUCCESS"
+Write-Log "Script Version: 2.4.2 - Cleanup and Filtering" "SUCCESS"
 Write-Log "PowerShell Version: $($PSVersionTable.PSVersion)"
 
 try {
@@ -1757,5 +1795,5 @@ else {
 }
 
 Write-DebugSection "SCRIPT COMPLETED"
-Write-Log "Script Version: 2.3.9 - Deletion Scheduled Calculation Fix" "SUCCESS"
+Write-Log "Script Version: 2.4.2 - Cleanup and Filtering" "SUCCESS"
 Write-Log "Debug log saved to: $debugOutputFile" "SUCCESS"
