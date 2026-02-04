@@ -1,6 +1,6 @@
 # ============================================================================
 # COMPREHENSIVE VM TRACKER - NEW SERVERS + DELETIONS + DECOMMISSIONS
-# Version 4.0.0 - Combined Production Release
+# Version 4.0.1 - FIXED: Properly shows offline/deleted VMs in new server report
 # ============================================================================
 
 # ============================================================================
@@ -310,7 +310,7 @@ function Get-DeletedDeploymentServers {
                                             DeploymentID = $deployment.id
                                             Status = "DELETED"
                                             CatalogItem = $catalogItem
-                                            DeploymentStatus = "Deleted"
+                                            DeploymentStatus = "Decomm/Offline"
                                             DeletedAt = $deployment.lastUpdatedAt
                                         }
                                     }
@@ -1117,11 +1117,15 @@ function Send-CombinedVMReport {
     # Build new VMs table
     $newVMsTableRows = ""
     $onlineCount = 0
+    $decommOfflineCount = 0
     
     foreach ($vm in ($NewVMsData | Sort-Object Name)) {
         if ($vm.Status -eq "Online") {
             $onlineCount++
             $newVMsTableRows += "<tr style='background-color: #e8f5e9;'>"
+        } elseif ($vm.Status -eq "Decomm/Offline") {
+            $decommOfflineCount++
+            $newVMsTableRows += "<tr style='background-color: #ffebee;'>"
         } else {
             $newVMsTableRows += "<tr>"
         }
@@ -1280,7 +1284,7 @@ function Send-CombinedVMReport {
 $(if($NewVMsData.Count -gt 0) {
 "<div class='summary'>
     <p><strong>Total New Servers:</strong> $($NewVMsData.Count)</p>
-    <p><strong>Online (Active):</strong> $onlineCount</p>
+    <p><strong>Online (Active):</strong> $onlineCount | <strong>Decomm/Offline (Deleted):</strong> $decommOfflineCount</p>
 </div>
 <table>
 <thead>
@@ -1382,7 +1386,7 @@ $decommissionTableRows
 # ============================================================================
 
 Write-Log "=== COMPREHENSIVE VM TRACKER STARTED ===" "SUCCESS"
-Write-Log "Version: 4.0.0 - Combined Production Release"
+Write-Log "Version: 4.0.1 - FIXED: Properly shows offline/deleted VMs"
 Write-Log "PowerShell Version: $($PSVersionTable.PSVersion)"
 
 # Load VMware PowerCLI
@@ -1474,6 +1478,7 @@ try {
             $status = "Unknown"
             $powerState = "Unknown"
             
+            # Check power state first
             if ($powerStateProp -and $powerStateProp.value) {
                 $powerStateValue = $powerStateProp.value.ToString().ToUpper()
                 if ($powerStateValue -eq "POWERED_ON" -or $powerStateValue -eq "1") {
@@ -1481,15 +1486,16 @@ try {
                     $powerState = "PoweredOn"
                 }
                 elseif ($powerStateValue -eq "POWERED_OFF" -or $powerStateValue -eq "0") {
-                    $status = "Online"
+                    $status = "Online"  # VM exists, just powered off
                     $powerState = "PoweredOff"
                 }
             }
             
+            # Check resource state - this tells us if VM actually exists
             if ($resourceStateProp -and $resourceStateProp.value) {
                 $resourceState = $resourceStateProp.value.ToString().ToUpper()
                 if ($resourceState -in @("NOT_EXISTING", "STOPPED")) {
-                    $status = "Offline"
+                    $status = "Decomm/Offline"  # VM no longer exists - FIXED: Changed from "Offline"
                     $powerState = "NotExisting"
                 }
                 elseif ($resourceState -in @("STARTED", "MAINTAINED", "RUNNING")) {
@@ -1499,6 +1505,7 @@ try {
                 }
             }
             
+            # Check health badge as fallback
             if ($status -eq "Unknown" -and $healthProp -and $healthProp.value) {
                 $healthValue = $healthProp.value.ToString().ToUpper()
                 
@@ -1506,13 +1513,13 @@ try {
                     $status = "Online"
                 }
                 elseif ($healthValue -match "GREY|GRAY|NONE") {
-                    $status = "Offline"
+                    $status = "Decomm/Offline"  # No health data = doesn't exist - FIXED: Changed from "Offline"
                 }
                 elseif ($healthValue -match "^[1-4]$") {
                     $status = "Online"
                 }
                 elseif ($healthValue -eq "0") {
-                    $status = "Offline"
+                    $status = "Decomm/Offline"  # FIXED: Changed from "Offline"
                 }
             }
             
@@ -1770,16 +1777,21 @@ foreach ($vmData in $newVMsData) {
         $finalStatus = $vmData.Status
         $finalPowerState = $vmData.PowerState
         
+        # FIXED: Check deployment status for failures first
         if ($depInfo.Status -match "FAILED|ERROR") {
-            $finalStatus = "Offline"
+            $finalStatus = "Decomm/Offline"
             $finalPowerState = "NotExisting"
         }
-        elseif ($vmData.Status -eq "Offline") {
-            $finalStatus = "Offline"
+        # FIXED: Trust Aria Operations if it says VM doesn't exist
+        elseif ($vmData.Status -eq "Decomm/Offline") {
+            $finalStatus = "Decomm/Offline"
             $finalPowerState = "NotExisting"
         }
-        elseif ($depInfo.Status -eq "DELETED" -or $depInfo.DeploymentStatus -eq "Deleted") {
-            continue  # Skip deleted VMs from new server report
+        # FIXED: Check if deployment was deleted
+        elseif ($depInfo.Status -eq "DELETED" -or $depInfo.DeploymentStatus -eq "Decomm/Offline") {
+            $finalStatus = "Decomm/Offline"
+            $finalPowerState = "NotExisting"
+            # REMOVED: The "continue" statement that was skipping these VMs
         }
         elseif ($vmData.Status -eq "Unknown") {
             $finalStatus = "Online"
