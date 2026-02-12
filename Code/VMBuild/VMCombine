@@ -21,6 +21,7 @@ $vCenters = @(
     "vcenter2.domain.com",
     "vcenter3.domain.com"
 )
+$vCenterDomain = "domainTest"
 
 # EMAIL CONFIGURATION
 $script:smtpServer = "smtp.yourdomain.com"
@@ -74,6 +75,48 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
         [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
     }
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+}
+
+function Convert-ToVCenterCredential {
+    param(
+        [Parameter(Mandatory=$true)][PSCredential]$Credential,
+        [Parameter(Mandatory=$true)][string]$VCenterDomain
+    )
+
+    $fullUsername = $Credential.UserName
+
+    try {
+        if ($fullUsername -match "^(.+)@(.+)$") {
+            $localPart = $matches[1]
+            $parts = $localPart -split "\."
+
+            if ($parts.Count -ge 2) {
+                $firstName = $parts[0]
+                $lastName  = $parts[1]
+                $initial   = $firstName.Substring(0, 1).ToUpper()
+                $vcUsername = "$lastName$initial.$VCenterDomain"
+            }
+            else {
+                $vcUsername = "$localPart.$VCenterDomain"
+            }
+        }
+        else {
+            $vcUsername = $fullUsername
+        }
+
+        Write-Log "vCenter username derived: $vcUsername"
+
+        $vcCredential = New-Object System.Management.Automation.PSCredential(
+            $vcUsername,
+            $Credential.Password
+        )
+
+        return $vcCredential
+    }
+    catch {
+        Write-Log "Error converting vCenter credential: $($_.Exception.Message) - using original" "WARN"
+        return $Credential
+    }
 }
 
 function Convert-ToSydneyTime {
@@ -811,7 +854,7 @@ function Get-DeletedVMsFromVCenter {
     $deletedVMs = @()
     
     try {
-        Connect-VIServer -Server $VCenter -Credential $Credential -ErrorAction Stop | Out-Null
+        Connect-VIServer -Server $VCenter -Credential $vCenterCredential -ErrorAction Stop | Out-Null
         Write-Log "Connected to vCenter" "SUCCESS"
         
         $cutoffDate = (Get-Date).AddDays(-$DaysBack)
@@ -825,6 +868,12 @@ function Get-DeletedVMsFromVCenter {
         foreach ($event in $events) {
             $vmName = $event.Vm.Name
             $vCenterShort = ($VCenter -split '\.')[0]
+
+            # Filter out workflow/application segment objects
+            if ($vmName -match "(?i)^workflow|(?i)workflow") {
+                Write-Log "  Skipping workflow object: $vmName" "WARN"
+                continue
+            }
 
             # Primary filter: must start with W or L (case insensitive)
             if ($vmName -notmatch "^[WLwl][A-Za-z0-9]") {
@@ -1432,6 +1481,8 @@ if (-not $credential) {
 $username = $credential.UserName
 $password = $credential.GetNetworkCredential().Password
 
+$vCenterCredential = Convert-ToVCenterCredential -Credential $credential -VCenterDomain $vCenterDomain
+Write-Log "vCenter credential prepared: $($vCenterCredential.UserName)"
 # ============================================================================
 # SECTION 1: GET NEW VMs FROM ARIA OPERATIONS
 # ============================================================================
@@ -1700,7 +1751,7 @@ foreach ($vCenter in $vCenters) {
     Write-Log "Connecting to: $vCenter"
     
     try {
-        Connect-VIServer -Server $vCenter -Credential $credential -ErrorAction Stop | Out-Null
+        Connect-VIServer -Server $vCenter -Credential $vCenterCredential -ErrorAction Stop | Out-Null
         
         $cutoffDate = (Get-Date).AddDays(-$daysBack)
         
@@ -1766,7 +1817,7 @@ foreach ($vcVM in $vCenterCreatedVMs.Values) {
         foreach ($vCenter in $vCenters) {
             try {
                 if (-not $vCenterConnections.ContainsKey($vCenter)) {
-                    Connect-VIServer -Server $vCenter -Credential $credential -ErrorAction Stop | Out-Null
+                    Connect-VIServer -Server $vCenter -Credential $vCenterCredential -ErrorAction Stop | Out-Null
                     $vCenterConnections[$vCenter] = $true
                 }
                 
@@ -1838,7 +1889,7 @@ foreach ($vmData in $newVMsData) {
             foreach ($vCenter in $vCenters) {
                 try {
                     if (-not $vCenterConnections.ContainsKey($vCenter)) {
-                        Connect-VIServer -Server $vCenter -Credential $credential -ErrorAction Stop | Out-Null
+                        Connect-VIServer -Server $vCenter -Credential $vCenterCredential -ErrorAction Stop | Out-Null
                         $vCenterConnections[$vCenter] = $true
                         Write-Log "  Connected to $vCenter for power state lookup"
                     }
@@ -1891,7 +1942,7 @@ foreach ($vmData in $newVMsData) {
             foreach ($vCenter in $vCenters) {
                 try {
                     if (-not $vCenterConnections.ContainsKey($vCenter)) {
-                        Connect-VIServer -Server $vCenter -Credential $credential -ErrorAction Stop | Out-Null
+                        Connect-VIServer -Server $vCenter -Credential $vCenterCredential -ErrorAction Stop | Out-Null
                         $vCenterConnections[$vCenter] = $true
                         Write-Log "  Connected to $vCenter for power state lookup"
                     }
