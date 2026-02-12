@@ -802,7 +802,8 @@ function Get-DeletedVMsFromVCenter {
     param(
         [Parameter(Mandatory=$true)][string]$VCenter,
         [Parameter(Mandatory=$true)][PSCredential]$Credential,
-        [Parameter(Mandatory=$true)][int]$DaysBack
+        [Parameter(Mandatory=$true)][int]$DaysBack,
+        [Parameter(Mandatory=$false)][hashtable]$KnownVRAVMs = @{}
     )
     
     Write-Log "Processing vCenter deletions: $VCenter"
@@ -822,16 +823,29 @@ function Get-DeletedVMsFromVCenter {
         Write-Log "Found $($events.Count) deletion events"
         
         foreach ($event in $events) {
+            $vmName = $event.Vm.Name
             $vCenterShort = ($VCenter -split '\.')[0]
+
+            # Primary filter: must start with W or L (case insensitive)
+            if ($vmName -notmatch "^[WLwl][A-Za-z0-9]") {
+                # Secondary check: allow through if it was a known vRA VM
+                if (-not $KnownVRAVMs.ContainsKey($vmName.ToLower())) {
+                    Write-Log "  Skipping non-VM vCenter object: $vmName" "WARN"
+                    continue
+                }
+                else {
+                    Write-Log "  Allowing non-W/L VM through (known vRA VM): $vmName" "INFO"
+                }
+            }
             
             $deletedVMs += New-Object PSObject -Property @{
-                VMName = $event.Vm.Name
-                DeletedAt = Convert-ToSydneyTime -DateTimeString $event.CreatedTime.ToString("yyyy-MM-ddTHH:mm:ss")
-                DeletedBy = if ($event.UserName) { $event.UserName } else { "N/A" }
-                EventType = $event.GetType().Name
-                Message = $event.FullFormattedMessage
-                vCenter = $vCenterShort
-                Source = "vCenter-Deleted"
+                VMName     = $vmName
+                DeletedAt  = Convert-ToSydneyTime -DateTimeString $event.CreatedTime.ToString("yyyy-MM-ddTHH:mm:ss")
+                DeletedBy  = if ($event.UserName) { $event.UserName } else { "N/A" }
+                EventType  = $event.GetType().Name
+                Message    = $event.FullFormattedMessage
+                vCenter    = $vCenterShort
+                Source     = "vCenter-Deleted"
             }
         }
         
@@ -1988,7 +2002,11 @@ foreach ($vraServer in $vraServers) {
 
 # Process vCenter Deletions
 foreach ($vCenter in $vCenters) {
-    $deletedVMs = Get-DeletedVMsFromVCenter -VCenter $vCenter -Credential $credential -DaysBack $daysBack
+    $deletedVMs = Get-DeletedVMsFromVCenter `
+        -VCenter $vCenter `
+        -Credential $credential `
+        -DaysBack $daysBack `
+        -KnownVRAVMs $deploymentData
     $allVCenterDeletedVMs += $deletedVMs
 }
 
