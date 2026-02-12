@@ -503,6 +503,11 @@ function Get-ActiveDeploymentsWithDecommission {
                         $hostname = $vmEntry.Value
                         
                         $existingVM = $decommissionData | Where-Object { 
+                            # Skip workflow/non-VM resource names
+                            if ($hostname -match "(?i)^workflow$|(?i)^workflow-|(?i)^workflow_") {
+                                Write-Log "  Skipping workflow resource: $hostname" "WARN"
+                                continue
+                            }
                             $_.VMName.ToLower() -eq $hostname.ToLower() -and 
                             $_.DeploymentID -eq $deployment.id 
                         }
@@ -807,6 +812,12 @@ function Get-DeletedVMsFromVRA {
             
             $vmKey = $serverName.ToLower()
             $existingVM = $deletedVMData | Where-Object { $_.VMName.ToLower() -eq $vmKey }
+
+            # Skip workflow/non-VM resource names
+            if ($serverName -match "(?i)^workflow$|(?i)^workflow-|(?i)^workflow_") {
+                Write-Log "  Skipping workflow resource: $serverName" "WARN"
+                continue
+            }
             
             if (-not $existingVM) {
                 $vraServerShort = ($VraServer -split '\.')[0]
@@ -1275,6 +1286,7 @@ function Send-CombinedVMReport {
     
     $deletedTableRows = ""
     foreach ($vm in ($deletedVMs | Sort-Object VMName)) {
+        $deletedVMs = $deletedVMs | Where-Object { $_.VMName -notmatch "(?i)^workflow" }
         $deletedTableRows += "<tr>"
         $deletedTableRows += "<td>$($vm.VMName)</td>"
         $deletedTableRows += "<td>$($vm.DeploymentName)</td>"
