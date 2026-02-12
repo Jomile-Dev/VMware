@@ -814,7 +814,7 @@ function Get-DeletedVMsFromVRA {
             $existingVM = $deletedVMData | Where-Object { $_.VMName.ToLower() -eq $vmKey }
 
             # Skip workflow/non-VM resource names
-            if ($serverName -match "(?i)^workflow$|(?i)^workflow-|(?i)^workflow_") {
+            if ($serverName -match "(?i)(workflow)") {
                 Write-Log "  Skipping workflow resource: $serverName" "WARN"
                 continue
             }
@@ -881,7 +881,7 @@ function Get-DeletedVMsFromVCenter {
             $vCenterShort = ($VCenter -split '\.')[0]
 
             # Filter out workflow/application segment objects
-            if ($vmName -match "(?i)^workflow|(?i)workflow") {
+            if ($vmName -match "(?i)(workflow)") {
                 Write-Log "  Skipping workflow object: $vmName" "WARN"
                 continue
             }
@@ -1284,9 +1284,10 @@ function Send-CombinedVMReport {
         }
     }
     
+    $deletedVMs = $deletedVMs | Where-Object { $_.VMName -notmatch "(?i)(workflow)" }
     $deletedTableRows = ""
     foreach ($vm in ($deletedVMs | Sort-Object VMName)) {
-        $deletedVMs = $deletedVMs | Where-Object { $_.VMName -notmatch "(?i)^workflow" }
+        $deletedTableRows += "<tr>"
         $deletedTableRows += "<tr>"
         $deletedTableRows += "<td>$($vm.VMName)</td>"
         $deletedTableRows += "<td>$($vm.DeploymentName)</td>"
