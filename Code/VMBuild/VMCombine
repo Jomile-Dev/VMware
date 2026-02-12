@@ -1,6 +1,6 @@
 # ============================================================================
 # COMPREHENSIVE VM TRACKER - NEW SERVERS + DELETIONS + DECOMMISSIONS
-# Version 4.0.1 - FIXED: Deleted VMs only in Deleted section, failed builds in New Server section
+# Version 4.0.2 - FIXED: Exclude non-VM deployments (app segments, reports, etc.)
 # ============================================================================
 
 # ============================================================================
@@ -131,6 +131,36 @@ function Extract-CloudResourceName {
     }
 
     return $serverName
+}
+
+function Test-IsValidVMHostname {
+    <#
+    .SYNOPSIS
+        Validates that a name looks like a real VM hostname and not a report,
+        application segment, or other non-VM catalog item name.
+    #>
+    param([string]$Name)
+
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+
+    # Reject if contains spaces (VM hostnames never have spaces)
+    if ($Name -match '\s') { return $false }
+
+    # Reject if too long to be a hostname (max 63 chars per DNS label)
+    if ($Name.Length -gt 63) { return $false }
+
+    # Reject if it contains characters not valid in hostnames
+    if ($Name -match '[,\(\)\[\]{}!@#\$%\^&\*=\+\|<>\?/\\]') { return $false }
+
+    # Reject common non-VM deployment name patterns
+    if ($Name -match '(?i)(report|segment|policy|template|blueprint|workflow|request|catalog|service|application|project|zone|network|gateway|firewall|load.?balanc|vip|nsx|avi)') {
+        return $false
+    }
+
+    # Must contain at least one letter
+    if ($Name -notmatch '[a-zA-Z]') { return $false }
+
+    return $true
 }
 
 function Get-AllEventsForRequest {
@@ -295,7 +325,8 @@ function Get-DeletedDeploymentServers {
                                         $serverName = $event.resourceName
                                     }
                                     
-                                    if ($serverName -and -not $deletedServerData.ContainsKey($serverName)) {
+                                    # FIX: Validate hostname before adding
+                                    if ($serverName -and (Test-IsValidVMHostname -Name $serverName) -and -not $deletedServerData.ContainsKey($serverName)) {
                                         $vraServerShort = ($VraServer -split '\.')[0]
                                         $requestedBy = if ($request.requestedBy) { $request.requestedBy } else { "N/A" }
                                         $requestor = if ($deployment.ownedBy) { $deployment.ownedBy } else { $requestedBy }
@@ -435,7 +466,8 @@ function Get-ActiveDeploymentsWithDecommission {
                                     $hostname = $resource.name
                                 }
                                 
-                                if ($hostname -and -not $foundVMs.ContainsKey($hostname.ToLower())) {
+                                # FIX: Validate hostname before adding
+                                if ($hostname -and (Test-IsValidVMHostname -Name $hostname) -and -not $foundVMs.ContainsKey($hostname.ToLower())) {
                                     $foundVMs[$hostname.ToLower()] = $hostname
                                 }
                             }
@@ -449,7 +481,8 @@ function Get-ActiveDeploymentsWithDecommission {
                             if ($event.resourceType -eq "Cloud.vSphere.Machine") {
                                 $hostname = Extract-CloudResourceName -Event $event
                                 
-                                if ($hostname -and -not $foundVMs.ContainsKey($hostname.ToLower())) {
+                                # FIX: Validate hostname before adding
+                                if ($hostname -and (Test-IsValidVMHostname -Name $hostname) -and -not $foundVMs.ContainsKey($hostname.ToLower())) {
                                     $foundVMs[$hostname.ToLower()] = $hostname
                                 }
                             }
@@ -665,8 +698,15 @@ function Get-DeletedVMsFromVRA {
             }
         }
         
+        # FIX: Changed from $hasVM = $true to $hasVM = $false
+        # Deployments with no resource info are skipped entirely.
+        # Previously this was $true, which caused non-VM catalog items
+        # (application segments, reports, NSX policies, etc.) to slip
+        # through into the deleted VMs report when their resources array
+        # was null or empty. Now we only include deployments we can
+        # positively confirm contain a Cloud.vSphere.Machine resource.
         if (-not $dep.resources) {
-            $hasVM = $true
+            $hasVM = $false
         }
         
         if ($hasVM) {
@@ -694,7 +734,8 @@ function Get-DeletedVMsFromVRA {
                         $serverName = $resource.properties.address
                     }
                     
-                    if ($serverName) {
+                    # FIX: Validate hostname looks like a real VM name before adding
+                    if ($serverName -and (Test-IsValidVMHostname -Name $serverName)) {
                         $vmKey = $serverName.ToLower()
                         if (-not $foundVMs.ContainsKey($vmKey)) {
                             $foundVMs[$vmKey] = $serverName
@@ -717,7 +758,8 @@ function Get-DeletedVMsFromVRA {
                         if ($event.resourceType -eq "Cloud.vSphere.Machine") {
                             $serverName = Extract-CloudResourceName -Event $event
                             
-                            if ($serverName) {
+                            # FIX: Validate hostname before adding
+                            if ($serverName -and (Test-IsValidVMHostname -Name $serverName)) {
                                 $vmKey = $serverName.ToLower()
                                 if (-not $foundVMs.ContainsKey($vmKey)) {
                                     $foundVMs[$vmKey] = $serverName
@@ -944,7 +986,8 @@ function Get-FailedDeploymentsFromVRA {
                 if (-not $serverName) {
                     foreach ($event in $requestEvents) {
                         $extractedName = Extract-CloudResourceName -Event $event
-                        if ($extractedName) {
+                        # FIX: Validate hostname before using
+                        if ($extractedName -and (Test-IsValidVMHostname -Name $extractedName)) {
                             $serverName = $extractedName
                             break
                         }
@@ -974,7 +1017,8 @@ function Get-FailedDeploymentsFromVRA {
                 "No cleanup action found in vRA history"
             }
             
-            if ($serverName) {
+            # FIX: Validate hostname before adding to failed list
+            if ($serverName -and (Test-IsValidVMHostname -Name $serverName)) {
                 $failedDeploymentData.Add([PSCustomObject]@{
                     VMName = $serverName
                     DeploymentId = $deployment.id
@@ -990,6 +1034,9 @@ function Get-FailedDeploymentsFromVRA {
                     CleanupInfo = $cleanupInfo
                     HasVraCleanup = ($hasCleanupAction -ne $null)
                 }) | Out-Null
+            }
+            elseif ($serverName) {
+                Write-Log "  Skipping invalid hostname from failed deployment '$($deployment.name)': $serverName" "WARN"
             }
         }
         catch {
@@ -1381,7 +1428,7 @@ $decommissionTableRows
 # ============================================================================
 
 Write-Log "=== COMPREHENSIVE VM TRACKER STARTED ===" "SUCCESS"
-Write-Log "Version: 4.0.1 - FIXED: Deleted VMs only appear in Deleted section, failed builds appear in New Server section"
+Write-Log "Version: 4.0.2 - FIXED: Exclude non-VM deployments (app segments, reports, etc.)"
 Write-Log "PowerShell Version: $($PSVersionTable.PSVersion)"
 
 # Load VMware PowerCLI
@@ -1473,7 +1520,6 @@ try {
             $status = "Unknown"
             $powerState = "Unknown"
             
-            # Check power state first
             if ($powerStateProp -and $powerStateProp.value) {
                 $powerStateValue = $powerStateProp.value.ToString().ToUpper()
                 if ($powerStateValue -eq "POWERED_ON" -or $powerStateValue -eq "1") {
@@ -1481,16 +1527,15 @@ try {
                     $powerState = "PoweredOn"
                 }
                 elseif ($powerStateValue -eq "POWERED_OFF" -or $powerStateValue -eq "0") {
-                    $status = "Online"  # VM exists, just powered off
+                    $status = "Online"
                     $powerState = "PoweredOff"
                 }
             }
             
-            # Check resource state - this tells us if VM actually exists
             if ($resourceStateProp -and $resourceStateProp.value) {
                 $resourceState = $resourceStateProp.value.ToString().ToUpper()
                 if ($resourceState -in @("NOT_EXISTING", "STOPPED")) {
-                    $status = "Decomm/Offline"  # VM no longer exists - FIXED: Changed from "Offline"
+                    $status = "Decomm/Offline"
                     $powerState = "NotExisting"
                 }
                 elseif ($resourceState -in @("STARTED", "MAINTAINED", "RUNNING")) {
@@ -1500,7 +1545,6 @@ try {
                 }
             }
             
-            # Check health badge as fallback
             if ($status -eq "Unknown" -and $healthProp -and $healthProp.value) {
                 $healthValue = $healthProp.value.ToString().ToUpper()
                 
@@ -1508,13 +1552,13 @@ try {
                     $status = "Online"
                 }
                 elseif ($healthValue -match "GREY|GRAY|NONE") {
-                    $status = "Decomm/Offline"  # No health data = doesn't exist - FIXED: Changed from "Offline"
+                    $status = "Decomm/Offline"
                 }
                 elseif ($healthValue -match "^[1-4]$") {
                     $status = "Online"
                 }
                 elseif ($healthValue -eq "0") {
-                    $status = "Decomm/Offline"  # FIXED: Changed from "Offline"
+                    $status = "Decomm/Offline"
                 }
             }
             
@@ -1567,7 +1611,6 @@ foreach ($vraServer in $vraServers) {
         
         Write-Log "Authenticated successfully" "SUCCESS"
         
-        # Fetch active deployments
         $vraUri = "https://$vraServer/deployment/api/deployments"
         $page = 0
         $size = 1000
@@ -1645,7 +1688,6 @@ foreach ($vraServer in $vraServers) {
         
         Write-Log "Processed active deployments" "SUCCESS"
         
-        # Fetch deleted deployments
         Write-Log "Fetching deleted deployments..."
         $deletedServers = Get-DeletedDeploymentServers -VraServer $vraServer -Headers $vraHeaders -DaysBack $deletedDaysBack
         
@@ -1679,7 +1721,6 @@ $vmsNeedingVCenterLookup = $newVMsData | Where-Object { -not $deploymentData.Con
 
 Write-Log "VMs needing vCenter lookup: $($vmsNeedingVCenterLookup.Count)"
 
-# Also check vCenter for VMs created in the last day that might not appear in Aria Ops (offline VMs)
 $vCenterCreatedVMs = @{}
 
 foreach ($vCenter in $vCenters) {
@@ -1690,7 +1731,6 @@ foreach ($vCenter in $vCenters) {
         
         $cutoffDate = (Get-Date).AddDays(-$daysBack)
         
-        # Get ALL VM creation events (not filtered by name)
         $events = Get-VIEvent -Server $vCenter -Start $cutoffDate -MaxSamples 50000 | Where-Object {
             $_.GetType().Name -in @('VmCreatedEvent', 'VmBeingDeployedEvent', 'VmRegisteredEvent', 'VmDeployedEvent')
         }
@@ -1701,7 +1741,6 @@ foreach ($vCenter in $vCenters) {
             $vmName = $event.Vm.Name
             $vCenterShort = ($vCenter -split '\.')[0]
             
-            # Track for lookup table (for VMs already in newVMsData)
             if ($vmName -in $vmsNeedingVCenterLookup -and -not $vCenterLookup.ContainsKey($vmName)) {
                 $vCenterLookup[$vmName] = @{
                     CreatedBy = if ($event.UserName) { $event.UserName } else { "N/A" }
@@ -1709,14 +1748,12 @@ foreach ($vCenter in $vCenters) {
                 }
             }
             
-            # Track ALL created VMs (to catch ones Aria Ops missed)
             if (-not $vCenterCreatedVMs.ContainsKey($vmName)) {
-                # Get current VM object to check power state
                 $vm = Get-VM -Name $vmName -Server $vCenter -ErrorAction SilentlyContinue
                 
                 if ($vm) {
                     $powerState = if ($vm.PowerState -eq "PoweredOn") { "PoweredOn" } else { "PoweredOff" }
-                    $status = "Online"  # It exists in vCenter, so it's online even if powered off
+                    $status = "Online"
                     
                     $vCenterCreatedVMs[$vmName] = @{
                         Name = $vmName
@@ -1739,14 +1776,11 @@ foreach ($vCenter in $vCenters) {
     }
 }
 
-# Add VMs from vCenter that weren't in Aria Ops data
 $existingVMNames = $newVMsData | Select-Object -ExpandProperty Name
-$vCenterVMsStillExist = @{}  # Track which vCenter VMs still exist
+$vCenterVMsStillExist = @{}
 
 foreach ($vcVM in $vCenterCreatedVMs.Values) {
     if ($vcVM.Name -notin $existingVMNames) {
-        # For vCenter-created VMs, we need to verify they still exist
-        # If they were deleted, they should only appear in Deleted section, not New Server section
         $vmStillExists = $false
         
         foreach ($vCenter in $vCenters) {
@@ -1768,7 +1802,6 @@ foreach ($vcVM in $vCenterCreatedVMs.Values) {
             }
         }
         
-        # Only add to new server deployments if VM still exists
         if ($vmStillExists) {
             Write-Log "  Adding VM from vCenter that wasn't in Aria Ops: $($vcVM.Name) (PowerState: $($vcVM.PowerState))" "SUCCESS"
             
@@ -1803,16 +1836,13 @@ foreach ($vmData in $newVMsData) {
         $finalStatus = $vmData.Status
         $finalPowerState = $vmData.PowerState
         
-        # FIXED: Skip VMs that were formally deleted via vRA - they appear in Deleted section
         if ($depInfo.Status -eq "DELETED" -or $depInfo.DeploymentStatus -eq "Decomm/Offline") {
-            continue  # Skip from new server report - will appear in deleted section instead
+            continue
         }
-        # Check deployment status for failures
         elseif ($depInfo.Status -match "FAILED|ERROR") {
             $finalStatus = "Decomm/Offline"
             $finalPowerState = "NotExisting"
         }
-        # Trust Aria Operations if it says VM doesn't exist (failed build)
         elseif ($vmData.Status -eq "Decomm/Offline") {
             $finalStatus = "Decomm/Offline"
             $finalPowerState = "NotExisting"
@@ -1858,13 +1888,10 @@ foreach ($vmData in $newVMsData) {
         }
     }
     else {
-        # VM not in vRA - check vCenter
         $vcInfo = $vCenterLookup[$vmName]
         $finalStatus = $vmData.Status
         $finalPowerState = $vmData.PowerState
         
-        # FIXED: If this is a vCenter VM that was marked as Decomm/Offline by Aria Ops,
-        # skip it from new server report - it will appear in Deleted section
         if ($vmData.Status -eq "Decomm/Offline") {
             Write-Log "  Skipping vCenter VM (deleted, will appear in Deleted section): $vmName"
             continue
@@ -1895,7 +1922,6 @@ foreach ($vmData in $newVMsData) {
                 }
             }
             
-            # If we still can't find it, skip it from new server report
             if ($finalPowerState -eq "Unknown") {
                 Write-Log "  Skipping vCenter VM (cannot verify existence): $vmName"
                 continue
@@ -1969,15 +1995,12 @@ foreach ($vraServer in $vraServers) {
             "Content-Type" = "application/json"
         }
         
-        # Get decommissions
         $decommVMs = Get-ActiveDeploymentsWithDecommission -VraServer $vraServer -Headers $vraHeaders
         $allVraDecommissionVMs += $decommVMs
         
-        # Get failed deployments
         $failedVMs = Get-FailedDeploymentsFromVRA -VraServer $vraServer -Headers $vraHeaders -DaysBack $daysBack
         $allVraFailedVMs += $failedVMs
         
-        # Get deleted VMs
         $deletedVMs = Get-DeletedVMsFromVRA -VraServer $vraServer -Headers $vraHeaders -DaysBack $daysBack
         $allVraDeletedVMs += $deletedVMs
     }
@@ -1986,13 +2009,11 @@ foreach ($vraServer in $vraServers) {
     }
 }
 
-# Process vCenter Deletions
 foreach ($vCenter in $vCenters) {
     $deletedVMs = Get-DeletedVMsFromVCenter -VCenter $vCenter -Credential $credential -DaysBack $daysBack
     $allVCenterDeletedVMs += $deletedVMs
 }
 
-# Match Failed VMs with vCenter
 $allVraFailedVMs = Match-FailedVMsWithVCenter -FailedVMsList $allVraFailedVMs -VCenterData $allVCenterDeletedVMs
 
 Write-Log "Total decommissions: $($allVraDecommissionVMs.Count)" "SUCCESS"
