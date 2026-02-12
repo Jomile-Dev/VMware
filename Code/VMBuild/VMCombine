@@ -822,7 +822,7 @@ function Get-DeletedVMsFromVCenter {
     $deletedVMs = @()
     
     try {
-        Connect-VIServer -Server $VCenter -Credential $credential -ErrorAction Stop | Out-Null
+        Connect-VIServer -Server $VCenter -Credential $Credential -ErrorAction Stop | Out-Null
         Write-Log "Connected to vCenter" "SUCCESS"
         
         $cutoffDate = (Get-Date).AddDays(-$DaysBack)
@@ -1244,7 +1244,6 @@ function Send-CombinedVMReport {
     $deletedVMs = $deletedVMs | Where-Object { $_.VMName -notmatch "(?i)(workflow)" }
     $deletedTableRows = ""
     foreach ($vm in ($deletedVMs | Sort-Object VMName)) {
-        $deletedTableRows += "<tr>"
         $deletedTableRows += "<tr>"
         $deletedTableRows += "<td>$($vm.VMName)</td>"
         $deletedTableRows += "<td>$($vm.DeploymentName)</td>"
