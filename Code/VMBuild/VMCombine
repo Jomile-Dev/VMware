@@ -1825,12 +1825,86 @@ foreach ($vcVM in $vCenterCreatedVMs.Values) {
 Write-Log "Total VMs after vCenter enrichment: $($newVMsData.Count)" "SUCCESS"
 
 # ============================================================================
-# SECTION 4: BUILD FINAL NEW VMs REPORT
+# SECTION 4: PROCESS DELETIONS AND DECOMMISSIONS
+# ============================================================================
+
+Write-Log "`n=== PROCESSING DELETIONS AND DECOMMISSIONS ===" "SUCCESS"
+
+$allVraDecommissionVMs = @()
+$allVraDeletedVMs = @()
+$allVraFailedVMs = @()
+$allVCenterDeletedVMs = @()
+
+foreach ($vraServer in $vraServers) {
+    try {
+        $vraAuthUri = "https://$vraServer/csp/gateway/am/api/login"
+        $vraAuthBody = @{
+            username = $username
+            password = $password
+        } | ConvertTo-Json
+        
+        $vraAuthResponse = Invoke-RestMethod -Uri $vraAuthUri -Method Post -Headers @{
+            "Content-Type" = "application/json"
+        } -Body $vraAuthBody -ErrorAction Stop
+        
+        $vraHeaders = @{
+            "Authorization" = "Bearer $($vraAuthResponse.cspAuthToken)"
+            "Content-Type" = "application/json"
+        }
+        
+        # Get decommissions
+        $decommVMs = Get-ActiveDeploymentsWithDecommission -VraServer $vraServer -Headers $vraHeaders
+        $allVraDecommissionVMs += $decommVMs
+        
+        # Get failed deployments
+        $failedVMs = Get-FailedDeploymentsFromVRA -VraServer $vraServer -Headers $vraHeaders -DaysBack $daysBack
+        $allVraFailedVMs += $failedVMs
+        
+        # Get deleted VMs
+        $deletedVMs = Get-DeletedVMsFromVRA -VraServer $vraServer -Headers $vraHeaders -DaysBack $daysBack
+        $allVraDeletedVMs += $deletedVMs
+    }
+    catch {
+        Write-Log "Error with vRA server $vraServer : $($_.Exception.Message)" "ERROR"
+    }
+}
+
+# Process vCenter Deletions
+foreach ($vCenter in $vCenters) {
+    $deletedVMs = Get-DeletedVMsFromVCenter `
+        -VCenter $vCenter `
+        -Credential $vCenterCredential `
+        -DaysBack $daysBack `
+        -KnownVRAVMs $deploymentData
+    $allVCenterDeletedVMs += $deletedVMs
+}
+
+# Match Failed VMs with vCenter
+$allVraFailedVMs = Match-FailedVMsWithVCenter -FailedVMsList $allVraFailedVMs -VCenterData $allVCenterDeletedVMs
+
+Write-Log "Total decommissions: $($allVraDecommissionVMs.Count)" "SUCCESS"
+Write-Log "Total failed deployments: $($allVraFailedVMs.Count)" "SUCCESS"
+Write-Log "Total deleted VMs: $($allVraDeletedVMs.Count)" "SUCCESS"
+Write-Log "Total vCenter deletions: $($allVCenterDeletedVMs.Count)" "SUCCESS"
+
+# ============================================================================
+# SECTION 5: BUILD FINAL NEW VMs REPORT
 # ============================================================================
 
 Write-Log "`n=== BUILDING NEW VMs REPORT ===" "SUCCESS"
 
 $reportData = @()
+
+foreach ($vmData in $newVMsData) {
+    
+    # Skip VMs built and deleted within the same period
+    $isDeleted = $allVraDeletedVMs | Where-Object { $_.VMName -eq $vmData.Name }
+    $isDeletedVC = $allVCenterDeletedVMs | Where-Object { $_.VMName -eq $vmData.Name }
+    
+    if ($isDeleted -or $isDeletedVC) {
+        Write-Log "  Skipping $($vmData.Name) - built and deleted within 24hrs, will appear in Deleted section only" "WARN"
+        continue
+    }
 
 foreach ($vmData in $newVMsData) {
     $vmName = $vmData.Name
@@ -1975,68 +2049,7 @@ foreach ($vCenter in $vCenterConnections.Keys) {
 
 Write-Log "New VMs report contains $($reportData.Count) records" "SUCCESS"
 
-# ============================================================================
-# SECTION 5: PROCESS DELETIONS AND DECOMMISSIONS
-# ============================================================================
 
-Write-Log "`n=== PROCESSING DELETIONS AND DECOMMISSIONS ===" "SUCCESS"
-
-$allVraDecommissionVMs = @()
-$allVraDeletedVMs = @()
-$allVraFailedVMs = @()
-$allVCenterDeletedVMs = @()
-
-foreach ($vraServer in $vraServers) {
-    try {
-        $vraAuthUri = "https://$vraServer/csp/gateway/am/api/login"
-        $vraAuthBody = @{
-            username = $username
-            password = $password
-        } | ConvertTo-Json
-        
-        $vraAuthResponse = Invoke-RestMethod -Uri $vraAuthUri -Method Post -Headers @{
-            "Content-Type" = "application/json"
-        } -Body $vraAuthBody -ErrorAction Stop
-        
-        $vraHeaders = @{
-            "Authorization" = "Bearer $($vraAuthResponse.cspAuthToken)"
-            "Content-Type" = "application/json"
-        }
-        
-        # Get decommissions
-        $decommVMs = Get-ActiveDeploymentsWithDecommission -VraServer $vraServer -Headers $vraHeaders
-        $allVraDecommissionVMs += $decommVMs
-        
-        # Get failed deployments
-        $failedVMs = Get-FailedDeploymentsFromVRA -VraServer $vraServer -Headers $vraHeaders -DaysBack $daysBack
-        $allVraFailedVMs += $failedVMs
-        
-        # Get deleted VMs
-        $deletedVMs = Get-DeletedVMsFromVRA -VraServer $vraServer -Headers $vraHeaders -DaysBack $daysBack
-        $allVraDeletedVMs += $deletedVMs
-    }
-    catch {
-        Write-Log "Error with vRA server $vraServer : $($_.Exception.Message)" "ERROR"
-    }
-}
-
-# Process vCenter Deletions
-foreach ($vCenter in $vCenters) {
-    $deletedVMs = Get-DeletedVMsFromVCenter `
-        -VCenter $vCenter `
-        -Credential $vCenterCredential `
-        -DaysBack $daysBack `
-        -KnownVRAVMs $deploymentData
-    $allVCenterDeletedVMs += $deletedVMs
-}
-
-# Match Failed VMs with vCenter
-$allVraFailedVMs = Match-FailedVMsWithVCenter -FailedVMsList $allVraFailedVMs -VCenterData $allVCenterDeletedVMs
-
-Write-Log "Total decommissions: $($allVraDecommissionVMs.Count)" "SUCCESS"
-Write-Log "Total failed deployments: $($allVraFailedVMs.Count)" "SUCCESS"
-Write-Log "Total deleted VMs: $($allVraDeletedVMs.Count)" "SUCCESS"
-Write-Log "Total vCenter deletions: $($allVCenterDeletedVMs.Count)" "SUCCESS"
 
 # ============================================================================
 # SECTION 6: SEND COMBINED REPORT
