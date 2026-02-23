@@ -1896,35 +1896,30 @@ Write-Log "`n=== BUILDING NEW VMs REPORT ===" "SUCCESS"
 $reportData = @()
 
 foreach ($vmData in $newVMsData) {
-    
+
     # Skip VMs built and deleted within the same period
     $isDeleted = $allVraDeletedVMs | Where-Object { $_.VMName -eq $vmData.Name }
     $isDeletedVC = $allVCenterDeletedVMs | Where-Object { $_.VMName -eq $vmData.Name }
-    
+
     if ($isDeleted -or $isDeletedVC) {
         Write-Log "  Skipping $($vmData.Name) - built and deleted within 24hrs, will appear in Deleted section only" "WARN"
         continue
     }
-}
 
-foreach ($vmData in $newVMsData) {
     $vmName = $vmData.Name
     $depInfo = $deploymentData[$vmName]
-    
+
     if ($depInfo) {
         $finalStatus = $vmData.Status
         $finalPowerState = $vmData.PowerState
-        
-        # FIXED: Skip VMs that were formally deleted via vRA - they appear in Deleted section
+
         if ($depInfo.Status -eq "DELETED" -or $depInfo.DeploymentStatus -eq "Decomm/Offline") {
-            continue  # Skip from new server report - will appear in deleted section instead
+            continue
         }
-        # Check deployment status for failures
         elseif ($depInfo.Status -match "FAILED|ERROR") {
             $finalStatus = "Decomm/Offline"
             $finalPowerState = "NotExisting"
         }
-        # Trust Aria Operations if it says VM doesn't exist (failed build)
         elseif ($vmData.Status -eq "Decomm/Offline") {
             $finalStatus = "Decomm/Offline"
             $finalPowerState = "NotExisting"
@@ -1932,58 +1927,7 @@ foreach ($vmData in $newVMsData) {
         elseif ($vmData.Status -eq "Unknown") {
             $finalStatus = "Online"
             $finalPowerState = "Unknown"
-            
-            foreach ($vCenter in $vCenters) {
-                try {
-                    if (-not $vCenterConnections.ContainsKey($vCenter)) {
-                        Connect-VIServer -Server $vCenter -Credential $credential -ErrorAction Stop | Out-Null
-                        $vCenterConnections[$vCenter] = $true
-                        Write-Log "  Connected to $vCenter for power state lookup"
-                    }
-                    
-                    $vm = Get-VM -Name $vmName -Server $vCenter -ErrorAction SilentlyContinue
-                    if ($vm) {
-                        $finalStatus = "Online"
-                        $finalPowerState = if ($vm.PowerState -eq "PoweredOn") { "PoweredOn" } else { "PoweredOff" }
-                        Write-Log "  Found $vmName on $vCenter - PowerState: $finalPowerState"
-                        break
-                    }
-                }
-                catch {
-                    # Continue to next vCenter
-                }
-            }
-        }
-    }
-        
-        $reportData += [PSCustomObject]@{
-            Name = $vmName
-            Status = $finalStatus
-            PowerState = $finalPowerState
-            DeploymentName = $depInfo.DeploymentName
-            CatalogItem = $depInfo.CatalogItem
-            RequestedBy = $depInfo.RequestedBy
-            Requestor = $depInfo.Requestor
-            Source = $depInfo.vRAServer
-        }
-    }
-    else {
-        # VM not in vRA - check vCenter
-        $vcInfo = $vCenterLookup[$vmName]
-        $finalStatus = $vmData.Status
-        $finalPowerState = $vmData.PowerState
-        
-        # FIXED: If this is a vCenter VM that was marked as Decomm/Offline by Aria Ops,
-        # skip it from new server report - it will appear in Deleted section
-        if ($vmData.Status -eq "Decomm/Offline") {
-            Write-Log "  Skipping vCenter VM (deleted, will appear in Deleted section): $vmName"
-            continue
-        }
-        
-        if ($finalStatus -eq "Unknown") {
-            $finalStatus = "Online"
-            $finalPowerState = "Unknown"
-            
+
             foreach ($vCenter in $vCenters) {
                 try {
                     if (-not $vCenterConnections.ContainsKey($vCenter)) {
@@ -1991,7 +1935,7 @@ foreach ($vmData in $newVMsData) {
                         $vCenterConnections[$vCenter] = $true
                         Write-Log "  Connected to $vCenter for power state lookup"
                     }
-                    
+
                     $vm = Get-VM -Name $vmName -Server $vCenter -ErrorAction SilentlyContinue
                     if ($vm) {
                         $finalStatus = "Online"
@@ -2000,39 +1944,82 @@ foreach ($vmData in $newVMsData) {
                         break
                     }
                 }
-                catch {
-                    # Continue
+                catch { }
+            }
+        }
+
+        $reportData += [PSCustomObject]@{
+            Name           = $vmName
+            Status         = $finalStatus
+            PowerState     = $finalPowerState
+            DeploymentName = $depInfo.DeploymentName
+            CatalogItem    = $depInfo.CatalogItem
+            RequestedBy    = $depInfo.RequestedBy
+            Requestor      = $depInfo.Requestor
+            Source         = $depInfo.vRAServer
+        }
+    }
+    else {
+        $vcInfo = $vCenterLookup[$vmName]
+        $finalStatus = $vmData.Status
+        $finalPowerState = $vmData.PowerState
+
+        if ($vmData.Status -eq "Decomm/Offline") {
+            Write-Log "  Skipping vCenter VM (deleted, will appear in Deleted section): $vmName"
+            continue
+        }
+
+        if ($finalStatus -eq "Unknown") {
+            $finalStatus = "Online"
+            $finalPowerState = "Unknown"
+
+            foreach ($vCenter in $vCenters) {
+                try {
+                    if (-not $vCenterConnections.ContainsKey($vCenter)) {
+                        Connect-VIServer -Server $vCenter -Credential $vCenterCredential -ErrorAction Stop | Out-Null
+                        $vCenterConnections[$vCenter] = $true
+                        Write-Log "  Connected to $vCenter for power state lookup"
+                    }
+
+                    $vm = Get-VM -Name $vmName -Server $vCenter -ErrorAction SilentlyContinue
+                    if ($vm) {
+                        $finalStatus = "Online"
+                        $finalPowerState = if ($vm.PowerState -eq "PoweredOn") { "PoweredOn" } else { "PoweredOff" }
+                        Write-Log "  Found $vmName on $vCenter - PowerState: $finalPowerState"
+                        break
+                    }
                 }
-            
-            # If we still can't find it, skip it from new server report
+                catch { }
+            }
+
             if ($finalPowerState -eq "Unknown") {
                 Write-Log "  Skipping vCenter VM (cannot verify existence): $vmName"
                 continue
             }
         }
-        
+
         if ($vcInfo) {
             $reportData += [PSCustomObject]@{
-                Name = $vmName
-                Status = $finalStatus
-                PowerState = $finalPowerState
+                Name           = $vmName
+                Status         = $finalStatus
+                PowerState     = $finalPowerState
                 DeploymentName = "N/A"
-                CatalogItem = "N/A"
-                RequestedBy = $vcInfo.CreatedBy
-                Requestor = $vcInfo.CreatedBy
-                Source = $vcInfo.vCenter
+                CatalogItem    = "N/A"
+                RequestedBy    = $vcInfo.CreatedBy
+                Requestor      = $vcInfo.CreatedBy
+                Source         = $vcInfo.vCenter
             }
         }
         else {
             $reportData += [PSCustomObject]@{
-                Name = $vmName
-                Status = $finalStatus
-                PowerState = $finalPowerState
+                Name           = $vmName
+                Status         = $finalStatus
+                PowerState     = $finalPowerState
                 DeploymentName = "N/A"
-                CatalogItem = "N/A"
-                RequestedBy = "N/A"
-                Requestor = "N/A"
-                Source = "Unknown"
+                CatalogItem    = "N/A"
+                RequestedBy    = "N/A"
+                Requestor      = "N/A"
+                Source         = "Unknown"
             }
         }
     }
@@ -2043,9 +2030,7 @@ foreach ($vCenter in $vCenterConnections.Keys) {
         Disconnect-VIServer -Server $vCenter -Confirm:$false -ErrorAction SilentlyContinue
         Write-Log "Disconnected from $vCenter"
     }
-    catch {
-        # Silent failure
-    }
+    catch { }
 }
 
 Write-Log "New VMs report contains $($reportData.Count) records" "SUCCESS"
