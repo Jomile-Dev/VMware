@@ -1,6 +1,6 @@
 # ============================================================================
 # COMPREHENSIVE VM TRACKER - NEW SERVERS + DELETIONS + DECOMMISSIONS
-# Version 4.0.1 - FIXED: Deleted VMs only in Deleted section, failed builds in New Server section
+# Version 4.0.1 - FIXED: Using sAMAccount for VC 
 # ============================================================================
 
 # ============================================================================
@@ -1442,13 +1442,19 @@ Disable-SSLValidation
 
 # Get credentials
 Write-Log "Requesting credentials..."
-$credential = Get-Credential -Message "Enter credentials for Aria Operations, vRA, and vCenter"
+$credential = Get-Credential -Message "Enter credentials for Aria Operations and vRA"
 if (-not $credential) {
     Write-Log "Credentials not provided. Exiting." "ERROR"
     exit
 }
 $username = $credential.UserName
 $password = $credential.GetNetworkCredential().Password
+
+$vCenterCredential = Get-Credential -Message "Enter credentials for vCenter"
+if (-not $vCenterCredential) {
+    Write-Log "vCenter credentials not provided. Exiting." "ERROR"
+    exit
+}
 
 # ============================================================================
 # SECTION 1: GET NEW VMs FROM ARIA OPERATIONS
@@ -1718,7 +1724,7 @@ foreach ($vCenter in $vCenters) {
     Write-Log "Connecting to: $vCenter"
     
     try {
-        Connect-VIServer -Server $vCenter -Credential $credential -ErrorAction Stop | Out-Null
+        Connect-VIServer -Server $vCenter -Credential $vCenterCredential -ErrorAction Stop | Out-Null
         
         $cutoffDate = (Get-Date).AddDays(-$daysBack)
         
@@ -1873,10 +1879,9 @@ foreach ($vmData in $newVMsData) {
                     # Continue to next vCenter
                 }
             }
-        }
-        else {
-            $finalStatus = "Online"
-        }
+            else {
+                $finalStatus = "Online"
+            }
         
         $reportData += [PSCustomObject]@{
             Name = $vmName
@@ -1909,7 +1914,7 @@ foreach ($vmData in $newVMsData) {
             foreach ($vCenter in $vCenters) {
                 try {
                     if (-not $vCenterConnections.ContainsKey($vCenter)) {
-                        Connect-VIServer -Server $vCenter -Credential $credential -ErrorAction Stop | Out-Null
+                        Connect-VIServer -Server $vCenter -Credential $vCenterCredential -ErrorAction Stop | Out-Null
                         $vCenterConnections[$vCenter] = $true
                         Write-Log "  Connected to $vCenter for power state lookup"
                     }
@@ -1925,7 +1930,6 @@ foreach ($vmData in $newVMsData) {
                 catch {
                     # Continue
                 }
-            }
             
             # If we still can't find it, skip it from new server report
             if ($finalPowerState -eq "Unknown") {
