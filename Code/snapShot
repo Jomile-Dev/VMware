@@ -454,7 +454,7 @@ if (-not $vraCredential) {
 
 # Authenticate with vRA
 Write-Host "Authenticating with vRA..." -ForegroundColor Yellow
-$allSnapshots = Get-AllSnapshots -vCenterServers $vCenters -Credential $credential
+$vraRefreshToken = Get-vRAAccessToken -Credential $vraCredential -Server $vraServer
 
 if ($vraRefreshToken) {
     $vraBearerToken = Get-vRABearerToken -RefreshToken $vraRefreshToken -Server $vraServer
@@ -474,7 +474,7 @@ else {
 
 # Collect snapshots from all vCenters
 Write-Host "`nCollecting snapshots from vCenters..." -ForegroundColor Yellow
-$allSnapshots = Get-AllSnapshots -vCenterServers $vCenters -Credential $credential
+$allSnapshots = Get-AllSnapshots -vCenterServers $vCenters -Credential $vcCredential
 
 if ($allSnapshots.Count -eq 0) {
     Write-Host "No snapshots found." -ForegroundColor Yellow
