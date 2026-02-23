@@ -1440,17 +1440,16 @@ catch {
 
 Disable-SSLValidation
 
-# Get credentials
-Write-Log "Requesting credentials..."
-$credential = Get-Credential -Message "Enter credentials for Aria Operations and vRA"
+# Load credentials from encrypted XML files
+$credential = Import-Clixml -Path "C:\Creds\aria_vra_cred.xml"
 if (-not $credential) {
-    Write-Log "Credentials not provided. Exiting." "ERROR"
+    Write-Log "Aria/vRA credentials not provided. Exiting." "ERROR"
     exit
 }
 $username = $credential.UserName
 $password = $credential.GetNetworkCredential().Password
 
-$vCenterCredential = Get-Credential -Message "Enter credentials for vCenter"
+$vCenterCredential = Import-Clixml -Path "C:\Creds\vcenter_cred.xml"
 if (-not $vCenterCredential) {
     Write-Log "vCenter credentials not provided. Exiting." "ERROR"
     exit
