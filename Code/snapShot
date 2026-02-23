@@ -33,7 +33,8 @@ function Get-vRAAccessToken {
     
     $uri = "https://$Server/csp/gateway/am/api/login?access_token"
     $body = @{
-        username = $Credential.UserName
+        username = $Credential.UserName.Split('@')[0]
+        domain   = $Credential.UserName.Split('@')[1]
         password = $Credential.GetNetworkCredential().Password
     } | ConvertTo-Json
     
