@@ -440,15 +440,21 @@ Write-Host "vCenter Snapshot Report with vRA Integration" -ForegroundColor Cyan
 Write-Host "========================================`n" -ForegroundColor Cyan
 
 # Get credentials for vCenter and vRA
-$credential = Get-Credential -Message "Enter credentials for vCenter and vRA"
-if (-not $credential) {
-    Write-Error "Credentials are required to continue."
+$vcCredential = Get-Credential -Message "Enter credentials for vCenter"
+if (-not $vcCredential) {
+    Write-Error "vCenter credentials are required to continue."
+    exit 1
+}
+
+$vraCredential = Get-Credential -Message "Enter credentials for vRA"
+if (-not $vraCredential) {
+    Write-Error "vRA credentials are required to continue."
     exit 1
 }
 
 # Authenticate with vRA
 Write-Host "Authenticating with vRA..." -ForegroundColor Yellow
-$vraRefreshToken = Get-vRAAccessToken -Credential $credential -Server $vraServer
+$allSnapshots = Get-AllSnapshots -vCenterServers $vCenters -Credential $credential
 
 if ($vraRefreshToken) {
     $vraBearerToken = Get-vRABearerToken -RefreshToken $vraRefreshToken -Server $vraServer
