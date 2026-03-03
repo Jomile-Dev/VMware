@@ -1,7 +1,4 @@
-# Get SHA-256 Certificate Fingerprint from URL
-param(
-    [string]$Url = "https://example.com"
-)
+$Url = "https://example.com"
 
 $uri = [System.Uri]$Url
 $hostname = $uri.Host
@@ -9,19 +6,13 @@ $port = if ($uri.Port -eq -1) { 443 } else { $uri.Port }
 
 $tcpClient = [System.Net.Sockets.TcpClient]::new($hostname, $port)
 $sslStream = [System.Net.Security.SslStream]::new($tcpClient.GetStream(), $false, { $true })
-
 $sslStream.AuthenticateAsClient($hostname)
 $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($sslStream.RemoteCertificate)
 
-$sha256 = [System.Security.Cryptography.SHA256]::Create()
-$hashBytes = $sha256.ComputeHash($cert.RawData)
-$fingerprint = ($hashBytes | ForEach-Object { $_.ToString("X2") }) -join ":"
+$hashBytes = [System.Security.Cryptography.SHA256]::Create().ComputeHash($cert.RawData)
+$fingerprint = ($hashBytes | ForEach-Object { $_.ToString("X2") }) -join ""
 
 Write-Host "URL:         $Url"
-Write-Host "Subject:     $($cert.Subject)"
-Write-Host "Issuer:      $($cert.Issuer)"
-Write-Host "Valid From:  $($cert.NotBefore)"
-Write-Host "Valid To:    $($cert.NotAfter)"
 Write-Host "SHA-256:     $fingerprint"
 
 $sslStream.Dispose()
