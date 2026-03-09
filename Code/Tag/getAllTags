@@ -81,12 +81,18 @@ foreach ($vcServer in $connectedServers) {
 
         $allTagsFlat = if ($allTagStrings) { $allTagStrings -join ", " } else { "" }
 
+        # Check if VM has the filter tag
+        $hasFilterTag = if ($FilterTag) {
+            if (($allTagsFlat -split ", ") -contains $FilterTag) { "Yes" } else { "No" }
+        } else { "N/A" }
+
         # Build result object
         $results += [PSCustomObject]@{
             VMName           = $vm.Name
             PowerState       = $vm.PowerState
             Cluster          = $vm.VMHost.Parent.Name
             vCenter          = $vcServer.Name
+            Has_FilterTag    = $hasFilterTag
             All_Tags         = $allTagsFlat
             Tags_By_Category = $tagsByCategoryStr
             Tag_Count        = if ($tagAssignments) { $tagAssignments.Count } else { 0 }
@@ -94,28 +100,31 @@ foreach ($vcServer in $connectedServers) {
     }
 }
 
-# 5. Filter to VMs missing the FilterTag
-if ($FilterTag) {
-    $exportResults = $results | Where-Object {
-        ($_.All_Tags -split ", ") -notcontains $FilterTag
-    }
-    Write-Host "`nTag checked : '$FilterTag'" -ForegroundColor Magenta
-    Write-Host "  Missing tag : $($exportResults.Count) of $($results.Count) VMs" -ForegroundColor Red
+# 5. Sort all results — missing tag first, then present
+$exportResults = if ($FilterTag) {
+    $results | Sort-Object Has_FilterTag  # "No" sorts before "Yes"
 } else {
-    $exportResults = $results
+    $results
 }
 
 # 5a. Console output
-Write-Host "`nVMs missing '$FilterTag':" -ForegroundColor Yellow
-$exportResults | Format-Table VMName, PowerState, Cluster, vCenter, All_Tags -AutoSize
+if ($FilterTag) {
+    $presentCount = ($results | Where-Object { $_.Has_FilterTag -eq "Yes" }).Count
+    $missingCount = ($results | Where-Object { $_.Has_FilterTag -eq "No" }).Count
+    Write-Host "`nTag checked : '$FilterTag'" -ForegroundColor Magenta
+    Write-Host "  Have tag    : $presentCount of $($results.Count) VMs" -ForegroundColor Green
+    Write-Host "  Missing tag : $missingCount of $($results.Count) VMs" -ForegroundColor Red
+}
+
+Write-Host "`nAll VMs (Has_FilterTag = Yes/No):" -ForegroundColor Yellow
+$exportResults | Format-Table VMName, PowerState, Cluster, vCenter, Has_FilterTag, All_Tags -AutoSize
 
 # 6. Summary
 Write-Host "`nSummary:" -ForegroundColor Cyan
-Write-Host "  Total VMs   : $($results.Count)"    -ForegroundColor Gray
-Write-Host "  Missing tag : $($exportResults.Count)" -ForegroundColor Gray
+Write-Host "  Total VMs   : $($results.Count)" -ForegroundColor Gray
 
-# 7. Export only missing VMs to CSV
-$safeFilter  = if ($FilterTag) { "_Missing_" + ($FilterTag -replace ":", "-") } else { "_All" }
+# 7. Export all VMs to CSV
+$safeFilter  = if ($FilterTag) { "_" + ($FilterTag -replace ":", "-") + "_Status" } else { "_All" }
 $timestamp   = Get-Date -Format "yyyyMMdd_HHmmss"
 $csvFileName = "VMs_Tags${safeFilter}_$timestamp.csv"
 $csvPath     = Join-Path $OutputFolder $csvFileName
