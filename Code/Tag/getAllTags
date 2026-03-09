@@ -1,0 +1,162 @@
+# Requires: VMware.PowerCLI
+
+# Output Configuration
+$OutputFolder = "C:\Reports"
+
+# 1. Prompt once for credentials
+$cred = Get-Credential -Message "Enter vCenter credentials"
+
+# 2. List all vCenters you want to connect to
+$vcenters = @(
+    "vcsa1.example.local",
+    "vcsa2.example.local",
+    "vcsa3.example.local"
+)
+
+# 3. Connect to each vCenter and store connections
+$connectedServers = @()
+
+foreach ($vc in $vcenters) {
+    Write-Host "Connecting to $vc..." -ForegroundColor Cyan
+    try {
+        $connection = Connect-VIServer -Server $vc -Credential $cred -WarningAction SilentlyContinue -ErrorAction Stop
+        $connectedServers += $connection
+        Write-Host "✅ Connected to $vc" -ForegroundColor Green
+    }
+    catch {
+        Write-Host "❌ Failed to connect to ${vc}: $_" -ForegroundColor Red
+    }
+}
+
+# 4. Get all VMs and ALL of their tags (across every category)
+$results = @()
+
+Write-Host "`nRetrieving VMs and all tags from $($connectedServers.Count) vCenter(s)..." -ForegroundColor Cyan
+
+foreach ($vcServer in $connectedServers) {
+    Write-Host "`nProcessing VMs from $($vcServer.Name)..." -ForegroundColor Yellow
+    
+    # Get VMs from this specific vCenter
+    $vms = Get-VM -Server $vcServer
+    Write-Host "  Found $($vms.Count) VMs" -ForegroundColor Gray
+    
+    foreach ($vm in $vms) {
+        # Get ALL tag assignments for this VM (no category filter)
+        $tagAssignments = Get-TagAssignment -Entity $vm -ErrorAction SilentlyContinue
+
+        # Build a flat "Category:TagName" list for all tags
+        $allTagStrings = if ($tagAssignments) {
+            $tagAssignments | ForEach-Object {
+                "$($_.Tag.Category.Name):$($_.Tag.Name)"
+            }
+        } else {
+            $null
+        }
+
+        # Also build per-category columns dynamically — collect unique categories
+        $tagsByCategory = @{}
+        if ($tagAssignments) {
+            foreach ($ta in $tagAssignments) {
+                $cat = $ta.Tag.Category.Name
+                if (-not $tagsByCategory.ContainsKey($cat)) {
+                    $tagsByCategory[$cat] = @()
+                }
+                $tagsByCategory[$cat] += $ta.Tag.Name
+            }
+        }
+
+        # Flatten category buckets to "Cat: tag1, tag2" strings
+        $tagsByCategoryStr = if ($tagsByCategory.Count -gt 0) {
+            ($tagsByCategory.GetEnumerator() | Sort-Object Key | ForEach-Object {
+                "$($_.Key): $($_.Value -join ', ')"
+            }) -join " | "
+        } else {
+            ""
+        }
+
+        $allTagsFlat = if ($allTagStrings) { $allTagStrings -join ", " } else { "" }
+
+        # Build result object
+        $results += [PSCustomObject]@{
+            VMName           = $vm.Name
+            PowerState       = $vm.PowerState
+            Cluster          = $vm.VMHost.Parent.Name
+            vCenter          = $vcServer.Name
+            All_Tags         = $allTagsFlat          # e.g. "VEEAM:Gold, Owner:TeamA"
+            Tags_By_Category = $tagsByCategoryStr    # e.g. "Owner: TeamA | VEEAM: Gold"
+            Tag_Count        = if ($tagAssignments) { $tagAssignments.Count } else { 0 }
+        }
+    }
+}
+
+# 5. Output results
+Write-Host "`nAll VMs with Tags:" -ForegroundColor Yellow
+$results | Format-Table -AutoSize
+
+# 6. Show summary
+$taggedCount   = ($results | Where-Object { $_.All_Tags -ne "" }).Count
+$untaggedCount = ($results | Where-Object { $_.All_Tags -eq "" }).Count
+$totalCount    = $results.Count
+
+Write-Host "`nSummary:" -ForegroundColor Cyan
+Write-Host "  Total VMs     : $totalCount"    -ForegroundColor Gray
+Write-Host "  VMs with tags : $taggedCount"   -ForegroundColor Gray
+Write-Host "  VMs untagged  : $untaggedCount" -ForegroundColor Gray
+
+# 6a. Count VMs per tag (Category:Name format)
+Write-Host "`nVMs per Tag (Category:Name):" -ForegroundColor Yellow
+$tagCounts = @{}
+foreach ($result in $results) {
+    if ($result.All_Tags -ne "") {
+        $tags = $result.All_Tags -split ", "
+        foreach ($tag in $tags) {
+            if ($tagCounts.ContainsKey($tag)) {
+                $tagCounts[$tag]++
+            } else {
+                $tagCounts[$tag] = 1
+            }
+        }
+    }
+}
+
+$tagCounts.GetEnumerator() | Sort-Object Value -Descending | ForEach-Object {
+    Write-Host "  $($_.Key): $($_.Value) VMs" -ForegroundColor Gray
+}
+
+# 6b. Count VMs per category
+Write-Host "`nVMs per Tag Category:" -ForegroundColor Yellow
+$catCounts = @{}
+foreach ($result in $results) {
+    if ($result.All_Tags -ne "") {
+        $tags = $result.All_Tags -split ", "
+        foreach ($tag in $tags) {
+            $cat = ($tag -split ":")[0].Trim()
+            if ($catCounts.ContainsKey($cat)) {
+                $catCounts[$cat]++
+            } else {
+                $catCounts[$cat] = 1
+            }
+        }
+    }
+}
+
+$catCounts.GetEnumerator() | Sort-Object Value -Descending | ForEach-Object {
+    Write-Host "  $($_.Key): $($_.Value) VMs" -ForegroundColor Gray
+}
+
+# 7. Export results to CSV
+$timestamp   = Get-Date -Format "yyyyMMdd_HHmmss"
+$csvFileName = "VMs_All_Tags_$timestamp.csv"
+$csvPath     = Join-Path $OutputFolder $csvFileName
+
+# Create output folder if it doesn't exist
+if (-not (Test-Path $OutputFolder)) {
+    New-Item -ItemType Directory -Path $OutputFolder | Out-Null
+}
+
+$results | Export-Csv -Path $csvPath -NoTypeInformation
+Write-Host "`n✅ CSV saved to: $csvPath" -ForegroundColor Green
+
+# 8. Disconnect from all vCenters
+Write-Host "`nDisconnecting from vCenters..." -ForegroundColor Cyan
+Disconnect-VIServer -Server * -Confirm:$false
