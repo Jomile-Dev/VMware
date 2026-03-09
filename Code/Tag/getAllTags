@@ -4,9 +4,9 @@
 $OutputFolder = "C:\Reports"
 
 # Tag Filter Configuration
-# Set to "Category:TagName" to filter for a specific tag, e.g. "App:XXXXXX"
+# Set to "Category:TagName" to filter for a specific tag, e.g. "App:generic"
 # Set to $null or "" to return all VMs regardless of tags
-$FilterTag = "App:XXXXXX"
+$FilterTag = "App:generic"
 
 # 1. Prompt once for credentials
 $cred = Get-Credential -Message "Enter vCenter credentials"
@@ -94,19 +94,19 @@ foreach ($vcServer in $connectedServers) {
     }
 }
 
-# 5. Apply tag filter (if set)
+# 5. Apply tag filter (if set) — finds VMs MISSING the specified tag
 if ($FilterTag) {
     $filteredResults = $results | Where-Object {
-        $_.All_Tags -split ", " | Where-Object { $_ -eq $FilterTag }
+        ($_.All_Tags -split ", ") -notcontains $FilterTag
     }
-    Write-Host "`nFiltering for tag: '$FilterTag'" -ForegroundColor Magenta
-    Write-Host "Matched $($filteredResults.Count) of $($results.Count) VMs" -ForegroundColor Magenta
+    Write-Host "`nVMs missing tag: '$FilterTag'" -ForegroundColor Magenta
+    Write-Host "$($filteredResults.Count) of $($results.Count) VMs do not have this tag" -ForegroundColor Magenta
 } else {
     $filteredResults = $results
 }
 
 # 5a. Output results
-Write-Host "`nVMs matching filter:" -ForegroundColor Yellow
+Write-Host "`nVMs missing tag '$FilterTag':" -ForegroundColor Yellow
 $filteredResults | Format-Table -AutoSize
 
 # 6. Show summary
@@ -161,7 +161,7 @@ $catCounts.GetEnumerator() | Sort-Object Value -Descending | ForEach-Object {
 }
 
 # 7. Export results to CSV
-$safeFilter  = if ($FilterTag) { "_" + ($FilterTag -replace ":", "-") } else { "_All" }
+$safeFilter  = if ($FilterTag) { "_Missing_" + ($FilterTag -replace ":", "-") } else { "_All" }
 $timestamp   = Get-Date -Format "yyyyMMdd_HHmmss"
 $csvFileName = "VMs_Tags${safeFilter}_$timestamp.csv"
 $csvPath     = Join-Path $OutputFolder $csvFileName
