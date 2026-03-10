@@ -1,12 +1,30 @@
 # ============================================================================
-# DIAGNOSTIC v2: Fetch FULL resource details individually
-# Gets everything under General, Storage, Network, Custom Properties tabs
+# VM MANAGED TAG AUDIT - Fixed v2
+# Fetches full resource via /deployment/api/resources/{id}
+# Checks constraints array for {"tag":"Managed:true"}
 # ============================================================================
 
-$vraServer      = "vra1.yourdomain.com"   # <-- change to your vRA server
-$maxDeployments = 3                        # <-- how many deployments to inspect
+$vraServers = @(
+    "vra1.yourdomain.com",
+    "vra2.yourdomain.com"
+)
+
+$outputCsv = "C:\Reports\VM_ManagedTag_Audit_$(Get-Date -Format 'yyyy-MM-dd_HHmm').csv"
 
 # ============================================================================
+# HELPERS
+# ============================================================================
+
+function Write-Log {
+    param([string]$Message, [string]$Level = "INFO")
+    $color = switch ($Level) {
+        "ERROR"   { "Red" }
+        "WARN"    { "Yellow" }
+        "SUCCESS" { "Green" }
+        default   { "Cyan" }
+    }
+    Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [$Level] $Message" -ForegroundColor $color
+}
 
 function Disable-SSLValidation {
     if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
@@ -24,149 +42,206 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 }
 
+# ============================================================================
+# MAIN
+# ============================================================================
+
 Disable-SSLValidation
 
 $credential = Import-Clixml -Path "C:\Creds\aria_vra_cred.xml"
 $username   = $credential.UserName
 $password   = $credential.GetNetworkCredential().Password
 
-# Auth
-$authResp = Invoke-RestMethod -Uri "https://$vraServer/csp/gateway/am/api/login" `
-    -Method Post `
-    -Headers @{ "Content-Type" = "application/json" } `
-    -Body (@{ username = $username; password = $password } | ConvertTo-Json) `
-    -ErrorAction Stop
+$report = [System.Collections.Generic.List[PSCustomObject]]::new()
 
-$headers = @{
-    "Authorization" = "Bearer $($authResp.cspAuthToken)"
-    "Content-Type"  = "application/json"
-}
+foreach ($vraServer in $vraServers) {
 
-Write-Host "`n=== Fetching deployments ===" -ForegroundColor Cyan
+    Write-Log "=== Connecting to vRA: $vraServer ==="
 
-$resp        = Invoke-RestMethod -Uri "https://$vraServer/deployment/api/deployments?page=0&size=100&expand=resources&apiVersion=2020-08-25" `
-    -Method Get -Headers $headers -ErrorAction Stop
-$deployments = if ($resp.content) { $resp.content } else { $resp }
+    try {
+        $authResp = Invoke-RestMethod `
+            -Uri "https://$vraServer/csp/gateway/am/api/login" `
+            -Method Post `
+            -Headers @{ "Content-Type" = "application/json" } `
+            -Body (@{ username = $username; password = $password } | ConvertTo-Json) `
+            -ErrorAction Stop
 
-$count = 0
+        $headers = @{
+            "Authorization" = "Bearer $($authResp.cspAuthToken)"
+            "Content-Type"  = "application/json"
+        }
+        Write-Log "Authenticated to $vraServer" "SUCCESS"
+    }
+    catch {
+        Write-Log "Auth failed for $vraServer : $($_.Exception.Message)" "ERROR"
+        continue
+    }
 
-foreach ($dep in $deployments) {
-    if ($count -ge $maxDeployments) { break }
+    # ------------------------------------------------------------------
+    # Page through all active deployments (lightweight, no expand needed)
+    # ------------------------------------------------------------------
+    $page           = 0
+    $pageSize       = 200
+    $allDeployments = [System.Collections.Generic.List[object]]::new()
 
-    $vmResources = $dep.resources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" }
-    if (-not $vmResources) { continue }
-
-    Write-Host "`n$('='*80)" -ForegroundColor Yellow
-    Write-Host "DEPLOYMENT : $($dep.name)" -ForegroundColor Yellow
-    Write-Host "ID         : $($dep.id)"
-    Write-Host "Status     : $($dep.status)"
-    Write-Host "Owner      : $($dep.ownedBy)"
-
-    foreach ($resource in $vmResources) {
-
-        Write-Host "`n  --- RESOURCE (from expand): $($resource.name) [$($resource.id)] ---" -ForegroundColor Cyan
-
-        # ----------------------------------------------------------------
-        # METHOD 1: Full resource detail endpoint
-        # ----------------------------------------------------------------
-        Write-Host "`n  [METHOD 1] GET /deployment/api/resources/{id}" -ForegroundColor Green
+    do {
+        $uri = "https://$vraServer/deployment/api/deployments?page=$page&size=$pageSize&apiVersion=2020-08-25"
         try {
-            $fullResource = Invoke-RestMethod `
-                -Uri "https://$vraServer/deployment/api/resources/$($resource.id)?apiVersion=2020-08-25" `
-                -Method Get -Headers $headers -ErrorAction Stop
+            $resp        = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers -ErrorAction Stop
+            $deployments = if ($resp.content) { $resp.content } else { $resp }
 
-            Write-Host "  Full resource JSON:" -ForegroundColor Green
-            $fullResource | ConvertTo-Json -Depth 15 | Write-Host
+            if ($deployments -and $deployments.Count -gt 0) {
+                $allDeployments.AddRange([object[]]$deployments)
+                $page++
+            } else { break }
+
+            $hasMore = if ($resp.totalPages)       { $page -lt $resp.totalPages }
+                       elseif ($resp.totalElements) { ($page * $pageSize) -lt $resp.totalElements }
+                       else                         { $deployments.Count -eq $pageSize }
         }
         catch {
-            Write-Host "  ERROR: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Log "Error paging deployments (page $page): $($_.Exception.Message)" "ERROR"
+            break
         }
+    } while ($hasMore)
 
-        # ----------------------------------------------------------------
-        # METHOD 2: Resource from deployment endpoint
-        # ----------------------------------------------------------------
-        Write-Host "`n  [METHOD 2] GET /deployment/api/deployments/{depId}/resources/{resId}" -ForegroundColor Green
+    Write-Log "Retrieved $($allDeployments.Count) deployments from $vraServer"
+
+    # ------------------------------------------------------------------
+    # For each deployment, get its resources, then fetch each VM fully
+    # ------------------------------------------------------------------
+    foreach ($dep in $allDeployments) {
+
+        # Get all resources for this deployment
         try {
-            $depResource = Invoke-RestMethod `
-                -Uri "https://$vraServer/deployment/api/deployments/$($dep.id)/resources/$($resource.id)?apiVersion=2020-08-25" `
-                -Method Get -Headers $headers -ErrorAction Stop
-
-            Write-Host "  Deployment-resource JSON:" -ForegroundColor Green
-            $depResource | ConvertTo-Json -Depth 15 | Write-Host
-        }
-        catch {
-            Write-Host "  ERROR: $($_.Exception.Message)" -ForegroundColor Red
-        }
-
-        # ----------------------------------------------------------------
-        # METHOD 3: List ALL resources for this deployment (no expand filter)
-        # ----------------------------------------------------------------
-        Write-Host "`n  [METHOD 3] GET /deployment/api/deployments/{depId}/resources" -ForegroundColor Green
-        try {
-            $allResources = Invoke-RestMethod `
+            $resResp      = Invoke-RestMethod `
                 -Uri "https://$vraServer/deployment/api/deployments/$($dep.id)/resources?apiVersion=2020-08-25" `
                 -Method Get -Headers $headers -ErrorAction Stop
-
-            $resources = if ($allResources.content) { $allResources.content } else { $allResources }
-            $matchedRes = $resources | Where-Object { $_.id -eq $resource.id -or $_.type -eq "Cloud.vSphere.Machine" }
-
-            Write-Host "  All deployment resources (VM type only):" -ForegroundColor Green
-            $matchedRes | ConvertTo-Json -Depth 15 | Write-Host
+            $depResources = if ($resResp.content) { $resResp.content } else { $resResp }
         }
         catch {
-            Write-Host "  ERROR: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Log "  Could not get resources for deployment $($dep.id): $($_.Exception.Message)" "WARN"
+            continue
         }
 
-        # ----------------------------------------------------------------
-        # METHOD 4: IaaS machine endpoint (gets OS/disk/network separately)
-        # ----------------------------------------------------------------
-        Write-Host "`n  [METHOD 4] GET /iaas/api/machines (by name)" -ForegroundColor Green
-        try {
-            # Try to get the VM name first
+        $vmResources = $depResources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" }
+        if (-not $vmResources) { continue }
+
+        foreach ($resource in $vmResources) {
+
+            # ----------------------------------------------------------
+            # Fetch the FULL resource (Method 1) — this has constraints
+            # ----------------------------------------------------------
+            $fullResource = $null
+            try {
+                $fullResource = Invoke-RestMethod `
+                    -Uri "https://$vraServer/deployment/api/resources/$($resource.id)?apiVersion=2020-08-25" `
+                    -Method Get -Headers $headers -ErrorAction Stop
+            }
+            catch {
+                Write-Log "  Could not fetch full resource $($resource.id): $($_.Exception.Message)" "WARN"
+                $fullResource = $resource   # fall back to the shallow version
+            }
+
+            # ----------------------------------------------------------
+            # Resolve VM name
+            # ----------------------------------------------------------
             $vmName = $null
-            if ($resource.properties) {
+            $props  = $fullResource.properties
+
+            if ($props) {
                 foreach ($field in @('resourceName','hostname','hostName','name','address')) {
-                    if ($resource.properties.PSObject.Properties[$field] -and $resource.properties.$field) {
-                        $vmName = $resource.properties.$field
+                    if ($props.PSObject.Properties[$field] -and $props.$field -and
+                        $props.$field -notmatch "Cloud_vSphere_Machine_\d+") {
+                        $vmName = $props.$field
                         break
                     }
                 }
             }
-            if (-not $vmName) { $vmName = $resource.name }
 
-            if ($vmName -and $vmName -notmatch "Cloud_vSphere_Machine_\d+") {
-                $iaasResp = Invoke-RestMethod `
-                    -Uri "https://$vraServer/iaas/api/machines?`$filter=name+eq+'$vmName'&apiVersion=2021-07-15" `
-                    -Method Get -Headers $headers -ErrorAction Stop
-
-                $machines = if ($iaasResp.content) { $iaasResp.content } else { $iaasResp }
-                Write-Host "  IaaS machine JSON:" -ForegroundColor Green
-                $machines | ConvertTo-Json -Depth 15 | Write-Host
+            if (-not $vmName -and $fullResource.name -notmatch "Cloud_vSphere_Machine_\d+") {
+                $vmName = $fullResource.name
             }
-            else {
-                Write-Host "  Skipped (could not resolve VM name)" -ForegroundColor Yellow
-            }
-        }
-        catch {
-            Write-Host "  ERROR: $($_.Exception.Message)" -ForegroundColor Red
-        }
 
-        # ----------------------------------------------------------------
-        # SUMMARY: Highlight anything with 'Managed' or 'constraints' or 'customProperties'
-        # ----------------------------------------------------------------
-        Write-Host "`n  === KEYWORD SCAN on expand data ===" -ForegroundColor Magenta
-        $expandJson = $resource | ConvertTo-Json -Depth 15 -Compress
+            if (-not $vmName) { $vmName = $resource.id }
 
-        foreach ($keyword in @("Managed", "constraint", "customPropert", "tag")) {
-            if ($expandJson -match $keyword) {
-                Write-Host "  [FOUND] keyword '$keyword' exists in expand data" -ForegroundColor Green
-            } else {
-                Write-Host "  [MISSING] keyword '$keyword' not in expand data" -ForegroundColor Red
+            # ----------------------------------------------------------
+            # Read constraints from properties
+            # Structure: "constraints":[{"tag":"Datacenter:XYZ"},{"tag":"Managed:true"},...]
+            # ----------------------------------------------------------
+            $constraints    = $null
+            $hasManagedTag  = $false
+            $allTags        = @()
+
+            if ($props -and $props.PSObject.Properties['constraints']) {
+                $constraints = $props.constraints
             }
+
+            if ($constraints) {
+                # constraints is an array of objects with a "tag" property
+                foreach ($entry in $constraints) {
+                    $tagValue = $null
+
+                    if ($entry -is [string]) {
+                        # Shouldn't happen given what you showed, but handle just in case
+                        $tagValue = $entry
+                    }
+                    elseif ($entry.PSObject.Properties['tag']) {
+                        $tagValue = $entry.tag
+                    }
+
+                    if ($tagValue) {
+                        $allTags += $tagValue
+
+                        if ($tagValue -eq "Managed:true") {
+                            $hasManagedTag = $true
+                        }
+                    }
+                }
+            }
+
+            # Friendly string of all tags for the CSV
+            $allTagsStr       = if ($allTags.Count -gt 0) { $allTags -join " | " } else { "(none)" }
+            $constraintsCount = if ($constraints) { @($constraints).Count } else { 0 }
+
+            Write-Log "  $vmName -> Managed:true=$hasManagedTag | Tags: $allTagsStr"
+
+            $report.Add([PSCustomObject]@{
+                VMName             = $vmName
+                HasManagedTag      = $hasManagedTag
+                ManagedTagStatus   = if ($hasManagedTag) { "YES - Managed:true present" } else { "NO  - tag missing" }
+                AllConstraintTags  = $allTagsStr
+                ConstraintCount    = $constraintsCount
+                DeploymentName     = $dep.name
+                DeploymentID       = $dep.id
+                DeploymentStatus   = $dep.status
+                Owner              = if ($dep.ownedBy)  { $dep.ownedBy }  else { "N/A" }
+                CreatedBy          = if ($dep.createdBy) { $dep.createdBy } else { "N/A" }
+                CatalogItem        = if ($dep.inputs -and $dep.inputs._catalogItemName) { $dep.inputs._catalogItemName } else { "N/A" }
+                vRAServer          = ($vraServer -split '\.')[0]
+                ResourceID         = $resource.id
+            })
         }
     }
-
-    $count++
 }
 
-Write-Host "`n`n=== DIAGNOSTIC COMPLETE - $count deployments inspected ===" -ForegroundColor Cyan
+# ============================================================================
+# EXPORT CSV
+# ============================================================================
+
+$outputDir = Split-Path $outputCsv
+if (-not (Test-Path $outputDir)) {
+    New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+}
+
+# Sort: untagged first, then alphabetical by VM name
+$report | Sort-Object HasManagedTag, VMName | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
+
+$managed   = ($report | Where-Object { $_.HasManagedTag -eq $true  }).Count
+$unmanaged = ($report | Where-Object { $_.HasManagedTag -eq $false }).Count
+
+Write-Log "=== AUDIT COMPLETE ===" "SUCCESS"
+Write-Log "Total VMs audited  : $($report.Count)"
+Write-Log "  Managed:true     : $managed"   "SUCCESS"
+Write-Log "  Tag missing      : $unmanaged" "WARN"
+Write-Log "CSV saved to       : $outputCsv" "SUCCESS"
