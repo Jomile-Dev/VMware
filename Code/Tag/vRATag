@@ -1,0 +1,250 @@
+# ============================================================================
+# VM MANAGED TAG AUDIT
+# Checks each Cloud.vSphere.Machine deployment's Custom Properties > constraints
+# for the presence of {"tag":"Managed:true"} and exports a CSV report.
+# ============================================================================
+
+# ============================================================================
+# CONFIGURATION - update to match your environment
+# ============================================================================
+
+$vraServers = @(
+    "vra1.yourdomain.com",
+    "vra2.yourdomain.com"
+)
+
+$outputCsv = "C:\Reports\VM_ManagedTag_Audit_$(Get-Date -Format 'yyyy-MM-dd_HHmm').csv"
+
+# ============================================================================
+# HELPERS
+# ============================================================================
+
+function Write-Log {
+    param([string]$Message, [string]$Level = "INFO")
+    $color = switch ($Level) {
+        "ERROR"   { "Red" }
+        "WARN"    { "Yellow" }
+        "SUCCESS" { "Green" }
+        default   { "Cyan" }
+    }
+    Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [$Level] $Message" -ForegroundColor $color
+}
+
+function Disable-SSLValidation {
+    if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
+        Add-Type @"
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+public class TrustAllCertsPolicy : ICertificatePolicy {
+    public bool CheckValidationResult(
+        ServicePoint svcPoint, X509Certificate certificate,
+        WebRequest request, int certificateProblem) { return true; }
+}
+"@
+        [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+    }
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+}
+
+function Get-VraAuthHeaders {
+    param([string]$VraServer, [string]$Username, [string]$Password)
+
+    $authUri  = "https://$VraServer/csp/gateway/am/api/login"
+    $authBody = @{ username = $Username; password = $Password } | ConvertTo-Json
+
+    $response = Invoke-RestMethod -Uri $authUri -Method Post `
+        -Headers @{ "Content-Type" = "application/json" } `
+        -Body $authBody -ErrorAction Stop
+
+    return @{
+        "Authorization" = "Bearer $($response.cspAuthToken)"
+        "Content-Type"  = "application/json"
+    }
+}
+
+# ============================================================================
+# CORE FUNCTION: Check constraints for Managed:true tag
+# ============================================================================
+
+function Test-ManagedTag {
+    <#
+    .SYNOPSIS
+        Returns $true if the constraints array contains {"tag":"Managed:true"}.
+    .PARAMETER Constraints
+        The raw value of the 'constraints' custom property (string or array).
+    #>
+    param($Constraints)
+
+    if ($null -eq $Constraints) { return $false }
+
+    # Normalise to a JSON string for pattern matching regardless of type
+    $json = if ($Constraints -is [string]) {
+        $Constraints
+    } else {
+        $Constraints | ConvertTo-Json -Depth 10 -Compress
+    }
+
+    # Match  "tag":"Managed:true"  with optional whitespace
+    return ($json -match '"tag"\s*:\s*"Managed:true"')
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+Disable-SSLValidation
+
+# Load credentials (adjust paths as needed)
+$credential = Import-Clixml -Path "C:\Creds\aria_vra_cred.xml"
+$username   = $credential.UserName
+$password   = $credential.GetNetworkCredential().Password
+
+$report = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+foreach ($vraServer in $vraServers) {
+
+    Write-Log "=== Connecting to vRA: $vraServer ==="
+
+    try {
+        $headers = Get-VraAuthHeaders -VraServer $vraServer -Username $username -Password $password
+        Write-Log "Authenticated to $vraServer" "SUCCESS"
+    }
+    catch {
+        Write-Log "Auth failed for $vraServer : $($_.Exception.Message)" "ERROR"
+        continue
+    }
+
+    # ---- Page through all active deployments --------------------------------
+    $page     = 0
+    $pageSize = 200
+    $allDeployments = [System.Collections.Generic.List[object]]::new()
+
+    do {
+        $uri = "https://$vraServer/deployment/api/deployments?page=$page&size=$pageSize&expand=resources&apiVersion=2020-08-25"
+        try {
+            $resp        = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers -ErrorAction Stop
+            $deployments = if ($resp.content) { $resp.content } else { $resp }
+
+            if ($deployments -and $deployments.Count -gt 0) {
+                $allDeployments.AddRange([object[]]$deployments)
+                $page++
+            } else { break }
+
+            $hasMore = if ($resp.totalPages)    { $page -lt $resp.totalPages }
+                       elseif ($resp.totalElements) { ($page * $pageSize) -lt $resp.totalElements }
+                       else { $deployments.Count -eq $pageSize }
+        }
+        catch {
+            Write-Log "Error paging deployments (page $page): $($_.Exception.Message)" "ERROR"
+            break
+        }
+    } while ($hasMore)
+
+    Write-Log "Retrieved $($allDeployments.Count) deployments from $vraServer"
+
+    # ---- Inspect each Cloud.vSphere.Machine resource ------------------------
+    foreach ($dep in $allDeployments) {
+
+        if (-not $dep.resources) { continue }
+
+        $vmResources = $dep.resources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" }
+
+        foreach ($resource in $vmResources) {
+
+            # Resolve VM hostname from properties (same logic as main script)
+            $vmName = $null
+            $props  = $resource.properties
+
+            if ($props) {
+                foreach ($field in @('resourceName','hostname','hostName','name','address')) {
+                    if ($props.PSObject.Properties[$field] -and $props.$field) {
+                        $candidate = $props.$field
+                        if ($candidate -notmatch "Cloud_vSphere_Machine_\d+") {
+                            $vmName = $candidate
+                            break
+                        }
+                    }
+                }
+            }
+
+            if (-not $vmName -and $resource.name -notmatch "Cloud_vSphere_Machine_\d+") {
+                $vmName = $resource.name
+            }
+
+            if (-not $vmName) { $vmName = $resource.id }   # last resort
+
+            # ---- Locate constraints in Custom Properties --------------------
+            #
+            # vRA exposes custom properties under resource.properties.
+            # The 'constraints' field may be:
+            #   (a) a JSON string  -> "[{\"tag\":\"Managed:true\"},{...}]"
+            #   (b) a PS array     -> @( @{tag="Managed:true"}, ... )
+            #   (c) absent / null
+            #
+            # We also check the top-level deployment inputs for constraints
+            # in case they are passed there instead.
+
+            $constraintsRaw = $null
+
+            # 1. resource.properties.constraints
+            if ($props -and $props.PSObject.Properties['constraints']) {
+                $constraintsRaw = $props.constraints
+            }
+
+            # 2. Fallback: deployment-level inputs (sometimes constraints live here)
+            if ($null -eq $constraintsRaw -and $dep.inputs -and $dep.inputs.PSObject.Properties['constraints']) {
+                $constraintsRaw = $dep.inputs.constraints
+            }
+
+            $hasManagedTag   = Test-ManagedTag -Constraints $constraintsRaw
+
+            # Serialise the raw constraints for the report (max 500 chars)
+            $constraintsStr = if ($null -eq $constraintsRaw) {
+                "(not set)"
+            } elseif ($constraintsRaw -is [string]) {
+                $constraintsRaw
+            } else {
+                ($constraintsRaw | ConvertTo-Json -Depth 5 -Compress)
+            }
+            if ($constraintsStr.Length -gt 500) {
+                $constraintsStr = $constraintsStr.Substring(0, 497) + "..."
+            }
+
+            $report.Add([PSCustomObject]@{
+                VMName           = $vmName
+                DeploymentName   = $dep.name
+                DeploymentID     = $dep.id
+                DeploymentStatus = $dep.status
+                Owner            = if ($dep.ownedBy)   { $dep.ownedBy }   else { "N/A" }
+                CreatedBy        = if ($dep.createdBy)  { $dep.createdBy } else { "N/A" }
+                CatalogItem      = if ($dep.inputs._catalogItemName) { $dep.inputs._catalogItemName } else { "N/A" }
+                vRAServer        = ($vraServer -split '\.')[0]
+                HasManagedTag    = $hasManagedTag          # $true / $false
+                ManagedTagStatus = if ($hasManagedTag) { "YES - Managed:true present" } else { "NO  - tag missing or false" }
+                RawConstraints   = $constraintsStr
+            })
+
+            Write-Log "  $vmName -> Managed:true = $hasManagedTag"
+        }
+    }
+}
+
+# ============================================================================
+# EXPORT CSV
+# ============================================================================
+
+$outputDir = Split-Path $outputCsv
+if (-not (Test-Path $outputDir)) {
+    New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+}
+
+$report | Sort-Object HasManagedTag, VMName | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
+
+$managed   = ($report | Where-Object { $_.HasManagedTag -eq $true  }).Count
+$unmanaged = ($report | Where-Object { $_.HasManagedTag -eq $false }).Count
+
+Write-Log "=== AUDIT COMPLETE ===" "SUCCESS"
+Write-Log "Total VMs audited : $($report.Count)"
+Write-Log "  Managed:true    : $managed"
+Write-Log "  Tag missing     : $unmanaged"
+Write-Log "CSV saved to      : $outputCsv" "SUCCESS"
