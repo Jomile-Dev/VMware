@@ -1,6 +1,8 @@
 # ============================================================================
-# VM MANAGED TAG AUDIT - v5
-# Uses /iaas/api/machines which returns all VMs + constraints in one call
+# VM MANAGED TAG AUDIT - v6
+# 1. IaaS API -> all VMs + deploymentId
+# 2. /deployment/api/deployments/{depId}/resources -> find resource ID by VM name
+# 3. /deployment/api/resources/{id} (Method 1) -> get constraints
 # ============================================================================
 
 $vraServers = @(
@@ -41,7 +43,8 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 }
 
-function Get-AllPages {
+# IaaS API uses $top/$skip pagination
+function Get-AllIaaSPages {
     param(
         [string]$BaseUri,
         [hashtable]$Headers,
@@ -53,8 +56,6 @@ function Get-AllPages {
 
     do {
         $separator = if ($BaseUri -match '\?') { '&' } else { '?' }
-
-        # IaaS API uses $top/$skip OData style pagination
         $uri = "$BaseUri${separator}`$top=$PageSize&`$skip=$skip"
 
         try {
@@ -64,10 +65,7 @@ function Get-AllPages {
             if ($items -and @($items).Count -gt 0) {
                 $all.AddRange([object[]]@($items))
                 Write-Log "    Skip $skip : $(@($items).Count) items (running total: $($all.Count))"
-
                 $skip += $PageSize
-
-                # Stop if fewer items returned than requested — last page
                 if (@($items).Count -lt $PageSize) { break }
             }
             else { break }
@@ -77,10 +75,47 @@ function Get-AllPages {
             break
         }
 
-        if ($skip -ge 10000) {
-            Write-Log "  Hit 10000 item safety cap" "WARN"
+        if ($skip -ge 10000) { Write-Log "  Hit 10000 safety cap" "WARN"; break }
+
+    } while ($true)
+
+    return $all
+}
+
+# Deployment API uses page/size pagination
+function Get-AllDepPages {
+    param(
+        [string]$BaseUri,
+        [hashtable]$Headers,
+        [int]$PageSize = 200
+    )
+
+    $all  = [System.Collections.Generic.List[object]]::new()
+    $page = 0
+
+    do {
+        $separator = if ($BaseUri -match '\?') { '&' } else { '?' }
+        $uri = "$BaseUri${separator}page=$page&size=$PageSize"
+
+        try {
+            $resp  = Invoke-RestMethod -Uri $uri -Method Get -Headers $Headers -ErrorAction Stop
+            $items = if ($resp.content) { $resp.content } else { $resp }
+
+            if ($items -and @($items).Count -gt 0) {
+                $all.AddRange([object[]]@($items))
+                $totalPages = if ($resp.totalPages) { [int]$resp.totalPages } else { 0 }
+                $page++
+                if ($totalPages -gt 0 -and $page -ge $totalPages) { break }
+                if (@($items).Count -lt $PageSize) { break }
+            }
+            else { break }
+        }
+        catch {
+            Write-Log "  Pagination error (page $page): $($_.Exception.Message)" "WARN"
             break
         }
+
+        if ($page -ge 500) { break }
 
     } while ($true)
 
@@ -124,24 +159,23 @@ foreach ($vraServer in $vraServers) {
     }
 
     # ------------------------------------------------------------------
-    # Fetch all machines from IaaS API — has constraints inline
+    # STEP 1: Get all VMs from IaaS API
     # ------------------------------------------------------------------
     Write-Log "Fetching all machines from IaaS API..."
 
-    $allMachines = Get-AllPages `
+    $allMachines = Get-AllIaaSPages `
         -BaseUri "https://$vraServer/iaas/api/machines?apiVersion=2021-07-15" `
         -Headers $headers
 
-    Write-Log "Total machines retrieved: $($allMachines.Count)" "SUCCESS"
+    Write-Log "Total machines from IaaS: $($allMachines.Count)" "SUCCESS"
 
-    $vmCount = 0
+    # Cache deployment resources to avoid re-fetching same deployment
+    $deploymentResourceCache = @{}
+
+    $vmCount  = 0
+    $errCount = 0
 
     foreach ($machine in $allMachines) {
-
-        # Filter to vSphere only — skip anything that isn't Cloud.vSphere.Machine
-        if ($machine.type -and $machine.type -ne "Cloud.vSphere.Machine") {
-            continue
-        }
 
         # Resolve VM name
         $vmName = $null
@@ -153,29 +187,85 @@ foreach ($vraServer in $vraServers) {
         }
         if (-not $vmName) { $vmName = $machine.id }
 
-        # Deduplicate across vRA servers
+        # Deduplicate
         if ($seenNames.ContainsKey($vmName.ToLower())) { continue }
         $seenNames[$vmName.ToLower()] = $true
 
         $vmCount++
+        if ($vmCount % 50 -eq 0) {
+            Write-Log "  Progress: $vmCount / $($allMachines.Count) | Errors: $errCount"
+        }
+
+        $depId = $machine.deploymentId
 
         # ----------------------------------------------------------
-        # Read constraints directly from machine object
-        # Structure: [{"tag":"Datacenter:XYZ"},{"tag":"Managed:true"},...]
+        # STEP 2: Get deployment resources (cached per deploymentId)
+        # ----------------------------------------------------------
+        $resourceId = $null
+
+        if ($depId) {
+            if (-not $deploymentResourceCache.ContainsKey($depId)) {
+                try {
+                    $depResources = Get-AllDepPages `
+                        -BaseUri "https://$vraServer/deployment/api/deployments/$depId/resources?apiVersion=2020-08-25" `
+                        -Headers $headers
+                    $deploymentResourceCache[$depId] = $depResources
+                }
+                catch {
+                    Write-Log "  Could not get resources for deployment $depId : $($_.Exception.Message)" "WARN"
+                    $deploymentResourceCache[$depId] = @()
+                }
+            }
+
+            # Match by VM name to get the deployment resource ID
+            $depResources = $deploymentResourceCache[$depId]
+            $matchedResource = $depResources | Where-Object {
+                $_.type -eq "Cloud.vSphere.Machine" -and (
+                    ($_.properties.PSObject.Properties['resourceName'] -and $_.properties.resourceName -eq $vmName) -or
+                    ($_.properties.PSObject.Properties['hostname']     -and $_.properties.hostname     -eq $vmName) -or
+                    ($_.properties.PSObject.Properties['hostName']     -and $_.properties.hostName     -eq $vmName) -or
+                    ($_.properties.PSObject.Properties['name']         -and $_.properties.name         -eq $vmName) -or
+                    ($_.name -eq $vmName)
+                )
+            } | Select-Object -First 1
+
+            if ($matchedResource) {
+                $resourceId = $matchedResource.id
+            }
+        }
+
+        # ----------------------------------------------------------
+        # STEP 3: Fetch full resource (Method 1) to get constraints
         # ----------------------------------------------------------
         $constraints   = $null
         $hasManagedTag = $false
         $allTags       = @()
 
-        # Constraints may sit at top level or under customProperties
-        if ($machine.PSObject.Properties['constraints']) {
-            $constraints = $machine.constraints
+        if ($resourceId) {
+            try {
+                $fullResource = Invoke-RestMethod `
+                    -Uri "https://$vraServer/deployment/api/resources/$resourceId`?apiVersion=2020-08-25" `
+                    -Method Get -Headers $headers -ErrorAction Stop
+
+                $props = $fullResource.properties
+
+                if ($props -and $props.PSObject.Properties['constraints']) {
+                    $constraints = $props.constraints
+                }
+            }
+            catch {
+                $errCount++
+                Write-Log "  Could not fetch resource $resourceId : $($_.Exception.Message)" "WARN"
+            }
         }
-        elseif ($machine.PSObject.Properties['customProperties'] -and
-                $machine.customProperties.PSObject.Properties['constraints']) {
-            $constraints = $machine.customProperties.constraints
+        else {
+            Write-Log "  Could not find deployment resource ID for: $vmName" "WARN"
         }
 
+        # ----------------------------------------------------------
+        # Parse constraints
+        # Structure: [{"tag":"Datacenter:XYZ"},{"tag":"Managed:true"},...]
+        # ----------------------------------------------------------
         if ($constraints) {
             foreach ($entry in @($constraints)) {
                 $tagValue = $null
@@ -207,16 +297,16 @@ foreach ($vraServer in $vraServers) {
             ManagedTagStatus  = if ($hasManagedTag) { "YES - Managed:true present" } else { "NO  - tag missing" }
             AllConstraintTags = $allTagsStr
             ConstraintCount   = $constraintsCount
-            DeploymentID      = if ($machine.deploymentId)  { $machine.deploymentId }  else { "N/A" }
-            Owner             = if ($machine.ownedBy)        { $machine.ownedBy }        else { "N/A" }
-            CreatedBy         = if ($machine.createdBy)      { $machine.createdBy }      else { "N/A" }
-            PowerState        = if ($machine.powerState)     { $machine.powerState }     else { "N/A" }
+            DeploymentID      = if ($depId)              { $depId }              else { "N/A" }
+            ResourceID        = if ($resourceId)          { $resourceId }         else { "N/A" }
+            Owner             = if ($machine.ownedBy)     { $machine.ownedBy }    else { "N/A" }
+            CreatedBy         = if ($machine.createdBy)   { $machine.createdBy }  else { "N/A" }
+            PowerState        = if ($machine.powerState)  { $machine.powerState } else { "N/A" }
             vRAServer         = ($vraServer -split '\.')[0]
-            ResourceID        = $machine.id
         })
     }
 
-    Write-Log "Finished $vraServer — $vmCount vSphere VMs processed" "SUCCESS"
+    Write-Log "Finished $vraServer — $vmCount VMs processed, $errCount errors" "SUCCESS"
 }
 
 # ============================================================================
