@@ -49,11 +49,13 @@ function Get-AllPages {
     )
 
     $all  = [System.Collections.Generic.List[object]]::new()
-    $page = 0
+    $skip = 0
 
     do {
         $separator = if ($BaseUri -match '\?') { '&' } else { '?' }
-        $uri = "$BaseUri${separator}page=$page&size=$PageSize"
+
+        # IaaS API uses $top/$skip OData style pagination
+        $uri = "$BaseUri${separator}`$top=$PageSize&`$skip=$skip"
 
         try {
             $resp  = Invoke-RestMethod -Uri $uri -Method Get -Headers $Headers -ErrorAction Stop
@@ -61,23 +63,22 @@ function Get-AllPages {
 
             if ($items -and @($items).Count -gt 0) {
                 $all.AddRange([object[]]@($items))
-                Write-Log "    Page $page : $(@($items).Count) items (running total: $($all.Count))"
+                Write-Log "    Skip $skip : $(@($items).Count) items (running total: $($all.Count))"
 
-                $totalPages = if ($resp.totalPages) { [int]$resp.totalPages } else { 0 }
-                $page++
+                $skip += $PageSize
 
-                if ($totalPages -gt 0 -and $page -ge $totalPages) { break }
+                # Stop if fewer items returned than requested — last page
                 if (@($items).Count -lt $PageSize) { break }
             }
             else { break }
         }
         catch {
-            Write-Log "  Pagination error (page $page): $($_.Exception.Message)" "WARN"
+            Write-Log "  Pagination error (skip $skip): $($_.Exception.Message)" "WARN"
             break
         }
 
-        if ($page -ge 500) {
-            Write-Log "  Hit 500 page safety cap" "WARN"
+        if ($skip -ge 10000) {
+            Write-Log "  Hit 10000 item safety cap" "WARN"
             break
         }
 
