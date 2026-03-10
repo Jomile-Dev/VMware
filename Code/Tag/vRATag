@@ -148,18 +148,44 @@ foreach ($vraServer in $vraServers) {
                 -Uri "https://$vraServer/deployment/api/resources/$($machine.id)?apiVersion=2020-08-25" `
                 -Method Get -Headers $headers -ErrorAction Stop
 
-            # Constraints sit at root level of fullResource, not under .properties
-            if ($fullResource.PSObject.Properties['constraints']) {
-                $constraints = $fullResource.constraints
-            }
-            # Fallback: check under .properties if root doesn't have it
-            elseif ($fullResource.properties -and $fullResource.properties.PSObject.Properties['constraints']) {
-                $constraints = $fullResource.properties.constraints
+            # fullResource comes back as an escaped JSON string, need to parse it
+            $parsed = $null
+            if ($fullResource -is [string]) {
+                $parsed = $fullResource | ConvertFrom-Json
+            } else {
+                # May already be an object but with a nested JSON string inside
+                $parsed = $fullResource
             }
 
-            # Debug: dump ALL tag values for first 3 VMs so we can verify exact format
+            # Try to find constraints - check common locations
+            $constraints = $null
+
+            # 1. Root level parsed object
+            if ($parsed.PSObject.Properties['constraints']) {
+                $constraints = $parsed.constraints
+            }
+            # 2. Inside a 'properties' string that needs another parse
+            elseif ($parsed.PSObject.Properties['properties']) {
+                $innerProps = $parsed.properties
+                if ($innerProps -is [string]) {
+                    try { $innerProps = $innerProps | ConvertFrom-Json } catch {}
+                }
+                if ($innerProps.PSObject.Properties['constraints']) {
+                    $constraints = $innerProps.constraints
+                }
+            }
+
+            # 3. If still nothing, try parsing the whole thing as string and regex extract
+            if (-not $constraints) {
+                $rawJson = $fullResource | ConvertTo-Json -Depth 20 -Compress
+                if ($rawJson -match '"constraints"\s*:\s*(\[.*?\])') {
+                    try { $constraints = $matches[1] | ConvertFrom-Json } catch {}
+                }
+            }
+
+            # Debug first 3 VMs
             if ($vmCount -le 3) {
-                Write-Log "  DEBUG $vmName constraints raw: $($constraints | ConvertTo-Json -Compress -Depth 5)" "WARN"
+                Write-Log "  DEBUG $vmName constraints: $($constraints | ConvertTo-Json -Compress -Depth 5)" "WARN"
             }
         }
         catch {
@@ -181,10 +207,14 @@ foreach ($vraServer in $vraServers) {
                 elseif ($entry.PSObject.Properties['tag']) {
                     $tagValue = $entry.tag
                 }
+                elseif ($entry.PSObject.Properties['value']) {
+                    $tagValue = $entry.value
+                }
 
                 if ($tagValue) {
                     $allTags += $tagValue
-                    if ($tagValue -eq "Managed:true") {
+                    # Match Managed:true regardless of what comes before it
+                    if ($tagValue -match "Managed:true") {
                         $hasManagedTag = $true
                     }
                 }
