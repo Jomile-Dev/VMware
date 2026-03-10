@@ -1,7 +1,6 @@
 # ============================================================================
-# VM MANAGED TAG AUDIT - Fixed v2
-# Fetches full resource via /deployment/api/resources/{id}
-# Checks constraints array for {"tag":"Managed:true"}
+# VM MANAGED TAG AUDIT - v3
+# Fixes: full deployment pagination, resource pagination, includes deleted
 # ============================================================================
 
 $vraServers = @(
@@ -42,6 +41,59 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 }
 
+# Fetches ALL pages from a vRA list endpoint and returns every item
+function Get-AllPages {
+    param(
+        [string]$BaseUri,
+        [hashtable]$Headers,
+        [int]$PageSize = 200
+    )
+
+    $all  = [System.Collections.Generic.List[object]]::new()
+    $page = 0
+
+    do {
+        $separator = if ($BaseUri -match '\?') { '&' } else { '?' }
+        $uri = "$BaseUri${separator}page=$page&size=$PageSize"
+
+        try {
+            $resp  = Invoke-RestMethod -Uri $uri -Method Get -Headers $Headers -ErrorAction Stop
+            $items = if ($resp.content) { $resp.content } else { $resp }
+
+            if ($items -and @($items).Count -gt 0) {
+                $all.AddRange([object[]]@($items))
+
+                # Determine if more pages exist
+                $totalPages = if ($resp.totalPages) { [int]$resp.totalPages } else { 0 }
+
+                $page++
+
+                # Stop if we've passed the last page
+                if ($totalPages -gt 0 -and $page -ge $totalPages) { break }
+
+                # Stop if we got fewer items than the page size (last page)
+                if (@($items).Count -lt $PageSize) { break }
+            }
+            else {
+                break
+            }
+        }
+        catch {
+            Write-Log "  Pagination error (page $page): $($_.Exception.Message)" "WARN"
+            break
+        }
+
+        # Safety cap
+        if ($page -ge 500) {
+            Write-Log "  Hit 500 page safety cap on $BaseUri" "WARN"
+            break
+        }
+
+    } while ($true)
+
+    return $all
+}
+
 # ============================================================================
 # MAIN
 # ============================================================================
@@ -52,11 +104,12 @@ $credential = Import-Clixml -Path "C:\Creds\aria_vra_cred.xml"
 $username   = $credential.UserName
 $password   = $credential.GetNetworkCredential().Password
 
-$report = [System.Collections.Generic.List[PSCustomObject]]::new()
+$report        = [System.Collections.Generic.List[PSCustomObject]]::new()
+$seenResources = @{}   # deduplicate by resource ID across vRA servers
 
 foreach ($vraServer in $vraServers) {
 
-    Write-Log "=== Connecting to vRA: $vraServer ==="
+    Write-Log "=== Connecting to vRA: $vraServer ===" "SUCCESS"
 
     try {
         $authResp = Invoke-RestMethod `
@@ -78,59 +131,54 @@ foreach ($vraServer in $vraServers) {
     }
 
     # ------------------------------------------------------------------
-    # Page through all active deployments (lightweight, no expand needed)
+    # Fetch ALL deployments — active AND deleted
     # ------------------------------------------------------------------
-    $page           = 0
-    $pageSize       = 200
-    $allDeployments = [System.Collections.Generic.List[object]]::new()
+    Write-Log "Fetching active deployments..."
+    $activeDeployments = Get-AllPages `
+        -BaseUri "https://$vraServer/deployment/api/deployments?apiVersion=2020-08-25" `
+        -Headers $headers
 
-    do {
-        $uri = "https://$vraServer/deployment/api/deployments?page=$page&size=$pageSize&apiVersion=2020-08-25"
-        try {
-            $resp        = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers -ErrorAction Stop
-            $deployments = if ($resp.content) { $resp.content } else { $resp }
+    Write-Log "Fetching deleted deployments..."
+    $deletedDeployments = Get-AllPages `
+        -BaseUri "https://$vraServer/deployment/api/deployments?deleted=true&apiVersion=2020-08-25" `
+        -Headers $headers
 
-            if ($deployments -and $deployments.Count -gt 0) {
-                $allDeployments.AddRange([object[]]$deployments)
-                $page++
-            } else { break }
+    $allDeployments = @($activeDeployments) + @($deletedDeployments)
+    Write-Log "Total deployments: $($allDeployments.Count) (active: $($activeDeployments.Count), deleted: $($deletedDeployments.Count))" "SUCCESS"
 
-            $hasMore = if ($resp.totalPages)       { $page -lt $resp.totalPages }
-                       elseif ($resp.totalElements) { ($page * $pageSize) -lt $resp.totalElements }
-                       else                         { $deployments.Count -eq $pageSize }
-        }
-        catch {
-            Write-Log "Error paging deployments (page $page): $($_.Exception.Message)" "ERROR"
-            break
-        }
-    } while ($hasMore)
+    $depCount = 0
+    $vmCount  = 0
 
-    Write-Log "Retrieved $($allDeployments.Count) deployments from $vraServer"
-
-    # ------------------------------------------------------------------
-    # For each deployment, get its resources, then fetch each VM fully
-    # ------------------------------------------------------------------
     foreach ($dep in $allDeployments) {
 
-        # Get all resources for this deployment
-        try {
-            $resResp      = Invoke-RestMethod `
-                -Uri "https://$vraServer/deployment/api/deployments/$($dep.id)/resources?apiVersion=2020-08-25" `
-                -Method Get -Headers $headers -ErrorAction Stop
-            $depResources = if ($resResp.content) { $resResp.content } else { $resResp }
-        }
-        catch {
-            Write-Log "  Could not get resources for deployment $($dep.id): $($_.Exception.Message)" "WARN"
-            continue
+        $depCount++
+        if ($depCount % 50 -eq 0) {
+            Write-Log "  Progress: $depCount / $($allDeployments.Count) deployments processed, $vmCount VMs found so far"
         }
 
-        $vmResources = $depResources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" }
-        if (-not $vmResources) { continue }
+        # ----------------------------------------------------------
+        # Get ALL resources for this deployment (paginated)
+        # ----------------------------------------------------------
+        $deletedParam = if ($dep.status -eq "DELETED" -or $dep.deleted -eq $true) { "&deleted=true" } else { "" }
+
+        $depResources = Get-AllPages `
+            -BaseUri "https://$vraServer/deployment/api/deployments/$($dep.id)/resources?apiVersion=2020-08-25$deletedParam" `
+            -Headers $headers
+
+        $vmResources = @($depResources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" })
+
+        if ($vmResources.Count -eq 0) { continue }
 
         foreach ($resource in $vmResources) {
 
+            # Skip if already processed (same resource can appear in active + deleted queries)
+            if ($seenResources.ContainsKey($resource.id)) { continue }
+            $seenResources[$resource.id] = $true
+
+            $vmCount++
+
             # ----------------------------------------------------------
-            # Fetch the FULL resource (Method 1) — this has constraints
+            # Fetch FULL resource detail (Method 1 — has constraints)
             # ----------------------------------------------------------
             $fullResource = $null
             try {
@@ -140,7 +188,7 @@ foreach ($vraServer in $vraServers) {
             }
             catch {
                 Write-Log "  Could not fetch full resource $($resource.id): $($_.Exception.Message)" "WARN"
-                $fullResource = $resource   # fall back to the shallow version
+                $fullResource = $resource
             }
 
             # ----------------------------------------------------------
@@ -151,7 +199,8 @@ foreach ($vraServer in $vraServers) {
 
             if ($props) {
                 foreach ($field in @('resourceName','hostname','hostName','name','address')) {
-                    if ($props.PSObject.Properties[$field] -and $props.$field -and
+                    if ($props.PSObject.Properties[$field] -and
+                        $props.$field -and
                         $props.$field -notmatch "Cloud_vSphere_Machine_\d+") {
                         $vmName = $props.$field
                         break
@@ -166,24 +215,22 @@ foreach ($vraServer in $vraServers) {
             if (-not $vmName) { $vmName = $resource.id }
 
             # ----------------------------------------------------------
-            # Read constraints from properties
-            # Structure: "constraints":[{"tag":"Datacenter:XYZ"},{"tag":"Managed:true"},...]
+            # Read constraints
+            # Structure: [{"tag":"Datacenter:XYZ"},{"tag":"Managed:true"},...]
             # ----------------------------------------------------------
-            $constraints    = $null
-            $hasManagedTag  = $false
-            $allTags        = @()
+            $constraints   = $null
+            $hasManagedTag = $false
+            $allTags       = @()
 
             if ($props -and $props.PSObject.Properties['constraints']) {
                 $constraints = $props.constraints
             }
 
             if ($constraints) {
-                # constraints is an array of objects with a "tag" property
-                foreach ($entry in $constraints) {
+                foreach ($entry in @($constraints)) {
                     $tagValue = $null
 
                     if ($entry -is [string]) {
-                        # Shouldn't happen given what you showed, but handle just in case
                         $tagValue = $entry
                     }
                     elseif ($entry.PSObject.Properties['tag']) {
@@ -192,7 +239,6 @@ foreach ($vraServer in $vraServers) {
 
                     if ($tagValue) {
                         $allTags += $tagValue
-
                         if ($tagValue -eq "Managed:true") {
                             $hasManagedTag = $true
                         }
@@ -200,11 +246,15 @@ foreach ($vraServer in $vraServers) {
                 }
             }
 
-            # Friendly string of all tags for the CSV
             $allTagsStr       = if ($allTags.Count -gt 0) { $allTags -join " | " } else { "(none)" }
             $constraintsCount = if ($constraints) { @($constraints).Count } else { 0 }
 
-            Write-Log "  $vmName -> Managed:true=$hasManagedTag | Tags: $allTagsStr"
+            # Deployment status - mark deleted clearly
+            $depStatusDisplay = if ($dep.status -eq "DELETED" -or $dep.deleted -eq $true) {
+                "DELETED"
+            } else {
+                $dep.status
+            }
 
             $report.Add([PSCustomObject]@{
                 VMName             = $vmName
@@ -214,15 +264,17 @@ foreach ($vraServer in $vraServers) {
                 ConstraintCount    = $constraintsCount
                 DeploymentName     = $dep.name
                 DeploymentID       = $dep.id
-                DeploymentStatus   = $dep.status
-                Owner              = if ($dep.ownedBy)  { $dep.ownedBy }  else { "N/A" }
-                CreatedBy          = if ($dep.createdBy) { $dep.createdBy } else { "N/A" }
+                DeploymentStatus   = $depStatusDisplay
+                Owner              = if ($dep.ownedBy)   { $dep.ownedBy }   else { "N/A" }
+                CreatedBy          = if ($dep.createdBy)  { $dep.createdBy } else { "N/A" }
                 CatalogItem        = if ($dep.inputs -and $dep.inputs._catalogItemName) { $dep.inputs._catalogItemName } else { "N/A" }
                 vRAServer          = ($vraServer -split '\.')[0]
                 ResourceID         = $resource.id
             })
         }
     }
+
+    Write-Log "Finished $vraServer — $vmCount Cloud.vSphere.Machine resources found" "SUCCESS"
 }
 
 # ============================================================================
@@ -234,14 +286,15 @@ if (-not (Test-Path $outputDir)) {
     New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
 }
 
-# Sort: untagged first, then alphabetical by VM name
+# Sort: NO tag first, then YES, alphabetical within each group
 $report | Sort-Object HasManagedTag, VMName | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
 
 $managed   = ($report | Where-Object { $_.HasManagedTag -eq $true  }).Count
 $unmanaged = ($report | Where-Object { $_.HasManagedTag -eq $false }).Count
 
+Write-Log ""
 Write-Log "=== AUDIT COMPLETE ===" "SUCCESS"
-Write-Log "Total VMs audited  : $($report.Count)"
-Write-Log "  Managed:true     : $managed"   "SUCCESS"
-Write-Log "  Tag missing      : $unmanaged" "WARN"
-Write-Log "CSV saved to       : $outputCsv" "SUCCESS"
+Write-Log "Total VMs in report : $($report.Count)"
+Write-Log "  Managed:true      : $managed"   "SUCCESS"
+Write-Log "  Tag missing       : $unmanaged" "WARN"
+Write-Log "CSV saved to        : $outputCsv" "SUCCESS"
