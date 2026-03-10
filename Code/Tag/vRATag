@@ -148,10 +148,18 @@ foreach ($vraServer in $vraServers) {
                 -Uri "https://$vraServer/deployment/api/resources/$($machine.id)?apiVersion=2020-08-25" `
                 -Method Get -Headers $headers -ErrorAction Stop
 
-            $props = $fullResource.properties
+            # Constraints sit at root level of fullResource, not under .properties
+            if ($fullResource.PSObject.Properties['constraints']) {
+                $constraints = $fullResource.constraints
+            }
+            # Fallback: check under .properties if root doesn't have it
+            elseif ($fullResource.properties -and $fullResource.properties.PSObject.Properties['constraints']) {
+                $constraints = $fullResource.properties.constraints
+            }
 
-            if ($props -and $props.PSObject.Properties['constraints']) {
-                $constraints = $props.constraints
+            # Debug: dump ALL tag values for first 3 VMs so we can verify exact format
+            if ($vmCount -le 3) {
+                Write-Log "  DEBUG $vmName constraints raw: $($constraints | ConvertTo-Json -Compress -Depth 5)" "WARN"
             }
         }
         catch {
