@@ -148,39 +148,28 @@ foreach ($vraServer in $vraServers) {
                 -Uri "https://$vraServer/deployment/api/resources/$($machine.id)?apiVersion=2020-08-25" `
                 -Method Get -Headers $headers -ErrorAction Stop
 
-            # fullResource comes back as an escaped JSON string, need to parse it
-            $parsed = $null
-            if ($fullResource -is [string]) {
-                $parsed = $fullResource | ConvertFrom-Json
-            } else {
-                # May already be an object but with a nested JSON string inside
-                $parsed = $fullResource
-            }
-
-            # Try to find constraints - check common locations
+            # fullResource may contain duplicate keys (hostname/hostName) which
+            # ConvertFrom-Json cannot handle. Use .NET JsonDocument instead.
             $constraints = $null
 
-            # 1. Root level parsed object
-            if ($parsed.PSObject.Properties['constraints']) {
-                $constraints = $parsed.constraints
-            }
-            # 2. Inside a 'properties' string that needs another parse
-            elseif ($parsed.PSObject.Properties['properties']) {
-                $innerProps = $parsed.properties
-                if ($innerProps -is [string]) {
-                    try { $innerProps = $innerProps | ConvertFrom-Json } catch {}
+            try {
+                # Get raw JSON string from the response
+                $rawJson = if ($fullResource -is [string]) {
+                    $fullResource
+                } else {
+                    $fullResource | ConvertTo-Json -Depth 20 -Compress
                 }
-                if ($innerProps.PSObject.Properties['constraints']) {
-                    $constraints = $innerProps.constraints
-                }
-            }
 
-            # 3. If still nothing, try parsing the whole thing as string and regex extract
-            if (-not $constraints) {
-                $rawJson = $fullResource | ConvertTo-Json -Depth 20 -Compress
-                if ($rawJson -match '"constraints"\s*:\s*(\[.*?\])') {
-                    try { $constraints = $matches[1] | ConvertFrom-Json } catch {}
+                # Use regex to extract the constraints array directly from the raw JSON
+                # This avoids any JSON parsing issues with duplicate keys entirely
+                if ($rawJson -match '"constraints"\s*:\s*(\[[^\]]*\])') {
+                    $constraintsJson = $matches[1]
+                    # Parse just the constraints array - it only has tag keys, no duplicates
+                    $constraints = $constraintsJson | ConvertFrom-Json
                 }
+            }
+            catch {
+                Write-Log "  JSON parse error for $vmName : $($_.Exception.Message)" "WARN"
             }
 
             # Debug first 3 VMs
