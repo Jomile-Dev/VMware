@@ -1,10 +1,10 @@
 # ============================================================================
-# DIAGNOSTIC: Dump raw Custom Properties for Cloud.vSphere.Machine resources
-# Run this first to see exactly what the constraints field looks like
+# DIAGNOSTIC v2: Fetch FULL resource details individually
+# Gets everything under General, Storage, Network, Custom Properties tabs
 # ============================================================================
 
-$vraServer = "vra1.yourdomain.com"   # <-- change to your vRA server
-$maxDeployments = 5                   # <-- how many deployments to inspect
+$vraServer      = "vra1.yourdomain.com"   # <-- change to your vRA server
+$maxDeployments = 3                        # <-- how many deployments to inspect
 
 # ============================================================================
 
@@ -42,7 +42,7 @@ $headers = @{
     "Content-Type"  = "application/json"
 }
 
-Write-Host "`n=== Fetching first $maxDeployments deployments with VM resources ===" -ForegroundColor Cyan
+Write-Host "`n=== Fetching deployments ===" -ForegroundColor Cyan
 
 $resp        = Invoke-RestMethod -Uri "https://$vraServer/deployment/api/deployments?page=0&size=100&expand=resources&apiVersion=2020-08-25" `
     -Method Get -Headers $headers -ErrorAction Stop
@@ -57,61 +57,116 @@ foreach ($dep in $deployments) {
     if (-not $vmResources) { continue }
 
     Write-Host "`n$('='*80)" -ForegroundColor Yellow
-    Write-Host "DEPLOYMENT: $($dep.name)  [$($dep.id)]" -ForegroundColor Yellow
+    Write-Host "DEPLOYMENT : $($dep.name)" -ForegroundColor Yellow
+    Write-Host "ID         : $($dep.id)"
     Write-Host "Status     : $($dep.status)"
     Write-Host "Owner      : $($dep.ownedBy)"
 
     foreach ($resource in $vmResources) {
-        Write-Host "`n  --- VM Resource: $($resource.name) ---" -ForegroundColor Cyan
-        Write-Host "  Resource Type: $($resource.type)"
-        Write-Host "  Resource ID  : $($resource.id)"
 
-        if ($resource.properties) {
-            Write-Host "`n  === ALL PROPERTIES (raw dump) ===" -ForegroundColor Green
-            $resource.properties | ConvertTo-Json -Depth 10 | Write-Host
+        Write-Host "`n  --- RESOURCE (from expand): $($resource.name) [$($resource.id)] ---" -ForegroundColor Cyan
 
-            Write-Host "`n  === PROPERTY NAMES ONLY ===" -ForegroundColor Green
-            $resource.properties.PSObject.Properties.Name | ForEach-Object {
-                Write-Host "    $_"
-            }
+        # ----------------------------------------------------------------
+        # METHOD 1: Full resource detail endpoint
+        # ----------------------------------------------------------------
+        Write-Host "`n  [METHOD 1] GET /deployment/api/resources/{id}" -ForegroundColor Green
+        try {
+            $fullResource = Invoke-RestMethod `
+                -Uri "https://$vraServer/deployment/api/resources/$($resource.id)?apiVersion=2020-08-25" `
+                -Method Get -Headers $headers -ErrorAction Stop
 
-            # Specifically highlight constraints if present
-            if ($resource.properties.PSObject.Properties['constraints']) {
-                Write-Host "`n  >>> CONSTRAINTS FIELD FOUND <<<" -ForegroundColor Magenta
-                Write-Host "  Type: $($resource.properties.constraints.GetType().FullName)"
-                Write-Host "  Value:"
-                $resource.properties.constraints | ConvertTo-Json -Depth 10 | Write-Host
-            } else {
-                Write-Host "`n  >>> NO 'constraints' field on resource.properties <<<" -ForegroundColor Red
-            }
+            Write-Host "  Full resource JSON:" -ForegroundColor Green
+            $fullResource | ConvertTo-Json -Depth 15 | Write-Host
+        }
+        catch {
+            Write-Host "  ERROR: $($_.Exception.Message)" -ForegroundColor Red
+        }
 
-            # Check for any property that mentions "Managed" anywhere
-            Write-Host "`n  === SEARCHING ALL PROPERTIES FOR 'Managed' ===" -ForegroundColor Green
-            $allPropsJson = $resource.properties | ConvertTo-Json -Depth 10 -Compress
-            if ($allPropsJson -match "Managed") {
-                $resource.properties.PSObject.Properties | ForEach-Object {
-                    $propJson = $_.Value | ConvertTo-Json -Depth 5 -Compress
-                    if ($propJson -match "Managed") {
-                        Write-Host "  FOUND in property '$($_.Name)': $propJson" -ForegroundColor Magenta
+        # ----------------------------------------------------------------
+        # METHOD 2: Resource from deployment endpoint
+        # ----------------------------------------------------------------
+        Write-Host "`n  [METHOD 2] GET /deployment/api/deployments/{depId}/resources/{resId}" -ForegroundColor Green
+        try {
+            $depResource = Invoke-RestMethod `
+                -Uri "https://$vraServer/deployment/api/deployments/$($dep.id)/resources/$($resource.id)?apiVersion=2020-08-25" `
+                -Method Get -Headers $headers -ErrorAction Stop
+
+            Write-Host "  Deployment-resource JSON:" -ForegroundColor Green
+            $depResource | ConvertTo-Json -Depth 15 | Write-Host
+        }
+        catch {
+            Write-Host "  ERROR: $($_.Exception.Message)" -ForegroundColor Red
+        }
+
+        # ----------------------------------------------------------------
+        # METHOD 3: List ALL resources for this deployment (no expand filter)
+        # ----------------------------------------------------------------
+        Write-Host "`n  [METHOD 3] GET /deployment/api/deployments/{depId}/resources" -ForegroundColor Green
+        try {
+            $allResources = Invoke-RestMethod `
+                -Uri "https://$vraServer/deployment/api/deployments/$($dep.id)/resources?apiVersion=2020-08-25" `
+                -Method Get -Headers $headers -ErrorAction Stop
+
+            $resources = if ($allResources.content) { $allResources.content } else { $allResources }
+            $matchedRes = $resources | Where-Object { $_.id -eq $resource.id -or $_.type -eq "Cloud.vSphere.Machine" }
+
+            Write-Host "  All deployment resources (VM type only):" -ForegroundColor Green
+            $matchedRes | ConvertTo-Json -Depth 15 | Write-Host
+        }
+        catch {
+            Write-Host "  ERROR: $($_.Exception.Message)" -ForegroundColor Red
+        }
+
+        # ----------------------------------------------------------------
+        # METHOD 4: IaaS machine endpoint (gets OS/disk/network separately)
+        # ----------------------------------------------------------------
+        Write-Host "`n  [METHOD 4] GET /iaas/api/machines (by name)" -ForegroundColor Green
+        try {
+            # Try to get the VM name first
+            $vmName = $null
+            if ($resource.properties) {
+                foreach ($field in @('resourceName','hostname','hostName','name','address')) {
+                    if ($resource.properties.PSObject.Properties[$field] -and $resource.properties.$field) {
+                        $vmName = $resource.properties.$field
+                        break
                     }
                 }
-            } else {
-                Write-Host "  'Managed' string not found anywhere in properties" -ForegroundColor Red
             }
-        } else {
-            Write-Host "  >>> resource.properties is NULL/EMPTY <<<" -ForegroundColor Red
-        }
-    }
+            if (-not $vmName) { $vmName = $resource.name }
 
-    # Also check deployment-level inputs
-    Write-Host "`n  === DEPLOYMENT-LEVEL INPUTS ===" -ForegroundColor Cyan
-    if ($dep.inputs) {
-        $dep.inputs | ConvertTo-Json -Depth 10 | Write-Host
-    } else {
-        Write-Host "  (no inputs)"
+            if ($vmName -and $vmName -notmatch "Cloud_vSphere_Machine_\d+") {
+                $iaasResp = Invoke-RestMethod `
+                    -Uri "https://$vraServer/iaas/api/machines?`$filter=name+eq+'$vmName'&apiVersion=2021-07-15" `
+                    -Method Get -Headers $headers -ErrorAction Stop
+
+                $machines = if ($iaasResp.content) { $iaasResp.content } else { $iaasResp }
+                Write-Host "  IaaS machine JSON:" -ForegroundColor Green
+                $machines | ConvertTo-Json -Depth 15 | Write-Host
+            }
+            else {
+                Write-Host "  Skipped (could not resolve VM name)" -ForegroundColor Yellow
+            }
+        }
+        catch {
+            Write-Host "  ERROR: $($_.Exception.Message)" -ForegroundColor Red
+        }
+
+        # ----------------------------------------------------------------
+        # SUMMARY: Highlight anything with 'Managed' or 'constraints' or 'customProperties'
+        # ----------------------------------------------------------------
+        Write-Host "`n  === KEYWORD SCAN on expand data ===" -ForegroundColor Magenta
+        $expandJson = $resource | ConvertTo-Json -Depth 15 -Compress
+
+        foreach ($keyword in @("Managed", "constraint", "customPropert", "tag")) {
+            if ($expandJson -match $keyword) {
+                Write-Host "  [FOUND] keyword '$keyword' exists in expand data" -ForegroundColor Green
+            } else {
+                Write-Host "  [MISSING] keyword '$keyword' not in expand data" -ForegroundColor Red
+            }
+        }
     }
 
     $count++
 }
 
-Write-Host "`n=== DIAGNOSTIC COMPLETE - $count deployments inspected ===" -ForegroundColor Cyan
+Write-Host "`n`n=== DIAGNOSTIC COMPLETE - $count deployments inspected ===" -ForegroundColor Cyan
