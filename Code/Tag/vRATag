@@ -1,11 +1,29 @@
 # ============================================================================
-# DIAGNOSTIC: Find correct consume API endpoint for Cloud.vSphere.Machine
-# Tests multiple URL variations to find the one matching the GUI's 837 count
+# VM MANAGED TAG AUDIT - v5
+# Uses /iaas/api/machines which returns all VMs + constraints in one call
 # ============================================================================
 
-$vraServer = "vra1.yourdomain.com"   # <-- change to your vRA server
+$vraServers = @(
+    "vra1.yourdomain.com",
+    "vra2.yourdomain.com"
+)
+
+$outputCsv = "C:\Reports\VM_ManagedTag_Audit_$(Get-Date -Format 'yyyy-MM-dd_HHmm').csv"
 
 # ============================================================================
+# HELPERS
+# ============================================================================
+
+function Write-Log {
+    param([string]$Message, [string]$Level = "INFO")
+    $color = switch ($Level) {
+        "ERROR"   { "Red" }
+        "WARN"    { "Yellow" }
+        "SUCCESS" { "Green" }
+        default   { "Cyan" }
+    }
+    Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [$Level] $Message" -ForegroundColor $color
+}
 
 function Disable-SSLValidation {
     if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
@@ -23,85 +41,200 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 }
 
+function Get-AllPages {
+    param(
+        [string]$BaseUri,
+        [hashtable]$Headers,
+        [int]$PageSize = 200
+    )
+
+    $all  = [System.Collections.Generic.List[object]]::new()
+    $page = 0
+
+    do {
+        $separator = if ($BaseUri -match '\?') { '&' } else { '?' }
+        $uri = "$BaseUri${separator}page=$page&size=$PageSize"
+
+        try {
+            $resp  = Invoke-RestMethod -Uri $uri -Method Get -Headers $Headers -ErrorAction Stop
+            $items = if ($resp.content) { $resp.content } else { $resp }
+
+            if ($items -and @($items).Count -gt 0) {
+                $all.AddRange([object[]]@($items))
+                Write-Log "    Page $page : $(@($items).Count) items (running total: $($all.Count))"
+
+                $totalPages = if ($resp.totalPages) { [int]$resp.totalPages } else { 0 }
+                $page++
+
+                if ($totalPages -gt 0 -and $page -ge $totalPages) { break }
+                if (@($items).Count -lt $PageSize) { break }
+            }
+            else { break }
+        }
+        catch {
+            Write-Log "  Pagination error (page $page): $($_.Exception.Message)" "WARN"
+            break
+        }
+
+        if ($page -ge 500) {
+            Write-Log "  Hit 500 page safety cap" "WARN"
+            break
+        }
+
+    } while ($true)
+
+    return $all
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
 Disable-SSLValidation
 
 $credential = Import-Clixml -Path "C:\Creds\aria_vra_cred.xml"
 $username   = $credential.UserName
 $password   = $credential.GetNetworkCredential().Password
 
-$authResp = Invoke-RestMethod `
-    -Uri "https://$vraServer/csp/gateway/am/api/login" `
-    -Method Post `
-    -Headers @{ "Content-Type" = "application/json" } `
-    -Body (@{ username = $username; password = $password } | ConvertTo-Json) `
-    -ErrorAction Stop
+$report    = [System.Collections.Generic.List[PSCustomObject]]::new()
+$seenNames = @{}
 
-$headers = @{
-    "Authorization" = "Bearer $($authResp.cspAuthToken)"
-    "Content-Type"  = "application/json"
-}
+foreach ($vraServer in $vraServers) {
 
-Write-Host "`n=== Testing API endpoints for Cloud.vSphere.Machine ===" -ForegroundColor Cyan
+    Write-Log "=== Connecting to vRA: $vraServer ===" "SUCCESS"
 
-$urlsToTest = @(
-    # Consume API variations
-    "https://$vraServer/consume/api/resources?resourceTypes=%5B%22Cloud.vSphere.Machine%22%5D&page=0&size=5",
-    "https://$vraServer/consume/api/resources?resourceTypes=Cloud.vSphere.Machine&page=0&size=5",
-    "https://$vraServer/consume/api/resources?`$filter=resourceType+eq+'Cloud.vSphere.Machine'&page=0&size=5",
-    "https://$vraServer/consume/api/resources?page=0&size=5&resourceType=Cloud.vSphere.Machine",
-
-    # Deployment API variations
-    "https://$vraServer/deployment/api/resources?resourceType=Cloud.vSphere.Machine&apiVersion=2020-08-25&page=0&size=5",
-    "https://$vraServer/deployment/api/resources?resourceTypes=%5B%22Cloud.vSphere.Machine%22%5D&apiVersion=2020-08-25&page=0&size=5",
-    "https://$vraServer/deployment/api/resources?type=Cloud.vSphere.Machine&apiVersion=2020-08-25&page=0&size=5",
-
-    # IaaS API
-    "https://$vraServer/iaas/api/machines?apiVersion=2021-07-15&page=0&size=5",
-    "https://$vraServer/iaas/api/resources?type=Cloud.vSphere.Machine&apiVersion=2021-07-15&page=0&size=5"
-)
-
-foreach ($url in $urlsToTest) {
-    Write-Host "`n--- Testing: $url" -ForegroundColor Yellow
     try {
-        $resp = Invoke-RestMethod -Uri $url -Method Get -Headers $headers -ErrorAction Stop
+        $authResp = Invoke-RestMethod `
+            -Uri "https://$vraServer/csp/gateway/am/api/login" `
+            -Method Post `
+            -Headers @{ "Content-Type" = "application/json" } `
+            -Body (@{ username = $username; password = $password } | ConvertTo-Json) `
+            -ErrorAction Stop
 
-        # Try to figure out count and structure
-        $items      = if ($resp.content)       { $resp.content }
-                      elseif ($resp.resources)  { $resp.resources }
-                      elseif ($resp.items)       { $resp.items }
-                      else                       { $resp }
-
-        $totalCount = if ($resp.totalElements) { $resp.totalElements }
-                      elseif ($resp.total)      { $resp.total }
-                      elseif ($resp.totalCount)  { $resp.totalCount }
-                      else                       { "unknown" }
-
-        Write-Host "  SUCCESS - Items on this page : $(@($items).Count)" -ForegroundColor Green
-        Write-Host "  Total elements reported      : $totalCount" -ForegroundColor Green
-        Write-Host "  Response top-level keys      : $($resp.PSObject.Properties.Name -join ', ')" -ForegroundColor Green
-
-        # Show first item structure if any returned
-        if (@($items).Count -gt 0) {
-            $first = @($items)[0]
-            Write-Host "  First item keys: $($first.PSObject.Properties.Name -join ', ')" -ForegroundColor Cyan
-
-            # Check if constraints/customProperties visible at top level
-            foreach ($keyword in @("constraint","customPropert","Managed","tag")) {
-                $itemJson = $first | ConvertTo-Json -Depth 10 -Compress
-                if ($itemJson -match $keyword) {
-                    Write-Host "  [FOUND] '$keyword' in first item" -ForegroundColor Magenta
-                } else {
-                    Write-Host "  [MISSING] '$keyword' not in first item" -ForegroundColor Gray
-                }
-            }
-
-            Write-Host "`n  First item full JSON:" -ForegroundColor Cyan
-            $first | ConvertTo-Json -Depth 10 | Write-Host
+        $headers = @{
+            "Authorization" = "Bearer $($authResp.cspAuthToken)"
+            "Content-Type"  = "application/json"
         }
+        Write-Log "Authenticated to $vraServer" "SUCCESS"
     }
     catch {
-        Write-Host "  FAILED: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Log "Auth failed for $vraServer : $($_.Exception.Message)" "ERROR"
+        continue
     }
+
+    # ------------------------------------------------------------------
+    # Fetch all machines from IaaS API — has constraints inline
+    # ------------------------------------------------------------------
+    Write-Log "Fetching all machines from IaaS API..."
+
+    $allMachines = Get-AllPages `
+        -BaseUri "https://$vraServer/iaas/api/machines?apiVersion=2021-07-15" `
+        -Headers $headers
+
+    Write-Log "Total machines retrieved: $($allMachines.Count)" "SUCCESS"
+
+    $vmCount = 0
+
+    foreach ($machine in $allMachines) {
+
+        # Filter to vSphere only — skip anything that isn't Cloud.vSphere.Machine
+        if ($machine.type -and $machine.type -ne "Cloud.vSphere.Machine") {
+            continue
+        }
+
+        # Resolve VM name
+        $vmName = $null
+        foreach ($field in @('name','hostName','hostname','address')) {
+            if ($machine.PSObject.Properties[$field] -and $machine.$field) {
+                $vmName = $machine.$field
+                break
+            }
+        }
+        if (-not $vmName) { $vmName = $machine.id }
+
+        # Deduplicate across vRA servers
+        if ($seenNames.ContainsKey($vmName.ToLower())) { continue }
+        $seenNames[$vmName.ToLower()] = $true
+
+        $vmCount++
+
+        # ----------------------------------------------------------
+        # Read constraints directly from machine object
+        # Structure: [{"tag":"Datacenter:XYZ"},{"tag":"Managed:true"},...]
+        # ----------------------------------------------------------
+        $constraints   = $null
+        $hasManagedTag = $false
+        $allTags       = @()
+
+        # Constraints may sit at top level or under customProperties
+        if ($machine.PSObject.Properties['constraints']) {
+            $constraints = $machine.constraints
+        }
+        elseif ($machine.PSObject.Properties['customProperties'] -and
+                $machine.customProperties.PSObject.Properties['constraints']) {
+            $constraints = $machine.customProperties.constraints
+        }
+
+        if ($constraints) {
+            foreach ($entry in @($constraints)) {
+                $tagValue = $null
+
+                if ($entry -is [string]) {
+                    $tagValue = $entry
+                }
+                elseif ($entry.PSObject.Properties['tag']) {
+                    $tagValue = $entry.tag
+                }
+
+                if ($tagValue) {
+                    $allTags += $tagValue
+                    if ($tagValue -eq "Managed:true") {
+                        $hasManagedTag = $true
+                    }
+                }
+            }
+        }
+
+        $allTagsStr       = if ($allTags.Count -gt 0) { $allTags -join " | " } else { "(none)" }
+        $constraintsCount = if ($constraints) { @($constraints).Count } else { 0 }
+
+        Write-Log "  $vmName -> Managed:true=$hasManagedTag | Tags: $allTagsStr"
+
+        $report.Add([PSCustomObject]@{
+            VMName            = $vmName
+            HasManagedTag     = $hasManagedTag
+            ManagedTagStatus  = if ($hasManagedTag) { "YES - Managed:true present" } else { "NO  - tag missing" }
+            AllConstraintTags = $allTagsStr
+            ConstraintCount   = $constraintsCount
+            DeploymentID      = if ($machine.deploymentId)  { $machine.deploymentId }  else { "N/A" }
+            Owner             = if ($machine.ownedBy)        { $machine.ownedBy }        else { "N/A" }
+            CreatedBy         = if ($machine.createdBy)      { $machine.createdBy }      else { "N/A" }
+            PowerState        = if ($machine.powerState)     { $machine.powerState }     else { "N/A" }
+            vRAServer         = ($vraServer -split '\.')[0]
+            ResourceID        = $machine.id
+        })
+    }
+
+    Write-Log "Finished $vraServer — $vmCount vSphere VMs processed" "SUCCESS"
 }
 
-Write-Host "`n=== DIAGNOSTIC COMPLETE ===" -ForegroundColor Cyan
+# ============================================================================
+# EXPORT CSV
+# ============================================================================
+
+$outputDir = Split-Path $outputCsv
+if (-not (Test-Path $outputDir)) {
+    New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+}
+
+$report | Sort-Object HasManagedTag, VMName | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
+
+$managed   = ($report | Where-Object { $_.HasManagedTag -eq $true  }).Count
+$unmanaged = ($report | Where-Object { $_.HasManagedTag -eq $false }).Count
+
+Write-Log ""
+Write-Log "=== AUDIT COMPLETE ===" "SUCCESS"
+Write-Log "Total VMs in report : $($report.Count)"
+Write-Log "  Managed:true      : $managed"   "SUCCESS"
+Write-Log "  Tag missing       : $unmanaged" "WARN"
+Write-Log "CSV saved to        : $outputCsv" "SUCCESS"
