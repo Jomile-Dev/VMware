@@ -1,7 +1,7 @@
 # ============================================================================
-# VM MANAGED TAG AUDIT - v7
+# VM MANAGED TAG AUDIT - v8
 # 1. IaaS API ($top/$skip) -> all VMs
-# 2. /deployment/api/resources/{machine.id} (Method 1) -> constraints
+# 2. /deployment/api/resources/{machine.id} (Method 1) -> constraints + softwareName
 #    machine.id == deployment resource.id (confirmed via diagnostic)
 # ============================================================================
 
@@ -41,6 +41,31 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
         [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
     }
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+}
+
+# Extracts a simple string field from raw JSON by key name
+# Avoids ConvertFrom-Json entirely to dodge duplicate key errors
+function Extract-JsonStringField {
+    param([string]$RawJson, [string]$FieldName)
+    if ($RawJson -match """$FieldName""\s*:\s*""([^""]+)""") {
+        return $matches[1]
+    }
+    return $null
+}
+
+# Extracts a JSON array from raw JSON by key name
+function Extract-JsonArray {
+    param([string]$RawJson, [string]$FieldName)
+    # Match array including nested objects - handles [{"tag":"x"},{"tag":"y"}]
+    if ($RawJson -match """$FieldName""\s*:\s*(\[[^\]]*\])") {
+        try {
+            return $matches[1] | ConvertFrom-Json
+        }
+        catch {
+            return $null
+        }
+    }
+    return $null
 }
 
 # ============================================================================
@@ -137,43 +162,32 @@ foreach ($vraServer in $vraServers) {
 
         # ----------------------------------------------------------
         # STEP 2: Fetch full resource using machine.id directly
-        # Confirmed: machine.id == deployment resource.id
+        # Use raw HTTP response to avoid ConvertFrom-Json duplicate key error
         # ----------------------------------------------------------
         $constraints   = $null
         $hasManagedTag = $false
         $allTags       = @()
+        $softwareName  = "N/A"
+        $rawJson       = $null
 
         try {
-            $fullResource = Invoke-RestMethod `
+            # Use Invoke-WebRequest instead of Invoke-RestMethod to get raw string
+            $webResp = Invoke-WebRequest `
                 -Uri "https://$vraServer/deployment/api/resources/$($machine.id)?apiVersion=2020-08-25" `
                 -Method Get -Headers $headers -ErrorAction Stop
 
-            # fullResource may contain duplicate keys (hostname/hostName) which
-            # ConvertFrom-Json cannot handle. Use .NET JsonDocument instead.
-            $constraints = $null
+            $rawJson = $webResp.Content
 
-            try {
-                # Get raw JSON string from the response
-                $rawJson = if ($fullResource -is [string]) {
-                    $fullResource
-                } else {
-                    $fullResource | ConvertTo-Json -Depth 20 -Compress
-                }
+            # Extract constraints array from raw JSON
+            $constraints = Extract-JsonArray -RawJson $rawJson -FieldName "constraints"
 
-                # Use regex to extract the constraints array directly from the raw JSON
-                # This avoids any JSON parsing issues with duplicate keys entirely
-                if ($rawJson -match '"constraints"\s*:\s*(\[[^\]]*\])') {
-                    $constraintsJson = $matches[1]
-                    # Parse just the constraints array - it only has tag keys, no duplicates
-                    $constraints = $constraintsJson | ConvertFrom-Json
-                }
-            }
-            catch {
-                Write-Log "  JSON parse error for $vmName : $($_.Exception.Message)" "WARN"
-            }
+            # Extract softwareName from raw JSON
+            $extracted = Extract-JsonStringField -RawJson $rawJson -FieldName "softwareName"
+            if ($extracted) { $softwareName = $extracted }
 
             # Debug first 3 VMs
             if ($vmCount -le 3) {
+                Write-Log "  DEBUG $vmName softwareName: $softwareName" "WARN"
                 Write-Log "  DEBUG $vmName constraints: $($constraints | ConvertTo-Json -Compress -Depth 5)" "WARN"
             }
         }
@@ -202,7 +216,7 @@ foreach ($vraServer in $vraServers) {
 
                 if ($tagValue) {
                     $allTags += $tagValue
-                    # Match Managed:true regardless of what comes before it
+                    # Match Managed:true regardless of any prefix
                     if ($tagValue -match "Managed:true") {
                         $hasManagedTag = $true
                     }
@@ -213,12 +227,13 @@ foreach ($vraServer in $vraServers) {
         $allTagsStr       = if ($allTags.Count -gt 0) { $allTags -join " | " } else { "(none)" }
         $constraintsCount = if ($constraints) { @($constraints).Count } else { 0 }
 
-        Write-Log "  $vmName -> Managed:true=$hasManagedTag | Tags: $allTagsStr"
+        Write-Log "  $vmName -> Managed:true=$hasManagedTag | OS=$softwareName | Tags=$allTagsStr"
 
         $report.Add([PSCustomObject]@{
             VMName            = $vmName
             HasManagedTag     = $hasManagedTag
             ManagedTagStatus  = if ($hasManagedTag) { "YES - Managed:true present" } else { "NO  - tag missing" }
+            SoftwareName      = $softwareName
             AllConstraintTags = $allTagsStr
             ConstraintCount   = $constraintsCount
             DeploymentID      = if ($machine.deploymentId) { $machine.deploymentId } else { "N/A" }
