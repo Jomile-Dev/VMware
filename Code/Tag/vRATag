@@ -1,7 +1,7 @@
 # ============================================================================
-# VM MANAGED TAG AUDIT - v8
+# VM MANAGED TAG AUDIT - v9
 # 1. IaaS API ($top/$skip) -> all VMs
-# 2. /deployment/api/resources/{machine.id} (Method 1) -> constraints + softwareName
+# 2. /deployment/api/resources/{machine.id} (Method 1) -> constraints + softwareName + tags
 #    machine.id == deployment resource.id (confirmed via diagnostic)
 # ============================================================================
 
@@ -164,11 +164,13 @@ foreach ($vraServer in $vraServers) {
         # STEP 2: Fetch full resource using machine.id directly
         # Use raw HTTP response to avoid ConvertFrom-Json duplicate key error
         # ----------------------------------------------------------
-        $constraints   = $null
-        $hasManagedTag = $false
-        $allTags       = @()
-        $softwareName  = "N/A"
-        $rawJson       = $null
+        $constraints      = $null
+        $resourceTags     = $null
+        $hasManagedTag    = $false
+        $allTags          = @()
+        $allResourceTags  = @()
+        $softwareName     = "N/A"
+        $rawJson          = $null
 
         try {
             # Use Invoke-WebRequest instead of Invoke-RestMethod to get raw string
@@ -181,6 +183,9 @@ foreach ($vraServer in $vraServers) {
             # Extract constraints array from raw JSON
             $constraints = Extract-JsonArray -RawJson $rawJson -FieldName "constraints"
 
+            # Extract top-level tags array from raw JSON (General > Tags in UI)
+            $resourceTags = Extract-JsonArray -RawJson $rawJson -FieldName "tags"
+
             # Extract softwareName from raw JSON
             $extracted = Extract-JsonStringField -RawJson $rawJson -FieldName "softwareName"
             if ($extracted) { $softwareName = $extracted }
@@ -189,6 +194,7 @@ foreach ($vraServer in $vraServers) {
             if ($vmCount -le 3) {
                 Write-Log "  DEBUG $vmName softwareName: $softwareName" "WARN"
                 Write-Log "  DEBUG $vmName constraints: $($constraints | ConvertTo-Json -Compress -Depth 5)" "WARN"
+                Write-Log "  DEBUG $vmName tags: $($resourceTags | ConvertTo-Json -Compress -Depth 5)" "WARN"
             }
         }
         catch {
@@ -224,10 +230,32 @@ foreach ($vraServer in $vraServers) {
             }
         }
 
-        $allTagsStr       = if ($allTags.Count -gt 0) { $allTags -join " | " } else { "(none)" }
+        # ----------------------------------------------------------
+        # Parse resource tags (General > Tags in deployment UI)
+        # Handles shapes: "string", {"tag":"x"}, {"key":"x","value":"y"}
+        # ----------------------------------------------------------
+        if ($resourceTags) {
+            foreach ($entry in @($resourceTags)) {
+                if ($entry -is [string]) {
+                    $allResourceTags += $entry
+                }
+                elseif ($entry.PSObject.Properties['key'] -and $entry.PSObject.Properties['value']) {
+                    $allResourceTags += "$($entry.key):$($entry.value)"
+                }
+                elseif ($entry.PSObject.Properties['tag']) {
+                    $allResourceTags += $entry.tag
+                }
+                elseif ($entry.PSObject.Properties['value']) {
+                    $allResourceTags += $entry.value
+                }
+            }
+        }
+
+        $allTagsStr       = if ($allTags.Count -gt 0)         { $allTags -join " | " }         else { "(none)" }
+        $resourceTagsStr  = if ($allResourceTags.Count -gt 0) { $allResourceTags -join " | " } else { "(none)" }
         $constraintsCount = if ($constraints) { @($constraints).Count } else { 0 }
 
-        Write-Log "  $vmName -> Managed:true=$hasManagedTag | OS=$softwareName | Tags=$allTagsStr"
+        Write-Log "  $vmName -> Managed:true=$hasManagedTag | OS=$softwareName | ConstraintTags=$allTagsStr | ResourceTags=$resourceTagsStr"
 
         $report.Add([PSCustomObject]@{
             VMName            = $vmName
@@ -235,6 +263,7 @@ foreach ($vraServer in $vraServers) {
             ManagedTagStatus  = if ($hasManagedTag) { "YES - Managed:true present" } else { "NO  - tag missing" }
             SoftwareName      = $softwareName
             AllConstraintTags = $allTagsStr
+            ResourceTags      = $resourceTagsStr
             ConstraintCount   = $constraintsCount
             DeploymentID      = if ($machine.deploymentId) { $machine.deploymentId } else { "N/A" }
             ResourceID        = $machine.id
