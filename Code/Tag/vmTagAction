@@ -1,17 +1,13 @@
 # ============================================================================
-# LIST DEPLOYMENT RESOURCE ACTIONS - READ ONLY
-# Fetches available Day-2 actions for Cloud.vSphere.Machine resources
-# NO changes are made - this is purely informational
+# FETCH Update Tags ACTION SCHEMA - READ ONLY
+# Gets the full input schema for the Update Tags day-2 action
+# NO changes are made - purely informational
 # ============================================================================
 
 $vraServer = "vra1.yourdomain.com"
 
-# Optional: filter to a specific deployment or VM name (set to $null for ALL)
-$filterDeploymentName = $null   # e.g. "MyDeployment" or $null for all
-$filterVMName         = $null   # e.g. "myvm01" or $null for all
-
 # ============================================================================
-# SSL + Auth (same pattern as your existing scripts)
+# SSL Bypass + Auth
 # ============================================================================
 
 function Disable-SSLValidation {
@@ -33,7 +29,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
 Disable-SSLValidation
 
 $credential = Import-Clixml -Path "C:\Creds\aria_vra_cred.xml"
-# OR use: $credential = Get-Credential -Message "Enter vRA credentials"
+# OR: $credential = Get-Credential -Message "Enter vRA credentials"
 
 $authResp = Invoke-RestMethod `
     -Uri "https://$vraServer/csp/gateway/am/api/login" `
@@ -50,107 +46,119 @@ $headers = @{
 Write-Host "Connected to $vraServer" -ForegroundColor Green
 
 # ============================================================================
-# STEP 1: Get all deployments (paged)
+# STEP 1: Get ONE deployment with a vSphere machine to use as our test subject
 # ============================================================================
 
-Write-Host "`nFetching deployments..." -ForegroundColor Cyan
+$resp = Invoke-RestMethod `
+    -Uri "https://$vraServer/deployment/api/deployments?page=0&size=100&expand=resources" `
+    -Method Get `
+    -Headers $headers
 
-$allDeployments = @()
-$page = 0
-$size = 100
+$allDeployments = if ($resp.content) { $resp.content } else { $resp }
 
-do {
-    $resp        = Invoke-RestMethod -Uri "https://$vraServer/deployment/api/deployments?page=$page&size=$size&expand=resources" -Headers $headers
-    $deployments = if ($resp.content) { $resp.content } else { $resp }
-    $allDeployments += $deployments
-    $hasMore = $resp.totalPages -and ($page -lt $resp.totalPages - 1)
-    $page++
-} while ($hasMore)
+# Grab just the first deployment that has a vSphere machine
+$testDeployment = $allDeployments | Where-Object {
+    $_.resources -and ($_.resources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" })
+} | Select-Object -First 1
 
-Write-Host "Found $($allDeployments.Count) total deployments" -ForegroundColor Gray
-
-# Apply optional name filter
-if ($filterDeploymentName) {
-    $allDeployments = $allDeployments | Where-Object { $_.name -like "*$filterDeploymentName*" }
-    Write-Host "Filtered to $($allDeployments.Count) deployments matching '$filterDeploymentName'" -ForegroundColor Yellow
+if (-not $testDeployment) {
+    Write-Host "No deployments with vSphere machines found!" -ForegroundColor Red
+    exit
 }
 
+$testMachine = $testDeployment.resources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" } | Select-Object -First 1
+
+if ($testMachine.properties.hostname) {
+    $vmName = $testMachine.properties.hostname
+} elseif ($testMachine.properties.resourceName) {
+    $vmName = $testMachine.properties.resourceName
+} elseif ($testMachine.name) {
+    $vmName = $testMachine.name
+} else {
+    $vmName = $testMachine.id
+}
+
+Write-Host "`nUsing test VM    : $vmName"                  -ForegroundColor Yellow
+Write-Host "Deployment       : $($testDeployment.name)"   -ForegroundColor Yellow
+Write-Host "ResourceID       : $($testMachine.id)"        -ForegroundColor Yellow
+
 # ============================================================================
-# STEP 2: For each deployment, find vSphere machines and GET their actions
+# STEP 2: Confirm the Update Tags action exists on this resource
 # ============================================================================
 
-$report = [System.Collections.Generic.List[PSCustomObject]]::new()
+Write-Host "`nFetching available actions..." -ForegroundColor Cyan
 
-foreach ($dep in $allDeployments) {
+$actionsResp = Invoke-RestMethod `
+    -Uri "https://$vraServer/deployment/api/resources/$($testMachine.id)/actions?apiVersion=2020-08-25" `
+    -Method Get `
+    -Headers $headers `
+    -ErrorAction Stop
 
-    $vSphereMachines = @($dep.resources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" })
-    if (-not $vSphereMachines) { continue }
+$actions = if ($actionsResp.content) { $actionsResp.content }
+           elseif ($actionsResp.items) { $actionsResp.items }
+           elseif ($actionsResp.actions) { $actionsResp.actions }
+           elseif ($actionsResp -is [array]) { $actionsResp }
+           else { @($actionsResp) }
 
-    foreach ($machine in $vSphereMachines) {
+Write-Host "Found $(@($actions).Count) actions on this resource" -ForegroundColor Gray
 
-        # ISE-compatible null coalescing
-        if ($machine.properties.hostname) {
-            $vmName = $machine.properties.hostname
-        } elseif ($machine.properties.resourceName) {
-            $vmName = $machine.properties.resourceName
-        } elseif ($machine.name) {
-            $vmName = $machine.name
-        } else {
-            $vmName = $machine.id
-        }
+$updateTagsAction = $actions | Where-Object {
+    $_.id -like "*Update*Tags*" -or $_.displayName -like "*Update*Tags*" -or $_.name -like "*Update*Tags*"
+}
 
-        if ($filterVMName -and $vmName -notlike "*$filterVMName*") { continue }
-
-        Write-Host "  Checking actions for: $vmName (ResourceID: $($machine.id))" -ForegroundColor Yellow
-
-        try {
-            # ---------------------------------------------------------------
-            # THIS IS THE READ-ONLY CALL:
-            # GET /deployment/api/resources/{id}/actions
-            # Returns available Day-2 actions - does NOT trigger anything
-            # ---------------------------------------------------------------
-            $actionsResp = Invoke-RestMethod `
-                -Uri "https://$vraServer/deployment/api/resources/$($machine.id)/actions?apiVersion=2020-08-25" `
-                -Method Get `
-                -Headers $headers `
-                -ErrorAction Stop
-
-            $actions = if ($actionsResp.content) { $actionsResp.content } else { $actionsResp }
-
-            foreach ($action in @($actions)) {
-                $report.Add([PSCustomObject]@{
-                    DeploymentName = $dep.name
-                    DeploymentID   = $dep.id
-                    VMName         = $vmName
-                    ResourceID     = $machine.id
-                    ActionID       = $action.id
-                    ActionName     = $action.name
-                    ActionType     = $action.type
-                    Description    = $action.description
-                    Valid          = $action.valid
-                    Reason         = $action.reason
-                })
-            }
-
-            Write-Host "    -> $(@($actions).Count) actions found" -ForegroundColor Green
-
-        } catch {
-            Write-Host "    ERROR fetching actions for $vmName : $($_.Exception.Message)" -ForegroundColor Red
-        }
+if (-not $updateTagsAction) {
+    Write-Host "`nUpdate Tags action NOT found. Available actions:" -ForegroundColor Red
+    $actions | ForEach-Object {
+        Write-Host "  - id: $($_.id)  |  name: $($_.name)  |  displayName: $($_.displayName)" -ForegroundColor White
     }
+    exit
 }
 
+Write-Host "`nFound Update Tags action:" -ForegroundColor Green
+Write-Host "  id          : $($updateTagsAction.id)"          -ForegroundColor White
+Write-Host "  name        : $($updateTagsAction.name)"        -ForegroundColor White
+Write-Host "  displayName : $($updateTagsAction.displayName)" -ForegroundColor White
+Write-Host "  valid       : $($updateTagsAction.valid)"       -ForegroundColor White
+Write-Host "  actionType  : $($updateTagsAction.actionType)"  -ForegroundColor White
+
 # ============================================================================
-# STEP 3: Display results
+# STEP 3: Fetch the full input SCHEMA for the Update Tags action
+# This tells us exactly what inputs the action expects (add/remove fields etc.)
 # ============================================================================
 
-Write-Host "`n=== AVAILABLE ACTIONS ===" -ForegroundColor Cyan
-$report | Format-Table DeploymentName, VMName, ActionName, ActionType, Valid -AutoSize
+Write-Host "`n--- ATTEMPT 1: /actions/{actionId}/schema ---" -ForegroundColor Magenta
+try {
+    $schemaResp = Invoke-RestMethod `
+        -Uri "https://$vraServer/deployment/api/resources/$($testMachine.id)/actions/$($updateTagsAction.id)/schema?apiVersion=2020-08-25" `
+        -Method Get `
+        -Headers $headers `
+        -ErrorAction Stop
 
-Write-Host "`n=== UNIQUE ACTION NAMES ACROSS ALL VMs ===" -ForegroundColor Magenta
-$report | Select-Object -ExpandProperty ActionName -Unique | Sort-Object | ForEach-Object {
-    Write-Host "  - $_" -ForegroundColor White
+    Write-Host "SUCCESS - Raw schema JSON:" -ForegroundColor Green
+    Write-Host ($schemaResp | ConvertTo-Json -Depth 10) -ForegroundColor Gray
+} catch {
+    Write-Host "Failed: $($_.Exception.Message)" -ForegroundColor Red
 }
 
-# Optional: export to CSV
-# $report | Export-Csv -Path "C:\Reports\vRA_Actions_$(Get-Date -Format 'yyyyMMdd_HHmm').csv" -NoTypeInformation
+Write-Host "`n--- ATTEMPT 2: /actions/{actionId}/inputs (alternate endpoint) ---" -ForegroundColor Magenta
+try {
+    $inputsResp = Invoke-RestMethod `
+        -Uri "https://$vraServer/deployment/api/resources/$($testMachine.id)/actions/$($updateTagsAction.id)/inputs?apiVersion=2020-08-25" `
+        -Method Get `
+        -Headers $headers `
+        -ErrorAction Stop
+
+    Write-Host "SUCCESS - Raw inputs JSON:" -ForegroundColor Green
+    Write-Host ($inputsResp | ConvertTo-Json -Depth 10) -ForegroundColor Gray
+} catch {
+    Write-Host "Failed: $($_.Exception.Message)" -ForegroundColor Red
+}
+
+Write-Host "`n--- ATTEMPT 3: Check if action object itself has inputs/schema property ---" -ForegroundColor Magenta
+Write-Host "All properties on the action object:" -ForegroundColor Yellow
+$updateTagsAction.PSObject.Properties | ForEach-Object {
+    Write-Host "  $($_.Name) : $($_.Value)" -ForegroundColor White
+}
+
+Write-Host "`n--- ATTEMPT 4: Full action object raw JSON (in case nested fields exist) ---" -ForegroundColor Magenta
+Write-Host ($updateTagsAction | ConvertTo-Json -Depth 10) -ForegroundColor Gray
