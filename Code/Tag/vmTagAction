@@ -47,7 +47,7 @@ $headers = @{
     "Content-Type"  = "application/json"
 }
 
-Write-Host "✅ Authenticated to $vraServer" -ForegroundColor Green
+Write-Host "Connected to $vraServer" -ForegroundColor Green
 
 # ============================================================================
 # STEP 1: Get all deployments (paged)
@@ -56,7 +56,8 @@ Write-Host "✅ Authenticated to $vraServer" -ForegroundColor Green
 Write-Host "`nFetching deployments..." -ForegroundColor Cyan
 
 $allDeployments = @()
-$page = 0; $size = 100
+$page = 0
+$size = 100
 
 do {
     $resp        = Invoke-RestMethod -Uri "https://$vraServer/deployment/api/deployments?page=$page&size=$size&expand=resources" -Headers $headers
@@ -87,7 +88,16 @@ foreach ($dep in $allDeployments) {
 
     foreach ($machine in $vSphereMachines) {
 
-        $vmName = $machine.properties.hostname ?? $machine.properties.resourceName ?? $machine.name ?? $machine.id
+        # ISE-compatible null coalescing
+        if ($machine.properties.hostname) {
+            $vmName = $machine.properties.hostname
+        } elseif ($machine.properties.resourceName) {
+            $vmName = $machine.properties.resourceName
+        } elseif ($machine.name) {
+            $vmName = $machine.name
+        } else {
+            $vmName = $machine.id
+        }
 
         if ($filterVMName -and $vmName -notlike "*$filterVMName*") { continue }
 
@@ -97,7 +107,7 @@ foreach ($dep in $allDeployments) {
             # ---------------------------------------------------------------
             # THIS IS THE READ-ONLY CALL:
             # GET /deployment/api/resources/{id}/actions
-            # Returns available Day-2 actions — does NOT trigger anything
+            # Returns available Day-2 actions - does NOT trigger anything
             # ---------------------------------------------------------------
             $actionsResp = Invoke-RestMethod `
                 -Uri "https://$vraServer/deployment/api/resources/$($machine.id)/actions?apiVersion=2020-08-25" `
@@ -115,17 +125,17 @@ foreach ($dep in $allDeployments) {
                     ResourceID     = $machine.id
                     ActionID       = $action.id
                     ActionName     = $action.name
-                    ActionType     = $action.type          # e.g. ResourceAction, DeploymentAction
+                    ActionType     = $action.type
                     Description    = $action.description
-                    Valid          = $action.valid         # whether it can currently be triggered
-                    Reason         = $action.reason        # if not valid, why
+                    Valid          = $action.valid
+                    Reason         = $action.reason
                 })
             }
 
-            Write-Host "    → $(@($actions).Count) actions found" -ForegroundColor Green
+            Write-Host "    -> $(@($actions).Count) actions found" -ForegroundColor Green
 
         } catch {
-            Write-Host "    ❌ Error fetching actions for $vmName : $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "    ERROR fetching actions for $vmName : $($_.Exception.Message)" -ForegroundColor Red
         }
     }
 }
