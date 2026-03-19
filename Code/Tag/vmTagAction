@@ -1,0 +1,146 @@
+# ============================================================================
+# LIST DEPLOYMENT RESOURCE ACTIONS - READ ONLY
+# Fetches available Day-2 actions for Cloud.vSphere.Machine resources
+# NO changes are made - this is purely informational
+# ============================================================================
+
+$vraServer = "vra1.yourdomain.com"
+
+# Optional: filter to a specific deployment or VM name (set to $null for ALL)
+$filterDeploymentName = $null   # e.g. "MyDeployment" or $null for all
+$filterVMName         = $null   # e.g. "myvm01" or $null for all
+
+# ============================================================================
+# SSL + Auth (same pattern as your existing scripts)
+# ============================================================================
+
+function Disable-SSLValidation {
+    if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
+        Add-Type @"
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+public class TrustAllCertsPolicy : ICertificatePolicy {
+    public bool CheckValidationResult(
+        ServicePoint svcPoint, X509Certificate certificate,
+        WebRequest request, int certificateProblem) { return true; }
+}
+"@
+        [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+    }
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+}
+
+Disable-SSLValidation
+
+$credential = Import-Clixml -Path "C:\Creds\aria_vra_cred.xml"
+# OR use: $credential = Get-Credential -Message "Enter vRA credentials"
+
+$authResp = Invoke-RestMethod `
+    -Uri "https://$vraServer/csp/gateway/am/api/login" `
+    -Method Post `
+    -Headers @{ "Content-Type" = "application/json" } `
+    -Body (@{ username = $credential.UserName; password = $credential.GetNetworkCredential().Password } | ConvertTo-Json) `
+    -ErrorAction Stop
+
+$headers = @{
+    "Authorization" = "Bearer $($authResp.cspAuthToken)"
+    "Content-Type"  = "application/json"
+}
+
+Write-Host "✅ Authenticated to $vraServer" -ForegroundColor Green
+
+# ============================================================================
+# STEP 1: Get all deployments (paged)
+# ============================================================================
+
+Write-Host "`nFetching deployments..." -ForegroundColor Cyan
+
+$allDeployments = @()
+$page = 0; $size = 100
+
+do {
+    $resp        = Invoke-RestMethod -Uri "https://$vraServer/deployment/api/deployments?page=$page&size=$size&expand=resources" -Headers $headers
+    $deployments = if ($resp.content) { $resp.content } else { $resp }
+    $allDeployments += $deployments
+    $hasMore = $resp.totalPages -and ($page -lt $resp.totalPages - 1)
+    $page++
+} while ($hasMore)
+
+Write-Host "Found $($allDeployments.Count) total deployments" -ForegroundColor Gray
+
+# Apply optional name filter
+if ($filterDeploymentName) {
+    $allDeployments = $allDeployments | Where-Object { $_.name -like "*$filterDeploymentName*" }
+    Write-Host "Filtered to $($allDeployments.Count) deployments matching '$filterDeploymentName'" -ForegroundColor Yellow
+}
+
+# ============================================================================
+# STEP 2: For each deployment, find vSphere machines and GET their actions
+# ============================================================================
+
+$report = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+foreach ($dep in $allDeployments) {
+
+    $vSphereMachines = @($dep.resources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" })
+    if (-not $vSphereMachines) { continue }
+
+    foreach ($machine in $vSphereMachines) {
+
+        $vmName = $machine.properties.hostname ?? $machine.properties.resourceName ?? $machine.name ?? $machine.id
+
+        if ($filterVMName -and $vmName -notlike "*$filterVMName*") { continue }
+
+        Write-Host "  Checking actions for: $vmName (ResourceID: $($machine.id))" -ForegroundColor Yellow
+
+        try {
+            # ---------------------------------------------------------------
+            # THIS IS THE READ-ONLY CALL:
+            # GET /deployment/api/resources/{id}/actions
+            # Returns available Day-2 actions — does NOT trigger anything
+            # ---------------------------------------------------------------
+            $actionsResp = Invoke-RestMethod `
+                -Uri "https://$vraServer/deployment/api/resources/$($machine.id)/actions?apiVersion=2020-08-25" `
+                -Method Get `
+                -Headers $headers `
+                -ErrorAction Stop
+
+            $actions = if ($actionsResp.content) { $actionsResp.content } else { $actionsResp }
+
+            foreach ($action in @($actions)) {
+                $report.Add([PSCustomObject]@{
+                    DeploymentName = $dep.name
+                    DeploymentID   = $dep.id
+                    VMName         = $vmName
+                    ResourceID     = $machine.id
+                    ActionID       = $action.id
+                    ActionName     = $action.name
+                    ActionType     = $action.type          # e.g. ResourceAction, DeploymentAction
+                    Description    = $action.description
+                    Valid          = $action.valid         # whether it can currently be triggered
+                    Reason         = $action.reason        # if not valid, why
+                })
+            }
+
+            Write-Host "    → $(@($actions).Count) actions found" -ForegroundColor Green
+
+        } catch {
+            Write-Host "    ❌ Error fetching actions for $vmName : $($_.Exception.Message)" -ForegroundColor Red
+        }
+    }
+}
+
+# ============================================================================
+# STEP 3: Display results
+# ============================================================================
+
+Write-Host "`n=== AVAILABLE ACTIONS ===" -ForegroundColor Cyan
+$report | Format-Table DeploymentName, VMName, ActionName, ActionType, Valid -AutoSize
+
+Write-Host "`n=== UNIQUE ACTION NAMES ACROSS ALL VMs ===" -ForegroundColor Magenta
+$report | Select-Object -ExpandProperty ActionName -Unique | Sort-Object | ForEach-Object {
+    Write-Host "  - $_" -ForegroundColor White
+}
+
+# Optional: export to CSV
+# $report | Export-Csv -Path "C:\Reports\vRA_Actions_$(Get-Date -Format 'yyyyMMdd_HHmm').csv" -NoTypeInformation
