@@ -113,7 +113,7 @@ for ($i = 0; $i -lt $servers.Count; $i++) {
 
     if (-not $deployment) {
         Write-Log "  Not found" -Color Red
-        $results.Add([PSCustomObject]@{ ServerName=$serverName; NewName=$newName; Status="Not Found"; OldName="N/A" })
+        $results.Add([PSCustomObject]@{ ServerName=[string]$serverName; NewName=[string]$newName; Status=[string]"Not Found"; OldName=[string]"N/A" })
         continue
     }
 
@@ -121,27 +121,27 @@ for ($i = 0; $i -lt $servers.Count; $i++) {
 
     if ($deployment.CurrentName -eq $newName) {
         Write-Log "  Already correct" -Color Cyan
-        $results.Add([PSCustomObject]@{ ServerName=$serverName; NewName=$newName; Status="Already Named"; OldName=$deployment.CurrentName })
+        $results.Add([PSCustomObject]@{ ServerName=[string]$serverName; NewName=[string]$newName; Status=[string]"Already Named"; OldName=[string]$deployment.CurrentName })
         continue
     }
 
     if (Rename-Deployment -DeploymentId $deployment.DeploymentId -NewName $newName) {
         Write-Log "  Renamed successfully" -Color Green
-        $results.Add([PSCustomObject]@{ ServerName=$serverName; NewName=$newName; Status="Renamed"; OldName=$deployment.CurrentName })
+        $results.Add([PSCustomObject]@{ ServerName=[string]$serverName; NewName=[string]$newName; Status=[string]"Renamed"; OldName=[string]$deployment.CurrentName })
     }
     else {
         Write-Log "  Failed to rename" -Color Red
-        $results.Add([PSCustomObject]@{ ServerName=$serverName; NewName=$newName; Status="Failed"; OldName=$deployment.CurrentName })
+        $results.Add([PSCustomObject]@{ ServerName=[string]$serverName; NewName=[string]$newName; Status=[string]"Failed"; OldName=[string]$deployment.CurrentName })
     }
 
     Start-Sleep -Milliseconds 200
 }
 
 # Summary
-$countRenamed      = ($results | Where-Object { $_.Status -eq 'Renamed' }).Count
-$countAlreadyNamed = ($results | Where-Object { $_.Status -eq 'Already Named' }).Count
-$countNotFound     = ($results | Where-Object { $_.Status -eq 'Not Found' }).Count
-$countFailed       = ($results | Where-Object { $_.Status -eq 'Failed' }).Count
+$countRenamed      = ($results | Where-Object { ($_.Status -replace [char]0,'').Trim() -eq 'Renamed' }).Count
+$countAlreadyNamed = ($results | Where-Object { ($_.Status -replace [char]0,'').Trim() -eq 'Already Named' }).Count
+$countNotFound     = ($results | Where-Object { ($_.Status -replace [char]0,'').Trim() -eq 'Not Found' }).Count
+$countFailed       = ($results | Where-Object { ($_.Status -replace [char]0,'').Trim() -eq 'Failed' }).Count
 
 Write-Log "=== SUMMARY ===" -Color Cyan
 Write-Log "Renamed:       $countRenamed"      -Color Green
