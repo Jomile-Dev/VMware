@@ -1,6 +1,11 @@
 # ============================================================================
 # COMPREHENSIVE VM TRACKER - NEW SERVERS + DELETIONS + DECOMMISSIONS
-# Version 4.0.1 - FIXED: Using sAMAccount for VC 
+# Version 4.1.0
+# Changes:
+#   - Decommission section: Added "Requester" column (from request inputs/requestedBy)
+#   - Decommission section: Renamed "Requested By" to "Initiated By" (separate column)
+#   - Deleted VMs: Cloud Resource Name extraction now strictly filters for names
+#     starting with W or L (case-insensitive) before falling back to resourceName
 # ============================================================================
 
 # ============================================================================
@@ -96,6 +101,15 @@ function Convert-ToSydneyTime {
 }
 
 function Extract-CloudResourceName {
+    # -----------------------------------------------------------------------
+    # Extracts the server name from a vRA event.
+    # Priority order:
+    #   1. "Cloud Resource Name: XXXXX" in details text  -> must start with W or L
+    #   2. cloudResourceName JSON key in details         -> must start with W or L
+    #   3. hostname / address JSON keys in details       -> must start with W or L
+    #   4. event.resourceName                            -> must start with W or L
+    # If none of the candidates start with W or L the function returns $null.
+    # -----------------------------------------------------------------------
     param([Parameter(Mandatory=$true)][PSObject]$Event)
 
     $serverName = $null
@@ -107,26 +121,44 @@ function Extract-CloudResourceName {
             ($Event.details | ConvertTo-Json -Compress -Depth 5)
         }
 
+        # 1. Preferred: "Cloud Resource Name: ServerNAMEXXXX"
         if ($detailsText -match "Cloud Resource Name:\s*([^\s,;]+)") {
-            $serverName = $matches[1].Trim()
-        }
-        elseif ($detailsText -match '"cloudResourceName"\s*:\s*"([^"]+)"') {
             $candidate = $matches[1].Trim()
-            if ($candidate -notmatch "Cloud_vSphere_Machine_\d+") {
+            if ($candidate -match "^[WLwl]") {
                 $serverName = $candidate
             }
         }
-        elseif ($detailsText -match '"hostname"\s*:\s*"([^"]+)"') {
-            $serverName = $matches[1].Trim()
+
+        # 2. cloudResourceName JSON key (skip generic placeholder names)
+        if (-not $serverName -and $detailsText -match '"cloudResourceName"\s*:\s*"([^"]+)"') {
+            $candidate = $matches[1].Trim()
+            if ($candidate -notmatch "Cloud_vSphere_Machine_\d+" -and $candidate -match "^[WLwl]") {
+                $serverName = $candidate
+            }
         }
-        elseif ($detailsText -match '"address"\s*:\s*"([^"]+)"') {
-            $serverName = $matches[1].Trim()
+
+        # 3. hostname key
+        if (-not $serverName -and $detailsText -match '"hostname"\s*:\s*"([^"]+)"') {
+            $candidate = $matches[1].Trim()
+            if ($candidate -match "^[WLwl]") {
+                $serverName = $candidate
+            }
+        }
+
+        # 4. address key
+        if (-not $serverName -and $detailsText -match '"address"\s*:\s*"([^"]+)"') {
+            $candidate = $matches[1].Trim()
+            if ($candidate -match "^[WLwl]") {
+                $serverName = $candidate
+            }
         }
     }
 
+    # 5. Fall back to resourceName on the event itself
     if (-not $serverName -and $Event.resourceName) {
-        if ($Event.resourceName -notmatch "Cloud_vSphere_Machine_\d+") {
-            $serverName = $Event.resourceName
+        $candidate = $Event.resourceName
+        if ($candidate -notmatch "Cloud_vSphere_Machine_\d+" -and $candidate -match "^[WLwl]") {
+            $serverName = $candidate
         }
     }
 
@@ -274,26 +306,8 @@ function Get-DeletedDeploymentServers {
                         if ($events -and $events.Count -gt 0) {
                             foreach ($event in $events) {
                                 if ($event.resourceType -eq "Cloud.vSphere.Machine") {
-                                    $serverName = $null
-                                    
-                                    if ($event.details) {
-                                        $detailsText = if ($event.details -is [string]) { 
-                                            $event.details 
-                                        } else { 
-                                            ($event.details | ConvertTo-Json -Compress -Depth 5)
-                                        }
-                                        
-                                        if ($detailsText -match "Cloud Resource Name:\s*([^\s,;]+)") {
-                                            $serverName = $matches[1].Trim()
-                                        }
-                                        elseif ($detailsText -match '"cloudResourceName"\s*:\s*"([^"]+)"') {
-                                            $serverName = $matches[1].Trim()
-                                        }
-                                    }
-                                    
-                                    if (-not $serverName -and $event.resourceName) {
-                                        $serverName = $event.resourceName
-                                    }
+                                    # Use the updated Extract-CloudResourceName which enforces W/L prefix
+                                    $serverName = Extract-CloudResourceName -Event $event
                                     
                                     if ($serverName -and -not $deletedServerData.ContainsKey($serverName)) {
                                         $vraServerShort = ($VraServer -split '\.')[0]
@@ -422,6 +436,24 @@ function Get-ActiveDeploymentsWithDecommission {
                 
                 if ($isDecommission) {
                     $foundVMs = @{}
+
+                    # ------------------------------------------------------------------
+                    # Requester: pulled from request inputs or requestedBy field.
+                    # This is the person who submitted the decommission request.
+                    # Initiated By: the deployment owner (ownedBy).
+                    # ------------------------------------------------------------------
+                    $requesterValue = "N/A"
+                    if ($request.inputs -and $request.inputs.requestedBy) {
+                        $requesterValue = $request.inputs.requestedBy
+                    }
+                    elseif ($request.inputs -and $request.inputs.requester) {
+                        $requesterValue = $request.inputs.requester
+                    }
+                    elseif ($request.requestedBy) {
+                        $requesterValue = $request.requestedBy
+                    }
+
+                    $initiatedByValue = if ($deployment.ownedBy) { $deployment.ownedBy } else { $request.requestedBy }
                     
                     if ($deployment.resources) {
                         foreach ($resource in $deployment.resources) {
@@ -460,7 +492,6 @@ function Get-ActiveDeploymentsWithDecommission {
                         $hostname = $vmEntry.Value
                         
                         $existingVM = $decommissionData | Where-Object { 
-                            # Skip workflow/non-VM resource names
                             if ($hostname -match "(?i)^workflow$|(?i)^workflow-|(?i)^workflow_") {
                                 Write-Log "  Skipping workflow resource: $hostname" "WARN"
                                 continue
@@ -520,24 +551,25 @@ function Get-ActiveDeploymentsWithDecommission {
                         }
 
                         $vmObject = New-Object PSObject -Property @{
-                            VMName = $hostname
-                            ResourceType = "Cloud.vSphere.Machine"
-                            DeploymentName = $deployment.name
-                            DeploymentID = $deployment.id
-                            DeploymentStatus = $deployment.status
-                            RequestID = $request.id
-                            RequestAction = $request.name
-                            RequestStatus = $request.status
-                            RequestedBy = $request.requestedBy
-                            Requestor = if ($deployment.ownedBy) { $deployment.ownedBy } else { $request.requestedBy }
-                            CatalogItem = $catalogItem
-                            InitiatedAt = $initiatedAt
-                            CompletedAt = if ($request.completedAt) { Convert-ToSydneyTime -DateTimeString $request.completedAt } else { "N/A" }
-                            DeletionDate = $deletionDate
+                            VMName            = $hostname
+                            ResourceType      = "Cloud.vSphere.Machine"
+                            DeploymentName    = $deployment.name
+                            DeploymentID      = $deployment.id
+                            DeploymentStatus  = $deployment.status
+                            RequestID         = $request.id
+                            RequestAction     = $request.name
+                            RequestStatus     = $request.status
+                            # v4.1.0: split into Requester (who raised it) and InitiatedBy (owner)
+                            Requester         = $requesterValue
+                            InitiatedBy       = $initiatedByValue
+                            CatalogItem       = $catalogItem
+                            InitiatedAt       = $initiatedAt
+                            CompletedAt       = if ($request.completedAt) { Convert-ToSydneyTime -DateTimeString $request.completedAt } else { "N/A" }
+                            DeletionDate      = $deletionDate
                             DaysUntilDeletion = $daysUntilDeletion
-                            vRAServer = $vraServerShort
-                            Source = "vRA-Decommission-InProgress"
-                            IsStillActive = $true
+                            vRAServer         = $vraServerShort
+                            Source            = "vRA-Decommission-InProgress"
+                            IsStillActive     = $true
                         }
                         
                         [void]$decommissionData.Add($vmObject)
@@ -687,16 +719,23 @@ function Get-DeletedVMsFromVRA {
         if ($deployment.resources) {
             foreach ($resource in $deployment.resources) {
                 if ($resource.type -eq "Cloud.vSphere.Machine") {
-                    $serverName = $null
-                    
-                    if ($resource.properties -and $resource.properties.resourceName) {
-                        $serverName = $resource.properties.resourceName
+                    # v4.1.0: Use Extract-CloudResourceName to enforce W/L prefix rule
+                    # Build a synthetic event-like object so we can reuse the function
+                    $syntheticEvent = [PSCustomObject]@{
+                        details      = $resource.properties | ConvertTo-Json -Compress -Depth 5
+                        resourceName = if ($resource.name) { $resource.name } else { $null }
                     }
-                    elseif ($resource.name -and $resource.name -notmatch "Cloud_vSphere_Machine_\d+") {
-                        $serverName = $resource.name
-                    }
-                    elseif ($resource.properties -and $resource.properties.address) {
-                        $serverName = $resource.properties.address
+                    $serverName = Extract-CloudResourceName -Event $syntheticEvent
+
+                    # Fallback for resource.properties direct fields (not in details JSON)
+                    if (-not $serverName -and $resource.properties) {
+                        foreach ($field in @('resourceName','hostname','hostName','name','address')) {
+                            $candidate = $resource.properties.$field
+                            if ($candidate -and $candidate -match "^[WLwl]") {
+                                $serverName = $candidate
+                                break
+                            }
+                        }
                     }
                     
                     if ($serverName) {
@@ -770,7 +809,6 @@ function Get-DeletedVMsFromVRA {
             $vmKey = $serverName.ToLower()
             $existingVM = $deletedVMData | Where-Object { $_.VMName.ToLower() -eq $vmKey }
 
-            # Skip workflow/non-VM resource names
             if ($serverName -match "(?i)(workflow)") {
                 Write-Log "  Skipping workflow resource: $serverName" "WARN"
                 continue
@@ -781,25 +819,25 @@ function Get-DeletedVMsFromVRA {
                 $catalogItem = if ($deployment.inputs._catalogItemName) { $deployment.inputs._catalogItemName } else { "N/A" }
                 
                 $deletedVMData += New-Object PSObject -Property @{
-                    VMName = $serverName
-                    ResourceType = "Cloud.vSphere.Machine"
-                    DeploymentName = $deployment.name
-                    DeploymentID = $deployment.id
-                    DeploymentStatus = $deployment.status
-                    RequestID = $deletionRequestId
-                    RequestAction = "Deployment.Delete"
-                    RequestStatus = $deletionRequestStatus
-                    RequestedBy = $deletedBy
-                    Requestor = $deletedBy
-                    CatalogItem = $catalogItem
-                    DeletedAt = Convert-ToSydneyTime -DateTimeString $deployment.lastUpdatedAt
-                    InitiatedAt = if ($deployment.createdAt) { Convert-ToSydneyTime -DateTimeString $deployment.createdAt } else { "N/A" }
-                    vRAServer = $vraServerShort
-                    EventType = "Deployment.Delete"
-                    EventStatus = $deletionRequestStatus
-                    EventMessage = "Deleted by $deletedBy"
-                    Source = "vRA-Deleted"
-                    IsStillActive = $false
+                    VMName             = $serverName
+                    ResourceType       = "Cloud.vSphere.Machine"
+                    DeploymentName     = $deployment.name
+                    DeploymentID       = $deployment.id
+                    DeploymentStatus   = $deployment.status
+                    RequestID          = $deletionRequestId
+                    RequestAction      = "Deployment.Delete"
+                    RequestStatus      = $deletionRequestStatus
+                    RequestedBy        = $deletedBy
+                    Requestor          = $deletedBy
+                    CatalogItem        = $catalogItem
+                    DeletedAt          = Convert-ToSydneyTime -DateTimeString $deployment.lastUpdatedAt
+                    InitiatedAt        = if ($deployment.createdAt) { Convert-ToSydneyTime -DateTimeString $deployment.createdAt } else { "N/A" }
+                    vRAServer          = $vraServerShort
+                    EventType          = "Deployment.Delete"
+                    EventStatus        = $deletionRequestStatus
+                    EventMessage       = "Deleted by $deletedBy"
+                    Source             = "vRA-Deleted"
+                    IsStillActive      = $false
                 }
             }
         }
@@ -837,15 +875,13 @@ function Get-DeletedVMsFromVCenter {
             $vmName = $event.Vm.Name
             $vCenterShort = ($VCenter -split '\.')[0]
 
-            # Filter out workflow/application segment objects
             if ($vmName -match "(?i)(workflow)") {
                 Write-Log "  Skipping workflow object: $vmName" "WARN"
                 continue
             }
 
-            # Primary filter: must start with W or L (case insensitive)
+            # v4.1.0: Enforce W/L prefix rule (consistent with Extract-CloudResourceName)
             if ($vmName -notmatch "^[WLwl][A-Za-z0-9]") {
-                # Secondary check: allow through if it was a known vRA VM
                 if (-not $KnownVRAVMs.ContainsKey($vmName.ToLower())) {
                     Write-Log "  Skipping non-VM vCenter object: $vmName" "WARN"
                     continue
@@ -856,13 +892,13 @@ function Get-DeletedVMsFromVCenter {
             }
             
             $deletedVMs += New-Object PSObject -Property @{
-                VMName     = $vmName
-                DeletedAt  = Convert-ToSydneyTime -DateTimeString $event.CreatedTime.ToString("yyyy-MM-ddTHH:mm:ss")
-                DeletedBy  = if ($event.UserName) { $event.UserName } else { "N/A" }
-                EventType  = $event.GetType().Name
-                Message    = $event.FullFormattedMessage
-                vCenter    = $vCenterShort
-                Source     = "vCenter-Deleted"
+                VMName    = $vmName
+                DeletedAt = Convert-ToSydneyTime -DateTimeString $event.CreatedTime.ToString("yyyy-MM-ddTHH:mm:ss")
+                DeletedBy = if ($event.UserName) { $event.UserName } else { "N/A" }
+                EventType = $event.GetType().Name
+                Message   = $event.FullFormattedMessage
+                vCenter   = $vCenterShort
+                Source    = "vCenter-Deleted"
             }
         }
         
@@ -944,18 +980,24 @@ function Get-FailedDeploymentsFromVRA {
         if ($deployment.resources) {
             foreach ($resource in $deployment.resources) {
                 if ($resource.type -eq "Cloud.vSphere.Machine") {
-                    if ($resource.properties -and $resource.properties.resourceName) {
-                        $serverName = $resource.properties.resourceName
-                        break
+                    # v4.1.0: Use Extract-CloudResourceName for W/L enforcement
+                    $syntheticEvent = [PSCustomObject]@{
+                        details      = $resource.properties | ConvertTo-Json -Compress -Depth 5
+                        resourceName = if ($resource.name) { $resource.name } else { $null }
                     }
-                    elseif ($resource.name -and $resource.name -notmatch "Cloud_vSphere_Machine_\d+") {
-                        $serverName = $resource.name
-                        break
+                    $serverName = Extract-CloudResourceName -Event $syntheticEvent
+
+                    if (-not $serverName -and $resource.properties) {
+                        foreach ($field in @('resourceName','hostname','hostName','name','address')) {
+                            $candidate = $resource.properties.$field
+                            if ($candidate -and $candidate -match "^[WLwl]") {
+                                $serverName = $candidate
+                                break
+                            }
+                        }
                     }
-                    elseif ($resource.properties -and $resource.properties.address) {
-                        $serverName = $resource.properties.address
-                        break
-                    }
+
+                    if ($serverName) { break }
                 }
             }
         }
@@ -983,14 +1025,14 @@ function Get-FailedDeploymentsFromVRA {
                 }
                 
                 $requestHistory += [PSCustomObject]@{
-                    RequestId = $request.id
-                    ActionId = $request.actionId
+                    RequestId   = $request.id
+                    ActionId    = $request.actionId
                     RequestName = $request.name
-                    Status = $request.status
+                    Status      = $request.status
                     InitiatedAt = $request.initiatedAt
                     CompletedAt = $request.completedAt
                     RequestedBy = $request.requestedBy
-                    Events = $requestEvents
+                    Events      = $requestEvents
                 }
             }
             
@@ -1007,19 +1049,19 @@ function Get-FailedDeploymentsFromVRA {
             
             if ($serverName) {
                 $failedDeploymentData.Add([PSCustomObject]@{
-                    VMName = $serverName
-                    DeploymentId = $deployment.id
-                    DeploymentName = $deployment.name
+                    VMName           = $serverName
+                    DeploymentId     = $deployment.id
+                    DeploymentName   = $deployment.name
                     DeploymentStatus = $deployment.status
-                    RequestStatus = "CREATE_FAILED"
-                    RequestedBy = $deployment.createdBy
-                    FailedAt = if ($deployment.lastUpdatedAt) { Convert-ToSydneyTime -DateTimeString $deployment.lastUpdatedAt } else { "N/A" }
-                    InitiatedAt = if ($deployment.createdAt) { Convert-ToSydneyTime -DateTimeString $deployment.createdAt } else { "N/A" }
-                    vRAServer = ($VraServer -split '\.')[0]
-                    Source = "vRA-Failed"
-                    RequestHistory = $requestHistory
-                    CleanupInfo = $cleanupInfo
-                    HasVraCleanup = ($hasCleanupAction -ne $null)
+                    RequestStatus    = "CREATE_FAILED"
+                    RequestedBy      = $deployment.createdBy
+                    FailedAt         = if ($deployment.lastUpdatedAt) { Convert-ToSydneyTime -DateTimeString $deployment.lastUpdatedAt } else { "N/A" }
+                    InitiatedAt      = if ($deployment.createdAt) { Convert-ToSydneyTime -DateTimeString $deployment.createdAt } else { "N/A" }
+                    vRAServer        = ($VraServer -split '\.')[0]
+                    Source           = "vRA-Failed"
+                    RequestHistory   = $requestHistory
+                    CleanupInfo      = $cleanupInfo
+                    HasVraCleanup    = ($hasCleanupAction -ne $null)
                 }) | Out-Null
             }
         }
@@ -1069,19 +1111,19 @@ function Match-FailedVMsWithVCenter {
             }
             
             $enrichedVM = [PSCustomObject]@{
-                VMName = $failedVM.VMName
+                VMName         = $failedVM.VMName
                 DeploymentName = $failedVM.DeploymentName
-                RequestStatus = "CREATE_FAILED"
-                Source = "vRA ($($failedVM.vRAServer))"
-                DeletedBy = $deletedBy
-                DeletedAt = $matchedVCRecord.DeletedAt
-                RequestAction = "Create Failed"
-                RequestedBy = $failedVM.RequestedBy
-                FailedAt = $failedVM.FailedAt
-                InitiatedAt = $failedVM.InitiatedAt
+                RequestStatus  = "CREATE_FAILED"
+                Source         = "vRA ($($failedVM.vRAServer))"
+                DeletedBy      = $deletedBy
+                DeletedAt      = $matchedVCRecord.DeletedAt
+                RequestAction  = "Create Failed"
+                RequestedBy    = $failedVM.RequestedBy
+                FailedAt       = $failedVM.FailedAt
+                InitiatedAt    = $failedVM.InitiatedAt
                 DeletionSource = $deletionSource
-                vCenterEvent = $matchedVCRecord.EventType
-                CleanupInfo = $failedVM.CleanupInfo
+                vCenterEvent   = $matchedVCRecord.EventType
+                CleanupInfo    = $failedVM.CleanupInfo
                 RequestHistory = $failedVM.RequestHistory
             }
             
@@ -1089,19 +1131,19 @@ function Match-FailedVMsWithVCenter {
         }
         else {
             $enrichedVM = [PSCustomObject]@{
-                VMName = $failedVM.VMName
+                VMName         = $failedVM.VMName
                 DeploymentName = $failedVM.DeploymentName
-                RequestStatus = "CREATE_FAILED"
-                Source = "vRA ($($failedVM.vRAServer))"
-                DeletedBy = "N/A"
-                DeletedAt = "N/A"
-                RequestAction = "Create Failed"
-                RequestedBy = $failedVM.RequestedBy
-                FailedAt = $failedVM.FailedAt
-                InitiatedAt = $failedVM.InitiatedAt
+                RequestStatus  = "CREATE_FAILED"
+                Source         = "vRA ($($failedVM.vRAServer))"
+                DeletedBy      = "N/A"
+                DeletedAt      = "N/A"
+                RequestAction  = "Create Failed"
+                RequestedBy    = $failedVM.RequestedBy
+                FailedAt       = $failedVM.FailedAt
+                InitiatedAt    = $failedVM.InitiatedAt
                 DeletionSource = "No vCenter deletion event found"
-                vCenterEvent = "N/A"
-                CleanupInfo = $failedVM.CleanupInfo
+                vCenterEvent   = "N/A"
+                CleanupInfo    = $failedVM.CleanupInfo
                 RequestHistory = $failedVM.RequestHistory
             }
             
@@ -1134,8 +1176,7 @@ function Send-CombinedVMReport {
     
     Write-Log "Building comprehensive email report"
     
-    # Build sets of VMs already accounted for
-    $vraVMNames = @{}
+    $vraVMNames  = @{}
     $failedVMNames = @{}
     
     foreach ($vm in $VraDeletedData)      { $vraVMNames[$vm.VMName.ToLower()] = $true }
@@ -1145,18 +1186,15 @@ function Send-CombinedVMReport {
         $vraVMNames[$vm.VMName.ToLower()] = $true
     }
     
-    # Build new VMs table
+    # ---- New VMs table ----
     $newVMsTableRows = ""
-    $onlineCount = 0
     
     foreach ($vm in ($NewVMsData | Sort-Object Name)) {
         if ($vm.Status -eq "Online") {
-            $onlineCount++
             $newVMsTableRows += "<tr style='background-color: #e8f5e9;'>"
         } else {
             $newVMsTableRows += "<tr>"
         }
-        
         $newVMsTableRows += "<td>$($vm.Name)</td>"
         $newVMsTableRows += "<td>$($vm.DeploymentName)</td>"
         $newVMsTableRows += "<td>$($vm.Status)</td>"
@@ -1168,31 +1206,24 @@ function Send-CombinedVMReport {
         $newVMsTableRows += "</tr>"
     }
     
-    # Build deleted VMs table
+    # ---- Deleted VMs table ----
     $deletedVMs = @()
     
-    # 1. vRA successfully-deleted deployments
     foreach ($vm in $VraDeletedData) {
-        if ($vm.RequestStatus -match "FAILED|ABORTED|REJECTED|FAILURE") {
-            continue
-        }
-        
+        if ($vm.RequestStatus -match "FAILED|ABORTED|REJECTED|FAILURE") { continue }
         $deletedVMs += New-Object PSObject -Property @{
-            VMName = $vm.VMName
-            RequestedBy = $vm.RequestedBy
-            DeletedAt = $vm.DeletedAt
+            VMName        = $vm.VMName
+            RequestedBy   = $vm.RequestedBy
+            DeletedAt     = $vm.DeletedAt
             DeploymentName = $vm.DeploymentName
             RequestAction = $vm.RequestAction
             RequestStatus = $vm.RequestStatus
-            Source = $vm.vRAServer
+            Source        = $vm.vRAServer
         }
     }
     
-    # 2. Failed vRA deployments
     foreach ($vm in $VraFailedData) {
-        if ($vm.DeletionSource -match "No vCenter deletion event found") {
-            continue
-        }
+        if ($vm.DeletionSource -match "No vCenter deletion event found") { continue }
         
         $status = "CREATE_FAILED"
         $sourceValue = $vm.Source
@@ -1207,41 +1238,35 @@ function Send-CombinedVMReport {
             $status = "CREATE_FAILED (no cleanup detected)"
         }
         
-        if ($vm.Source -match '\(([^)]+)\)') {
-            $sourceValue = $matches[1]
-        }
+        if ($vm.Source -match '\(([^)]+)\)') { $sourceValue = $matches[1] }
         
         $deletedVMs += New-Object PSObject -Property @{
-            VMName = $vm.VMName
-            RequestedBy = $vm.RequestedBy
-            DeletedAt = if ($vm.DeletedAt -ne "N/A") { $vm.DeletedAt } else { $vm.FailedAt }
+            VMName        = $vm.VMName
+            RequestedBy   = $vm.RequestedBy
+            DeletedAt     = if ($vm.DeletedAt -ne "N/A") { $vm.DeletedAt } else { $vm.FailedAt }
             DeploymentName = $vm.DeploymentName
             RequestAction = "Deployment Create (Failed)"
             RequestStatus = $status
-            Source = $sourceValue
+            Source        = $sourceValue
         }
     }
     
-    # 3. Pure vCenter deletions
     foreach ($vm in $VCenterData) {
         $vmLower = $vm.VMName.ToLower()
-        
-        if ($vraVMNames.ContainsKey($vmLower) -or $failedVMNames.ContainsKey($vmLower)) {
-            continue
-        }
-        
+        if ($vraVMNames.ContainsKey($vmLower) -or $failedVMNames.ContainsKey($vmLower)) { continue }
         $deletedVMs += New-Object PSObject -Property @{
-            VMName = $vm.VMName
-            RequestedBy = $vm.DeletedBy
-            DeletedAt = $vm.DeletedAt
+            VMName        = $vm.VMName
+            RequestedBy   = $vm.DeletedBy
+            DeletedAt     = $vm.DeletedAt
             DeploymentName = "N/A"
             RequestAction = $vm.EventType
             RequestStatus = "Deleted (vCenter)"
-            Source = $vm.vCenter
+            Source        = $vm.vCenter
         }
     }
     
     $deletedVMs = $deletedVMs | Where-Object { $_.VMName -notmatch "(?i)(workflow)" }
+    
     $deletedTableRows = ""
     foreach ($vm in ($deletedVMs | Sort-Object VMName)) {
         $deletedTableRows += "<tr>"
@@ -1255,19 +1280,21 @@ function Send-CombinedVMReport {
         $deletedTableRows += "</tr>"
     }
     
-    # Build decommission table
+    # ---- Decommission table ----
+    # v4.1.0: Requester (from request details/inputs) + Initiated By (deployment owner) as separate columns
     $decommissionVMs = @()
     foreach ($vm in $VraDecommissionData) {
         $decommissionVMs += New-Object PSObject -Property @{
-            VMName = if ($vm.VMName) { $vm.VMName } else { "N/A" }
-            RequestedBy = if ($vm.RequestedBy) { $vm.RequestedBy } else { "N/A" }
-            InitiatedAt = if ($vm.InitiatedAt) { $vm.InitiatedAt } else { "N/A" }
-            DeletionDate = if ($vm.DeletionDate) { $vm.DeletionDate } else { "N/A" }
+            VMName            = if ($vm.VMName)            { $vm.VMName }            else { "N/A" }
+            Requester         = if ($vm.Requester)         { $vm.Requester }         else { "N/A" }
+            InitiatedBy       = if ($vm.InitiatedBy)       { $vm.InitiatedBy }       else { "N/A" }
+            InitiatedAt       = if ($vm.InitiatedAt)       { $vm.InitiatedAt }       else { "N/A" }
+            DeletionDate      = if ($vm.DeletionDate)      { $vm.DeletionDate }      else { "N/A" }
             DaysUntilDeletion = if ($vm.DaysUntilDeletion) { $vm.DaysUntilDeletion } else { "N/A" }
-            DeploymentName = if ($vm.DeploymentName) { $vm.DeploymentName } else { "N/A" }
-            RequestAction = if ($vm.RequestAction) { $vm.RequestAction } else { "N/A" }
-            RequestStatus = if ($vm.RequestStatus) { $vm.RequestStatus } else { "N/A" }
-            Source = if ($vm.vRAServer) { $vm.vRAServer } else { "N/A" }
+            DeploymentName    = if ($vm.DeploymentName)    { $vm.DeploymentName }    else { "N/A" }
+            RequestAction     = if ($vm.RequestAction)     { $vm.RequestAction }     else { "N/A" }
+            RequestStatus     = if ($vm.RequestStatus)     { $vm.RequestStatus }     else { "N/A" }
+            Source            = if ($vm.vRAServer)         { $vm.vRAServer }         else { "N/A" }
         }
     }
     
@@ -1283,7 +1310,8 @@ function Send-CombinedVMReport {
         $decommissionTableRows += "<td>$($vm.DeploymentName)</td>"
         $decommissionTableRows += "<td>$($vm.RequestAction)</td>"
         $decommissionTableRows += "<td>$($vm.RequestStatus)</td>"
-        $decommissionTableRows += "<td>$($vm.RequestedBy)</td>"
+        $decommissionTableRows += "<td>$($vm.Requester)</td>"       # Who raised the decommission request
+        $decommissionTableRows += "<td>$($vm.InitiatedBy)</td>"     # Deployment owner
         $decommissionTableRows += "<td>$($vm.InitiatedAt)</td>"
         $decommissionTableRows += "<td>$($vm.DeletionDate)</td>"
         $decommissionTableRows += "<td><strong>$($vm.DaysUntilDeletion)</strong></td>"
@@ -1365,7 +1393,8 @@ $(if($decommissionVMs.Count -gt 0) {
 <th>Deployment Name</th>
 <th>Request Action</th>
 <th>Request Status</th>
-<th>Requested By</th>
+<th>Requester</th>
+<th>Initiated By</th>
 <th>Initiated At</th>
 <th>Deletion Date</th>
 <th>Days Until Deletion</th>
@@ -1386,14 +1415,14 @@ $decommissionTableRows
     
     try {
         $mailParams = @{
-            To = $To
-            From = $From
-            Subject = $Subject
-            Body = $htmlBody
+            To         = $To
+            From       = $From
+            Subject    = $Subject
+            Body       = $htmlBody
             BodyAsHtml = $true
             SmtpServer = $SmtpServer
-            Port = $SmtpPort
-            UseSsl = $true
+            Port       = $SmtpPort
+            UseSsl     = $true
         }
         
         if ($Cc -and $Cc.Count -gt 0) {
@@ -1413,7 +1442,7 @@ $decommissionTableRows
 # ============================================================================
 
 Write-Log "=== COMPREHENSIVE VM TRACKER STARTED ===" "SUCCESS"
-Write-Log "Version: 4.0.1 - FIXED: Deleted VMs only appear in Deleted section, failed builds appear in New Server section"
+Write-Log "Version: 4.1.0"
 Write-Log "PowerShell Version: $($PSVersionTable.PSVersion)"
 
 # Load VMware PowerCLI
@@ -1503,61 +1532,55 @@ try {
             if (-not $nameProp) { continue }
             $vmName = $nameProp.value
             
-            $healthProp = $response.property | Where-Object { $_.name -eq "badge|health" -or $_.name -eq "summary|health" } | Select-Object -First 1
-            $resourceStateProp = $response.property | Where-Object { $_.name -eq "summary|resourceState" } | Select-Object -First 1
-            $powerStateProp = $response.property | Where-Object { $_.name -eq "summary|runtime|powerState" } | Select-Object -First 1
+            $healthProp         = $response.property | Where-Object { $_.name -eq "badge|health" -or $_.name -eq "summary|health" } | Select-Object -First 1
+            $resourceStateProp  = $response.property | Where-Object { $_.name -eq "summary|resourceState" } | Select-Object -First 1
+            $powerStateProp     = $response.property | Where-Object { $_.name -eq "summary|runtime|powerState" } | Select-Object -First 1
             
-            $status = "Unknown"
+            $status     = "Unknown"
             $powerState = "Unknown"
             
-            # Check power state first
             if ($powerStateProp -and $powerStateProp.value) {
                 $powerStateValue = $powerStateProp.value.ToString().ToUpper()
                 if ($powerStateValue -eq "POWERED_ON" -or $powerStateValue -eq "1") {
-                    $status = "Online"
+                    $status     = "Online"
                     $powerState = "PoweredOn"
                 }
                 elseif ($powerStateValue -eq "POWERED_OFF" -or $powerStateValue -eq "0") {
-                    $status = "Online"  # VM exists, just powered off
+                    $status     = "Online"
                     $powerState = "PoweredOff"
                 }
             }
             
-            # Check resource state - this tells us if VM actually exists
             if ($resourceStateProp -and $resourceStateProp.value) {
                 $resourceState = $resourceStateProp.value.ToString().ToUpper()
                 if ($resourceState -in @("NOT_EXISTING", "STOPPED")) {
-                    $status = "Decomm/Offline"  # VM no longer exists - FIXED: Changed from "Offline"
+                    $status     = "Decomm/Offline"
                     $powerState = "NotExisting"
                 }
                 elseif ($resourceState -in @("STARTED", "MAINTAINED", "RUNNING")) {
-                    if ($status -eq "Unknown") {
-                        $status = "Online"
-                    }
+                    if ($status -eq "Unknown") { $status = "Online" }
                 }
             }
             
-            # Check health badge as fallback
             if ($status -eq "Unknown" -and $healthProp -and $healthProp.value) {
                 $healthValue = $healthProp.value.ToString().ToUpper()
-                
                 if ($healthValue -match "GREEN|YELLOW|ORANGE|RED") {
                     $status = "Online"
                 }
                 elseif ($healthValue -match "GREY|GRAY|NONE") {
-                    $status = "Decomm/Offline"  # No health data = doesn't exist - FIXED: Changed from "Offline"
+                    $status = "Decomm/Offline"
                 }
                 elseif ($healthValue -match "^[1-4]$") {
                     $status = "Online"
                 }
                 elseif ($healthValue -eq "0") {
-                    $status = "Decomm/Offline"  # FIXED: Changed from "Offline"
+                    $status = "Decomm/Offline"
                 }
             }
             
             $newVMsData += [PSCustomObject]@{
-                Name = $vmName
-                Status = $status
+                Name       = $vmName
+                Status     = $status
                 PowerState = $powerState
                 ResourceId = $identifier
             }
@@ -1604,7 +1627,6 @@ foreach ($vraServer in $vraServers) {
         
         Write-Log "Authenticated successfully" "SUCCESS"
         
-        # Fetch active deployments
         $vraUri = "https://$vraServer/deployment/api/deployments"
         $page = 0
         $size = 1000
@@ -1640,39 +1662,27 @@ foreach ($vraServer in $vraServers) {
                     if ($machine.properties) {
                         $props = $machine.properties
                         
-                        if ($props.PSObject.Properties['hostname']) {
-                            $hostname = $props.hostname
-                        }
-                        elseif ($props.PSObject.Properties['resourceName']) {
-                            $hostname = $props.resourceName
-                        }
-                        elseif ($props.PSObject.Properties['name']) {
-                            $hostname = $props.name
-                        }
-                        elseif ($props.PSObject.Properties['address']) {
-                            $hostname = $props.address
-                        }
-                        elseif ($props.PSObject.Properties['hostName']) {
-                            $hostname = $props.hostName
-                        }
+                        if ($props.PSObject.Properties['hostname'])     { $hostname = $props.hostname }
+                        elseif ($props.PSObject.Properties['resourceName']) { $hostname = $props.resourceName }
+                        elseif ($props.PSObject.Properties['name'])     { $hostname = $props.name }
+                        elseif ($props.PSObject.Properties['address'])  { $hostname = $props.address }
+                        elseif ($props.PSObject.Properties['hostName']) { $hostname = $props.hostName }
                     }
                     
-                    if (-not $hostname -and $machine.name) {
-                        $hostname = $machine.name
-                    }
+                    if (-not $hostname -and $machine.name) { $hostname = $machine.name }
                     
                     if ($hostname -and -not $deploymentData.ContainsKey($hostname)) {
                         $vraServerShort = ($vraServer -split '\.')[0]
                         
                         $deploymentData[$hostname] = @{
                             DeploymentName = $dep.name
-                            Description = if ($dep.description) { $dep.description } else { "N/A" }
-                            RequestedBy = if ($dep.createdBy) { $dep.createdBy } else { "N/A" }
-                            Requestor = if ($dep.ownedBy) { $dep.ownedBy } else { $dep.createdBy }
-                            vRAServer = $vraServerShort
-                            DeploymentID = $dep.id
-                            Status = $dep.status
-                            CatalogItem = if ($dep.inputs._catalogItemName) { $dep.inputs._catalogItemName } else { "N/A" }
+                            Description    = if ($dep.description) { $dep.description } else { "N/A" }
+                            RequestedBy    = if ($dep.createdBy) { $dep.createdBy } else { "N/A" }
+                            Requestor      = if ($dep.ownedBy) { $dep.ownedBy } else { $dep.createdBy }
+                            vRAServer      = $vraServerShort
+                            DeploymentID   = $dep.id
+                            Status         = $dep.status
+                            CatalogItem    = if ($dep.inputs._catalogItemName) { $dep.inputs._catalogItemName } else { "N/A" }
                             DeploymentStatus = "Online"
                         }
                     }
@@ -1682,7 +1692,6 @@ foreach ($vraServer in $vraServers) {
         
         Write-Log "Processed active deployments" "SUCCESS"
         
-        # Fetch deleted deployments
         Write-Log "Fetching deleted deployments..."
         $deletedServers = Get-DeletedDeploymentServers -VraServer $vraServer -Headers $vraHeaders -DaysBack $deletedDaysBack
         
@@ -1716,7 +1725,6 @@ $vmsNeedingVCenterLookup = $newVMsData | Where-Object { -not $deploymentData.Con
 
 Write-Log "VMs needing vCenter lookup: $($vmsNeedingVCenterLookup.Count)"
 
-# Also check vCenter for VMs created in the last day that might not appear in Aria Ops (offline VMs)
 $vCenterCreatedVMs = @{}
 
 foreach ($vCenter in $vCenters) {
@@ -1727,7 +1735,6 @@ foreach ($vCenter in $vCenters) {
         
         $cutoffDate = (Get-Date).AddDays(-$daysBack)
         
-        # Get ALL VM creation events (not filtered by name)
         $events = Get-VIEvent -Server $vCenter -Start $cutoffDate -MaxSamples 50000 | Where-Object {
             $_.GetType().Name -in @('VmCreatedEvent', 'VmBeingDeployedEvent', 'VmRegisteredEvent', 'VmDeployedEvent')
         }
@@ -1738,29 +1745,26 @@ foreach ($vCenter in $vCenters) {
             $vmName = $event.Vm.Name
             $vCenterShort = ($vCenter -split '\.')[0]
             
-            # Track for lookup table (for VMs already in newVMsData)
             if ($vmName -in $vmsNeedingVCenterLookup -and -not $vCenterLookup.ContainsKey($vmName)) {
                 $vCenterLookup[$vmName] = @{
                     CreatedBy = if ($event.UserName) { $event.UserName } else { "N/A" }
-                    vCenter = $vCenterShort
+                    vCenter   = $vCenterShort
                 }
             }
             
-            # Track ALL created VMs (to catch ones Aria Ops missed)
             if (-not $vCenterCreatedVMs.ContainsKey($vmName)) {
-                # Get current VM object to check power state
                 $vm = Get-VM -Name $vmName -Server $vCenter -ErrorAction SilentlyContinue
                 
                 if ($vm) {
                     $powerState = if ($vm.PowerState -eq "PoweredOn") { "PoweredOn" } else { "PoweredOff" }
-                    $status = "Online"  # It exists in vCenter, so it's online even if powered off
+                    $status = "Online"
                     
                     $vCenterCreatedVMs[$vmName] = @{
-                        Name = $vmName
-                        Status = $status
+                        Name       = $vmName
+                        Status     = $status
                         PowerState = $powerState
-                        CreatedBy = if ($event.UserName) { $event.UserName } else { "N/A" }
-                        vCenter = $vCenterShort
+                        CreatedBy  = if ($event.UserName) { $event.UserName } else { "N/A" }
+                        vCenter    = $vCenterShort
                         ResourceId = "vCenter-$($vm.Id)"
                         FromVCenter = $true
                     }
@@ -1776,14 +1780,11 @@ foreach ($vCenter in $vCenters) {
     }
 }
 
-# Add VMs from vCenter that weren't in Aria Ops data
 $existingVMNames = $newVMsData | Select-Object -ExpandProperty Name
-$vCenterVMsStillExist = @{}  # Track which vCenter VMs still exist
+$vCenterVMsStillExist = @{}
 
 foreach ($vcVM in $vCenterCreatedVMs.Values) {
     if ($vcVM.Name -notin $existingVMNames) {
-        # For vCenter-created VMs, we need to verify they still exist
-        # If they were deleted, they should only appear in Deleted section, not New Server section
         $vmStillExists = $false
         
         foreach ($vCenter in $vCenters) {
@@ -1800,18 +1801,14 @@ foreach ($vcVM in $vCenterCreatedVMs.Values) {
                     break
                 }
             }
-            catch {
-                # Continue to next vCenter
-            }
+            catch { }
         }
         
-        # Only add to new server deployments if VM still exists
         if ($vmStillExists) {
             Write-Log "  Adding VM from vCenter that wasn't in Aria Ops: $($vcVM.Name) (PowerState: $($vcVM.PowerState))" "SUCCESS"
-            
             $newVMsData += [PSCustomObject]@{
-                Name = $vcVM.Name
-                Status = $vcVM.Status
+                Name       = $vcVM.Name
+                Status     = $vcVM.Status
                 PowerState = $vcVM.PowerState
                 ResourceId = $vcVM.ResourceId
             }
@@ -1852,15 +1849,12 @@ foreach ($vraServer in $vraServers) {
             "Content-Type" = "application/json"
         }
         
-        # Get decommissions
         $decommVMs = Get-ActiveDeploymentsWithDecommission -VraServer $vraServer -Headers $vraHeaders
         $allVraDecommissionVMs += $decommVMs
         
-        # Get failed deployments
         $failedVMs = Get-FailedDeploymentsFromVRA -VraServer $vraServer -Headers $vraHeaders -DaysBack $daysBack
         $allVraFailedVMs += $failedVMs
         
-        # Get deleted VMs
         $deletedVMs = Get-DeletedVMsFromVRA -VraServer $vraServer -Headers $vraHeaders -DaysBack $daysBack
         $allVraDeletedVMs += $deletedVMs
     }
@@ -1869,7 +1863,6 @@ foreach ($vraServer in $vraServers) {
     }
 }
 
-# Process vCenter Deletions
 foreach ($vCenter in $vCenters) {
     $deletedVMs = Get-DeletedVMsFromVCenter `
         -VCenter $vCenter `
@@ -1879,7 +1872,6 @@ foreach ($vCenter in $vCenters) {
     $allVCenterDeletedVMs += $deletedVMs
 }
 
-# Match Failed VMs with vCenter
 $allVraFailedVMs = Match-FailedVMsWithVCenter -FailedVMsList $allVraFailedVMs -VCenterData $allVCenterDeletedVMs
 
 Write-Log "Total decommissions: $($allVraDecommissionVMs.Count)" "SUCCESS"
@@ -1897,8 +1889,7 @@ $reportData = @()
 
 foreach ($vmData in $newVMsData) {
 
-    # Skip VMs built and deleted within the same period
-    $isDeleted = $allVraDeletedVMs | Where-Object { $_.VMName -eq $vmData.Name }
+    $isDeleted   = $allVraDeletedVMs    | Where-Object { $_.VMName -eq $vmData.Name }
     $isDeletedVC = $allVCenterDeletedVMs | Where-Object { $_.VMName -eq $vmData.Name }
 
     if ($isDeleted -or $isDeletedVC) {
@@ -1906,26 +1897,26 @@ foreach ($vmData in $newVMsData) {
         continue
     }
 
-    $vmName = $vmData.Name
+    $vmName  = $vmData.Name
     $depInfo = $deploymentData[$vmName]
 
     if ($depInfo) {
-        $finalStatus = $vmData.Status
+        $finalStatus     = $vmData.Status
         $finalPowerState = $vmData.PowerState
 
         if ($depInfo.Status -eq "DELETED" -or $depInfo.DeploymentStatus -eq "Decomm/Offline") {
             continue
         }
         elseif ($depInfo.Status -match "FAILED|ERROR") {
-            $finalStatus = "Decomm/Offline"
+            $finalStatus     = "Decomm/Offline"
             $finalPowerState = "NotExisting"
         }
         elseif ($vmData.Status -eq "Decomm/Offline") {
-            $finalStatus = "Decomm/Offline"
+            $finalStatus     = "Decomm/Offline"
             $finalPowerState = "NotExisting"
         }
         elseif ($vmData.Status -eq "Unknown") {
-            $finalStatus = "Online"
+            $finalStatus     = "Online"
             $finalPowerState = "Unknown"
 
             foreach ($vCenter in $vCenters) {
@@ -1938,7 +1929,7 @@ foreach ($vmData in $newVMsData) {
 
                     $vm = Get-VM -Name $vmName -Server $vCenter -ErrorAction SilentlyContinue
                     if ($vm) {
-                        $finalStatus = "Online"
+                        $finalStatus     = "Online"
                         $finalPowerState = if ($vm.PowerState -eq "PoweredOn") { "PoweredOn" } else { "PoweredOff" }
                         Write-Log "  Found $vmName on $vCenter - PowerState: $finalPowerState"
                         break
@@ -1960,8 +1951,8 @@ foreach ($vmData in $newVMsData) {
         }
     }
     else {
-        $vcInfo = $vCenterLookup[$vmName]
-        $finalStatus = $vmData.Status
+        $vcInfo          = $vCenterLookup[$vmName]
+        $finalStatus     = $vmData.Status
         $finalPowerState = $vmData.PowerState
 
         if ($vmData.Status -eq "Decomm/Offline") {
@@ -1970,7 +1961,7 @@ foreach ($vmData in $newVMsData) {
         }
 
         if ($finalStatus -eq "Unknown") {
-            $finalStatus = "Online"
+            $finalStatus     = "Online"
             $finalPowerState = "Unknown"
 
             foreach ($vCenter in $vCenters) {
@@ -1983,7 +1974,7 @@ foreach ($vmData in $newVMsData) {
 
                     $vm = Get-VM -Name $vmName -Server $vCenter -ErrorAction SilentlyContinue
                     if ($vm) {
-                        $finalStatus = "Online"
+                        $finalStatus     = "Online"
                         $finalPowerState = if ($vm.PowerState -eq "PoweredOn") { "PoweredOn" } else { "PoweredOff" }
                         Write-Log "  Found $vmName on $vCenter - PowerState: $finalPowerState"
                         break
@@ -2035,8 +2026,6 @@ foreach ($vCenter in $vCenterConnections.Keys) {
 
 Write-Log "New VMs report contains $($reportData.Count) records" "SUCCESS"
 
-
-
 # ============================================================================
 # SECTION 6: SEND COMBINED REPORT
 # ============================================================================
@@ -2068,14 +2057,14 @@ if ($totalActivity -eq 0) {
     
     try {
         $mailParams = @{
-            To = $script:smtpTo
-            From = $script:smtpFrom
-            Subject = "No VM Activity - $(Get-Date -Format 'dd-MM-yyyy')"
-            Body = $noActivityHtml
+            To         = $script:smtpTo
+            From       = $script:smtpFrom
+            Subject    = "No VM Activity - $(Get-Date -Format 'dd-MM-yyyy')"
+            Body       = $noActivityHtml
             BodyAsHtml = $true
             SmtpServer = $script:smtpServer
-            Port = $script:smtpPort
-            UseSsl = $true
+            Port       = $script:smtpPort
+            UseSsl     = $true
         }
         
         if ($script:smtpCc -and $script:smtpCc.Count -gt 0) {
@@ -2091,17 +2080,17 @@ if ($totalActivity -eq 0) {
 }
 else {
     Send-CombinedVMReport `
-        -NewVMsData $reportData `
-        -VraDeletedData $allVraDeletedVMs `
+        -NewVMsData        $reportData `
+        -VraDeletedData    $allVraDeletedVMs `
         -VraDecommissionData $allVraDecommissionVMs `
-        -VraFailedData $allVraFailedVMs `
-        -VCenterData $allVCenterDeletedVMs `
-        -SmtpServer $script:smtpServer `
-        -SmtpPort $script:smtpPort `
-        -From $script:smtpFrom `
-        -To $script:smtpTo `
-        -Cc $script:smtpCc `
-        -Subject $script:smtpSubject
+        -VraFailedData     $allVraFailedVMs `
+        -VCenterData       $allVCenterDeletedVMs `
+        -SmtpServer        $script:smtpServer `
+        -SmtpPort          $script:smtpPort `
+        -From              $script:smtpFrom `
+        -To                $script:smtpTo `
+        -Cc                $script:smtpCc `
+        -Subject           $script:smtpSubject
 }
 
 Write-Log "`n=== SCRIPT COMPLETED ===" "SUCCESS"
