@@ -1,11 +1,5 @@
 # ============================================================================
-# COMPREHENSIVE VM TRACKER - NEW SERVERS + DELETIONS + DECOMMISSIONS
-# Version 4.1.0
-# Changes:
-#   - Decommission section: Added "Requester" column (from request inputs/requestedBy)
-#   - Decommission section: Renamed "Requested By" to "Initiated By" (separate column)
-#   - Deleted VMs: Cloud Resource Name extraction now strictly filters for names
-#     starting with W or L (case-insensitive) before falling back to resourceName
+# COMPREHENSIVE VM TRACKER v4.1 - NEW SERVERS + DELETIONS + DECOMMISSIONS
 # ============================================================================
 
 # ============================================================================
@@ -1885,6 +1879,11 @@ Write-Log "`n=== BUILDING NEW VMs REPORT ===" "SUCCESS"
 $reportData = @()
 
 foreach ($vmData in $newVMsData) {
+
+    if ($vmData.PowerState -eq "NotExisting" -or $vmData.Status -eq "Decomm/Offline") {
+        Write-Log "  Skipping $($vmData.Name) - PowerState is NotExisting, VM no longer exists" "WARN"
+        continue
+    }
 
     $isDeleted   = $allVraDeletedVMs    | Where-Object { $_.VMName -and $_.VMName.ToLower() -eq $vmData.Name.ToLower() }
     $isDeletedVC = $allVCenterDeletedVMs | Where-Object { $_.VMName -and $_.VMName.ToLower() -eq $vmData.Name.ToLower() }
