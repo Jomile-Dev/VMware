@@ -1959,6 +1959,12 @@ foreach ($vmData in $newVMsData) {
             }
         }
 
+        # Final guard - never report a VM that no longer exists
+        if ($finalStatus -eq "Decomm/Offline" -or $finalPowerState -eq "NotExisting") {
+            Write-Log "  Skipping $vmName - resolved to Decomm/Offline or NotExisting, belongs in Deleted section" "WARN"
+            continue
+        }
+
         $reportData += [PSCustomObject]@{
             Name           = $vmName
             Status         = $finalStatus
@@ -1975,8 +1981,8 @@ foreach ($vmData in $newVMsData) {
         $finalStatus     = $vmData.Status
         $finalPowerState = $vmData.PowerState
 
-        if ($vmData.Status -eq "Decomm/Offline") {
-            Write-Log "  Skipping vCenter VM (deleted, will appear in Deleted section): $vmName"
+        if ($vmData.Status -eq "Decomm/Offline" -or $vmData.PowerState -eq "NotExisting") {
+            Write-Log "  Skipping vCenter VM (no longer exists, belongs in Deleted section): $vmName"
             continue
         }
 
@@ -2007,6 +2013,12 @@ foreach ($vmData in $newVMsData) {
                 Write-Log "  Skipping vCenter VM (cannot verify existence): $vmName"
                 continue
             }
+        }
+
+        # Final guard for non-vRA VMs
+        if ($finalStatus -eq "Decomm/Offline" -or $finalPowerState -eq "NotExisting") {
+            Write-Log "  Skipping $vmName - resolved to Decomm/Offline or NotExisting, belongs in Deleted section" "WARN"
+            continue
         }
 
         if ($vcInfo) {
