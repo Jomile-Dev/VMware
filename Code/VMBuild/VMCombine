@@ -438,9 +438,8 @@ function Get-ActiveDeploymentsWithDecommission {
                     $foundVMs = @{}
 
                     # ------------------------------------------------------------------
-                    # Requester: pulled from request inputs or requestedBy field.
-                    # This is the person who submitted the decommission request.
-                    # Initiated By: the deployment owner (ownedBy).
+                    # Requester:   person named in request inputs (on behalf of).
+                    # Initiated By: who actually submitted the request (original behaviour).
                     # ------------------------------------------------------------------
                     $requesterValue = "N/A"
                     if ($request.inputs -and $request.inputs.requestedBy) {
@@ -449,11 +448,9 @@ function Get-ActiveDeploymentsWithDecommission {
                     elseif ($request.inputs -and $request.inputs.requester) {
                         $requesterValue = $request.inputs.requester
                     }
-                    elseif ($request.requestedBy) {
-                        $requesterValue = $request.requestedBy
-                    }
 
-                    $initiatedByValue = if ($deployment.ownedBy) { $deployment.ownedBy } else { $request.requestedBy }
+                    # Original behaviour: the account that clicked submit on the request
+                    $initiatedByValue = if ($request.requestedBy) { $request.requestedBy } else { "N/A" }
                     
                     if ($deployment.resources) {
                         foreach ($resource in $deployment.resources) {
@@ -1889,11 +1886,11 @@ $reportData = @()
 
 foreach ($vmData in $newVMsData) {
 
-    $isDeleted   = $allVraDeletedVMs    | Where-Object { $_.VMName -eq $vmData.Name }
-    $isDeletedVC = $allVCenterDeletedVMs | Where-Object { $_.VMName -eq $vmData.Name }
+    $isDeleted   = $allVraDeletedVMs    | Where-Object { $_.VMName -and $_.VMName.ToLower() -eq $vmData.Name.ToLower() }
+    $isDeletedVC = $allVCenterDeletedVMs | Where-Object { $_.VMName -and $_.VMName.ToLower() -eq $vmData.Name.ToLower() }
 
     if ($isDeleted -or $isDeletedVC) {
-        Write-Log "  Skipping $($vmData.Name) - built and deleted within 24hrs, will appear in Deleted section only" "WARN"
+        Write-Log "  Skipping $($vmData.Name) - appears in Deleted section, excluding from New Servers" "WARN"
         continue
     }
 
