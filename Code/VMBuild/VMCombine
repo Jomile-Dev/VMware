@@ -1,5 +1,11 @@
 # ============================================================================
-# COMPREHENSIVE VM TRACKER v4.1 - NEW SERVERS + DELETIONS + DECOMMISSIONS
+# COMPREHENSIVE VM TRACKER - NEW SERVERS + DELETIONS + DECOMMISSIONS
+# Version 4.1.0
+# Changes:
+#   - Decommission section: Added "Requester" column (from request inputs/requestedBy)
+#   - Decommission section: Renamed "Requested By" to "Initiated By" (separate column)
+#   - Deleted VMs: Cloud Resource Name extraction now strictly filters for names
+#     starting with W or L (case-insensitive) before falling back to resourceName
 # ============================================================================
 
 # ============================================================================
@@ -1885,11 +1891,29 @@ foreach ($vmData in $newVMsData) {
         continue
     }
 
-    $isDeleted   = $allVraDeletedVMs    | Where-Object { $_.VMName -and $_.VMName.ToLower() -eq $vmData.Name.ToLower() }
-    $isDeletedVC = $allVCenterDeletedVMs | Where-Object { $_.VMName -and $_.VMName.ToLower() -eq $vmData.Name.ToLower() }
+    # Match on full name and short hostname to handle FQDN vs hostname mismatches
+    $vmNameLower = $vmData.Name.ToLower()
+    $vmNameShort = ($vmData.Name -split '\.')[0].ToLower()
+
+    $isDeleted   = $allVraDeletedVMs | Where-Object {
+        if (-not $_.VMName) { return $false }
+        $n = $_.VMName.ToLower(); $s = ($_.VMName -split '\.')[0].ToLower()
+        $n -eq $vmNameLower -or $s -eq $vmNameShort
+    }
+    $isDeletedVC = $allVCenterDeletedVMs | Where-Object {
+        if (-not $_.VMName) { return $false }
+        $n = $_.VMName.ToLower(); $s = ($_.VMName -split '\.')[0].ToLower()
+        $n -eq $vmNameLower -or $s -eq $vmNameShort
+    }
 
     if ($isDeleted -or $isDeletedVC) {
-        Write-Log "  Skipping $($vmData.Name) - appears in Deleted section, excluding from New Servers" "WARN"
+        Write-Log "  Skipping $($vmData.Name) - found in Deleted VM lists, excluding from New Servers" "WARN"
+        continue
+    }
+
+    # Also check deletedDeploymentData lookup
+    if ($deletedDeploymentData.ContainsKey($vmData.Name) -or $deletedDeploymentData.ContainsKey($vmNameShort)) {
+        Write-Log "  Skipping $($vmData.Name) - found in deleted deployment lookup" "WARN"
         continue
     }
 
