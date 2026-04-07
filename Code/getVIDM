@@ -1,16 +1,16 @@
 # ==============================================================================
 # Get-vIDM-Groups.ps1
-# Retrieves all synced groups from VMware Identity Manager (vIDM)
-# via the Admin REST API and exports to CSV.
+# Retrieves all synced groups from VMware Identity Manager (vIDM).
+# Loads credentials from an existing XML file created with:
+#   Get-Credential | Export-Clixml -Path "C:\Scripts\vIDM-Cred.xml"
 # ==============================================================================
 
 # ---------------------------
 # CONFIGURATION - Edit these
 # ---------------------------
-$vIDM_URL  = "https://your-vidm-fqdn.example.com"   # No trailing slash
-$AdminUser = "admin"
-$AdminPass = "YourPasswordHere"
-$OutputCSV = ".\vIDM_Groups.csv"
+$vIDM_URL      = "https://your-vidm-fqdn.example.com"   # No trailing slash
+$CredentialXML = "C:\Scripts\vIDM-Cred.xml"             # Path to your cred XML
+$OutputCSV     = ".\vIDM_Groups.csv"
 
 # Ignore SSL cert errors if using self-signed certs (comment out if not needed)
 Add-Type @"
@@ -25,13 +25,37 @@ Add-Type @"
 [System.Net.ServicePointManager]::SecurityProtocol  = [System.Net.SecurityProtocolType]::Tls12
 
 # ==============================================================================
-# STEP 1: Authenticate — get bearer token
+# STEP 1: Import credentials from XML
 # ==============================================================================
-Write-Host "`n[1/4] Authenticating to vIDM..." -ForegroundColor Cyan
+Write-Host "`n[1/5] Loading credentials from: $CredentialXML" -ForegroundColor Cyan
+
+if (-not (Test-Path $CredentialXML)) {
+    Write-Host "    ERROR: File not found at '$CredentialXML'" -ForegroundColor Red
+    Write-Host "    Create it first with:" -ForegroundColor Yellow
+    Write-Host "      Get-Credential | Export-Clixml -Path '$CredentialXML'" -ForegroundColor Yellow
+    exit 1
+}
+
+try {
+    $cred      = Import-Clixml -Path $CredentialXML
+    $plainUser = $cred.UserName
+    $plainPass = $cred.GetNetworkCredential().Password
+    Write-Host "    Loaded credentials for: $plainUser" -ForegroundColor Green
+}
+catch {
+    Write-Host "    ERROR: Could not read credential file. Was it created by a different user/machine?" -ForegroundColor Red
+    Write-Host "    $($_.Exception.Message)"
+    exit 1
+}
+
+# ==============================================================================
+# STEP 2: Authenticate — get bearer token
+# ==============================================================================
+Write-Host "`n[2/5] Authenticating as '$plainUser'..." -ForegroundColor Cyan
 
 $authBody = @{
-    username   = $AdminUser
-    password   = $AdminPass
+    username   = $plainUser
+    password   = $plainPass
     issueToken = $true
 } | ConvertTo-Json
 
@@ -46,15 +70,15 @@ try {
     Write-Host "    Auth successful. Token acquired." -ForegroundColor Green
 }
 catch {
-    Write-Host "    ERROR: Authentication failed. Check URL/credentials." -ForegroundColor Red
+    Write-Host "    ERROR: Authentication failed. Check credentials." -ForegroundColor Red
     Write-Host "    $($_.Exception.Message)"
     exit 1
 }
 
 # ==============================================================================
-# STEP 2: Get all Directory configs to find Directory ID(s)
+# STEP 3: Get all Directory configs
 # ==============================================================================
-Write-Host "`n[2/4] Fetching directory configurations..." -ForegroundColor Cyan
+Write-Host "`n[3/5] Fetching directory configurations..." -ForegroundColor Cyan
 
 $dirHeaders = @{
     Authorization = "Bearer $token"
@@ -68,10 +92,7 @@ try {
         -Headers $dirHeaders
 
     $directories = $dirResp.items
-    Write-Host "    Found $($directories.Count) directory/directories:" -ForegroundColor Green
-    $directories | ForEach-Object {
-        Write-Host "      - $($_.name)  [ID: $($_.directoryConfigId)]" -ForegroundColor White
-    }
+    Write-Host "    Found $($directories.Count) directory/directories." -ForegroundColor Green
 }
 catch {
     Write-Host "    ERROR: Could not retrieve directories." -ForegroundColor Red
@@ -80,9 +101,33 @@ catch {
 }
 
 # ==============================================================================
-# STEP 3: For each directory, page through all synced groups
+# STEP 4: Select which directory/domain to query
 # ==============================================================================
-Write-Host "`n[3/4] Retrieving synced groups (paginated)..." -ForegroundColor Cyan
+Write-Host "`n[4/5] Select a directory to query:`n" -ForegroundColor Cyan
+
+for ($i = 0; $i -lt $directories.Count; $i++) {
+    Write-Host "    [$($i + 1)] $($directories[$i].name)  (ID: $($directories[$i].directoryConfigId))" -ForegroundColor White
+}
+Write-Host "    [A] All directories" -ForegroundColor White
+Write-Host ""
+
+do {
+    $selection    = Read-Host "    Enter choice"
+    $validChoices = (1..$directories.Count) + @("A","a")
+} while ($selection -notin $validChoices)
+
+if ($selection -in @("A","a")) {
+    $selectedDirs = $directories
+    Write-Host "    -> Querying ALL directories.`n" -ForegroundColor Yellow
+} else {
+    $selectedDirs = @($directories[[int]$selection - 1])
+    Write-Host "    -> Querying: $($selectedDirs[0].name)`n" -ForegroundColor Yellow
+}
+
+# ==============================================================================
+# STEP 5: Page through all synced groups for selected directory/directories
+# ==============================================================================
+Write-Host "[5/5] Retrieving synced groups (paginated)..." -ForegroundColor Cyan
 
 $groupHeaders = @{
     Authorization = "Bearer $token"
@@ -91,13 +136,13 @@ $groupHeaders = @{
 
 $allGroups = @()
 
-foreach ($dir in $directories) {
-    $dirId   = $dir.directoryConfigId
-    $dirName = $dir.name
+foreach ($dir in $selectedDirs) {
+    $dirId    = $dir.directoryConfigId
+    $dirName  = $dir.name
     Write-Host "`n    Directory: $dirName" -ForegroundColor Yellow
 
-    $page     = 0
-    $pageSize = 100
+    $page      = 0
+    $pageSize  = 100
     $dirGroups = @()
 
     do {
@@ -120,7 +165,6 @@ foreach ($dir in $directories) {
 
     Write-Host "    Total groups in '$dirName': $($dirGroups.Count)" -ForegroundColor Green
 
-    # Tag each group with its directory name for the export
     foreach ($g in $dirGroups) {
         $allGroups += [PSCustomObject]@{
             DirectoryName     = $dirName
@@ -133,15 +177,13 @@ foreach ($dir in $directories) {
 }
 
 # ==============================================================================
-# STEP 4: Output results
+# OUTPUT
 # ==============================================================================
-Write-Host "`n[4/4] Results" -ForegroundColor Cyan
-Write-Host "    Total groups across all directories: $($allGroups.Count)" -ForegroundColor Green
+Write-Host "`n--- Results ---" -ForegroundColor Cyan
+Write-Host "    Total groups: $($allGroups.Count)" -ForegroundColor Green
 
-# Display in console
 $allGroups | Format-Table -AutoSize
 
-# Export to CSV
 $allGroups | Export-Csv -Path $OutputCSV -NoTypeInformation -Encoding UTF8
 Write-Host "`n    Exported to: $OutputCSV" -ForegroundColor Green
 Write-Host "`nDone.`n" -ForegroundColor Cyan
