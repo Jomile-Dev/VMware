@@ -1,7 +1,9 @@
 # ==============================================================================
 # Get-vIDM-Groups.ps1
 # Retrieves all synced groups from VMware Identity Manager (vIDM).
-# Loads credentials from an existing XML file created with:
+# Credentials loaded from XML, domain specified separately in config.
+#
+# To create your credential XML (username + password only, no domain):
 #   Get-Credential | Export-Clixml -Path "C:\Scripts\vIDM-Cred.xml"
 # ==============================================================================
 
@@ -10,6 +12,7 @@
 # ---------------------------
 $vIDM_URL      = "https://your-vidm-fqdn.example.com"   # No trailing slash
 $CredentialXML = "C:\Scripts\vIDM-Cred.xml"             # Path to your cred XML
+$Domain        = "corp.example.com"                      # AD domain to authenticate against
 $OutputCSV     = ".\vIDM_Groups.csv"
 
 # Ignore SSL cert errors if using self-signed certs (comment out if not needed)
@@ -25,7 +28,7 @@ Add-Type @"
 [System.Net.ServicePointManager]::SecurityProtocol  = [System.Net.SecurityProtocolType]::Tls12
 
 # ==============================================================================
-# STEP 1: Import credentials from XML
+# STEP 1: Import credentials from XML and combine with domain
 # ==============================================================================
 Write-Host "`n[1/5] Loading credentials from: $CredentialXML" -ForegroundColor Cyan
 
@@ -41,6 +44,7 @@ try {
     $plainUser = $cred.UserName
     $plainPass = $cred.GetNetworkCredential().Password
     Write-Host "    Loaded credentials for: $plainUser" -ForegroundColor Green
+    Write-Host "    Domain: $Domain" -ForegroundColor Green
 }
 catch {
     Write-Host "    ERROR: Could not read credential file. Was it created by a different user/machine?" -ForegroundColor Red
@@ -51,10 +55,10 @@ catch {
 # ==============================================================================
 # STEP 2: Authenticate — get bearer token
 # ==============================================================================
-Write-Host "`n[2/5] Authenticating as '$plainUser'..." -ForegroundColor Cyan
+Write-Host "`n[2/5] Authenticating as '$plainUser@$Domain'..." -ForegroundColor Cyan
 
 $authBody = @{
-    username   = $plainUser
+    username   = "$plainUser@$Domain"
     password   = $plainPass
     issueToken = $true
 } | ConvertTo-Json
@@ -70,7 +74,7 @@ try {
     Write-Host "    Auth successful. Token acquired." -ForegroundColor Green
 }
 catch {
-    Write-Host "    ERROR: Authentication failed. Check credentials." -ForegroundColor Red
+    Write-Host "    ERROR: Authentication failed. Check credentials and domain." -ForegroundColor Red
     Write-Host "    $($_.Exception.Message)"
     exit 1
 }
