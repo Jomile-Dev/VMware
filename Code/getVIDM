@@ -1,0 +1,147 @@
+# ==============================================================================
+# Get-vIDM-Groups.ps1
+# Retrieves all synced groups from VMware Identity Manager (vIDM)
+# via the Admin REST API and exports to CSV.
+# ==============================================================================
+
+# ---------------------------
+# CONFIGURATION - Edit these
+# ---------------------------
+$vIDM_URL  = "https://your-vidm-fqdn.example.com"   # No trailing slash
+$AdminUser = "admin"
+$AdminPass = "YourPasswordHere"
+$OutputCSV = ".\vIDM_Groups.csv"
+
+# Ignore SSL cert errors if using self-signed certs (comment out if not needed)
+Add-Type @"
+    using System.Net;
+    using System.Security.Cryptography.X509Certificates;
+    public class TrustAll : ICertificatePolicy {
+        public bool CheckValidationResult(ServicePoint sp, X509Certificate cert,
+            WebRequest req, int problem) { return true; }
+    }
+"@
+[System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAll
+[System.Net.ServicePointManager]::SecurityProtocol  = [System.Net.SecurityProtocolType]::Tls12
+
+# ==============================================================================
+# STEP 1: Authenticate — get bearer token
+# ==============================================================================
+Write-Host "`n[1/4] Authenticating to vIDM..." -ForegroundColor Cyan
+
+$authBody = @{
+    username   = $AdminUser
+    password   = $AdminPass
+    issueToken = $true
+} | ConvertTo-Json
+
+try {
+    $authResp = Invoke-RestMethod `
+        -Uri         "$vIDM_URL/SAAS/API/1.0/REST/auth/system/login" `
+        -Method      POST `
+        -Body        $authBody `
+        -ContentType "application/json"
+
+    $token = $authResp.sessionToken
+    Write-Host "    Auth successful. Token acquired." -ForegroundColor Green
+}
+catch {
+    Write-Host "    ERROR: Authentication failed. Check URL/credentials." -ForegroundColor Red
+    Write-Host "    $($_.Exception.Message)"
+    exit 1
+}
+
+# ==============================================================================
+# STEP 2: Get all Directory configs to find Directory ID(s)
+# ==============================================================================
+Write-Host "`n[2/4] Fetching directory configurations..." -ForegroundColor Cyan
+
+$dirHeaders = @{
+    Authorization = "Bearer $token"
+    Accept        = "application/vnd.vmware.horizon.manager.connector.management.directory.list+json"
+}
+
+try {
+    $dirResp = Invoke-RestMethod `
+        -Uri     "$vIDM_URL/SAAS/jersey/manager/api/connectormanagement/directoryconfigs" `
+        -Method  GET `
+        -Headers $dirHeaders
+
+    $directories = $dirResp.items
+    Write-Host "    Found $($directories.Count) directory/directories:" -ForegroundColor Green
+    $directories | ForEach-Object {
+        Write-Host "      - $($_.name)  [ID: $($_.directoryConfigId)]" -ForegroundColor White
+    }
+}
+catch {
+    Write-Host "    ERROR: Could not retrieve directories." -ForegroundColor Red
+    Write-Host "    $($_.Exception.Message)"
+    exit 1
+}
+
+# ==============================================================================
+# STEP 3: For each directory, page through all synced groups
+# ==============================================================================
+Write-Host "`n[3/4] Retrieving synced groups (paginated)..." -ForegroundColor Cyan
+
+$groupHeaders = @{
+    Authorization = "Bearer $token"
+    Accept        = "application/json"
+}
+
+$allGroups = @()
+
+foreach ($dir in $directories) {
+    $dirId   = $dir.directoryConfigId
+    $dirName = $dir.name
+    Write-Host "`n    Directory: $dirName" -ForegroundColor Yellow
+
+    $page     = 0
+    $pageSize = 100
+    $dirGroups = @()
+
+    do {
+        try {
+            $resp = Invoke-RestMethod `
+                -Uri     "$vIDM_URL/SAAS/jersey/manager/api/connectormanagement/directoryconfigs/$dirId/groups?pageSize=$pageSize&page=$page" `
+                -Method  GET `
+                -Headers $groupHeaders
+
+            $batch = $resp.items
+            $dirGroups += $batch
+            Write-Host "      Page $page : $($batch.Count) groups retrieved" -ForegroundColor Gray
+            $page++
+        }
+        catch {
+            Write-Host "      ERROR on page $page : $($_.Exception.Message)" -ForegroundColor Red
+            break
+        }
+    } while ($batch.Count -eq $pageSize)
+
+    Write-Host "    Total groups in '$dirName': $($dirGroups.Count)" -ForegroundColor Green
+
+    # Tag each group with its directory name for the export
+    foreach ($g in $dirGroups) {
+        $allGroups += [PSCustomObject]@{
+            DirectoryName     = $dirName
+            DirectoryID       = $dirId
+            GroupName         = $g.name
+            DistinguishedName = $g.distinguishedName
+            ObjectGUID        = $g.objectGuid
+        }
+    }
+}
+
+# ==============================================================================
+# STEP 4: Output results
+# ==============================================================================
+Write-Host "`n[4/4] Results" -ForegroundColor Cyan
+Write-Host "    Total groups across all directories: $($allGroups.Count)" -ForegroundColor Green
+
+# Display in console
+$allGroups | Format-Table -AutoSize
+
+# Export to CSV
+$allGroups | Export-Csv -Path $OutputCSV -NoTypeInformation -Encoding UTF8
+Write-Host "`n    Exported to: $OutputCSV" -ForegroundColor Green
+Write-Host "`nDone.`n" -ForegroundColor Cyan
