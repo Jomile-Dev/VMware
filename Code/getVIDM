@@ -1,6 +1,216 @@
 # ==============================================================================
 # Get-vIDM-Groups.ps1
 # Retrieves all synced groups from VMware Identity Manager (vIDM).
+#
+# Credentials are loaded from an encrypted XML file.
+# Domain is specified separately in the config block below.
+#
+# To create your credential XML (username + password only, no domain):
+#   Get-Credential | Export-Clixml -Path "C:\Scripts\vIDM-Cred.xml"
+# ==============================================================================
+
+# ---------------------------
+# CONFIGURATION - Edit these
+# ---------------------------
+$vIDM_URL      = "https://your-vidm-fqdn.example.com"
+$CredentialXML = "C:\Scripts\vIDM-Cred.xml"
+$Domain        = "corp.example.com"
+$OutputCSV     = ".\vIDM_Groups.csv"
+
+# Bypass SSL certificate validation for self-signed certs.
+# Comment this block out if your vIDM has a trusted certificate.
+Add-Type @"
+    using System.Net;
+    using System.Security.Cryptography.X509Certificates;
+    public class TrustAll : ICertificatePolicy {
+        public bool CheckValidationResult(ServicePoint sp, X509Certificate cert,
+            WebRequest req, int problem) { return true; }
+    }
+"@
+[System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAll
+[System.Net.ServicePointManager]::SecurityProtocol  = [System.Net.SecurityProtocolType]::Tls12
+
+# ==============================================================================
+# STEP 1: Import credentials from XML
+# ==============================================================================
+Write-Host "`n[1/5] Loading credentials from: $CredentialXML" -ForegroundColor Cyan
+
+if (-not (Test-Path $CredentialXML)) {
+    Write-Host "    ERROR: File not found at '$CredentialXML'" -ForegroundColor Red
+    Write-Host "    Create it with: Get-Credential | Export-Clixml -Path '$CredentialXML'" -ForegroundColor Yellow
+    exit 1
+}
+
+try {
+    $cred      = Import-Clixml -Path $CredentialXML
+    $plainUser = $cred.UserName
+    $plainPass = $cred.GetNetworkCredential().Password
+    Write-Host "    Loaded. Username: $plainUser | Domain: $Domain" -ForegroundColor Green
+}
+catch {
+    Write-Host "    ERROR: Could not decrypt credential file." -ForegroundColor Red
+    Write-Host "    This file must be opened by the same user account on the same machine that created it." -ForegroundColor Yellow
+    Write-Host "    $($_.Exception.Message)"
+    exit 1
+}
+
+# ==============================================================================
+# STEP 2: Authenticate against vIDM and retrieve a session token
+#
+# Endpoint : POST /SAAS/API/1.0/REST/auth/system/login
+# Auth body fields:
+#   username   - the AD username (no domain suffix needed, domain is separate)
+#   password   - the AD password
+#   domain     - the AD domain vIDM should authenticate against (e.g. corp.example.com)
+#                this tells vIDM which directory to route the auth to
+#   issueToken - set to true to get a session token back in the response
+#
+# Response:
+#   sessionToken - used as a Bearer token in all subsequent API calls
+# ==============================================================================
+Write-Host "`n[2/5] Authenticating as '$plainUser' against domain '$Domain'..." -ForegroundColor Cyan
+
+$authBody = @{
+    username   = $plainUser
+    password   = $plainPass
+    domain     = $Domain
+    issueToken = $true
+} | ConvertTo-Json
+
+try {
+    $authResp = Invoke-RestMethod `
+        -Uri         "$vIDM_URL/SAAS/API/1.0/REST/auth/system/login" `
+        -Method      POST `
+        -Body        $authBody `
+        -ContentType "application/json"
+
+    $token = $authResp.sessionToken
+    Write-Host "    Auth successful. Session token acquired." -ForegroundColor Green
+}
+catch {
+    Write-Host "    ERROR: Authentication failed." -ForegroundColor Red
+    Write-Host "    Check that:" -ForegroundColor Yellow
+    Write-Host "      - Username '$plainUser' is correct (no domain suffix, just the username)" -ForegroundColor Yellow
+    Write-Host "      - Domain '$Domain' matches exactly what is configured in vIDM" -ForegroundColor Yellow
+    Write-Host "      - The account has admin rights in vIDM" -ForegroundColor Yellow
+    Write-Host "    $($_.Exception.Message)"
+    exit 1
+}
+
+# ==============================================================================
+# STEP 3: Fetch all directory configurations from vIDM
+# ==============================================================================
+Write-Host "`n[3/5] Fetching directory configurations..." -ForegroundColor Cyan
+
+$dirHeaders = @{
+    Authorization = "Bearer $token"
+    Accept        = "application/vnd.vmware.horizon.manager.connector.management.directory.list+json"
+}
+
+try {
+    $dirResp = Invoke-RestMethod `
+        -Uri     "$vIDM_URL/SAAS/jersey/manager/api/connectormanagement/directoryconfigs" `
+        -Method  GET `
+        -Headers $dirHeaders
+
+    $directories = $dirResp.items
+    Write-Host "    Found $($directories.Count) directory/directories." -ForegroundColor Green
+}
+catch {
+    Write-Host "    ERROR: Could not retrieve directories." -ForegroundColor Red
+    Write-Host "    $($_.Exception.Message)"
+    exit 1
+}
+
+# ==============================================================================
+# STEP 4: Prompt user to select which directory to query
+# ==============================================================================
+Write-Host "`n[4/5] Select a directory to query:`n" -ForegroundColor Cyan
+
+for ($i = 0; $i -lt $directories.Count; $i++) {
+    Write-Host "    [$($i + 1)] $($directories[$i].name)  (ID: $($directories[$i].directoryConfigId))" -ForegroundColor White
+}
+Write-Host "    [A] All directories" -ForegroundColor White
+Write-Host ""
+
+do {
+    $selection    = Read-Host "    Enter choice"
+    $validChoices = (1..$directories.Count) + @("A","a")
+} while ($selection -notin $validChoices)
+
+if ($selection -in @("A","a")) {
+    $selectedDirs = $directories
+    Write-Host "    -> Querying ALL directories.`n" -ForegroundColor Yellow
+} else {
+    $selectedDirs = @($directories[[int]$selection - 1])
+    Write-Host "    -> Querying: $($selectedDirs[0].name)`n" -ForegroundColor Yellow
+}
+
+# ==============================================================================
+# STEP 5: Page through all synced groups for the selected directory/directories
+# ==============================================================================
+Write-Host "[5/5] Retrieving synced groups (paginated)..." -ForegroundColor Cyan
+
+$groupHeaders = @{
+    Authorization = "Bearer $token"
+    Accept        = "application/json"
+}
+
+$allGroups = @()
+
+foreach ($dir in $selectedDirs) {
+    $dirId    = $dir.directoryConfigId
+    $dirName  = $dir.name
+    Write-Host "`n    Directory: $dirName" -ForegroundColor Yellow
+
+    $page      = 0
+    $pageSize  = 100
+    $dirGroups = @()
+
+    do {
+        try {
+            $resp = Invoke-RestMethod `
+                -Uri     "$vIDM_URL/SAAS/jersey/manager/api/connectormanagement/directoryconfigs/$dirId/groups?pageSize=$pageSize&page=$page" `
+                -Method  GET `
+                -Headers $groupHeaders
+
+            $batch = $resp.items
+            $dirGroups += $batch
+            Write-Host "      Page $page : $($batch.Count) groups retrieved" -ForegroundColor Gray
+            $page++
+        }
+        catch {
+            Write-Host "      ERROR on page $page : $($_.Exception.Message)" -ForegroundColor Red
+            break
+        }
+    } while ($batch.Count -eq $pageSize)
+
+    Write-Host "    Total groups in '$dirName': $($dirGroups.Count)" -ForegroundColor Green
+
+    foreach ($g in $dirGroups) {
+        $allGroups += [PSCustomObject]@{
+            DirectoryName     = $dirName
+            DirectoryID       = $dirId
+            GroupName         = $g.name
+            DistinguishedName = $g.distinguishedName
+            ObjectGUID        = $g.objectGuid
+        }
+    }
+}
+
+# ==============================================================================
+# OUTPUT: Display results and export to CSV
+# ==============================================================================
+Write-Host "`n--- Results ---" -ForegroundColor Cyan
+Write-Host "    Total groups: $($allGroups.Count)" -ForegroundColor Green
+
+$allGroups | Format-Table -AutoSize
+
+$allGroups | Export-Csv -Path $OutputCSV -NoTypeInformation -Encoding UTF8
+Write-Host "`n    Exported to: $OutputCSV" -ForegroundColor Green
+Write-Host "`nDone.`n" -ForegroundColor Cyan# ==============================================================================
+# Get-vIDM-Groups.ps1
+# Retrieves all synced groups from VMware Identity Manager (vIDM).
 # Credentials loaded from XML, domain specified separately in config.
 #
 # To create your credential XML (username + password only, no domain):
