@@ -1,5 +1,312 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
+  Aria Operations 8.18.6
+  Dashboard: CPU Contention & Overprovisioning — VI Workload Domains
+  Import: Dashboards > Actions > Import
+  Alert import: Alerts > Alert Definitions > Import
+
+  Scoped clusters:
+  (no UUIDs entered — scopes to all clusters)
+-->
+<dashboardList>
+  <dashboard id="cpu-contention-vi-dashboard" version="8.18.6">
+    <n>CPU Contention &amp; Overprovisioning — VI Workload Domains</n>
+    <description>Single-pane CPU demand, N-1 headroom, CPU Ready, vCPU:pCPU ratio and heatmap scoped to VI workload clusters.</description>
+    <widgetList>
+
+      <!-- SCOREBOARD: Clusters breaching N-1 -->
+      <widget id="sb-n1-breach" type="scoreboard" row="0" col="0" rowSpan="2" colSpan="3">
+        <n>Clusters breaching N-1 capacity</n>
+        <config>
+          <objectScope>
+      <adapterKind>VMWARE</adapterKind>
+      <resourceKind>ClusterComputeResource</resourceKind>
+          </objectScope>
+          <metric>summary|capacityRemainingUsingDemandMetric</metric>
+          <thresholds>
+            <threshold color="red"    operator="lt" value="0"  label="BREACH"/>
+            <threshold color="yellow" operator="lt" value="15" label="MARGINAL"/>
+            <threshold color="green"  operator="gte" value="15" label="OK"/>
+          </thresholds>
+          <aggregation>count_critical</aggregation>
+          <displayFormat>COUNT_CRITICAL_OF_TOTAL</displayFormat>
+        </config>
+      </widget>
+
+      <!-- SCOREBOARD: Peak vCPU:pCPU ratio -->
+      <widget id="sb-vcpu-ratio" type="scoreboard" row="0" col="3" rowSpan="2" colSpan="3">
+        <n>Peak vCPU:pCPU ratio</n>
+        <config>
+          <objectScope>
+      <adapterKind>VMWARE</adapterKind>
+      <resourceKind>HostSystem</resourceKind>
+          </objectScope>
+          <metric>cpu|vcpusPerCore</metric>
+          <thresholds>
+            <threshold color="red"    operator="gt"  value="3.0" label="Policy breach"/>
+            <threshold color="yellow" operator="gt"  value="2.5" label="Warning"/>
+            <threshold color="green"  operator="lte" value="2.5" label="OK"/>
+          </thresholds>
+          <aggregation>max</aggregation>
+          <displayFormat>MAX_VALUE</displayFormat>
+        </config>
+      </widget>
+
+      <!-- SCOREBOARD: Clusters with CPU Ready >5% -->
+      <widget id="sb-cpu-ready" type="scoreboard" row="0" col="6" rowSpan="2" colSpan="3">
+        <n>Clusters with CPU Ready &gt;5%</n>
+        <config>
+          <objectScope>
+      <adapterKind>VMWARE</adapterKind>
+      <resourceKind>ClusterComputeResource</resourceKind>
+          </objectScope>
+          <metric>cpu|readyPct</metric>
+          <thresholds>
+            <threshold color="red"    operator="gt"  value="10" label="Critical"/>
+            <threshold color="yellow" operator="gt"  value="5"  label="Contention"/>
+            <threshold color="green"  operator="lte" value="5"  label="OK"/>
+          </thresholds>
+          <aggregation>count_critical</aggregation>
+          <displayFormat>COUNT_CRITICAL_OF_TOTAL</displayFormat>
+        </config>
+      </widget>
+
+      <!-- SCOREBOARD: Worst cluster CPU demand -->
+      <widget id="sb-peak-demand" type="scoreboard" row="0" col="9" rowSpan="2" colSpan="3">
+        <n>Worst cluster CPU demand</n>
+        <config>
+          <objectScope>
+      <adapterKind>VMWARE</adapterKind>
+      <resourceKind>ClusterComputeResource</resourceKind>
+          </objectScope>
+          <metric>cpu|demandmhz</metric>
+          <thresholds>
+            <threshold color="red"    operator="gt"  value="85" label="N-1 will breach 100%"/>
+            <threshold color="yellow" operator="gt"  value="70" label="Limited headroom"/>
+            <threshold color="green"  operator="lte" value="70" label="OK"/>
+          </thresholds>
+          <aggregation>max_percent_of_capacity</aggregation>
+          <displayFormat>PERCENTAGE</displayFormat>
+        </config>
+      </widget>
+
+      <!-- TOP-N: CPU demand vs N-1 per cluster -->
+      <widget id="topn-demand" type="topN" row="2" col="0" rowSpan="5" colSpan="7">
+        <n>CPU demand — current vs N-1 projection per cluster</n>
+        <config>
+          <objectScope>
+      <adapterKind>VMWARE</adapterKind>
+      <resourceKind>ClusterComputeResource</resourceKind>
+          </objectScope>
+          <metrics>
+            <metric id="current" key="cpu|demandmhz"
+              label="Current demand %" displayAs="percent_of_capacity"/>
+            <metric id="n1proj"
+              key="summary|capacityRemainingUsingDemandMetric"
+              label="N-1 projected %" displayAs="inverse_percent_of_capacity"/>
+          </metrics>
+          <topN>10</topN>
+          <sortBy>current</sortBy>
+          <sortOrder>desc</sortOrder>
+          <thresholds>
+            <threshold metric="n1proj" color="red"    operator="gt" value="100" label="N-1 BREACH"/>
+            <threshold metric="n1proj" color="yellow" operator="gt" value="85"  label="N-1 MARGINAL"/>
+          </thresholds>
+          <referenceLines>
+            <referenceLine value="100" label="N-1 breach" color="red"    style="dashed"/>
+            <referenceLine value="85"  label="Warning"    color="yellow" style="dashed"/>
+          </referenceLines>
+        </config>
+      </widget>
+
+      <!-- LIST: N-1 headroom table -->
+      <widget id="list-n1" type="list" row="2" col="7" rowSpan="5" colSpan="5">
+        <n>N-1 host failure — headroom check</n>
+        <config>
+          <objectScope>
+      <adapterKind>VMWARE</adapterKind>
+      <resourceKind>ClusterComputeResource</resourceKind>
+          </objectScope>
+          <columns>
+            <column key="object|name"
+              label="Cluster" width="180"/>
+            <column key="cpu|demandmhz"
+              label="Current %" width="90"
+              displayAs="percent_of_capacity" colorThreshold="true"/>
+            <column key="summary|capacityRemainingUsingDemandMetric"
+              label="N-1 headroom %" width="110"
+              displayAs="value" colorThreshold="true"/>
+            <column key="cpu|vcpusPerCore"
+              label="vCPU:pCPU" width="90"
+              displayAs="ratio"/>
+          </columns>
+          <thresholds>
+            <threshold column="summary|capacityRemainingUsingDemandMetric"
+              color="red"    operator="lt"  value="0"  badge="BREACH"/>
+            <threshold column="summary|capacityRemainingUsingDemandMetric"
+              color="yellow" operator="lt"  value="15" badge="MARGINAL"/>
+            <threshold column="summary|capacityRemainingUsingDemandMetric"
+              color="green"  operator="gte" value="15" badge="OK"/>
+          </thresholds>
+          <sortBy>summary|capacityRemainingUsingDemandMetric</sortBy>
+          <sortOrder>asc</sortOrder>
+        </config>
+      </widget>
+
+      <!-- TOP-N: CPU Ready top VMs -->
+      <widget id="topn-ready" type="topN" row="7" col="0" rowSpan="5" colSpan="4">
+        <n>CPU Ready % — top offending VMs</n>
+        <config>
+          <objectScope>
+      <adapterKind>VMWARE</adapterKind>
+      <resourceKind>VirtualMachine</resourceKind>
+          </objectScope>
+          <metrics>
+            <metric id="ready" key="cpu|readyPct"
+              label="CPU Ready %" displayAs="percent"/>
+          </metrics>
+          <topN>15</topN>
+          <sortBy>ready</sortBy>
+          <sortOrder>desc</sortOrder>
+          <thresholds>
+            <threshold color="red"    operator="gt"  value="10" label="Severe"/>
+            <threshold color="yellow" operator="gt"  value="5"  label="Contention"/>
+            <threshold color="green"  operator="lte" value="5"  label="OK"/>
+          </thresholds>
+          <referenceLines>
+            <referenceLine value="5"  label="5% threshold"  color="yellow" style="dashed"/>
+            <referenceLine value="10" label="10% critical"  color="red"    style="dashed"/>
+          </referenceLines>
+        </config>
+      </widget>
+
+      <!-- LIST: vCPU:pCPU per host -->
+      <widget id="list-ratio" type="list" row="7" col="4" rowSpan="5" colSpan="4">
+        <n>vCPU:pCPU ratio — per host</n>
+        <config>
+          <objectScope>
+      <adapterKind>VMWARE</adapterKind>
+      <resourceKind>HostSystem</resourceKind>
+          </objectScope>
+          <columns>
+            <column key="object|name"      label="Host"         width="200"/>
+            <column key="cpu|vcpusPerCore" label="vCPU:pCPU"    width="100"
+              displayAs="ratio" colorThreshold="true"/>
+            <column key="cpu|demandmhz"    label="CPU demand %"  width="110"
+              displayAs="percent_of_capacity" colorThreshold="true"/>
+            <column key="cpu|readyPct"     label="CPU Ready %"   width="100"
+              displayAs="percent" colorThreshold="true"/>
+          </columns>
+          <thresholds>
+            <threshold column="cpu|vcpusPerCore"
+              color="red"    operator="gt"  value="3.0" label="Policy breach"/>
+            <threshold column="cpu|vcpusPerCore"
+              color="yellow" operator="gt"  value="2.5" label="Warning"/>
+            <threshold column="cpu|vcpusPerCore"
+              color="green"  operator="lte" value="2.5" label="OK"/>
+          </thresholds>
+          <sortBy>cpu|vcpusPerCore</sortBy>
+          <sortOrder>desc</sortOrder>
+        </config>
+      </widget>
+
+      <!-- HEATMAP: Host CPU demand -->
+      <widget id="heatmap-hosts" type="heatmap" row="7" col="8" rowSpan="5" colSpan="4">
+        <n>CPU demand heatmap — all VI hosts (7-day peak)</n>
+        <config>
+          <objectScope>
+      <adapterKind>VMWARE</adapterKind>
+      <resourceKind>HostSystem</resourceKind>
+          </objectScope>
+          <metric>cpu|demandmhz</metric>
+          <metricDisplayAs>percent_of_capacity</metricDisplayAs>
+          <timeRange>LAST_7_DAYS</timeRange>
+          <aggregation>max</aggregation>
+          <groupBy>parent_cluster</groupBy>
+          <thresholds>
+            <threshold color="green"  operator="lt"  value="75"  label="OK"/>
+            <threshold color="yellow" operator="lt"  value="100" label="Warning"/>
+            <threshold color="red"    operator="gte" value="100" label="Critical"/>
+          </thresholds>
+          <cellSize>medium</cellSize>
+          <showObjectName>true</showObjectName>
+          <showGroupLabel>true</showGroupLabel>
+        </config>
+      </widget>
+
+    </widgetList>
+
+    <!-- ALERT DEFINITIONS (import separately via Alerts > Alert Definitions > Import) -->
+    <alertDefinitions>
+
+      <alertDefinition id="alert-n1-breach">
+        <n>N-1 capacity breach — VI cluster cannot survive host failure</n>
+        <severity>CRITICAL</severity>
+        <impact>RISK</impact>
+        <objectType>ClusterComputeResource</objectType>
+        <adapterKind>VMWARE</adapterKind>
+        <symptoms>
+          <symptom type="metric">
+            <metric>summary|capacityRemainingUsingDemandMetric</metric>
+            <operator>lt</operator>
+            <threshold>0</threshold>
+            <waitCycles>1</waitCycles>
+            <cancelCycles>3</cancelCycles>
+            <severity>CRITICAL</severity>
+            <message>Cluster {object_name} N-1 headroom is {metric_value}% — host failure will overload cluster</message>
+          </symptom>
+        </symptoms>
+      </alertDefinition>
+
+      <alertDefinition id="alert-vcpu-ratio">
+        <n>vCPU:pCPU exceeds 3:1 policy — host overprovisioned</n>
+        <severity>WARNING</severity>
+        <impact>EFFICIENCY</impact>
+        <objectType>HostSystem</objectType>
+        <adapterKind>VMWARE</adapterKind>
+        <symptoms>
+          <symptom type="metric">
+            <metric>cpu|vcpusPerCore</metric>
+            <operator>gt</operator>
+            <threshold>3.0</threshold>
+            <waitCycles>2</waitCycles>
+            <cancelCycles>3</cancelCycles>
+            <severity>WARNING</severity>
+            <message>Host {object_name} vCPU:pCPU is {metric_value}:1 — exceeds 3:1 policy</message>
+          </symptom>
+        </symptoms>
+      </alertDefinition>
+
+      <alertDefinition id="alert-cpu-ready">
+        <n>CPU Ready contention — VMs starved of CPU time</n>
+        <severity>WARNING</severity>
+        <impact>PERFORMANCE</impact>
+        <objectType>ClusterComputeResource</objectType>
+        <adapterKind>VMWARE</adapterKind>
+        <symptoms>
+          <symptom type="metric">
+            <metric>cpu|readyPct</metric>
+            <operator>gt</operator>
+            <threshold>5</threshold>
+            <waitCycles>3</waitCycles>
+            <cancelCycles>5</cancelCycles>
+            <severity>WARNING</severity>
+            <message>Cluster {object_name} CPU Ready is {metric_value}% — active contention</message>
+          </symptom>
+        </symptoms>
+      </alertDefinition>
+
+    </alertDefinitions>
+
+    <layout>
+      <columns>12</columns>
+      <defaultTimeRange>LAST_24_HOURS</defaultTimeRange>
+      <refreshInterval>300</refreshInterval>
+    </layout>
+
+  </dashboard>
+</dashboardList><?xml version="1.0" encoding="UTF-8"?>
+<!--
   VMware Aria Operations 8.18.6
   Dashboard: CPU Contention & Overprovisioning — VI Workload Domains
   Import via: Dashboards -> Actions -> Import Dashboard
