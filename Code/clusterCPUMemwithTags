@@ -10,8 +10,8 @@ $vCenterServers = @(
     "vcenter1.yourdomain.com",
     "vcenter2.yourdomain.com"
 )
-$CredPath    = "C:\Creds\vcenter_cred.xml"
-$ExportPath  = "$PSScriptRoot\VMReport_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+$CredPath   = "C:\Creds\vcenter_cred.xml"
+$ExportPath = "C:\Reports\VMReport_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Load credentials ──────────────────────────────────────────────────────────
@@ -31,9 +31,17 @@ catch {
     exit 1
 }
 
-# ── Loop through each vCenter ─────────────────────────────────────────────────
-$allResults = @()
+# ── Ensure export folder exists ───────────────────────────────────────────────
+$exportDir = Split-Path $ExportPath -Parent
+if (-not (Test-Path $exportDir)) {
+    New-Item -ItemType Directory -Path $exportDir -Force | Out-Null
+    Write-Host "Created folder: $exportDir" -ForegroundColor DarkGray
+}
 
+# ── Use a List for performance with large VM counts ───────────────────────────
+$allResults = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+# ── Loop through each vCenter ─────────────────────────────────────────────────
 foreach ($vc in $vCenterServers) {
 
     Write-Host "========================================" -ForegroundColor DarkGray
@@ -49,7 +57,7 @@ foreach ($vc in $vCenterServers) {
     }
 
     # ── Get all VMs on this vCenter ───────────────────────────────────────────
-    $vms = Get-VM -Server $vc
+    $vms = Get-VM -Server $vc -WarningAction SilentlyContinue
 
     if (-not $vms) {
         Write-Warning "No VMs found on $vc."
@@ -74,11 +82,16 @@ foreach ($vc in $vCenterServers) {
             $tagString = "Tags unavailable"
         }
 
-        # ── Cluster ───────────────────────────────────────────────────────────
-        $cluster = (Get-VMHost -VM $vm -Server $vc -ErrorAction SilentlyContinue |
-                    Get-Cluster -ErrorAction SilentlyContinue).Name
+        # ── Cluster (safe — standalone hosts return "No cluster") ─────────────
+        try {
+            $vmHost  = Get-VMHost -VM $vm -Server $vc -ErrorAction Stop
+            $cluster = (Get-Cluster -VMHost $vmHost -ErrorAction Stop).Name
+        }
+        catch {
+            $cluster = "No cluster"
+        }
 
-        $allResults += [PSCustomObject]@{
+        $allResults.Add([PSCustomObject]@{
             vCenter    = $vc
             VMName     = $vm.Name
             Cluster    = $cluster
@@ -86,7 +99,7 @@ foreach ($vc in $vCenterServers) {
             NumCPU     = $vm.NumCpu
             MemoryGB   = $vm.MemoryGB
             Tags       = $tagString
-        }
+        })
     }
 
     Write-Host "Finished $vc.`n" -ForegroundColor Green
@@ -96,118 +109,17 @@ foreach ($vc in $vCenterServers) {
     Write-Host "Disconnected from $vc.`n" -ForegroundColor DarkGray
 }
 
-# ── Display all results ───────────────────────────────────────────────────────
+# ── Display summary in console ────────────────────────────────────────────────
 Write-Host "========================================" -ForegroundColor DarkGray
 Write-Host "Total VMs collected: $($allResults.Count)" -ForegroundColor Cyan
-$allResults | Format-Table -AutoSize
+$allResults | Format-Table vCenter, VMName, Cluster, PowerState, NumCPU, MemoryGB -AutoSize
+Write-Host "(Tags omitted from console view — see CSV for full output)" -ForegroundColor DarkGray
 
 # ── Export CSV ────────────────────────────────────────────────────────────────
 try {
-    $exportDir = Split-Path $ExportPath -Parent
-    if ($exportDir -and -not (Test-Path $exportDir)) {
-        New-Item -ItemType Directory -Path $exportDir -Force | Out-Null
-    }
     $allResults | Export-Csv -Path $ExportPath -NoTypeInformation -Encoding UTF8
     Write-Host "Report saved to: $ExportPath" -ForegroundColor Green
 }
 catch {
     Write-Warning "Could not export CSV: $_"
-}# =============================================================================
-# Get-VMReport.ps1
-# Retrieves assigned CPU, Memory, Power State, and Tags for all VMs
-# Requires: VMware PowerCLI (VMware.PowerCLI module)
-# =============================================================================
-
-# ── Configuration — edit these before running ─────────────────────────────────
-$vCenterServer = "vcenter.yourdomain.com"
-$CredPath      = "C:\Creds\vcenter_cred.xml"
-$ExportPath    = "$PSScriptRoot\VMReport_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
-# ─────────────────────────────────────────────────────────────────────────────
-
-# ── Load credentials ──────────────────────────────────────────────────────────
-if (-not (Test-Path $CredPath)) {
-    Write-Error "Credential file not found at: $CredPath"
-    Write-Host "To create it, run:" -ForegroundColor Yellow
-    Write-Host "  Get-Credential | Export-Clixml -Path '$CredPath'" -ForegroundColor Yellow
-    exit 1
 }
-
-try {
-    $cred = Import-Clixml -Path $CredPath
-    Write-Host "Credentials loaded." -ForegroundColor Green
-}
-catch {
-    Write-Error "Failed to load credentials: $_"
-    exit 1
-}
-
-# ── Connect to vCenter ────────────────────────────────────────────────────────
-try {
-    Write-Host "Connecting to $vCenterServer ..." -ForegroundColor Cyan
-    Connect-VIServer -Server $vCenterServer -Credential $cred -ErrorAction Stop | Out-Null
-    Write-Host "Connected.`n" -ForegroundColor Green
-}
-catch {
-    Write-Error "Connection failed: $_"
-    exit 1
-}
-
-# ── Get all VMs ───────────────────────────────────────────────────────────────
-$vms = Get-VM
-
-if (-not $vms) {
-    Write-Warning "No VMs found on $vCenterServer."
-    Disconnect-VIServer -Server $vCenterServer -Confirm:$false
-    exit 0
-}
-
-Write-Host "Found $($vms.Count) VM(s). Collecting data...`n" -ForegroundColor Cyan
-
-$results = foreach ($vm in $vms) {
-
-    # ── Tags ──────────────────────────────────────────────────────────────────
-    try {
-        $tagAssignments = Get-TagAssignment -Entity $vm -ErrorAction Stop
-        $tagString = ($tagAssignments | ForEach-Object {
-            "$($_.Tag.Category.Name):$($_.Tag.Name)"
-        }) -join " | "
-
-        if (-not $tagString) { $tagString = "No tags assigned" }
-    }
-    catch {
-        $tagString = "Tags unavailable"
-    }
-
-    # ── Cluster ───────────────────────────────────────────────────────────────
-    $cluster = (Get-VMHost -VM $vm -ErrorAction SilentlyContinue |
-                Get-Cluster -ErrorAction SilentlyContinue).Name
-
-    [PSCustomObject]@{
-        VMName     = $vm.Name
-        Cluster    = $cluster
-        PowerState = $vm.PowerState
-        NumCPU     = $vm.NumCpu
-        MemoryGB   = $vm.MemoryGB
-        Tags       = $tagString
-    }
-}
-
-# ── Display ───────────────────────────────────────────────────────────────────
-$results | Format-Table -AutoSize
-
-# ── Export CSV ────────────────────────────────────────────────────────────────
-try {
-    $exportDir = Split-Path $ExportPath -Parent
-    if ($exportDir -and -not (Test-Path $exportDir)) {
-        New-Item -ItemType Directory -Path $exportDir -Force | Out-Null
-    }
-    $results | Export-Csv -Path $ExportPath -NoTypeInformation -Encoding UTF8
-    Write-Host "Report saved to: $ExportPath" -ForegroundColor Green
-}
-catch {
-    Write-Warning "Could not export CSV: $_"
-}
-
-# ── Disconnect ────────────────────────────────────────────────────────────────
-Disconnect-VIServer -Server $vCenterServer -Confirm:$false
-Write-Host "Disconnected from $vCenterServer." -ForegroundColor Green
