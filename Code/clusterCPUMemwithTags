@@ -1,6 +1,120 @@
 # =============================================================================
 # Get-VMReport.ps1
 # Retrieves assigned CPU, Memory, Power State, and Tags for all VMs
+# across multiple vCenter servers
+# Requires: VMware PowerCLI (VMware.PowerCLI module)
+# =============================================================================
+
+# ── Configuration — edit these before running ─────────────────────────────────
+$vCenterServers = @(
+    "vcenter1.yourdomain.com",
+    "vcenter2.yourdomain.com"
+)
+$CredPath    = "C:\Creds\vcenter_cred.xml"
+$ExportPath  = "$PSScriptRoot\VMReport_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Load credentials ──────────────────────────────────────────────────────────
+if (-not (Test-Path $CredPath)) {
+    Write-Error "Credential file not found at: $CredPath"
+    Write-Host "To create it, run:" -ForegroundColor Yellow
+    Write-Host "  Get-Credential | Export-Clixml -Path '$CredPath'" -ForegroundColor Yellow
+    exit 1
+}
+
+try {
+    $cred = Import-Clixml -Path $CredPath
+    Write-Host "Credentials loaded.`n" -ForegroundColor Green
+}
+catch {
+    Write-Error "Failed to load credentials: $_"
+    exit 1
+}
+
+# ── Loop through each vCenter ─────────────────────────────────────────────────
+$allResults = @()
+
+foreach ($vc in $vCenterServers) {
+
+    Write-Host "========================================" -ForegroundColor DarkGray
+    Write-Host "Connecting to: $vc" -ForegroundColor Cyan
+
+    try {
+        Connect-VIServer -Server $vc -Credential $cred -ErrorAction Stop | Out-Null
+        Write-Host "Connected.`n" -ForegroundColor Green
+    }
+    catch {
+        Write-Warning "Could not connect to $vc — skipping. Error: $_"
+        continue
+    }
+
+    # ── Get all VMs on this vCenter ───────────────────────────────────────────
+    $vms = Get-VM -Server $vc
+
+    if (-not $vms) {
+        Write-Warning "No VMs found on $vc."
+        Disconnect-VIServer -Server $vc -Confirm:$false
+        continue
+    }
+
+    Write-Host "Found $($vms.Count) VM(s) on $vc. Collecting data..." -ForegroundColor Cyan
+
+    foreach ($vm in $vms) {
+
+        # ── Tags ──────────────────────────────────────────────────────────────
+        try {
+            $tagAssignments = Get-TagAssignment -Entity $vm -Server $vc -ErrorAction Stop
+            $tagString = ($tagAssignments | ForEach-Object {
+                "$($_.Tag.Category.Name):$($_.Tag.Name)"
+            }) -join " | "
+
+            if (-not $tagString) { $tagString = "No tags assigned" }
+        }
+        catch {
+            $tagString = "Tags unavailable"
+        }
+
+        # ── Cluster ───────────────────────────────────────────────────────────
+        $cluster = (Get-VMHost -VM $vm -Server $vc -ErrorAction SilentlyContinue |
+                    Get-Cluster -ErrorAction SilentlyContinue).Name
+
+        $allResults += [PSCustomObject]@{
+            vCenter    = $vc
+            VMName     = $vm.Name
+            Cluster    = $cluster
+            PowerState = $vm.PowerState
+            NumCPU     = $vm.NumCpu
+            MemoryGB   = $vm.MemoryGB
+            Tags       = $tagString
+        }
+    }
+
+    Write-Host "Finished $vc.`n" -ForegroundColor Green
+
+    # ── Disconnect from this vCenter before moving to next ────────────────────
+    Disconnect-VIServer -Server $vc -Confirm:$false
+    Write-Host "Disconnected from $vc.`n" -ForegroundColor DarkGray
+}
+
+# ── Display all results ───────────────────────────────────────────────────────
+Write-Host "========================================" -ForegroundColor DarkGray
+Write-Host "Total VMs collected: $($allResults.Count)" -ForegroundColor Cyan
+$allResults | Format-Table -AutoSize
+
+# ── Export CSV ────────────────────────────────────────────────────────────────
+try {
+    $exportDir = Split-Path $ExportPath -Parent
+    if ($exportDir -and -not (Test-Path $exportDir)) {
+        New-Item -ItemType Directory -Path $exportDir -Force | Out-Null
+    }
+    $allResults | Export-Csv -Path $ExportPath -NoTypeInformation -Encoding UTF8
+    Write-Host "Report saved to: $ExportPath" -ForegroundColor Green
+}
+catch {
+    Write-Warning "Could not export CSV: $_"
+}# =============================================================================
+# Get-VMReport.ps1
+# Retrieves assigned CPU, Memory, Power State, and Tags for all VMs
 # Requires: VMware PowerCLI (VMware.PowerCLI module)
 # =============================================================================
 
