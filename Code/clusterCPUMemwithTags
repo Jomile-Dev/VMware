@@ -4,18 +4,13 @@
 # Requires: VMware PowerCLI (VMware.PowerCLI module)
 # =============================================================================
 
-param(
-    [Parameter(Mandatory = $true)]
-    [string]$vCenterServer,
+# ── Configuration — edit these before running ─────────────────────────────────
+$vCenterServer = "vcenter.yourdomain.com"
+$CredPath      = "C:\Creds\vcenter_cred.xml"
+$ExportPath    = "$PSScriptRoot\VMReport_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+# ─────────────────────────────────────────────────────────────────────────────
 
-    [Parameter(Mandatory = $true)]
-    [string]$CredPath,
-
-    [Parameter(Mandatory = $false)]
-    [string]$ExportPath = "$PSScriptRoot\VMReport_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
-)
-
-# ── Load credentials ───────────────────────────────────────────────────────────
+# ── Load credentials ──────────────────────────────────────────────────────────
 if (-not (Test-Path $CredPath)) {
     Write-Error "Credential file not found at: $CredPath"
     Write-Host "To create it, run:" -ForegroundColor Yellow
@@ -70,16 +65,16 @@ $results = foreach ($vm in $vms) {
     }
 
     # ── Cluster ───────────────────────────────────────────────────────────────
-    $cluster = (Get-VMHost -VM $vm -ErrorAction SilentlyContinue | 
+    $cluster = (Get-VMHost -VM $vm -ErrorAction SilentlyContinue |
                 Get-Cluster -ErrorAction SilentlyContinue).Name
 
     [PSCustomObject]@{
-        VMName       = $vm.Name
-        Cluster      = $cluster
-        PowerState   = $vm.PowerState
-        NumCPU       = $vm.NumCpu
-        MemoryGB     = $vm.MemoryGB
-        Tags         = $tagString
+        VMName     = $vm.Name
+        Cluster    = $cluster
+        PowerState = $vm.PowerState
+        NumCPU     = $vm.NumCpu
+        MemoryGB   = $vm.MemoryGB
+        Tags       = $tagString
     }
 }
 
