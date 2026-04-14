@@ -19,7 +19,6 @@ $CSVFolder         = "C:\Reports"
 $Timestamp         = Get-Date -Format 'yyyyMMdd_HHmmss'
 $CSVPathLinux      = "$CSVFolder\VMUptime_Linux_$Timestamp.csv"
 $CSVPathWindows    = "$CSVFolder\VMUptime_Windows_$Timestamp.csv"
-$CSVPathOther      = "$CSVFolder\VMUptime_Other_$Timestamp.csv"
 
 # ── EMAIL CONFIGURATION ───────────────────────────────────────
 $SendEmail      = $true                                                              # Set to $false to disable email
@@ -132,25 +131,21 @@ $allResults | Sort-Object Cluster, UptimeDays -Descending |
 
 # ── SUMMARY STATS ─────────────────────────────────────────────
 $totalVMs    = $allResults.Count
-$poweredOn   = ($allResults | Where-Object { $_.PowerState -eq "PoweredOn" }).Count
-$poweredOff  = ($allResults | Where-Object { $_.PowerState -ne "PoweredOn" }).Count   # Will always be 0 after filter, kept for completeness
 
-$above14     = ($allResults | Where-Object { $_.UptimeDays -ne $null -and $_.UptimeDays -gt 14 }).Count
-$between7and14 = ($allResults | Where-Object { $_.UptimeDays -ne $null -and $_.UptimeDays -ge 7 -and $_.UptimeDays -le 14 }).Count
-$below7      = ($allResults | Where-Object { $_.UptimeDays -ne $null -and $_.UptimeDays -lt 7 }).Count
+$above14       = ($allResults | Where-Object { $_.UptimeDays -ne $null -and [double]$_.UptimeDays -gt 14 }).Count
+$between7and14 = ($allResults | Where-Object { $_.UptimeDays -ne $null -and [double]$_.UptimeDays -ge 7 -and [double]$_.UptimeDays -le 14 }).Count
+$below7        = ($allResults | Where-Object { $_.UptimeDays -ne $null -and [double]$_.UptimeDays -lt 7 }).Count
 
 Write-Host "`n--- Summary ---" -ForegroundColor Yellow
 Write-Host "  Total VMs              : $totalVMs"
-Write-Host "  Powered On             : $poweredOn"
-Write-Host "  Powered Off            : $poweredOff"
 Write-Host "  Uptime > 14 days       : $above14"
-Write-Host "  Uptime 7–14 days       : $between7and14"
+Write-Host "  Uptime 7-14 days       : $between7and14"
 Write-Host "  Uptime < 7 days        : $below7"
 
 # ── SPLIT BY OS ───────────────────────────────────────────────
-$linuxVMs   = $allResults | Where-Object { $_.GuestOS -match "Linux" }
+# Anything that is not Windows goes into Linux (including unknown/other OS)
+$linuxVMs   = $allResults | Where-Object { $_.GuestOS -notmatch "Windows" }
 $windowsVMs = $allResults | Where-Object { $_.GuestOS -match "Windows" }
-$otherVMs   = $allResults | Where-Object { $_.GuestOS -notmatch "Linux" -and $_.GuestOS -notmatch "Windows" }
 
 # ── CSV EXPORT ────────────────────────────────────────────────
 Write-Host "`nExporting CSVs..." -ForegroundColor Cyan
@@ -177,14 +172,6 @@ try {
         Write-Host "Windows CSV saved to: $CSVPathWindows" -ForegroundColor Green
     } else {
         Write-Host "No Windows VMs found — skipping Windows CSV." -ForegroundColor Gray
-    }
-
-    if ($otherVMs) {
-        $otherVMs | Sort-Object Cluster, Hostname | Select-Object $selectFields |
-            Export-Csv -Path $CSVPathOther -NoTypeInformation -Encoding UTF8
-        Write-Host "Other CSV saved to  : $CSVPathOther" -ForegroundColor Green
-    } else {
-        Write-Host "No Other/Unknown VMs found — skipping Other CSV." -ForegroundColor Gray
     }
 }
 catch {
@@ -218,10 +205,8 @@ if ($SendEmail) {
     <strong>Summary</strong>
     <table>
       <tr><td class="label">Total VMs</td><td>$totalVMs</td></tr>
-      <tr><td class="label">Powered On</td><td>$poweredOn</td></tr>
-      <tr><td class="label">Powered Off</td><td>$poweredOff</td></tr>
       <tr><td class="label">Uptime &gt; 14 days</td><td>$above14</td></tr>
-      <tr><td class="label">Uptime 7–14 days</td><td>$between7and14</td></tr>
+      <tr><td class="label">Uptime 7-14 days</td><td>$between7and14</td></tr>
       <tr><td class="label">Uptime &lt; 7 days</td><td>$below7</td></tr>
     </table>
   </div>
@@ -238,7 +223,6 @@ if ($SendEmail) {
     $attachments = @()
     if (Test-Path $CSVPathLinux)   { $attachments += $CSVPathLinux }
     if (Test-Path $CSVPathWindows) { $attachments += $CSVPathWindows }
-    if (Test-Path $CSVPathOther)   { $attachments += $CSVPathOther }
 
     # Build mail parameters
     $mailParams = @{
