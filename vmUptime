@@ -1,10 +1,11 @@
 # ============================================================
 # Get-VMUptime.ps1
 # Retrieves uptime for ALL VMs across multiple vCenter servers
+# Exports CSV and sends report via email
 # Requires: VMware PowerCLI
 # ============================================================
 
-# ── VARIABLES ────────────────────────────────────────────────
+# ── VCENTER VARIABLES ─────────────────────────────────────────
 $vCenterServers = @(
     "vcenter01.domain.local",
     "vcenter02.domain.local",
@@ -12,15 +13,26 @@ $vCenterServers = @(
 )
 
 $CredentialPath = "C:\Creds\vcenter_creds.xml"   # Path to saved credential XML
-$ExportCSV      = $true                           # Set to $false to skip export
-$CSVPath        = "C:\Reports\VMUptime_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
-$ReportTitle    = "VM Uptime Report"
 
-# ── LOAD CREDENTIALS ─────────────────────────────────────────
+# ── CSV EXPORT VARIABLES ──────────────────────────────────────
+$CSVFolder      = "C:\Reports"
+$CSVPath        = "$CSVFolder\VMUptime_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+
+# ── EMAIL CONFIGURATION ───────────────────────────────────────
+$SendEmail      = $true                                                              # Set to $false to disable email
+$EmailTo        = "admin@company.com"                                                # Recipient email
+$EmailFrom      = "vmware-reports@company.com"                                       # Sender email
+$EmailSubject   = "VMware VM Uptime Report - $(Get-Date -Format 'yyyy-MM-dd')"       # Email subject
+$SMTPServer     = "mail.company.com"                                                 # Your SMTP server
+$SMTPPort       = 465                                                                # SSL port (465 for SSL, 587 for TLS)
+$UseSSL         = $true                                                              # Use SSL encryption
+$SMTPCredentials = $null                                                             # Set to $null if no SMTP auth required
+
+# ── LOAD VCENTER CREDENTIALS ──────────────────────────────────
 # To save credentials the first time, run:
 #   Get-Credential | Export-Clixml -Path "C:\Creds\vcenter_creds.xml"
 
-Write-Host "`nLoading credentials from: $CredentialPath" -ForegroundColor Cyan
+Write-Host "`nLoading vCenter credentials from: $CredentialPath" -ForegroundColor Cyan
 
 try {
     $Credential = Import-Clixml -Path $CredentialPath -ErrorAction Stop
@@ -43,11 +55,11 @@ foreach ($vc in $vCenterServers) {
     }
     catch {
         Write-Warning "[$vc] Connection failed: $_"
-        continue   # Skip to next vCenter
+        continue
     }
 
-    # Get ALL VMs in this vCenter
     Write-Host "[$vc] Retrieving all VMs..."
+
     try {
         $vms = Get-VM -ErrorAction Stop
     }
@@ -60,7 +72,7 @@ foreach ($vc in $vCenterServers) {
     foreach ($vm in $vms) {
         $uptimeDays   = $null
         $uptimeString = "N/A"
-        $bootTime     = $null
+        $bootTime     = "N/A"
         $powerState   = $vm.PowerState
 
         if ($powerState -eq "PoweredOn") {
@@ -68,24 +80,27 @@ foreach ($vc in $vCenterServers) {
 
             if ($uptimeSecs -gt 0) {
                 $ts           = [TimeSpan]::FromSeconds($uptimeSecs)
-                $bootTime     = (Get-Date).AddSeconds(-$uptimeSecs)
+                $bootTime     = (Get-Date).AddSeconds(-$uptimeSecs).ToString("yyyy-MM-dd HH:mm:ss")
                 $uptimeDays   = [math]::Round($ts.TotalDays, 2)
                 $uptimeString = "{0}d {1}h {2}m {3}s" -f $ts.Days, $ts.Hours, $ts.Minutes, $ts.Seconds
             }
         }
 
+        $cluster = (Get-Cluster -VM $vm -ErrorAction SilentlyContinue).Name
+        if (-not $cluster) { $cluster = "N/A" }
+
         $allResults += [PSCustomObject]@{
+            Hostname        = $vm.Name
+            Cluster         = $cluster
             vCenter         = $vc
-            VMName          = $vm.Name
             PowerState      = $powerState
+            UptimeFormatted = $uptimeString
+            UptimeDays      = $uptimeDays
+            BootTime        = $bootTime
+            Host            = $vm.VMHost.Name
             NumCPU          = $vm.NumCpu
             MemoryGB        = [math]::Round($vm.MemoryGB, 2)
-            Host            = $vm.VMHost.Name
-            Cluster         = (Get-Cluster -VM $vm -ErrorAction SilentlyContinue).Name
             GuestOS         = $vm.Guest.OSFullName
-            BootTime        = if ($bootTime) { $bootTime.ToString("yyyy-MM-dd HH:mm:ss") } else { "N/A" }
-            UptimeDays      = $uptimeDays
-            UptimeFormatted = $uptimeString
         }
     }
 
@@ -94,18 +109,19 @@ foreach ($vc in $vCenterServers) {
     Write-Host "[$vc] Disconnected." -ForegroundColor Gray
 }
 
-# ── DISPLAY RESULTS ───────────────────────────────────────────
+# ── VALIDATE RESULTS ──────────────────────────────────────────
 if ($allResults.Count -eq 0) {
-    Write-Warning "No VMs retrieved from any vCenter."
+    Write-Warning "No VMs retrieved from any vCenter. Exiting."
     exit 0
 }
 
-Write-Host "`n=== $ReportTitle — $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') ===`n" -ForegroundColor Yellow
+# ── DISPLAY TABLE ─────────────────────────────────────────────
+Write-Host "`n=== VMware VM Uptime Report — $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') ===`n" -ForegroundColor Yellow
 
-$allResults | Sort-Object vCenter, UptimeDays -Descending |
-    Format-Table vCenter, VMName, PowerState, UptimeFormatted, UptimeDays, BootTime, Host, Cluster -AutoSize
+$allResults | Sort-Object Cluster, UptimeDays -Descending |
+    Format-Table Hostname, Cluster, PowerState, UptimeFormatted, UptimeDays, BootTime, Host -AutoSize
 
-# ── SUMMARY PER VCENTER ───────────────────────────────────────
+# ── SUMMARY ───────────────────────────────────────────────────
 Write-Host "`n--- Summary by vCenter ---" -ForegroundColor Cyan
 
 foreach ($vc in $vCenterServers) {
@@ -120,11 +136,10 @@ foreach ($vc in $vCenterServers) {
     Write-Host "    Powered On  : $poweredOn"
     Write-Host "    Powered Off : $poweredOff"
     if ($avgUptime) {
-        Write-Host ("    Avg Uptime  : {0:N2} days" -f $grandAvg)
+        Write-Host ("    Avg Uptime  : {0:N2} days" -f $avgUptime)
     }
 }
 
-# ── GRAND TOTAL ────────────────────────────────────────────────
 $totalOn  = ($allResults | Where-Object { $_.PowerState -eq "PoweredOn" }).Count
 $totalOff = ($allResults | Where-Object { $_.PowerState -ne "PoweredOn" }).Count
 $grandAvg = ($allResults | Where-Object { $_.UptimeDays -ne $null } |
@@ -138,21 +153,126 @@ if ($grandAvg) {
     Write-Host ("  Overall Avg Uptime            : {0:N2} days" -f $grandAvg)
 }
 
-# ── OPTIONAL CSV EXPORT ────────────────────────────────────────
-if ($ExportCSV) {
-    try {
-        # Create output folder if it doesn't exist
-        $csvDir = Split-Path $CSVPath -Parent
-        if (-not (Test-Path $csvDir)) {
-            New-Item -ItemType Directory -Path $csvDir -Force | Out-Null
-        }
+# ── CSV EXPORT ────────────────────────────────────────────────
+Write-Host "`nExporting CSV..." -ForegroundColor Cyan
 
-        $allResults | Export-Csv -Path $CSVPath -NoTypeInformation -Encoding UTF8
-        Write-Host "`nReport exported to: $CSVPath" -ForegroundColor Green
+try {
+    if (-not (Test-Path $CSVFolder)) {
+        New-Item -ItemType Directory -Path $CSVFolder -Force | Out-Null
+    }
+
+    $allResults | Sort-Object Cluster, Hostname |
+        Select-Object Hostname, Cluster, vCenter, PowerState, UptimeFormatted, UptimeDays, BootTime, Host, NumCPU, MemoryGB,
+            @{Name="OperatingSystem"; Expression={$_.GuestOS}} |
+        Export-Csv -Path $CSVPath -NoTypeInformation -Encoding UTF8
+
+    Write-Host "CSV saved to: $CSVPath" -ForegroundColor Green
+}
+catch {
+    Write-Error "CSV export failed: $_"
+    exit 1
+}
+
+# ── SEND EMAIL ────────────────────────────────────────────────
+if ($SendEmail) {
+    Write-Host "`nSending email report..." -ForegroundColor Cyan
+
+    # Build HTML email body
+    $htmlBody = @"
+<html>
+<head>
+  <style>
+    body  { font-family: Arial, sans-serif; font-size: 13px; color: #333; }
+    h2    { color: #0066cc; }
+    table { border-collapse: collapse; width: 100%; margin-top: 10px; }
+    th    { background-color: #0066cc; color: white; padding: 8px 12px; text-align: left; }
+    td    { padding: 6px 12px; border-bottom: 1px solid #ddd; }
+    tr:nth-child(even) { background-color: #f2f2f2; }
+    .summary { margin-top: 20px; background: #f9f9f9; padding: 12px; border-left: 4px solid #0066cc; }
+  </style>
+</head>
+<body>
+  <h2>VMware VM Uptime Report</h2>
+  <p>Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</p>
+
+  <div class="summary">
+    <strong>Summary</strong><br/>
+    Total VMs   : $($allResults.Count)<br/>
+    Powered On  : $totalOn<br/>
+    Powered Off : $totalOff<br/>
+    $(if ($grandAvg) { "Avg Uptime  : $([math]::Round($grandAvg, 2)) days" })
+  </div>
+
+  <br/>
+  <p>Please find the full VM uptime report attached as a CSV file.</p>
+
+  <table>
+    <tr>
+      <th>Hostname</th>
+      <th>Cluster</th>
+      <th>vCenter</th>
+      <th>Power State</th>
+      <th>Uptime</th>
+      <th>Uptime (Days)</th>
+      <th>Boot Time</th>
+      <th>ESXi Host</th>
+      <th>Operating System</th>
+    </tr>
+"@
+
+    foreach ($row in ($allResults | Sort-Object Cluster, Hostname)) {
+        $htmlBody += @"
+    <tr>
+      <td>$($row.Hostname)</td>
+      <td>$($row.Cluster)</td>
+      <td>$($row.vCenter)</td>
+      <td>$($row.PowerState)</td>
+      <td>$($row.UptimeFormatted)</td>
+      <td>$($row.UptimeDays)</td>
+      <td>$($row.BootTime)</td>
+      <td>$($row.Host)</td>
+      <td>$($row.GuestOS)</td>
+    </tr>
+"@
+    }
+
+    $htmlBody += @"
+  </table>
+  <br/>
+  <p style="color:#888; font-size:11px;">This is an automated report generated by Get-VMUptime.ps1</p>
+</body>
+</html>
+"@
+
+    # Build mail parameters
+    $mailParams = @{
+        From        = $EmailFrom
+        To          = $EmailTo
+        Subject     = $EmailSubject
+        Body        = $htmlBody
+        BodyAsHtml  = $true
+        SmtpServer  = $SMTPServer
+        Port        = $SMTPPort
+        UseSSL      = $UseSSL
+        Attachments = $CSVPath
+        ErrorAction = "Stop"
+    }
+
+    # Add SMTP credentials only if provided
+    if ($SMTPCredentials) {
+        $mailParams.Credential = $SMTPCredentials
+    }
+
+    try {
+        Send-MailMessage @mailParams
+        Write-Host "Email sent successfully to: $EmailTo" -ForegroundColor Green
     }
     catch {
-        Write-Warning "CSV export failed: $_"
+        Write-Error "Failed to send email: $_"
     }
+}
+else {
+    Write-Host "`nEmail skipped (`$SendEmail = `$false)." -ForegroundColor Gray
 }
 
 Write-Host "`nDone.`n" -ForegroundColor Cyan
