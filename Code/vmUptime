@@ -84,7 +84,7 @@ foreach ($vc in $vCenterServers) {
         if ($vm.PowerState -ne "PoweredOn") { continue }
 
         # ── UPTIME CALCULATION ────────────────────────────────
-        $uptimeDays   = $null
+        $uptimeDays   = [double]::NaN
         $uptimeString = "N/A"
         $bootTime     = "N/A"
 
@@ -93,7 +93,7 @@ foreach ($vc in $vCenterServers) {
         if ($uptimeSecs -gt 0) {
             $ts           = [TimeSpan]::FromSeconds($uptimeSecs)
             $bootTime     = (Get-Date).AddSeconds(-$uptimeSecs).ToString("yyyy-MM-dd HH:mm:ss")
-            $uptimeDays   = [math]::Round($ts.TotalDays, 2)
+            $uptimeDays   = [double][math]::Round($ts.TotalDays, 2)
             $uptimeString = "{0}d {1}h {2}m {3}s" -f $ts.Days, $ts.Hours, $ts.Minutes, $ts.Seconds
         }
 
@@ -132,9 +132,9 @@ $allResults | Sort-Object Cluster, UptimeDays -Descending |
 # ── SUMMARY STATS ─────────────────────────────────────────────
 $totalVMs    = $allResults.Count
 
-$above14       = ($allResults | Where-Object { $_.UptimeDays -ne $null -and [double]$_.UptimeDays -gt 14 }).Count
-$between7and14 = ($allResults | Where-Object { $_.UptimeDays -ne $null -and [double]$_.UptimeDays -ge 7 -and [double]$_.UptimeDays -le 14 }).Count
-$below7        = ($allResults | Where-Object { $_.UptimeDays -ne $null -and [double]$_.UptimeDays -lt 7 }).Count
+$above14       = ($allResults | Where-Object { $_.UptimeDays -is [double] -and -not [double]::IsNaN($_.UptimeDays) -and $_.UptimeDays -gt 14 }).Count
+$between7and14 = ($allResults | Where-Object { $_.UptimeDays -is [double] -and -not [double]::IsNaN($_.UptimeDays) -and $_.UptimeDays -ge 7 -and $_.UptimeDays -le 14 }).Count
+$below7        = ($allResults | Where-Object { $_.UptimeDays -is [double] -and -not [double]::IsNaN($_.UptimeDays) -and $_.UptimeDays -lt 7 }).Count
 
 Write-Host "`n--- Summary ---" -ForegroundColor Yellow
 Write-Host "  Total VMs              : $totalVMs"
