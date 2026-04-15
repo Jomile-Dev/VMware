@@ -1,14 +1,10 @@
-$vraServer = "vra1.yourdomain.com"
-
-$cred     = Get-Credential -Message "Enter vRA credentials"
-$username = $cred.UserName
-$password = $cred.GetNetworkCredential().Password
-
-# vRA 8.x refresh token request
 $authResp = Invoke-RestMethod `
-    -Uri "https://$vraServer/csp/gateway/am/api/login?access_token" `
+    -Uri "https://$vraServer/csp/gateway/am/api/auth/api-tokens/authorize" `
     -Method POST `
-    -Headers @{ "Content-Type" = "application/json" } `
-    -Body (@{ username = $username; password = $password } | ConvertTo-Json)
+    -Headers @{ "Content-Type" = "application/x-www-form-urlencoded" } `
+    -Body "refresh_token=$refreshToken"
 
-$authResp | ConvertTo-Json -Depth 5
+$vraHeaders = @{
+    "Authorization" = "Bearer $($authResp.access_token)"
+    "Content-Type"  = "application/json"
+}
