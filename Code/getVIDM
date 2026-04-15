@@ -1,33 +1,33 @@
-# Exact same auth as the working deployment script
-$vraServer = "your-vra-server"
+# Replace the entire vRA groups section with this
+$skip     = 0
+$pageSize = 200
 
-$credential = Get-Credential -Message "Enter vRA credentials"
-$username = $credential.UserName
-$password = $credential.GetNetworkCredential().Password
+do {
+    $resp = Invoke-RestMethod `
+        -Uri "https://$vraServer/iaas/api/projects?apiVersion=2021-07-15&`$top=$pageSize&`$skip=$skip" `
+        -Method GET `
+        -Headers $vraHeaders `
+        -ErrorAction Stop
 
-$authResp = Invoke-RestMethod `
-    -Uri "https://$vraServer/csp/gateway/am/api/login" `
-    -Method POST `
-    -Headers @{ "Content-Type" = "application/json" } `
-    -Body (@{ username = $username; password = $password } | ConvertTo-Json)
+    $items = if ($resp.content) { $resp.content } else { $resp }
 
-$vraHeaders = @{
-    "Authorization" = "Bearer $($authResp.cspAuthToken)"
-    "Content-Type"  = "application/json"
-}
+    if ($items -and @($items).Count -gt 0) {
+        foreach ($project in $items) {
+            # Pull groups from project members
+            $project.members | Where-Object { $_.type -eq "group" } |
+                ForEach-Object { $vraGroupNames += $_.email.Trim() }
 
-# Test with the one endpoint we know works from deployment script
-$test = Invoke-RestMethod `
-    -Uri "https://$vraServer/deployment/api/deployments?page=0&size=1" `
-    -Method GET `
-    -Headers $vraHeaders
+            $project.administrators | Where-Object { $_.type -eq "group" } |
+                ForEach-Object { $vraGroupNames += $_.email.Trim() }
 
-Write-Host "Deployment test worked: $($test.content.Count) result"
+            $project.viewers | Where-Object { $_.type -eq "group" } |
+                ForEach-Object { $vraGroupNames += $_.email.Trim() }
+        }
+        $skip += $pageSize
+        if (@($items).Count -lt $pageSize) { break }
+    }
+    else { break }
+} while ($true)
 
-# Now test IAM
-$orgTest = Invoke-RestMethod `
-    -Uri "https://$vraServer/csp/gateway/am/api/loggedin/user/orgs" `
-    -Method GET `
-    -Headers $vraHeaders
-
-$orgTest | ConvertTo-Json -Depth 3
+$vraGroupNames = $vraGroupNames | Sort-Object -Unique
+Write-Log "Retrieved $($vraGroupNames.Count) groups from projects on $vraServer" "SUCCESS"
