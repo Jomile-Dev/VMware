@@ -14,10 +14,12 @@
 # -- vRA Credentials --
 # Get-Credential | Export-Clixml -Path "C:\Creds\aria_vra_cred.xml"
 #
-# HOW vRA AUTH WORKS:
-# Login with ?access_token returns both cspAuthToken and refreshToken
-# cspAuthToken is used for deployment/iaas APIs
-# refreshToken is exchanged for a full org-scoped token for IAM APIs
+# NOTE ON vRA GROUP SOURCE:
+# The IAM enterprise groups API requires cloud-only token exchange not available
+# on on-prem vRA 8.x. Groups are instead pulled from project memberships
+# (members, administrators, viewers) which covers all groups assigned in vRA.
+# Normalisation strips domain prefixes/suffixes before comparing so naming
+# differences between vIDM and vRA don't cause false mismatches.
 #
 # ============================================================================
 
@@ -151,7 +153,7 @@ foreach ($vidmServer in $vidmServers) {
 $vidmGroups = $vidmGroups | Sort-Object NormalizedName -Unique
 
 # ============================================================================
-# STEP 2: COLLECT vRA ENTERPRISE GROUPS FROM ALL INSTANCES
+# STEP 2: COLLECT vRA GROUPS FROM ALL INSTANCES (via Projects)
 # ============================================================================
 
 $vraGroups = [System.Collections.Generic.List[PSCustomObject]]::new()
@@ -161,32 +163,18 @@ foreach ($vraServer in $vraServers) {
     Write-Log "=== Connecting to vRA: $vraServer ===" "SUCCESS"
 
     try {
-        # Step 1 — Login to get both cspAuthToken and refreshToken
         $loginResp = Invoke-RestMethod `
-            -Uri "https://$vraServer/csp/gateway/am/api/login?access_token" `
+            -Uri "https://$vraServer/csp/gateway/am/api/login" `
             -Method POST `
             -Headers @{ "Content-Type" = "application/json" } `
             -Body (@{ username = $vraUser; password = $vraPass } | ConvertTo-Json) `
             -ErrorAction Stop
 
-        Write-Log "Login response fields: $($loginResp | Get-Member -MemberType NoteProperty | Select-Object -ExpandProperty Name)" "WARN"
-
-        # Step 2 — Exchange refreshToken for org-scoped access token
-        $refreshToken = $loginResp.refreshToken
-        Write-Log "Exchanging refresh token for org-scoped token..." "WARN"
-
-        $tokenResp = Invoke-RestMethod `
-            -Uri "https://$vraServer/csp/gateway/am/api/auth/api-tokens/authorize" `
-            -Method POST `
-            -Headers @{ "Content-Type" = "application/x-www-form-urlencoded" } `
-            -Body "refresh_token=$refreshToken" `
-            -ErrorAction Stop
-
         $vraHeaders = @{
-            "Authorization" = "Bearer $($tokenResp.access_token)"
+            "Authorization" = "Bearer $($loginResp.cspAuthToken)"
             "Content-Type"  = "application/json"
         }
-        Write-Log "Authenticated to $vraServer with org-scoped token" "SUCCESS"
+        Write-Log "Authenticated to $vraServer" "SUCCESS"
     }
     catch {
         Write-Log "vRA auth failed for $vraServer : $($_.Exception.Message)" "ERROR"
@@ -194,51 +182,45 @@ foreach ($vraServer in $vraServers) {
     }
 
     try {
-        # Get org ID from logged in user
-        $org     = Invoke-RestMethod `
-            -Uri "https://$vraServer/csp/gateway/am/api/loggedin/user/orgs" `
-            -Method GET `
-            -Headers $vraHeaders `
-            -ErrorAction Stop
-
-        $refLink = $org.refLinks | Select-Object -First 1
-        $orgId   = $refLink -replace ".*/orgs/([^/]+).*", '$1'
-        Write-Log "Org ID: $orgId"
-
-        # Get enterprise groups with pagination
         $skip     = 0
         $pageSize = 200
 
         do {
-            $uri = "https://$vraServer/csp/gateway/am/api/orgs/$orgId/groups?groupType=ENTERPRISE&take=$pageSize&skip=$skip"
-
             $resp = Invoke-RestMethod `
-                -Uri $uri `
+                -Uri "https://$vraServer/iaas/api/projects?apiVersion=2021-07-15&`$top=$pageSize&`$skip=$skip" `
                 -Method GET `
                 -Headers $vraHeaders `
                 -ErrorAction Stop
 
-            $items = $resp.results
+            $items = if ($resp.content) { $resp.content } else { $resp }
 
             if ($items -and @($items).Count -gt 0) {
-                foreach ($g in $items) {
-                    if ($g.displayName) {
-                        $vraGroups.Add([PSCustomObject]@{
-                            OriginalName   = $g.displayName.Trim()
-                            NormalizedName = Normalize-GroupName $g.displayName
-                            Domain         = $g.domain
-                            UserCount      = $g.userCount
-                        })
+                foreach ($project in $items) {
+                    # Pull groups from all project roles
+                    foreach ($role in @('members', 'administrators', 'viewers', 'supervisors')) {
+                        $project.$role |
+                            Where-Object { $_.type -eq "group" } |
+                            ForEach-Object {
+                                $name = if ($_.email) { $_.email } elseif ($_.name) { $_.name } else { $null }
+                                if ($name) {
+                                    $vraGroups.Add([PSCustomObject]@{
+                                        OriginalName   = $name.Trim()
+                                        NormalizedName = Normalize-GroupName $name
+                                        ProjectName    = $project.name
+                                        Role           = $role
+                                    })
+                                }
+                            }
                     }
                 }
-                Write-Log "  Skip $skip : $(@($items).Count) groups retrieved"
+                Write-Log "  Skip $skip : $(@($items).Count) projects retrieved"
                 $skip += $pageSize
                 if (@($items).Count -lt $pageSize) { break }
             }
             else { break }
         } while ($true)
 
-        Write-Log "Retrieved $($vraGroups.Count) enterprise groups from $vraServer" "SUCCESS"
+        Write-Log "Retrieved $($vraGroups.Count) groups from projects on $vraServer" "SUCCESS"
     }
     catch {
         Write-Log "vRA failed for $vraServer : $($_.Exception.Message)" "ERROR"
@@ -270,8 +252,8 @@ foreach ($g in $vidmGroups) {
         InvIDM         = "YES"
         InvRA          = if ($inVRA) { "YES" } else { "NO" }
         MissingFrom    = if ($inVRA) { "None" } else { "vRA" }
-        Domain         = if ($vraMatch) { $vraMatch.Domain }    else { "N/A" }
-        UserCount      = if ($vraMatch) { $vraMatch.UserCount } else { "N/A" }
+        vRAProject     = if ($vraMatch) { $vraMatch.ProjectName } else { "N/A" }
+        vRARole        = if ($vraMatch) { $vraMatch.Role }        else { "N/A" }
     })
 }
 
@@ -285,8 +267,8 @@ foreach ($g in $vraGroups) {
             InvIDM         = "NO"
             InvRA          = "YES"
             MissingFrom    = "vIDM"
-            Domain         = $g.Domain
-            UserCount      = $g.UserCount
+            vRAProject     = $g.ProjectName
+            vRARole        = $g.Role
         })
     }
 }
