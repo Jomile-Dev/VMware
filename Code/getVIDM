@@ -179,6 +179,22 @@ foreach ($vraServer in $vraServers) {
         continue
     }
 
+    # ── Debug: test org lookup ────────────────────────────────────────────────
+    try {
+        Write-Log "Testing org lookup..." "WARN"
+        $orgTest = Invoke-RestMethod `
+            -Uri "https://$vraServer/csp/gateway/am/api/loggedin/user/orgs" `
+            -Method GET `
+            -Headers $vraHeaders `
+            -ErrorAction Stop
+        Write-Log "Org lookup succeeded: $($orgTest | ConvertTo-Json -Depth 3 -Compress)" "WARN"
+    }
+    catch {
+        Write-Log "Org lookup failed: $($_.Exception.Message)" "ERROR"
+        continue
+    }
+    # ── End debug ─────────────────────────────────────────────────────────────
+
     try {
         # Get org ID from logged in user
         $org     = Invoke-RestMethod `
