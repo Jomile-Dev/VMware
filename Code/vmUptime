@@ -201,6 +201,7 @@ if ($SendEmail) {
     .summary table { border-collapse: collapse; margin-top: 8px; }
     .summary td { padding: 3px 16px 3px 0; }
     .label { font-weight: bold; color: #555; }
+    h3 { color: #0066cc; margin-top: 24px; margin-bottom: 4px; }
   </style>
 </head>
 <body>
@@ -208,12 +209,32 @@ if ($SendEmail) {
   <p>Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</p>
 
   <div class="summary">
-    <strong>Summary</strong>
+    <strong>Overall Summary</strong>
     <table>
       <tr><td class="label">Total VMs</td><td>$($totalVMs)</td></tr>
       <tr><td class="label">Uptime &gt; 14 days</td><td>$($above14)</td></tr>
       <tr><td class="label">Uptime 7-14 days</td><td>$($between7and14)</td></tr>
       <tr><td class="label">Uptime &lt; 7 days</td><td>$($below7)</td></tr>
+    </table>
+  </div>
+
+  <div class="summary">
+    <strong>Windows VMs</strong>
+    <table>
+      <tr><td class="label">Total</td><td>$($windowsVMs.Count)</td></tr>
+      <tr><td class="label">Uptime &gt; 14 days</td><td>$(($windowsVMs | Where-Object { -not [double]::IsNaN([double]$_.UptimeDays) -and [double]$_.UptimeDays -gt 14 }).Count)</td></tr>
+      <tr><td class="label">Uptime 7-14 days</td><td>$(($windowsVMs | Where-Object { -not [double]::IsNaN([double]$_.UptimeDays) -and [double]$_.UptimeDays -ge 7 -and [double]$_.UptimeDays -le 14 }).Count)</td></tr>
+      <tr><td class="label">Uptime &lt; 7 days</td><td>$(($windowsVMs | Where-Object { -not [double]::IsNaN([double]$_.UptimeDays) -and [double]$_.UptimeDays -lt 7 }).Count)</td></tr>
+    </table>
+  </div>
+
+  <div class="summary">
+    <strong>Linux / Other VMs</strong>
+    <table>
+      <tr><td class="label">Total</td><td>$($linuxVMs.Count)</td></tr>
+      <tr><td class="label">Uptime &gt; 14 days</td><td>$(($linuxVMs | Where-Object { -not [double]::IsNaN([double]$_.UptimeDays) -and [double]$_.UptimeDays -gt 14 }).Count)</td></tr>
+      <tr><td class="label">Uptime 7-14 days</td><td>$(($linuxVMs | Where-Object { -not [double]::IsNaN([double]$_.UptimeDays) -and [double]$_.UptimeDays -ge 7 -and [double]$_.UptimeDays -le 14 }).Count)</td></tr>
+      <tr><td class="label">Uptime &lt; 7 days</td><td>$(($linuxVMs | Where-Object { -not [double]::IsNaN([double]$_.UptimeDays) -and [double]$_.UptimeDays -lt 7 }).Count)</td></tr>
     </table>
   </div>
 
