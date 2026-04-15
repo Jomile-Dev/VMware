@@ -1,9 +1,12 @@
-# Login with system account first
-$sysLogin = Invoke-RestMethod `
-    -Uri "https://$vidmFQDN/SAAS/API/1.0/REST/auth/system/login" `
+# Just run this on its own to inspect the login response
+$loginResponse = Invoke-RestMethod `
+    -Uri "https://$vidmFQDN/SAAS/auth/login" `
     -Method POST `
-    -Headers @{ "Content-Type" = "application/json"; "Accept" = "application/json" } `
-    -Body (@{ username = "admin"; password = "sys_password"; issueToken = "true" } | ConvertTo-Json)
+    -Headers @{ 
+        "Content-Type" = "application/json"
+        "Accept"       = "application/json"
+    } `
+    -Body (@{ username = $username; password = $password; domain = $domain; issueToken = "true" } | ConvertTo-Json)
 
-$sysToken = $sysLogin.sessionToken
-Write-Host "System token retrieved"
+# Dump the full response so we can see what token fields come back
+$loginResponse | ConvertTo-Json -Depth 10
