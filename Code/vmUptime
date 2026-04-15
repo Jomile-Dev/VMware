@@ -12,7 +12,13 @@ $vCenterServers = @(
     "vcenter03.domain.local"
 )
 
-$CredentialPath = "C:\Creds\vcenter_creds.xml"   # Path to saved credential XML
+$CredentialPath = "C:\Creds\vcenter_creds.xml"   # Path to saved vCenter credential XML
+
+# ── GUEST OS CREDENTIALS ──────────────────────────────────────
+# Separate credentials used by Invoke-VMScript to log into the guest OS
+# To save guest credentials the first time, run:
+#   Get-Credential | Export-Clixml -Path "C:\Creds\guest_creds.xml"
+$GuestCredentialPath = "C:\Creds\guest_creds.xml"
 
 # ── CSV EXPORT VARIABLES ──────────────────────────────────────
 $CSVFolder         = "C:\Reports"
@@ -41,7 +47,19 @@ try {
     Write-Host "Credentials loaded successfully." -ForegroundColor Green
 }
 catch {
-    Write-Error "Failed to load credentials: $_"
+    Write-Error "Failed to load vCenter credentials: $_"
+    exit 1
+}
+
+# ── LOAD GUEST OS CREDENTIALS ─────────────────────────────────
+Write-Host "Loading guest OS credentials from: $GuestCredentialPath" -ForegroundColor Cyan
+
+try {
+    $GuestCredential = Import-Clixml -Path $GuestCredentialPath -ErrorAction Stop
+    Write-Host "Guest credentials loaded successfully." -ForegroundColor Green
+}
+catch {
+    Write-Error "Failed to load guest credentials: $_"
     exit 1
 }
 
@@ -83,14 +101,37 @@ foreach ($vc in $vCenterServers) {
         # Skip powered off VMs
         if ($vm.PowerState -ne "PoweredOn") { continue }
 
-        # ── UPTIME CALCULATION ────────────────────────────────
+        # ── UPTIME CALCULATION (Guest OS) ─────────────────────
         $uptimeDays   = [double]::NaN
         $uptimeString = "N/A"
         $bootTime     = "N/A"
 
-        $uptimeSecs = $vm.ExtensionData.Summary.QuickStats.UptimeSeconds
+        # Skip if VMware Tools not running — Invoke-VMScript requires it
+        if ($vm.Guest.ExtensionData.ToolsRunningStatus -ne "guestToolsRunning") {
+            Write-Warning "[$($vm.Name)] VMware Tools not running — skipping guest uptime query."
+            $uptimeSecs = $null
+        }
+        else {
+            try {
+                if ($vm.Guest.OSFullName -match "Windows") {
+                    $result = Invoke-VMScript -VM $vm -GuestCredential $GuestCredential -ScriptType PowerShell -ScriptText `
+                        '(Get-Date) - (gcim Win32_OperatingSystem).LastBootUpTime | Select-Object -ExpandProperty TotalSeconds' `
+                        -ErrorAction Stop
+                }
+                else {
+                    $result = Invoke-VMScript -VM $vm -GuestCredential $GuestCredential -ScriptType Bash -ScriptText `
+                        "awk '{print $1}' /proc/uptime" `
+                        -ErrorAction Stop
+                }
+                $uptimeSecs = [double]($result.ScriptOutput.Trim())
+            }
+            catch {
+                Write-Warning "[$($vm.Name)] Failed to get guest uptime: $_"
+                $uptimeSecs = $null
+            }
+        }
 
-        if ($uptimeSecs -gt 0) {
+        if ($uptimeSecs -ne $null -and $uptimeSecs -gt 0) {
             $ts           = [TimeSpan]::FromSeconds($uptimeSecs)
             $bootTime     = (Get-Date).AddSeconds(-$uptimeSecs).ToString("yyyy-MM-dd HH:mm:ss")
             $uptimeDays   = [double][math]::Round($ts.TotalDays, 2)
