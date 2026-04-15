@@ -1,18 +1,9 @@
-# ── Try OAuth2 password grant for domain account ──────────────────────────────
-$clientId     = "admin"        # try with admin as client ID first
-$clientSecret = ""             # leave blank first attempt
-
-$base64Creds = [Convert]::ToBase64String(
-    [Text.Encoding]::ASCII.GetBytes("${clientId}:${clientSecret}"))
-
 $loginResponse = Invoke-RestMethod `
     -Uri "https://$vidmFQDN/SAAS/auth/oauthtoken" `
     -Method POST `
+    -UseBasicParsing `
     -Headers @{
-        "Authorization" = "Basic $base64Creds"
-        "Content-Type"  = "application/x-www-form-urlencoded"
-        "Accept"        = "application/json"
+        "Content-Type" = "application/x-www-form-urlencoded"
+        "Accept"       = "application/json"
     } `
     -Body "grant_type=password&username=$username&password=$password&domain=$domain"
-
-$loginResponse | ConvertTo-Json -Depth 5
