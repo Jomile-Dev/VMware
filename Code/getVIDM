@@ -1,1 +1,10 @@
-$orgId = "your-org-id-here"
+$org = Invoke-RestMethod `
+    -Uri "https://$vraServer/csp/gateway/am/api/loggedin/user/orgs" `
+    -Method GET `
+    -Headers $vraHeaders
+
+# Grab org ID from refLinks URL instead of items
+$refLink = $org.refLinks | Select-Object -First 1
+$orgId = $refLink -replace ".*/orgs/([^/]+).*", '$1'
+
+Write-Log "Org ID: $orgId"
