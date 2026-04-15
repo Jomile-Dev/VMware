@@ -93,7 +93,7 @@ foreach ($vc in $vCenterServers) {
         if ($uptimeSecs -gt 0) {
             $ts           = [TimeSpan]::FromSeconds($uptimeSecs)
             $bootTime     = (Get-Date).AddSeconds(-$uptimeSecs).ToString("yyyy-MM-dd HH:mm:ss")
-            $uptimeDays   = [double][math]::Round($ts.TotalDays, 2)
+            $uptimeDays   = [double][math]::Round($ts.TotalDays, 2)   # explicit [double] cast prevents Decimal coercion
             $uptimeString = "{0}d {1}h {2}m {3}s" -f $ts.Days, $ts.Hours, $ts.Minutes, $ts.Seconds
         }
 
@@ -105,7 +105,7 @@ foreach ($vc in $vCenterServers) {
             Cluster         = $cluster
             PowerState      = $vm.PowerState
             UptimeFormatted = $uptimeString
-            UptimeDays      = $uptimeDays
+            UptimeDays      = [double]$uptimeDays   # FIX: lock type to [double] at storage time
             BootTime        = $bootTime
             Host            = $vm.VMHost.Name
             GuestOS         = $vm.Guest.OSFullName
@@ -130,11 +130,14 @@ $allResults | Sort-Object Cluster, UptimeDays -Descending |
     Format-Table Hostname, Cluster, PowerState, UptimeFormatted, UptimeDays, BootTime, Host -AutoSize
 
 # ── SUMMARY STATS ─────────────────────────────────────────────
-$totalVMs    = $allResults.Count
+# FIX: Pre-filter valid numeric entries using -isnot [string] (excludes the literal "N/A" stored as NaN)
+# then cast to [double] at comparison time — avoids -is [double] silently failing when PS stores as Decimal
+$totalVMs  = $allResults.Count
 
-$above14       = ($allResults | Where-Object { $_.UptimeDays -is [double] -and -not [double]::IsNaN($_.UptimeDays) -and $_.UptimeDays -gt 14 }).Count
-$between7and14 = ($allResults | Where-Object { $_.UptimeDays -is [double] -and -not [double]::IsNaN($_.UptimeDays) -and $_.UptimeDays -ge 7 -and $_.UptimeDays -le 14 }).Count
-$below7        = ($allResults | Where-Object { $_.UptimeDays -is [double] -and -not [double]::IsNaN($_.UptimeDays) -and $_.UptimeDays -lt 7 }).Count
+$validVMs      = $allResults | Where-Object { $_.UptimeDays -isnot [string] -and -not [double]::IsNaN([double]$_.UptimeDays) }
+$above14       = ($validVMs | Where-Object { [double]$_.UptimeDays -gt 14 }).Count
+$between7and14 = ($validVMs | Where-Object { [double]$_.UptimeDays -ge 7 -and [double]$_.UptimeDays -le 14 }).Count
+$below7        = ($validVMs | Where-Object { [double]$_.UptimeDays -lt 7 }).Count
 
 Write-Host "`n--- Summary ---" -ForegroundColor Yellow
 Write-Host "  Total VMs              : $totalVMs"
