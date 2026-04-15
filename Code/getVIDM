@@ -25,6 +25,74 @@ $token = $loginResponse.sessionToken
 $headers = @{ "Authorization" = "HZN $token"; "Accept" = "application/json" }
 Write-Host "`n✔ Authenticated as $username"
 
+# ── Step 2: Get directories ───────────────────────────────────────────────────
+$directories = Invoke-RestMethod `
+    -Uri "https://$vidmFQDN/SAAS/jersey/manager/api/connectormanagement/directoryconfigs" `
+    -Method GET `
+    -Headers @{
+        "Authorization" = "HZN $token"
+        "Accept"        = "application/vnd.vmware.horizon.manager.connector.management.directory.list+json"
+    }
+
+Write-Host "`n=== Active Directory Found ==="
+Write-Host "Name : $($adDirectory.name)"
+Write-Host "ID   : $($adDirectory.directoryId)"
+Write-Host "Type : $($adDirectory.type)"
+
+# ── Step 3: Sync settings for that directory ─────────────────────────────────
+$syncProfile = Invoke-RestMethod `
+    -Uri "https://$vidmFQDN/SAAS/jersey/manager/api/connectormanagement/directoryconfigs/$($adDirectory.directoryId)/syncprofile" `
+    -Method GET -Headers $headers
+
+Write-Host "`n=== Sync Settings ==="
+Write-Host "Sync Enabled     : $($syncProfile.enableSync)"
+Write-Host "Sync Frequency   : $($syncProfile.syncFrequency)"
+Write-Host "Last Sync Status : $($syncProfile.syncStatus)"
+Write-Host "Last Sync Time   : $($syncProfile.lastSyncTime)"
+
+# ── Step 4: Groups synced under that directory ────────────────────────────────
+$groups = Invoke-RestMethod `
+    -Uri "https://$vidmFQDN/SAAS/jersey/manager/api/scim/Groups?count=500" `
+    -Method GET -Headers $headers
+
+# Filter to only groups belonging to this directory (non-local groups have a domain)
+$adGroups = $groups.Resources | Where-Object { $_.displayName -notmatch "^System" }
+
+Write-Host "`n=== Groups ($($adGroups.Count) found) ==="
+foreach ($g in $adGroups) {
+    Write-Host "Group : $($g.displayName)  |  ID: $($g.id)"
+}
+
+# ── Step 5: Export ────────────────────────────────────────────────────────────
+$adGroups | Select-Object displayName, id |
+    Export-Csv -Path ".\vidm_ad_groups.csv" -NoTypeInformation
+Write-Host "`n✔ Exported to vidm_ad_groups.csv"# ── SSL bypass (self-signed certs) ──────────────────────────────────────────
+Add-Type @"
+    using System.Net;
+    using System.Security.Cryptography.X509Certificates;
+    public class TrustAllCertsPolicy : ICertificatePolicy {
+        public bool CheckValidationResult(
+            ServicePoint srvPoint, X509Certificate certificate,
+            WebRequest request, int certificateProblem) { return true; }}
+"@
+[System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+
+# ── Your details ─────────────────────────────────────────────────────────────
+$vidmFQDN = "your-vidm.domain.com"
+$username = "admin"
+$password = "your_password"
+
+# ── Step 1: Login — get HZN session token ────────────────────────────────────
+$loginResponse = Invoke-RestMethod `
+    -Uri "https://$vidmFQDN/SAAS/API/1.0/REST/auth/system/login" `
+    -Method POST `
+    -Headers @{ "Content-Type" = "application/json"; "Accept" = "application/json" } `
+    -Body (@{ username = $username; password = $password; issueToken = "true" } | ConvertTo-Json)
+
+$token = $loginResponse.sessionToken
+$headers = @{ "Authorization" = "HZN $token"; "Accept" = "application/json" }
+Write-Host "`n✔ Authenticated as $username"
+
 # ── Step 2: Get all directories, filter out System/Local ─────────────────────
 $directories = Invoke-RestMethod `
     -Uri "https://$vidmFQDN/SAAS/jersey/manager/api/connectormanagement/directoryconfigs" `
