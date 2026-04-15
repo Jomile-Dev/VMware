@@ -15,15 +15,11 @@ $username  = "yourusername"       # just the username, no domain\ or @domain
 $password  = "your_password"
 $domain    = "yourdomain"         # AD domain name as it appears in vIDM
 
-# ── Step 1: Authenticate ──────────────────────────────────────────────────────
 $loginResponse = Invoke-RestMethod `
-    -Uri "https://$vidmFQDN/SAAS/API/1.0/REST/auth/login" `
+    -Uri "https://$vidmFQDN/SAAS/auth/login" `
     -Method POST `
-    -Headers @{ 
-        "Content-Type" = "application/x-www-form-urlencoded"
-        "Accept"       = "application/json" 
-    } `
-    -Body "username=$username&password=$password&domain=$domain&issueToken=true"
+    -Headers @{ "Content-Type" = "application/json"; "Accept" = "application/json" } `
+    -Body (@{ username = $username; password = $password; domain = $domain; issueToken = "true" } | ConvertTo-Json)
 
 $token = $loginResponse.sessionToken
 Write-Host "`n✔ Authenticated as $username"
