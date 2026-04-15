@@ -1,21 +1,33 @@
-Replace just this one line inside the do loop:
-powershell$uri = "https://$vraServer/csp/gateway/am/api/orgs/$orgId/groups?groupType=ENTERPRISE&take=$pageSize&skip=$skip"
-Test each option by swapping that one line out at a time. So for Option 1 replace it with:
-powershell$uri = "https://$vraServer/csp/gateway/am/api/v2/orgs/$orgId/groups?groupType=ENTERPRISE&take=$pageSize&skip=$skip"
-For Option 2:
-powershell$uri = "https://$vraServer/csp/gateway/am/api/orgs/$orgId/groups?take=$pageSize&skip=$skip"
-For Option 3 replace the whole do/while loop with just:
-powershell$resp = Invoke-RestMethod `
-    -Uri "https://$vraServer/csp/gateway/am/api/loggedin/user/groups" `
+# Exact same auth as the working deployment script
+$vraServer = "your-vra-server"
+
+$credential = Get-Credential -Message "Enter vRA credentials"
+$username = $credential.UserName
+$password = $credential.GetNetworkCredential().Password
+
+$authResp = Invoke-RestMethod `
+    -Uri "https://$vraServer/csp/gateway/am/api/login" `
+    -Method POST `
+    -Headers @{ "Content-Type" = "application/json" } `
+    -Body (@{ username = $username; password = $password } | ConvertTo-Json)
+
+$vraHeaders = @{
+    "Authorization" = "Bearer $($authResp.cspAuthToken)"
+    "Content-Type"  = "application/json"
+}
+
+# Test with the one endpoint we know works from deployment script
+$test = Invoke-RestMethod `
+    -Uri "https://$vraServer/deployment/api/deployments?page=0&size=1" `
     -Method GET `
     -Headers $vraHeaders
 
-$resp | ConvertTo-Json -Depth 5
-For Option 4 replace the whole do/while loop with just:
-powershell$resp = Invoke-RestMethod `
-    -Uri "https://$vraServer/iaas/api/projects?apiVersion=2021-07-15&`$top=200&`$skip=0" `
+Write-Host "Deployment test worked: $($test.content.Count) result"
+
+# Now test IAM
+$orgTest = Invoke-RestMethod `
+    -Uri "https://$vraServer/csp/gateway/am/api/loggedin/user/orgs" `
     -Method GET `
     -Headers $vraHeaders
 
-$resp | ConvertTo-Json -Depth 5
-Start with Option 1 and work down — what does each one return?
+$orgTest | ConvertTo-Json -Depth 3
