@@ -24,17 +24,6 @@ $loginResponse = Invoke-RestMethod `
 $token = $loginResponse.sessionToken
 Write-Host "`n✔ Authenticated as $username"
 
-# ── Step 2: Get Active Directory ──────────────────────────────────────────────
-$directories = Invoke-RestMethod `
-    -Uri "https://$vidmFQDN/SAAS/jersey/manager/api/connectormanagement/directoryconfigs" `
-    -Method GET `
-    -Headers @{
-        "Authorization" = "HZN $token"
-        "Accept"        = "application/vnd.vmware.horizon.manager.connector.management.directory.list+json"
-    }
-
-$adDirectory = $directories.items | Where-Object { $_.type -eq "ACTIVE_DIRECTORY" }
-
 Write-Host "`n=== Active Directory Found ==="
 Write-Host "Name : $($adDirectory.name)"
 Write-Host "ID   : $($adDirectory.directoryId)"
