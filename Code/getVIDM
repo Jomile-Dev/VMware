@@ -1,1 +1,21 @@
-$uri = "https://$vraServer/csp/gateway/am/api/v2/orgs/$orgId/groups?groupType=ENTERPRISE&take=$pageSize&skip=$skip"
+Replace just this one line inside the do loop:
+powershell$uri = "https://$vraServer/csp/gateway/am/api/orgs/$orgId/groups?groupType=ENTERPRISE&take=$pageSize&skip=$skip"
+Test each option by swapping that one line out at a time. So for Option 1 replace it with:
+powershell$uri = "https://$vraServer/csp/gateway/am/api/v2/orgs/$orgId/groups?groupType=ENTERPRISE&take=$pageSize&skip=$skip"
+For Option 2:
+powershell$uri = "https://$vraServer/csp/gateway/am/api/orgs/$orgId/groups?take=$pageSize&skip=$skip"
+For Option 3 replace the whole do/while loop with just:
+powershell$resp = Invoke-RestMethod `
+    -Uri "https://$vraServer/csp/gateway/am/api/loggedin/user/groups" `
+    -Method GET `
+    -Headers $vraHeaders
+
+$resp | ConvertTo-Json -Depth 5
+For Option 4 replace the whole do/while loop with just:
+powershell$resp = Invoke-RestMethod `
+    -Uri "https://$vraServer/iaas/api/projects?apiVersion=2021-07-15&`$top=200&`$skip=0" `
+    -Method GET `
+    -Headers $vraHeaders
+
+$resp | ConvertTo-Json -Depth 5
+Start with Option 1 and work down — what does each one return?
