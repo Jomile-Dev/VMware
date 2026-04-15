@@ -18,11 +18,7 @@ $domain    = "yourdomain"         # AD domain name as it appears in vIDM
 $loginResponse = Invoke-RestMethod `
     -Uri "https://$vidmFQDN/SAAS/auth/login" `
     -Method POST `
-    $headers = @{
-        "Authorization"        = "HZN $token"
-        "Accept"               = "application/json"
-        "X-Request-For-Tenant" = "$domain"    # tells vIDM which tenant context to use
-    }
+    -Headers @{ "Content-Type" = "application/json"; "Accept" = "application/json" } `
     -Body (@{ username = $username; password = $password; domain = $domain; issueToken = "true" } | ConvertTo-Json)
 
 $token = $loginResponse.sessionToken
@@ -32,10 +28,10 @@ Write-Host "`n✔ Authenticated as $username"
 $groups = Invoke-RestMethod `
     -Uri "https://$vidmFQDN/SAAS/jersey/manager/api/scim/Groups?count=500" `
     -Method GET `
-    $headers = @{
+    -Headers @{
         "Authorization"        = "HZN $token"
         "Accept"               = "application/json"
-        "X-Request-For-Tenant" = "$domain"    # tells vIDM which tenant context to use
+        "X-Request-For-Tenant" = "$domain"
     }
 
 $adGroups = $groups.Resources | Where-Object { $_.displayName -ne $null }
