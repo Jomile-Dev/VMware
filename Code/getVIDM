@@ -19,7 +19,11 @@ $domain    = "yourdomain"
 $loginResponse = Invoke-RestMethod `
     -Uri "https://$vidmFQDN/SAAS/auth/login" `
     -Method POST `
-    -Headers @{ "Content-Type" = "application/json"; "Accept" = "application/json" } `
+    -Headers @{ 
+        "Content-Type" = "application/json"
+        "Accept"       = "application/json"
+        "X-Request-For-Tenant" = "$domain"
+    } `
     -Body (@{ username = $username; password = $password; domain = $domain; issueToken = "true" } | ConvertTo-Json)
 
 $token = $loginResponse.sessionToken
