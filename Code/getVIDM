@@ -1,108 +1,72 @@
-# Bypass self-signed SSL certificates
-add-type @"
+# ── SSL bypass (self-signed certs) ──────────────────────────────────────────
+Add-Type @"
     using System.Net;
     using System.Security.Cryptography.X509Certificates;
     public class TrustAllCertsPolicy : ICertificatePolicy {
         public bool CheckValidationResult(
             ServicePoint srvPoint, X509Certificate certificate,
-            WebRequest request, int certificateProblem) {
-            return true; }}
+            WebRequest request, int certificateProblem) { return true; }}
 "@
 [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
 
-# Your vIDM details
-$vidmFQDN     = "your-vidm.domain.com"
-$username     = "admin"        # System Domain local account
-$password     = "your_password"
-$clientId     = "your_client_id"    # From Remote App Access
-$clientSecret = "your_shared_secret" # From Remote App Access
+# ── Your details ─────────────────────────────────────────────────────────────
+$vidmFQDN = "your-vidm.domain.com"
+$username = "admin"
+$password = "your_password"
 
-$loginBody = @{
-    username   = $username
-    password   = $password
-    issueToken = "true"
-} | ConvertTo-Json
-
+# ── Step 1: Login — get HZN session token ────────────────────────────────────
 $loginResponse = Invoke-RestMethod `
     -Uri "https://$vidmFQDN/SAAS/API/1.0/REST/auth/system/login" `
     -Method POST `
     -Headers @{ "Content-Type" = "application/json"; "Accept" = "application/json" } `
-    -Body $loginBody
+    -Body (@{ username = $username; password = $password; issueToken = "true" } | ConvertTo-Json)
 
-$sessionToken = $loginResponse.sessionToken
-Write-Host "Session Token retrieved: $($sessionToken.Substring(0,20))..."
+$token = $loginResponse.sessionToken
+$headers = @{ "Authorization" = "HZN $token"; "Accept" = "application/json" }
+Write-Host "`n✔ Authenticated as $username"
 
-$base64Creds = [Convert]::ToBase64String(
-    [Text.Encoding]::ASCII.GetBytes("${clientId}:${clientSecret}"))
-
-$tokenResponse = Invoke-RestMethod `
-    -Uri "https://$vidmFQDN/SAAS/auth/oauthtoken" `
-    -Method POST `
-    -Headers @{
-        "Authorization" = "Basic $base64Creds"
-        "Content-Type"  = "application/x-www-form-urlencoded"
-        "Accept"        = "application/json"
-    } `
-    -Body "grant_type=client_credentials"
-
-$accessToken = $tokenResponse.access_token
-Write-Host "Access Token retrieved successfully"
-
+# ── Step 2: Get all directories, filter out System/Local ─────────────────────
 $directories = Invoke-RestMethod `
     -Uri "https://$vidmFQDN/SAAS/jersey/manager/api/connectormanagement/directoryconfigs" `
-    -Method GET `
-    -Headers @{
-        "Authorization" = "HZN $sessionToken"
-        "Accept"        = "application/json"
-    }
+    -Method GET -Headers $headers
 
-Write-Host "=== Directories Found ==="
-foreach ($dir in $directories.items) {
-    Write-Host "Name : $($dir.name)"
-    Write-Host "Type : $($dir.type)"
-    Write-Host "ID   : $($dir.directoryId)"
-    Write-Host "---"
+$adDirectory = $directories.items | Where-Object { $_.type -eq "ACTIVE_DIRECTORY" }
+
+if (-not $adDirectory) {
+    Write-Warning "No Active Directory (LDAP) directory found."
+    exit
 }
 
-# Filter groups by directory name — change "YourDirectoryName" to match yours
-$targetDirectory = "YourDirectoryName"
+Write-Host "`n=== Active Directory Found ==="
+Write-Host "Name : $($adDirectory.name)"
+Write-Host "ID   : $($adDirectory.directoryId)"
+Write-Host "Type : $($adDirectory.type)"
 
+# ── Step 3: Sync settings for that directory ─────────────────────────────────
+$syncProfile = Invoke-RestMethod `
+    -Uri "https://$vidmFQDN/SAAS/jersey/manager/api/connectormanagement/directoryconfigs/$($adDirectory.directoryId)/syncprofile" `
+    -Method GET -Headers $headers
+
+Write-Host "`n=== Sync Settings ==="
+Write-Host "Sync Enabled     : $($syncProfile.enableSync)"
+Write-Host "Sync Frequency   : $($syncProfile.syncFrequency)"
+Write-Host "Last Sync Status : $($syncProfile.syncStatus)"
+Write-Host "Last Sync Time   : $($syncProfile.lastSyncTime)"
+
+# ── Step 4: Groups synced under that directory ────────────────────────────────
 $groups = Invoke-RestMethod `
     -Uri "https://$vidmFQDN/SAAS/jersey/manager/api/scim/Groups?count=500" `
-    -Method GET `
-    -Headers @{
-        "Authorization" = "Bearer $accessToken"
-        "Accept"        = "application/json"
-    }
+    -Method GET -Headers $headers
 
-Write-Host "=== Groups in $targetDirectory ==="
-$filteredGroups = $groups.Resources | Where-Object {
-    $_.displayName -ne $null
+# Filter to only groups belonging to this directory (non-local groups have a domain)
+$adGroups = $groups.Resources | Where-Object { $_.displayName -notmatch "^System" }
+
+Write-Host "`n=== Groups ($($adGroups.Count) found) ==="
+foreach ($g in $adGroups) {
+    Write-Host "Group : $($g.displayName)  |  ID: $($g.id)"
 }
 
-foreach ($group in $filteredGroups) {
-    Write-Host "Group : $($group.displayName)"
-    Write-Host "ID    : $($group.id)"
-    Write-Host "---"
-}
-
-# Export to CSV
-$filteredGroups | Select-Object displayName, id |
-    Export-Csv -Path ".\vidm_groups.csv" -NoTypeInformation
-Write-Host "Exported to vidm_groups.csv"
-
-# Replace with actual group ID from Step 5
-$groupId = "your-group-id-here"
-
-$groupDetails = Invoke-RestMethod `
-    -Uri "https://$vidmFQDN/SAAS/jersey/manager/api/scim/Groups/$groupId" `
-    -Method GET `
-    -Headers @{
-        "Authorization" = "Bearer $accessToken"
-        "Accept"        = "application/json"
-    }
-
-Write-Host "=== Members of $($groupDetails.displayName) ==="
-foreach ($member in $groupDetails.members) {
-    Write-Host "Member: $($member.display) | ID: $($member.value)"
-}
+# ── Step 5: Export ────────────────────────────────────────────────────────────
+$adGroups | Select-Object displayName, id |
+    Export-Csv -Path ".\vidm_ad_groups.csv" -NoTypeInformation
+Write-Host "`n✔ Exported to vidm_ad_groups.csv"
