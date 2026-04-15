@@ -1,18 +1,5 @@
-# Run this on its own first
-$authResp = Invoke-RestMethod `
-    -Uri "https://$vraServer/csp/gateway/am/api/login" `
-    -Method POST `
-    -Headers @{ "Content-Type" = "application/json" } `
-    -Body (@{ username = $vraUser; password = $vraPass } | ConvertTo-Json)
-
-$vraHeaders = @{
-    "Authorization" = "Bearer $($authResp.cspAuthToken)"
-    "Content-Type"  = "application/json"
-}
-
-# Dump the org response raw
 $org = Invoke-RestMethod `
-    -Uri "https://$vraServer/csp/gateway/am/api/orgs" `
+    -Uri "https://$vraServer/csp/gateway/am/api/loggedin/user/orgs" `
     -Method GET `
     -Headers $vraHeaders
 
