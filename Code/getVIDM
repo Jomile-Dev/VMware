@@ -1,317 +1,108 @@
-# ==============================================================================
-# Get-vIDM-Groups.ps1
-# Retrieves all synced groups from VMware Identity Manager (vIDM).
-#
-# AD Authentication flow (replicates what the vIDM login page does):
-#
-#   STEP 1 - Get a local System token using configadmin (local account)
-#   STEP 2 - Use that token to create a temporary OAuth client in vIDM
-#   STEP 3 - Exchange AD credentials + OAuth client for an AD-based access token
-#   STEP 4 - Use that access token for all API calls
-#
-# The OAuth client only needs to be created once. If you already have one,
-# set $OAuthClientId and $OAuthClientSecret below and comment out STEP 2.
-#
-# Credentials are loaded from two XML files:
-#   - Local admin cred (configadmin) : Get-Credential | Export-Clixml -Path ".\vidm-local-cred.xml"
-#   - AD cred                        : Get-Credential | Export-Clixml -Path ".\vidm-ad-cred.xml"
-# ==============================================================================
-
-# ---------------------------
-# CONFIGURATION - Edit these
-# ---------------------------
-$vIDM_URL          = "https://your-vidm-fqdn.example.com"
-$LocalCredXML      = ".\vidm-local-cred.xml"
-$ADCredXML         = ".\vidm-ad-cred.xml"
-$ADDomain          = "corp.example.com"
-$OAuthClientId     = "psScript-vidm-client"
-$OAuthClientSecret = "VMware01!"
-$OutputCSV         = ".\vIDM_Groups.csv"
-
-# Bypass SSL certificate validation for self-signed certs.
-# Comment this block out if your vIDM has a trusted certificate.
-Add-Type @"
+# Bypass self-signed SSL certificates
+add-type @"
     using System.Net;
     using System.Security.Cryptography.X509Certificates;
-    public class TrustAll : ICertificatePolicy {
-        public bool CheckValidationResult(ServicePoint sp, X509Certificate cert,
-            WebRequest req, int problem) { return true; }
-    }
+    public class TrustAllCertsPolicy : ICertificatePolicy {
+        public bool CheckValidationResult(
+            ServicePoint srvPoint, X509Certificate certificate,
+            WebRequest request, int certificateProblem) {
+            return true; }}
 "@
-[System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAll
-[System.Net.ServicePointManager]::SecurityProtocol  = [System.Net.SecurityProtocolType]::Tls12
+[System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
 
-# ==============================================================================
-# STEP 1: Load local admin cred from XML and get a System domain session token.
-#
-# This uses the local configadmin account (System Domain), not AD.
-# Endpoint : POST /SAAS/API/1.0/REST/auth/system/login
-# Body     : username, password, issueToken = true
-# Returns  : sessionToken — used only to create the OAuth client in Step 2
-# ==============================================================================
-Write-Host "`n[1/6] Loading local admin credentials and getting System token..." -ForegroundColor Cyan
+# Your vIDM details
+$vidmFQDN     = "your-vidm.domain.com"
+$username     = "admin"        # System Domain local account
+$password     = "your_password"
+$clientId     = "your_client_id"    # From Remote App Access
+$clientSecret = "your_shared_secret" # From Remote App Access
 
-if (-not (Test-Path $LocalCredXML)) {
-    Write-Host "    ERROR: Local credential file not found: $LocalCredXML" -ForegroundColor Red
-    Write-Host "    Create it with: Get-Credential | Export-Clixml -Path '$LocalCredXML'" -ForegroundColor Yellow
-    exit 1
-}
-
-try {
-    $localCred  = Import-Clixml -Path $LocalCredXML
-    $localUser  = $localCred.UserName
-    $localPass  = $localCred.GetNetworkCredential().Password
-}
-catch {
-    Write-Host "    ERROR: Could not decrypt local credential file." -ForegroundColor Red
-    Write-Host "    Must be opened by the same user/machine that created it." -ForegroundColor Yellow
-    exit 1
-}
-
-$systemAuthBody = @{
-    username   = $localUser
-    password   = $localPass
-    issueToken = $true
+$loginBody = @{
+    username   = $username
+    password   = $password
+    issueToken = "true"
 } | ConvertTo-Json
 
-try {
-    $systemAuthResp = Invoke-RestMethod `
-        -Uri         "$vIDM_URL/SAAS/API/1.0/REST/auth/system/login" `
-        -Method      POST `
-        -Body        $systemAuthBody `
-        -ContentType "application/json"
+$loginResponse = Invoke-RestMethod `
+    -Uri "https://$vidmFQDN/SAAS/API/1.0/REST/auth/system/login" `
+    -Method POST `
+    -Headers @{ "Content-Type" = "application/json"; "Accept" = "application/json" } `
+    -Body $loginBody
 
-    $systemToken = $systemAuthResp.sessionToken
-    Write-Host "    System token acquired for: $localUser" -ForegroundColor Green
-}
-catch {
-    Write-Host "    ERROR: Failed to get System token." -ForegroundColor Red
-    Write-Host "    Check that '$localUser' is a valid local System Domain account in vIDM." -ForegroundColor Yellow
-    Write-Host "    $($_.Exception.Message)"
-    exit 1
-}
+$sessionToken = $loginResponse.sessionToken
+Write-Host "Session Token retrieved: $($sessionToken.Substring(0,20))..."
 
-# ==============================================================================
-# STEP 2: Create an OAuth client in vIDM using the System token.
-#
-# This only needs to be done once. After the client exists in vIDM you can
-# comment out this entire step and reuse $OAuthClientId / $OAuthClientSecret.
-#
-# Endpoint : POST /SAAS/jersey/manager/api/oauth2clients
-# Headers  : Authorization: HZN <systemToken>
-# Body     : clientId, secret (Base64 encoded), scope = "user admin"
-# ==============================================================================
-Write-Host "`n[2/6] Creating OAuth client in vIDM (skip this step if client already exists)..." -ForegroundColor Cyan
+$base64Creds = [Convert]::ToBase64String(
+    [Text.Encoding]::ASCII.GetBytes("${clientId}:${clientSecret}"))
 
-$base64Secret = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($OAuthClientSecret))
+$tokenResponse = Invoke-RestMethod `
+    -Uri "https://$vidmFQDN/SAAS/auth/oauthtoken" `
+    -Method POST `
+    -Headers @{
+        "Authorization" = "Basic $base64Creds"
+        "Content-Type"  = "application/x-www-form-urlencoded"
+        "Accept"        = "application/json"
+    } `
+    -Body "grant_type=client_credentials"
 
-$oauthClientBody = @{
-    clientId                  = $OAuthClientId
-    secret                    = $base64Secret
-    scope                     = "user admin"
-    authGrantTypes            = "password"
-    accessTokenTTL            = 10800
-    refreshTokenTTL           = 2592000
-    refreshTokenIdleTTL       = 2592000
-} | ConvertTo-Json
+$accessToken = $tokenResponse.access_token
+Write-Host "Access Token retrieved successfully"
 
-$oauthClientHeaders = @{
-    Authorization  = "HZN $systemToken"
-    Accept         = "application/json"
-    "Content-Type" = "application/json"
-}
-
-try {
-    $oauthClientResp = Invoke-RestMethod `
-        -Uri     "$vIDM_URL/SAAS/jersey/manager/api/oauth2clients" `
-        -Method  POST `
-        -Headers $oauthClientHeaders `
-        -Body    $oauthClientBody
-
-    Write-Host "    OAuth client '$OAuthClientId' created successfully." -ForegroundColor Green
-}
-catch {
-    if ($_.Exception.Response.StatusCode -eq 400) {
-        Write-Host "    OAuth client '$OAuthClientId' already exists — continuing." -ForegroundColor Yellow
+$directories = Invoke-RestMethod `
+    -Uri "https://$vidmFQDN/SAAS/jersey/manager/api/connectormanagement/directoryconfigs" `
+    -Method GET `
+    -Headers @{
+        "Authorization" = "HZN $sessionToken"
+        "Accept"        = "application/json"
     }
-    else {
-        Write-Host "    ERROR: Could not create OAuth client." -ForegroundColor Red
-        Write-Host "    $($_.Exception.Message)"
-        exit 1
+
+Write-Host "=== Directories Found ==="
+foreach ($dir in $directories.items) {
+    Write-Host "Name : $($dir.name)"
+    Write-Host "Type : $($dir.type)"
+    Write-Host "ID   : $($dir.directoryId)"
+    Write-Host "---"
+}
+
+# Filter groups by directory name — change "YourDirectoryName" to match yours
+$targetDirectory = "YourDirectoryName"
+
+$groups = Invoke-RestMethod `
+    -Uri "https://$vidmFQDN/SAAS/jersey/manager/api/scim/Groups?count=500" `
+    -Method GET `
+    -Headers @{
+        "Authorization" = "Bearer $accessToken"
+        "Accept"        = "application/json"
     }
+
+Write-Host "=== Groups in $targetDirectory ==="
+$filteredGroups = $groups.Resources | Where-Object {
+    $_.displayName -ne $null
 }
 
-# ==============================================================================
-# STEP 3: Load AD credentials from XML and exchange for an AD-based access token.
-#
-# This is the equivalent of selecting your AD domain in the vIDM login page,
-# then entering your username and password.
-#
-# Endpoint : POST /SAAS/auth/oauthtoken?grant_type=password
-# Auth     : Basic auth using OAuth client ID and secret (NOT Base64 encoded here)
-# Body     : Form data (NOT JSON) — username, password, domain
-# Returns  : access_token — used for all subsequent API calls
-# ==============================================================================
-Write-Host "`n[3/6] Loading AD credentials and authenticating as AD user..." -ForegroundColor Cyan
-
-if (-not (Test-Path $ADCredXML)) {
-    Write-Host "    ERROR: AD credential file not found: $ADCredXML" -ForegroundColor Red
-    Write-Host "    Create it with: Get-Credential | Export-Clixml -Path '$ADCredXML'" -ForegroundColor Yellow
-    exit 1
+foreach ($group in $filteredGroups) {
+    Write-Host "Group : $($group.displayName)"
+    Write-Host "ID    : $($group.id)"
+    Write-Host "---"
 }
 
-try {
-    $adCred  = Import-Clixml -Path $ADCredXML
-    $adUser  = $adCred.UserName
-    $adPass  = $adCred.GetNetworkCredential().Password
-}
-catch {
-    Write-Host "    ERROR: Could not decrypt AD credential file." -ForegroundColor Red
-    Write-Host "    Must be opened by the same user/machine that created it." -ForegroundColor Yellow
-    exit 1
-}
+# Export to CSV
+$filteredGroups | Select-Object displayName, id |
+    Export-Csv -Path ".\vidm_groups.csv" -NoTypeInformation
+Write-Host "Exported to vidm_groups.csv"
 
-# Body must be form-encoded (not JSON) — this matches what the vIDM login page posts
-$adTokenBody = "username=$([uri]::EscapeDataString($adUser))&password=$([uri]::EscapeDataString($adPass))&domain=$([uri]::EscapeDataString($ADDomain))"
+# Replace with actual group ID from Step 5
+$groupId = "your-group-id-here"
 
-# OAuth client credentials go in the Authorization header as Basic auth
-$oauthBasic = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("${OAuthClientId}:${OAuthClientSecret}"))
-
-$adTokenHeaders = @{
-    Authorization = "Basic $oauthBasic"
-}
-
-try {
-    $adTokenResp = Invoke-RestMethod `
-        -Uri         "$vIDM_URL/SAAS/auth/oauthtoken?grant_type=password" `
-        -Method      POST `
-        -Headers     $adTokenHeaders `
-        -Body        $adTokenBody `
-        -ContentType "application/x-www-form-urlencoded"
-
-    $accessToken = $adTokenResp.access_token
-    Write-Host "    AD access token acquired for: $adUser@$ADDomain" -ForegroundColor Green
-}
-catch {
-    Write-Host "    ERROR: AD authentication failed." -ForegroundColor Red
-    Write-Host "    Check that:" -ForegroundColor Yellow
-    Write-Host "      - Username '$adUser' is correct (no domain suffix)" -ForegroundColor Yellow
-    Write-Host "      - Domain '$ADDomain' matches exactly what is configured in vIDM" -ForegroundColor Yellow
-    Write-Host "      - The AD account has admin rights in vIDM" -ForegroundColor Yellow
-    Write-Host "      - The OAuth client '$OAuthClientId' exists in vIDM" -ForegroundColor Yellow
-    Write-Host "    $($_.Exception.Message)"
-    exit 1
-}
-
-# ==============================================================================
-# STEP 4: Fetch all directory configurations from vIDM
-# ==============================================================================
-Write-Host "`n[4/6] Fetching directory configurations..." -ForegroundColor Cyan
-
-$apiHeaders = @{
-    Authorization = "Bearer $accessToken"
-    Accept        = "application/vnd.vmware.horizon.manager.connector.management.directory.list+json"
-}
-
-try {
-    $dirResp = Invoke-RestMethod `
-        -Uri     "$vIDM_URL/SAAS/jersey/manager/api/connectormanagement/directoryconfigs" `
-        -Method  GET `
-        -Headers $apiHeaders
-
-    $directories = $dirResp.items
-    Write-Host "    Found $($directories.Count) directory/directories." -ForegroundColor Green
-}
-catch {
-    Write-Host "    ERROR: Could not retrieve directories." -ForegroundColor Red
-    Write-Host "    $($_.Exception.Message)"
-    exit 1
-}
-
-# ==============================================================================
-# STEP 5: Prompt user to select which directory to query
-# ==============================================================================
-Write-Host "`n[5/6] Select a directory to query:`n" -ForegroundColor Cyan
-
-for ($i = 0; $i -lt $directories.Count; $i++) {
-    Write-Host "    [$($i + 1)] $($directories[$i].name)  (ID: $($directories[$i].directoryConfigId))" -ForegroundColor White
-}
-Write-Host "    [A] All directories" -ForegroundColor White
-Write-Host ""
-
-do {
-    $selection    = Read-Host "    Enter choice"
-    $validChoices = (1..$directories.Count) + @("A","a")
-} while ($selection -notin $validChoices)
-
-if ($selection -in @("A","a")) {
-    $selectedDirs = $directories
-    Write-Host "    -> Querying ALL directories.`n" -ForegroundColor Yellow
-} else {
-    $selectedDirs = @($directories[[int]$selection - 1])
-    Write-Host "    -> Querying: $($selectedDirs[0].name)`n" -ForegroundColor Yellow
-}
-
-# ==============================================================================
-# STEP 6: Page through all synced groups for the selected directory/directories
-# ==============================================================================
-Write-Host "[6/6] Retrieving synced groups (paginated)..." -ForegroundColor Cyan
-
-$groupHeaders = @{
-    Authorization = "Bearer $accessToken"
-    Accept        = "application/json"
-}
-
-$allGroups = @()
-
-foreach ($dir in $selectedDirs) {
-    $dirId    = $dir.directoryConfigId
-    $dirName  = $dir.name
-    Write-Host "`n    Directory: $dirName" -ForegroundColor Yellow
-
-    $page      = 0
-    $pageSize  = 100
-    $dirGroups = @()
-
-    do {
-        try {
-            $resp = Invoke-RestMethod `
-                -Uri     "$vIDM_URL/SAAS/jersey/manager/api/connectormanagement/directoryconfigs/$dirId/groups?pageSize=$pageSize&page=$page" `
-                -Method  GET `
-                -Headers $groupHeaders
-
-            $batch = $resp.items
-            $dirGroups += $batch
-            Write-Host "      Page $page : $($batch.Count) groups retrieved" -ForegroundColor Gray
-            $page++
-        }
-        catch {
-            Write-Host "      ERROR on page $page : $($_.Exception.Message)" -ForegroundColor Red
-            break
-        }
-    } while ($batch.Count -eq $pageSize)
-
-    Write-Host "    Total groups in '$dirName': $($dirGroups.Count)" -ForegroundColor Green
-
-    foreach ($g in $dirGroups) {
-        $allGroups += [PSCustomObject]@{
-            DirectoryName     = $dirName
-            DirectoryID       = $dirId
-            GroupName         = $g.name
-            DistinguishedName = $g.distinguishedName
-            ObjectGUID        = $g.objectGuid
-        }
+$groupDetails = Invoke-RestMethod `
+    -Uri "https://$vidmFQDN/SAAS/jersey/manager/api/scim/Groups/$groupId" `
+    -Method GET `
+    -Headers @{
+        "Authorization" = "Bearer $accessToken"
+        "Accept"        = "application/json"
     }
+
+Write-Host "=== Members of $($groupDetails.displayName) ==="
+foreach ($member in $groupDetails.members) {
+    Write-Host "Member: $($member.display) | ID: $($member.value)"
 }
-
-# ==============================================================================
-# OUTPUT: Display results and export to CSV
-# ==============================================================================
-Write-Host "`n--- Results ---" -ForegroundColor Cyan
-Write-Host "    Total groups: $($allGroups.Count)" -ForegroundColor Green
-
-$allGroups | Format-Table -AutoSize
-
-$allGroups | Export-Csv -Path $OutputCSV -NoTypeInformation -Encoding UTF8
-Write-Host "`n    Exported to: $OutputCSV" -ForegroundColor Green
-Write-Host "`nDone.`n" -ForegroundColor Cyan
