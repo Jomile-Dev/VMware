@@ -1,4 +1,12 @@
-# ── SSL bypass ───────────────────────────────────────────────────────────────
+# Login with system account first
+$sysLogin = Invoke-RestMethod `
+    -Uri "https://$vidmFQDN/SAAS/API/1.0/REST/auth/system/login" `
+    -Method POST `
+    -Headers @{ "Content-Type" = "application/json"; "Accept" = "application/json" } `
+    -Body (@{ username = "admin"; password = "sys_password"; issueToken = "true" } | ConvertTo-Json)
+
+$sysToken = $sysLogin.sessionToken
+Write-Host "System token retrieved"# ── SSL bypass ───────────────────────────────────────────────────────────────
 Add-Type @"
     using System.Net;
     using System.Security.Cryptography.X509Certificates;
