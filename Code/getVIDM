@@ -20,9 +20,10 @@
 # Step 3 — Use same org-scoped token for BOTH IAM enterprise groups AND projects
 #
 # HOW AD LOOKUP WORKS:
-# Bulk pulls ALL groups from each domain via Global Catalog (port 3268)
-# into a hashtable at the start — then does instant lookups per group
-# Much faster than querying AD individually per group
+# Uses PowerShell runspaces to query 10 groups in parallel at a time
+# Each query hits the Global Catalog (port 3268) for fast forest-wide search
+# Exact CN match so AD returns instantly — no wildcards
+# Works fine in PowerShell ISE
 #
 # COMPARISON LOGIC:
 # Groups are compared across three sources:
@@ -55,6 +56,9 @@ $adDomains = @(
     "domain1.com"
     # "domain2.com"
 )
+
+# ── Parallel threads for AD lookup (10 is safe, increase if DC can handle it) ─
+$adParallelThreads = 10
 
 $outputCsv = "C:\Reports\Group_Comparison_$(Get-Date -Format 'yyyy-MM-dd_HHmm').csv"
 
@@ -100,6 +104,80 @@ function Normalize-GroupName {
     return $Name.Trim().ToLower()
 }
 
+# AD lookup scriptblock used inside each runspace
+$adLookupScript = {
+    param([string]$GroupName, [string[]]$Domains)
+    foreach ($domain in $Domains) {
+        try {
+            $result = Get-ADObject `
+                -LDAPFilter "(&(objectClass=group)(cn=$GroupName))" `
+                -Server "$($domain):3268" `
+                -Properties DistinguishedName `
+                -ErrorAction Stop |
+                Select-Object -First 1
+            if ($result) {
+                return [PSCustomObject]@{
+                    Name = $GroupName
+                    DN   = $result.DistinguishedName
+                }
+            }
+        }
+        catch { }
+    }
+    return [PSCustomObject]@{
+        Name = $GroupName
+        DN   = "Not Found"
+    }
+}
+
+# Run parallel AD lookups using runspaces
+function Get-ADGroupDNParallel {
+    param(
+        [string[]]$GroupNames,
+        [string[]]$Domains,
+        [int]$Threads = 10
+    )
+
+    $pool = [RunspaceFactory]::CreateRunspacePool(1, $Threads)
+    $pool.Open()
+
+    $jobs = foreach ($name in $GroupNames) {
+        $ps = [PowerShell]::Create()
+        $ps.RunspacePool = $pool
+        [void]$ps.AddScript($adLookupScript)
+        [void]$ps.AddArgument($name)
+        [void]$ps.AddArgument($Domains)
+
+        [PSCustomObject]@{
+            Name   = $name
+            Handle = $ps.BeginInvoke()
+            PS     = $ps
+        }
+    }
+
+    # Collect all results into hashtable
+    $results = @{}
+    foreach ($job in $jobs) {
+        try {
+            $result = $job.PS.EndInvoke($job.Handle)
+            if ($result -and $result[0]) {
+                $results[$result[0].Name] = $result[0].DN
+            }
+        }
+        catch {
+            $results[$job.Name] = "Not Found"
+        }
+        finally {
+            $job.PS.Dispose()
+        }
+    }
+
+    $pool.Close()
+    $pool.Dispose()
+
+    return $results
+}
+
 # ============================================================================
 # STARTUP
 # ============================================================================
@@ -114,41 +192,6 @@ $clientSecret = $vidmCred.ClientSecret
 $vraCred  = Import-Clixml -Path "C:\Creds\aria_vra_cred.xml"
 $vraUser  = $vraCred.UserName
 $vraPass  = $vraCred.GetNetworkCredential().Password
-
-# ============================================================================
-# STEP 0: BULK PULL ALL AD GROUPS INTO CACHE
-# Queries Global Catalog (port 3268) once per domain
-# Stores Name -> DistinguishedName in a hashtable for instant lookups
-# ============================================================================
-
-Write-Log "=== Building AD Group Cache ===" "SUCCESS"
-
-$adGroupCache = @{}
-
-foreach ($domain in $adDomains) {
-    Write-Log "Pulling all groups from $domain via Global Catalog..." 
-    try {
-        $adGroups = Get-ADObject `
-            -LDAPFilter "(objectClass=group)" `
-            -Server "$($domain):3268" `
-            -Properties DistinguishedName `
-            -ErrorAction Stop
-
-        foreach ($g in $adGroups) {
-            $key = $g.Name.ToLower()
-            if (-not $adGroupCache.ContainsKey($key)) {
-                $adGroupCache[$key] = $g.DistinguishedName
-            }
-        }
-
-        Write-Log "Cached $($adGroups.Count) groups from $domain" "SUCCESS"
-    }
-    catch {
-        Write-Log "AD cache failed for $domain : $($_.Exception.Message)" "ERROR"
-    }
-}
-
-Write-Log "Total AD groups cached: $($adGroupCache.Count)" "SUCCESS"
 
 # ============================================================================
 # STEP 1: COLLECT vIDM GROUPS FROM ALL INSTANCES
@@ -338,16 +381,29 @@ $vraEnterpriseGroups = $vraEnterpriseGroups | Sort-Object NormalizedName -Unique
 $vraProjectGroups    = $vraProjectGroups    | Sort-Object NormalizedName -Unique
 
 # ============================================================================
-# STEP 3: COMPARE ACROSS ALL THREE SOURCES
+# STEP 3: PARALLEL AD LOOKUP FOR ALL UNIQUE GROUP NAMES
 # ============================================================================
-
-Write-Log "=== Comparing Groups ===" "SUCCESS"
 
 $vidmNormalized    = $vidmGroups          | Select-Object -ExpandProperty NormalizedName
 $vraEntNormalized  = $vraEnterpriseGroups | Select-Object -ExpandProperty NormalizedName
 $vraProjNormalized = $vraProjectGroups    | Select-Object -ExpandProperty NormalizedName
 
 $allGroupNames = ($vidmNormalized + $vraEntNormalized + $vraProjNormalized) | Sort-Object -Unique
+
+Write-Log "=== Running Parallel AD Lookup for $($allGroupNames.Count) groups ===" "SUCCESS"
+
+$adResults = Get-ADGroupDNParallel `
+    -GroupNames $allGroupNames `
+    -Domains $adDomains `
+    -Threads $adParallelThreads
+
+Write-Log "AD lookup complete" "SUCCESS"
+
+# ============================================================================
+# STEP 4: COMPARE ACROSS ALL THREE SOURCES
+# ============================================================================
+
+Write-Log "=== Comparing Groups ===" "SUCCESS"
 
 $report = [System.Collections.Generic.List[PSCustomObject]]::new()
 
@@ -374,8 +430,8 @@ foreach ($normalizedName in $allGroupNames) {
               elseif (-not $inVIDM -and ($inIAM -or $inProject))     { "Missing from vIDM" }
               else                                                     { "Unknown" }
 
-    # Instant hashtable lookup — no AD query needed per group
-    $adDN = $adGroupCache[$normalizedName]
+    # Instant lookup from parallel AD results
+    $adDN = $adResults[$normalizedName]
     if (-not $adDN) { $adDN = "Not Found" }
 
     $report.Add([PSCustomObject]@{
@@ -392,7 +448,7 @@ foreach ($normalizedName in $allGroupNames) {
 }
 
 # ============================================================================
-# STEP 4: EXPORT CSV
+# STEP 5: EXPORT CSV
 # ============================================================================
 
 $outputDir = Split-Path $outputCsv
