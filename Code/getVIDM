@@ -119,12 +119,15 @@ function Normalize-GroupName {
 }
 
 # Strip domain prefix/suffix but keep original casing for AD CN lookup
+# Also strips trailing dot + 2 chars e.g. .ts .us .gs which are common typos
 function Get-CleanGroupName {
     param([string]$Name)
     if (-not $Name) { return $null }
     $Name = $Name.Trim()
     if ($Name -match "^[^\\]+\\(.+)$") { $Name = $matches[1] }
     if ($Name -match "^([^@]+)@.+$")   { $Name = $matches[1] }
+    # Strip trailing dot + exactly 2 letters e.g. .ts .us .gs .uk
+    $Name = $Name -replace '\.[a-zA-Z]{2}$', ''
     return $Name.Trim()
 }
 
