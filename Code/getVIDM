@@ -1,10 +1,17 @@
-# Paste your cspAuthToken from Step 1 here
-$token = "your-cspAuthToken-here"
+$vraServer = "vra1.yourdomain.com"
+$vraUser   = "yourusername"
+$vraPass   = "yourpassword"
+$vraDomain = "yourdomain"    # blank for local
 
-Invoke-RestMethod `
-    -Uri "https://$vraServer/csp/gateway/am/api/loggedin/user/orgs" `
-    -Method GET `
-    -Headers @{ 
-        "Authorization" = "Bearer $token"
-        "Content-Type"  = "application/json" 
-    } | ConvertTo-Json -Depth 5
+# Step 1 - Login
+$loginResp = Invoke-RestMethod `
+    -Uri "https://$vraServer/csp/gateway/am/api/login?access_token" `
+    -Method POST `
+    -Headers @{ "Content-Type" = "application/json" } `
+    -Body (@{ username = $vraUser; password = $vraPass; domain = $vraDomain } | ConvertTo-Json)
+
+Write-Host "refresh_token value: $($loginResp.refresh_token)"
+
+# Step 2 - Exchange using correct underscore field name
+$tokenResp = Invoke-RestMethod `
+    -Uri "
