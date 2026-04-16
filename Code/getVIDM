@@ -23,7 +23,7 @@
 # Uses PowerShell runspaces to query 10 groups in parallel at a time
 # Each query hits the Global Catalog (port 3268) for fast forest-wide search
 # Exact CN match so AD returns instantly — no wildcards
-# Works fine in PowerShell ISE
+# Only queries groups found in vIDM or vRA — not entire AD
 #
 # COMPARISON LOGIC:
 # Groups are compared across three sources:
@@ -57,9 +57,19 @@ $adDomains = @(
     # "domain2.com"
 )
 
-# ── Parallel threads for AD lookup (10 is safe, increase if DC can handle it) ─
+# ── Parallel threads for AD lookup ────────────────────────────────────────────
 $adParallelThreads = 10
 
+# ── Email Settings ────────────────────────────────────────────────────────────
+$SendEmail    = $true
+$EmailTo      = "admin@company.com"
+$EmailFrom    = "vmware-reports@company.com"
+$EmailSubject = "vIDM + vRA Group Comparison Audit - $(Get-Date -Format 'yyyy-MM-dd')"
+$SMTPServer   = "mail.company.com"
+$SMTPPort     = 465
+$UseSSL       = $true
+
+# ── Output ────────────────────────────────────────────────────────────────────
 $outputCsv = "C:\Reports\Group_Comparison_$(Get-Date -Format 'yyyy-MM-dd_HHmm').csv"
 
 # ============================================================================
@@ -155,7 +165,6 @@ function Get-ADGroupDNParallel {
         }
     }
 
-    # Collect all results into hashtable
     $results = @{}
     foreach ($job in $jobs) {
         try {
@@ -260,7 +269,6 @@ foreach ($vraServer in $vraServers) {
     Write-Log "=== Connecting to vRA: $vraServer ===" "SUCCESS"
 
     try {
-        # Step 1 — Login to get refresh_token
         $loginResp = Invoke-RestMethod `
             -Uri "https://$vraServer/csp/gateway/am/api/login?access_token" `
             -Method POST `
@@ -268,7 +276,6 @@ foreach ($vraServer in $vraServers) {
             -Body (@{ username = $vraUser; password = $vraPass } | ConvertTo-Json) `
             -ErrorAction Stop
 
-        # Step 2 — Exchange refresh_token for org-scoped access_token
         $tokenResp = Invoke-RestMethod `
             -Uri "https://$vraServer/csp/gateway/am/api/auth/api-tokens/authorize" `
             -Method POST `
@@ -276,7 +283,6 @@ foreach ($vraServer in $vraServers) {
             -Body "refresh_token=$($loginResp.refresh_token)" `
             -ErrorAction Stop
 
-        # Use same org-scoped token for both IAM and projects
         $vraHeaders = @{
             "Authorization" = "Bearer $($tokenResp.access_token)"
             "Content-Type"  = "application/json"
@@ -430,7 +436,6 @@ foreach ($normalizedName in $allGroupNames) {
               elseif (-not $inVIDM -and ($inIAM -or $inProject))     { "Missing from vIDM" }
               else                                                     { "Unknown" }
 
-    # Instant lookup from parallel AD results
     $adDN = $adResults[$normalizedName]
     if (-not $adDN) { $adDN = "Not Found" }
 
@@ -478,3 +483,38 @@ Write-Log "Missing from vIDM              : $missingVIDM"   "WARN"
 Write-Log "Found in AD                    : $adFound"       "SUCCESS"
 Write-Log "Not Found in AD                : $adNotFound"    "WARN"
 Write-Log "CSV saved to                   : $outputCsv"     "SUCCESS"
+
+# ============================================================================
+# STEP 6: EMAIL CSV AND CLEANUP
+# ============================================================================
+
+if ($SendEmail) {
+    Write-Log "=== Sending Email ===" "SUCCESS"
+    try {
+        $emailParams = @{
+            To          = $EmailTo
+            From        = $EmailFrom
+            Subject     = $EmailSubject
+            Body        = "Please find attached the vIDM + vRA Group Comparison Audit report generated on $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')."
+            Attachments = $outputCsv
+            SmtpServer  = $SMTPServer
+            Port        = $SMTPPort
+            UseSsl      = $UseSSL
+        }
+
+        Send-MailMessage @emailParams
+        Write-Log "Email sent successfully to $EmailTo" "SUCCESS"
+    }
+    catch {
+        Write-Log "Failed to send email: $($_.Exception.Message)" "ERROR"
+    }
+}
+
+# ── Cleanup CSV ───────────────────────────────────────────────────────────────
+try {
+    Remove-Item -Path $outputCsv -Force -ErrorAction Stop
+    Write-Log "CSV deleted: $outputCsv" "SUCCESS"
+}
+catch {
+    Write-Log "Failed to delete CSV: $($_.Exception.Message)" "ERROR"
+}
