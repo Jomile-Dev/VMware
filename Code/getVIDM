@@ -19,6 +19,11 @@
 # Step 2 — Exchange refresh_token for full org-scoped access_token
 # Step 3 — Use same org-scoped token for BOTH IAM enterprise groups AND projects
 #
+# HOW AD LOOKUP WORKS:
+# Bulk pulls ALL groups from each domain via Global Catalog (port 3268)
+# into a hashtable at the start — then does instant lookups per group
+# Much faster than querying AD individually per group
+#
 # COMPARISON LOGIC:
 # Groups are compared across three sources:
 #   - vIDM        : all synced AD groups
@@ -31,11 +36,6 @@
 #   In Project not in IAM          — assigned to project but not in IAM
 #   Missing from vRA               — in vIDM but not in vRA at all
 #   Missing from vIDM              — in vRA but not synced to vIDM
-#
-# AD LOOKUP:
-# Searches each domain in $adDomains for the group using a partial name match
-# Returns the CN and DistinguishedName of the first match found
-# If not found in any domain, columns show "Not Found"
 #
 # ============================================================================
 
@@ -50,7 +50,7 @@ $vraServers = @(
     # "vra2.yourdomain.com"
 )
 
-# ── AD Domains to search ──────────────────────────────────────────────────────
+# ── AD Domains to search via Global Catalog ───────────────────────────────────
 $adDomains = @(
     "domain1.com"
     # "domain2.com"
@@ -100,38 +100,6 @@ function Normalize-GroupName {
     return $Name.Trim().ToLower()
 }
 
-# Search AD across all specified domains for a group by partial name
-# Returns CN and DistinguishedName of first match found
-function Find-ADGroupAcrossDomains {
-    param([string]$GroupName)
-
-    foreach ($domain in $adDomains) {
-        try {
-            $result = Get-ADGroup `
-                -Server $domain `
-                -Filter "Name -like '*$GroupName*'" `
-                -Properties DistinguishedName `
-                -ErrorAction Stop |
-                Select-Object -First 1
-
-            if ($result) {
-                return [PSCustomObject]@{
-                    CN = $result.Name
-                    DN = $result.DistinguishedName
-                }
-            }
-        }
-        catch {
-            Write-Log "AD lookup failed on $domain for '$GroupName': $($_.Exception.Message)" "WARN"
-        }
-    }
-
-    return [PSCustomObject]@{
-        CN = "Not Found"
-        DN = "Not Found"
-    }
-}
-
 # ============================================================================
 # STARTUP
 # ============================================================================
@@ -146,6 +114,41 @@ $clientSecret = $vidmCred.ClientSecret
 $vraCred  = Import-Clixml -Path "C:\Creds\aria_vra_cred.xml"
 $vraUser  = $vraCred.UserName
 $vraPass  = $vraCred.GetNetworkCredential().Password
+
+# ============================================================================
+# STEP 0: BULK PULL ALL AD GROUPS INTO CACHE
+# Queries Global Catalog (port 3268) once per domain
+# Stores Name -> DistinguishedName in a hashtable for instant lookups
+# ============================================================================
+
+Write-Log "=== Building AD Group Cache ===" "SUCCESS"
+
+$adGroupCache = @{}
+
+foreach ($domain in $adDomains) {
+    Write-Log "Pulling all groups from $domain via Global Catalog..." 
+    try {
+        $adGroups = Get-ADObject `
+            -LDAPFilter "(objectClass=group)" `
+            -Server "$($domain):3268" `
+            -Properties DistinguishedName `
+            -ErrorAction Stop
+
+        foreach ($g in $adGroups) {
+            $key = $g.Name.ToLower()
+            if (-not $adGroupCache.ContainsKey($key)) {
+                $adGroupCache[$key] = $g.DistinguishedName
+            }
+        }
+
+        Write-Log "Cached $($adGroups.Count) groups from $domain" "SUCCESS"
+    }
+    catch {
+        Write-Log "AD cache failed for $domain : $($_.Exception.Message)" "ERROR"
+    }
+}
+
+Write-Log "Total AD groups cached: $($adGroupCache.Count)" "SUCCESS"
 
 # ============================================================================
 # STEP 1: COLLECT vIDM GROUPS FROM ALL INSTANCES
@@ -346,16 +349,9 @@ $vraProjNormalized = $vraProjectGroups    | Select-Object -ExpandProperty Normal
 
 $allGroupNames = ($vidmNormalized + $vraEntNormalized + $vraProjNormalized) | Sort-Object -Unique
 
-$report   = [System.Collections.Generic.List[PSCustomObject]]::new()
-$total    = $allGroupNames.Count
-$current  = 0
+$report = [System.Collections.Generic.List[PSCustomObject]]::new()
 
 foreach ($normalizedName in $allGroupNames) {
-
-    $current++
-    if ($current % 20 -eq 0) {
-        Write-Log "  AD Lookup Progress: $current / $total"
-    }
 
     $inVIDM    = $vidmNormalized    -contains $normalizedName
     $inIAM     = $vraEntNormalized  -contains $normalizedName
@@ -378,8 +374,9 @@ foreach ($normalizedName in $allGroupNames) {
               elseif (-not $inVIDM -and ($inIAM -or $inProject))     { "Missing from vIDM" }
               else                                                     { "Unknown" }
 
-    # AD Lookup using normalised name
-    $adResult = Find-ADGroupAcrossDomains -GroupName $normalizedName
+    # Instant hashtable lookup — no AD query needed per group
+    $adDN = $adGroupCache[$normalizedName]
+    if (-not $adDN) { $adDN = "Not Found" }
 
     $report.Add([PSCustomObject]@{
         GroupName       = $originalName
@@ -390,8 +387,7 @@ foreach ($normalizedName in $allGroupNames) {
         Status          = $status
         ProjectName     = if ($projMatch) { $projMatch.ProjectName } else { "N/A" }
         ProjectRole     = if ($projMatch) { $projMatch.Role }        else { "N/A" }
-        AD_CN           = $adResult.CN
-        AD_DN           = $adResult.DN
+        AD_DN           = $adDN
     })
 }
 
