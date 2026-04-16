@@ -1,13 +1,12 @@
-# Use the access_token from the exchange response
-$orgHeaders = @{
-    "Authorization" = "Bearer $($tokenResp.access_token)"
-    "Content-Type"  = "application/json"
-}
+# Extract org ID from reflink
+$refLink = $org.refLinks | Select-Object -First 1
+$orgId   = $refLink -replace ".*/orgs/([^/]+).*", '$1'
+Write-Host "Org ID: $orgId"
 
-# Test org lookup
-$org = Invoke-RestMethod `
-    -Uri "https://$vraServer/csp/gateway/am/api/loggedin/user/orgs" `
+# Test enterprise groups
+$resp = Invoke-RestMethod `
+    -Uri "https://$vraServer/csp/gateway/am/api/orgs/$orgId/groups?groupType=ENTERPRISE&take=5&skip=0" `
     -Method GET `
     -Headers $orgHeaders
 
-$org | ConvertTo-Json -Depth 5
+$resp | ConvertTo-Json -Depth 5
