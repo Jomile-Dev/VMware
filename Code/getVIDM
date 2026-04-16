@@ -24,6 +24,7 @@
 # ActiveDirectory module is imported inside each runspace explicitly
 # Each query hits the Global Catalog (port 3268) for fast forest-wide search
 # Uses original casing clean name (no domain prefix/suffix) for CN match
+# Strips trailing dot + 2 chars e.g. .ts .us .gs before searching AD
 # Only queries groups found in vIDM or vRA — not entire AD
 #
 # COMPARISON LOGIC:
@@ -108,25 +109,26 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
 }
 
 # Normalise group names for comparison only
-# Strips domain prefixes (DOMAIN\group) and suffixes (group@domain.com)
+# Strips domain prefixes (DOMAIN\group), suffixes (group@domain.com)
+# and trailing dot + 2 chars e.g. .ts .us .gs
 function Normalize-GroupName {
     param([string]$Name)
     if (-not $Name) { return $null }
     $Name = $Name.Trim()
     if ($Name -match "^[^\\]+\\(.+)$") { $Name = $matches[1] }
     if ($Name -match "^([^@]+)@.+$")   { $Name = $matches[1] }
+    $Name = $Name -replace '\.[a-zA-Z]{2}$', ''
     return $Name.Trim().ToLower()
 }
 
-# Strip domain prefix/suffix but keep original casing for AD CN lookup
-# Also strips trailing dot + 2 chars e.g. .ts .us .gs which are common typos
+# Strip domain prefix/suffix and trailing dot + 2 chars
+# Keeps original casing for AD CN lookup
 function Get-CleanGroupName {
     param([string]$Name)
     if (-not $Name) { return $null }
     $Name = $Name.Trim()
     if ($Name -match "^[^\\]+\\(.+)$") { $Name = $matches[1] }
     if ($Name -match "^([^@]+)@.+$")   { $Name = $matches[1] }
-    # Strip trailing dot + exactly 2 letters e.g. .ts .us .gs .uk
     $Name = $Name -replace '\.[a-zA-Z]{2}$', ''
     return $Name.Trim()
 }
@@ -415,7 +417,7 @@ $vraEnterpriseGroups = $vraEnterpriseGroups | Sort-Object NormalizedName -Unique
 # Note: vraProjectGroups is NOT deduplicated — same group can appear in multiple projects
 
 # ============================================================================
-# STEP 3: PARALLEL AD LOOKUP USING CLEAN NAMES (original casing, no domain)
+# STEP 3: PARALLEL AD LOOKUP USING CLEAN NAMES (original casing, no domain, no trailing .xx)
 # ============================================================================
 
 $vidmNormalized    = $vidmGroups          | Select-Object -ExpandProperty NormalizedName
@@ -424,7 +426,7 @@ $vraProjNormalized = $vraProjectGroups    | Select-Object -ExpandProperty Normal
 
 $allGroupNames = ($vidmNormalized + $vraEntNormalized + $vraProjNormalized) | Sort-Object -Unique
 
-# Build clean name list for AD lookup — original casing, domain prefix/suffix stripped
+# Build clean name list for AD lookup — original casing, domain and trailing .xx stripped
 $allCleanNames = (
     ($vidmGroups          | Select-Object -ExpandProperty CleanName) +
     ($vraEnterpriseGroups | Select-Object -ExpandProperty CleanName) +
@@ -474,7 +476,7 @@ foreach ($normalizedName in $allGroupNames) {
               elseif (-not $inVIDM -and ($inIAM -or $inProject))     { "Missing from vIDM" }
               else                                                     { "Unknown" }
 
-    # Lookup using clean name — original casing, domain stripped
+    # Lookup using clean name — original casing, domain and trailing .xx stripped
     $adDN = $adResults[$sourceObj.CleanName]
     if (-not $adDN) { $adDN = "Not Found" }
 
