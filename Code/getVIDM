@@ -1,23 +1,13 @@
-$vraServer = "vra1.yourdomain.com"
-$vraUser   = "yourusername"
-$vraPass   = "yourpassword"
-$vraDomain = "yourdomain"    # blank for local
+# Use the access_token from the exchange response
+$orgHeaders = @{
+    "Authorization" = "Bearer $($tokenResp.access_token)"
+    "Content-Type"  = "application/json"
+}
 
-# Step 1 - Login
-$loginResp = Invoke-RestMethod `
-    -Uri "https://$vraServer/csp/gateway/am/api/login?access_token" `
-    -Method POST `
-    -Headers @{ "Content-Type" = "application/json" } `
-    -Body (@{ username = $vraUser; password = $vraPass; domain = $vraDomain } | ConvertTo-Json)
+# Test org lookup
+$org = Invoke-RestMethod `
+    -Uri "https://$vraServer/csp/gateway/am/api/loggedin/user/orgs" `
+    -Method GET `
+    -Headers $orgHeaders
 
-Write-Host "refresh_token value: $($loginResp.refresh_token)"
-
-# Step 2 - Exchange using correct underscore field name
-$tokenResp = Invoke-RestMethod `
-    -Uri "https://$vraServer/csp/gateway/am/api/auth/api-tokens/authorize" `
-    -Method POST `
-    -Headers @{ "Content-Type" = "application/x-www-form-urlencoded" } `
-    -Body "refresh_token=$($loginResp.refresh_token)"
-
-Write-Host "Exchange response:"
-$tokenResp | ConvertTo-Json -Depth 5
+$org | ConvertTo-Json -Depth 5
