@@ -1,12 +1,385 @@
-# Extract org ID from reflink
-$refLink = $org.refLinks | Select-Object -First 1
-$orgId   = $refLink -replace ".*/orgs/([^/]+).*", '$1'
-Write-Host "Org ID: $orgId"
+# ============================================================================
+# vIDM + vRA ENTERPRISE GROUP COMPARISON AUDIT
+# ============================================================================
+#
+# FIRST TIME SETUP — Run these lines ONCE to create encrypted credential files
+# (Uses Windows DPAPI — only decryptable by your user account on this machine)
+#
+# -- vIDM OAuth Client (created in vIDM > Catalog > Remote App Access) --
+# [PSCustomObject]@{
+#     ClientId     = "ps-script"
+#     ClientSecret = "your-secret-here"
+# } | Export-Clixml -Path "C:\Creds\vidm_oauth_cred.xml"
+#
+# -- vRA Credentials --
+# Get-Credential | Export-Clixml -Path "C:\Creds\aria_vra_cred.xml"
+#
+# HOW vRA AUTH WORKS:
+# Step 1 — Login with ?access_token to get refresh_token (underscore)
+# Step 2 — Exchange refresh_token for full org-scoped access_token
+# Step 3 — Use org-scoped token for IAM enterprise groups API
+# Step 4 — Use cspAuthToken for project memberships API
+#
+# COMPARISON LOGIC:
+# Groups are compared across three sources:
+#   - vIDM        : all synced AD groups
+#   - vRA IAM     : groups in Identity & Access Management > Enterprise Groups
+#   - vRA Projects: groups assigned to at least one project
+#
+# STATUS column:
+#   Fully Matched        — in all three
+#   In IAM not Project   — in vIDM + IAM but not assigned to any project
+#   Missing from vRA     — in vIDM but not in vRA at all
+#   Missing from vIDM    — in vRA but not synced to vIDM
+#
+# ============================================================================
 
-# Test enterprise groups
-$resp = Invoke-RestMethod `
-    -Uri "https://$vraServer/csp/gateway/am/api/orgs/$orgId/groups?groupType=ENTERPRISE&take=5&skip=0" `
-    -Method GET `
-    -Headers $orgHeaders
+# ── Servers ───────────────────────────────────────────────────────────────────
+$vidmServers = @(
+    "prd01.test.domain"
+    # "prd02.test.domain"
+)
 
-$resp | ConvertTo-Json -Depth 5
+$vraServers = @(
+    "vra1.yourdomain.com"
+    # "vra2.yourdomain.com"
+)
+
+$outputCsv = "C:\Reports\Group_Comparison_$(Get-Date -Format 'yyyy-MM-dd_HHmm').csv"
+
+# ============================================================================
+# HELPERS
+# ============================================================================
+
+function Write-Log {
+    param([string]$Message, [string]$Level = "INFO")
+    $color = switch ($Level) {
+        "ERROR"   { "Red" }
+        "WARN"    { "Yellow" }
+        "SUCCESS" { "Green" }
+        default   { "Cyan" }
+    }
+    Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [$Level] $Message" -ForegroundColor $color
+}
+
+function Disable-SSLValidation {
+    if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
+        Add-Type @"
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+public class TrustAllCertsPolicy : ICertificatePolicy {
+    public bool CheckValidationResult(
+        ServicePoint svcPoint, X509Certificate certificate,
+        WebRequest request, int certificateProblem) { return true; }
+}
+"@
+        [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+    }
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+}
+
+# Normalise group names for comparison
+# Strips domain prefixes (DOMAIN\group) and suffixes (group@domain.com)
+function Normalize-GroupName {
+    param([string]$Name)
+    if (-not $Name) { return $null }
+    $Name = $Name.Trim()
+    if ($Name -match "^[^\\]+\\(.+)$") { $Name = $matches[1] }
+    if ($Name -match "^([^@]+)@.+$")   { $Name = $matches[1] }
+    return $Name.Trim().ToLower()
+}
+
+# ============================================================================
+# STARTUP
+# ============================================================================
+
+Disable-SSLValidation
+
+# ── Load Credentials ──────────────────────────────────────────────────────────
+$vidmCred     = Import-Clixml -Path "C:\Creds\vidm_oauth_cred.xml"
+$clientId     = $vidmCred.ClientId
+$clientSecret = $vidmCred.ClientSecret
+
+$vraCred  = Import-Clixml -Path "C:\Creds\aria_vra_cred.xml"
+$vraUser  = $vraCred.UserName
+$vraPass  = $vraCred.GetNetworkCredential().Password
+
+# ============================================================================
+# STEP 1: COLLECT vIDM GROUPS FROM ALL INSTANCES
+# ============================================================================
+
+$vidmGroups = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+foreach ($vidmServer in $vidmServers) {
+
+    Write-Log "=== Connecting to vIDM: $vidmServer ===" "SUCCESS"
+
+    try {
+        $base64Creds = [Convert]::ToBase64String(
+            [Text.Encoding]::ASCII.GetBytes("${clientId}:${clientSecret}"))
+
+        $loginResponse = Invoke-RestMethod `
+            -Uri "https://$vidmServer/SAAS/auth/oauthtoken" `
+            -Method POST `
+            -Headers @{
+                "Authorization" = "Basic $base64Creds"
+                "Content-Type"  = "application/x-www-form-urlencoded"
+                "Accept"        = "application/json"
+            } `
+            -Body "grant_type=client_credentials" `
+            -ErrorAction Stop
+
+        $accessToken = $loginResponse.access_token
+        Write-Log "Authenticated to $vidmServer" "SUCCESS"
+
+        $groups = Invoke-RestMethod `
+            -Uri "https://$vidmServer/SAAS/jersey/manager/api/scim/Groups?count=500" `
+            -Method GET `
+            -Headers @{
+                "Authorization" = "Bearer $accessToken"
+                "Accept"        = "application/json"
+            } `
+            -ErrorAction Stop
+
+        $fetched = $groups.Resources | Where-Object { $_.displayName -ne $null }
+
+        foreach ($g in $fetched) {
+            $vidmGroups.Add([PSCustomObject]@{
+                OriginalName   = $g.displayName.Trim()
+                NormalizedName = Normalize-GroupName $g.displayName
+            })
+        }
+
+        Write-Log "Retrieved $($fetched.Count) groups from $vidmServer" "SUCCESS"
+    }
+    catch {
+        Write-Log "vIDM failed for $vidmServer : $($_.Exception.Message)" "ERROR"
+    }
+}
+
+$vidmGroups = $vidmGroups | Sort-Object NormalizedName -Unique
+
+# ============================================================================
+# STEP 2: COLLECT vRA ENTERPRISE GROUPS + PROJECT GROUPS FROM ALL INSTANCES
+# ============================================================================
+
+$vraEnterpriseGroups = [System.Collections.Generic.List[PSCustomObject]]::new()
+$vraProjectGroups    = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+foreach ($vraServer in $vraServers) {
+
+    Write-Log "=== Connecting to vRA: $vraServer ===" "SUCCESS"
+
+    try {
+        # Login to get refresh_token (underscore)
+        $loginResp = Invoke-RestMethod `
+            -Uri "https://$vraServer/csp/gateway/am/api/login?access_token" `
+            -Method POST `
+            -Headers @{ "Content-Type" = "application/json" } `
+            -Body (@{ username = $vraUser; password = $vraPass } | ConvertTo-Json) `
+            -ErrorAction Stop
+
+        # Exchange refresh_token for org-scoped access_token
+        $tokenResp = Invoke-RestMethod `
+            -Uri "https://$vraServer/csp/gateway/am/api/auth/api-tokens/authorize" `
+            -Method POST `
+            -Headers @{ "Content-Type" = "application/x-www-form-urlencoded" } `
+            -Body "refresh_token=$($loginResp.refresh_token)" `
+            -ErrorAction Stop
+
+        # Org-scoped headers for IAM enterprise groups
+        $iamHeaders = @{
+            "Authorization" = "Bearer $($tokenResp.access_token)"
+            "Content-Type"  = "application/json"
+        }
+
+        # Standard headers for project memberships
+        $vraHeaders = @{
+            "Authorization" = "Bearer $($loginResp.cspAuthToken)"
+            "Content-Type"  = "application/json"
+        }
+
+        Write-Log "Authenticated to $vraServer" "SUCCESS"
+    }
+    catch {
+        Write-Log "vRA auth failed for $vraServer : $($_.Exception.Message)" "ERROR"
+        continue
+    }
+
+    # ── Collect IAM Enterprise Groups ─────────────────────────────────────────
+    try {
+        $org     = Invoke-RestMethod `
+            -Uri "https://$vraServer/csp/gateway/am/api/loggedin/user/orgs" `
+            -Method GET `
+            -Headers $iamHeaders `
+            -ErrorAction Stop
+
+        $refLink = $org.refLinks | Select-Object -First 1
+        $orgId   = $refLink -replace ".*/orgs/([^/]+).*", '$1'
+        Write-Log "Org ID: $orgId"
+
+        $skip     = 0
+        $pageSize = 200
+
+        do {
+            $uri = "https://$vraServer/csp/gateway/am/api/orgs/$orgId/groups?groupType=ENTERPRISE&take=$pageSize&skip=$skip"
+
+            $resp  = Invoke-RestMethod -Uri $uri -Method GET -Headers $iamHeaders -ErrorAction Stop
+            $items = $resp.results
+
+            if ($items -and @($items).Count -gt 0) {
+                foreach ($g in $items) {
+                    if ($g.displayName) {
+                        $vraEnterpriseGroups.Add([PSCustomObject]@{
+                            OriginalName   = $g.displayName.Trim()
+                            NormalizedName = Normalize-GroupName $g.displayName
+                            Domain         = $g.domain
+                            UserCount      = $g.userCount
+                        })
+                    }
+                }
+                Write-Log "  IAM Skip $skip : $(@($items).Count) groups retrieved"
+                $skip += $pageSize
+                if (@($items).Count -lt $pageSize) { break }
+            }
+            else { break }
+        } while ($true)
+
+        Write-Log "Retrieved $($vraEnterpriseGroups.Count) IAM enterprise groups from $vraServer" "SUCCESS"
+    }
+    catch {
+        Write-Log "vRA IAM groups failed for $vraServer : $($_.Exception.Message)" "ERROR"
+    }
+
+    # ── Collect Project Groups ────────────────────────────────────────────────
+    try {
+        $skip     = 0
+        $pageSize = 200
+
+        do {
+            $resp  = Invoke-RestMethod `
+                -Uri "https://$vraServer/iaas/api/projects?apiVersion=2021-07-15&`$top=$pageSize&`$skip=$skip" `
+                -Method GET `
+                -Headers $vraHeaders `
+                -ErrorAction Stop
+
+            $items = if ($resp.content) { $resp.content } else { $resp }
+
+            if ($items -and @($items).Count -gt 0) {
+                foreach ($project in $items) {
+                    foreach ($role in @('members', 'administrators', 'viewers', 'supervisors')) {
+                        $project.$role |
+                            Where-Object { $_.type -eq "group" } |
+                            ForEach-Object {
+                                $name = if ($_.email) { $_.email } elseif ($_.name) { $_.name } else { $null }
+                                if ($name) {
+                                    $vraProjectGroups.Add([PSCustomObject]@{
+                                        OriginalName   = $name.Trim()
+                                        NormalizedName = Normalize-GroupName $name
+                                        ProjectName    = $project.name
+                                        Role           = $role
+                                    })
+                                }
+                            }
+                    }
+                }
+                Write-Log "  Projects Skip $skip : $(@($items).Count) projects retrieved"
+                $skip += $pageSize
+                if (@($items).Count -lt $pageSize) { break }
+            }
+            else { break }
+        } while ($true)
+
+        Write-Log "Retrieved $($vraProjectGroups.Count) project groups from $vraServer" "SUCCESS"
+    }
+    catch {
+        Write-Log "vRA projects failed for $vraServer : $($_.Exception.Message)" "ERROR"
+    }
+}
+
+$vraEnterpriseGroups = $vraEnterpriseGroups | Sort-Object NormalizedName -Unique
+$vraProjectGroups    = $vraProjectGroups    | Sort-Object NormalizedName -Unique
+
+# ============================================================================
+# STEP 3: COMPARE ACROSS ALL THREE SOURCES
+# ============================================================================
+
+Write-Log "=== Comparing Groups ===" "SUCCESS"
+
+$vidmNormalized       = $vidmGroups          | Select-Object -ExpandProperty NormalizedName
+$vraEntNormalized     = $vraEnterpriseGroups | Select-Object -ExpandProperty NormalizedName
+$vraProjNormalized    = $vraProjectGroups    | Select-Object -ExpandProperty NormalizedName
+
+# Combine all unique group names across all three sources
+$allGroupNames = ($vidmNormalized + $vraEntNormalized + $vraProjNormalized) | Sort-Object -Unique
+
+$report = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+foreach ($normalizedName in $allGroupNames) {
+
+    $inVIDM    = $vidmNormalized    -contains $normalizedName
+    $inIAM     = $vraEntNormalized  -contains $normalizedName
+    $inProject = $vraProjNormalized -contains $normalizedName
+
+    # Get original name from whichever source has it
+    $originalName = if ($inVIDM) {
+        ($vidmGroups | Where-Object { $_.NormalizedName -eq $normalizedName } | Select-Object -First 1).OriginalName
+    } elseif ($inIAM) {
+        ($vraEnterpriseGroups | Where-Object { $_.NormalizedName -eq $normalizedName } | Select-Object -First 1).OriginalName
+    } else {
+        ($vraProjectGroups | Where-Object { $_.NormalizedName -eq $normalizedName } | Select-Object -First 1).OriginalName
+    }
+
+    # Get extra details
+    $iamMatch  = $vraEnterpriseGroups | Where-Object { $_.NormalizedName -eq $normalizedName } | Select-Object -First 1
+    $projMatch = $vraProjectGroups    | Where-Object { $_.NormalizedName -eq $normalizedName } | Select-Object -First 1
+
+    # Determine status
+    $status = if     ($inVIDM -and $inIAM -and $inProject) { "Fully Matched" }
+              elseif ($inVIDM -and $inIAM -and -not $inProject) { "In IAM not assigned to Project" }
+              elseif ($inVIDM -and -not $inIAM -and $inProject) { "In Project not in IAM" }
+              elseif ($inVIDM -and -not $inIAM -and -not $inProject) { "Missing from vRA" }
+              elseif (-not $inVIDM -and ($inIAM -or $inProject)) { "Missing from vIDM" }
+              else { "Unknown" }
+
+    $report.Add([PSCustomObject]@{
+        GroupName          = $originalName
+        NormalizedName     = $normalizedName
+        InvIDM             = if ($inVIDM)    { "YES" } else { "NO" }
+        InvRAEnterprise    = if ($inIAM)     { "YES" } else { "NO" }
+        InvRAProjects      = if ($inProject) { "YES" } else { "NO" }
+        Status             = $status
+        Domain             = if ($iamMatch)  { $iamMatch.Domain }      else { "N/A" }
+        UserCount          = if ($iamMatch)  { $iamMatch.UserCount }   else { "N/A" }
+        ProjectName        = if ($projMatch) { $projMatch.ProjectName } else { "N/A" }
+        ProjectRole        = if ($projMatch) { $projMatch.Role }        else { "N/A" }
+    })
+}
+
+# ============================================================================
+# STEP 4: EXPORT CSV
+# ============================================================================
+
+$outputDir = Split-Path $outputCsv
+if (-not (Test-Path $outputDir)) {
+    New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+}
+
+$report | Sort-Object Status, GroupName |
+    Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
+
+$fullyMatched    = ($report | Where-Object { $_.Status -eq "Fully Matched" }).Count
+$iamNotProject   = ($report | Where-Object { $_.Status -eq "In IAM not assigned to Project" }).Count
+$projectNotIAM   = ($report | Where-Object { $_.Status -eq "In Project not in IAM" }).Count
+$missingVRA      = ($report | Where-Object { $_.Status -eq "Missing from vRA" }).Count
+$missingVIDM     = ($report | Where-Object { $_.Status -eq "Missing from vIDM" }).Count
+
+Write-Log ""
+Write-Log "=== AUDIT COMPLETE ===" "SUCCESS"
+Write-Log "Total Groups                  : $($report.Count)"
+Write-Log "Fully Matched                 : $fullyMatched"  "SUCCESS"
+Write-Log "In IAM not assigned to Project: $iamNotProject" "WARN"
+Write-Log "In Project not in IAM         : $projectNotIAM" "WARN"
+Write-Log "Missing from vRA              : $missingVRA"    "WARN"
+Write-Log "Missing from vIDM             : $missingVIDM"   "WARN"
+Write-Log "CSV saved to                  : $outputCsv"     "SUCCESS"
