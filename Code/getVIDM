@@ -14,4 +14,10 @@ Write-Host "refresh_token value: $($loginResp.refresh_token)"
 
 # Step 2 - Exchange using correct underscore field name
 $tokenResp = Invoke-RestMethod `
-    -Uri "
+    -Uri "https://$vraServer/csp/gateway/am/api/auth/api-tokens/authorize" `
+    -Method POST `
+    -Headers @{ "Content-Type" = "application/x-www-form-urlencoded" } `
+    -Body "refresh_token=$($loginResp.refresh_token)"
+
+Write-Host "Exchange response:"
+$tokenResp | ConvertTo-Json -Depth 5
