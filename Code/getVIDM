@@ -21,8 +21,9 @@
 #
 # HOW AD LOOKUP WORKS:
 # Uses PowerShell runspaces to query 10 groups in parallel at a time
+# ActiveDirectory module is imported inside each runspace explicitly
 # Each query hits the Global Catalog (port 3268) for fast forest-wide search
-# Uses ORIGINAL group name (not normalized) for CN match in AD
+# Uses original casing clean name (no domain prefix/suffix) for CN match
 # Only queries groups found in vIDM or vRA — not entire AD
 #
 # COMPARISON LOGIC:
@@ -37,6 +38,9 @@
 #   In Project not in IAM          — assigned to project but not in IAM
 #   Missing from vRA               — in vIDM but not in vRA at all
 #   Missing from vIDM              — in vRA but not synced to vIDM
+#
+# ProjectNames — all projects the group is assigned to pipe separated
+# ProjectRoles — all roles the group has across projects pipe separated
 #
 # ============================================================================
 
@@ -114,8 +118,7 @@ function Normalize-GroupName {
     return $Name.Trim().ToLower()
 }
 
-# Strip domain prefix/suffix from original name for AD CN lookup
-# Keeps original casing — just removes DOMAIN\ or @domain.com
+# Strip domain prefix/suffix but keep original casing for AD CN lookup
 function Get-CleanGroupName {
     param([string]$Name)
     if (-not $Name) { return $null }
@@ -125,9 +128,14 @@ function Get-CleanGroupName {
     return $Name.Trim()
 }
 
-# AD lookup scriptblock used inside each runspace
+# AD lookup scriptblock — runs inside each runspace
+# ActiveDirectory module imported explicitly since runspaces start blank
 $adLookupScript = {
     param([string]$GroupName, [string[]]$Domains)
+
+    # Must import AD module — runspaces don't inherit parent session modules
+    Import-Module ActiveDirectory -ErrorAction Stop
+
     foreach ($domain in $Domains) {
         try {
             $result = Get-ADObject `
@@ -136,6 +144,7 @@ $adLookupScript = {
                 -Properties DistinguishedName `
                 -ErrorAction Stop |
                 Select-Object -First 1
+
             if ($result) {
                 return [PSCustomObject]@{
                     Name = $GroupName
@@ -145,6 +154,7 @@ $adLookupScript = {
         }
         catch { }
     }
+
     return [PSCustomObject]@{
         Name = $GroupName
         DN   = "Not Found"
@@ -398,7 +408,8 @@ foreach ($vraServer in $vraServers) {
 }
 
 $vraEnterpriseGroups = $vraEnterpriseGroups | Sort-Object NormalizedName -Unique
-$vraProjectGroups    = $vraProjectGroups    | Sort-Object NormalizedName -Unique
+
+# Note: vraProjectGroups is NOT deduplicated — same group can appear in multiple projects
 
 # ============================================================================
 # STEP 3: PARALLEL AD LOOKUP USING CLEAN NAMES (original casing, no domain)
@@ -406,7 +417,7 @@ $vraProjectGroups    = $vraProjectGroups    | Sort-Object NormalizedName -Unique
 
 $vidmNormalized    = $vidmGroups          | Select-Object -ExpandProperty NormalizedName
 $vraEntNormalized  = $vraEnterpriseGroups | Select-Object -ExpandProperty NormalizedName
-$vraProjNormalized = $vraProjectGroups    | Select-Object -ExpandProperty NormalizedName
+$vraProjNormalized = $vraProjectGroups    | Select-Object -ExpandProperty NormalizedName | Sort-Object -Unique
 
 $allGroupNames = ($vidmNormalized + $vraEntNormalized + $vraProjNormalized) | Sort-Object -Unique
 
@@ -440,7 +451,6 @@ foreach ($normalizedName in $allGroupNames) {
     $inIAM     = $vraEntNormalized  -contains $normalizedName
     $inProject = $vraProjNormalized -contains $normalizedName
 
-    # Get original and clean name from whichever source has it
     $sourceObj = if ($inVIDM) {
         $vidmGroups | Where-Object { $_.NormalizedName -eq $normalizedName } | Select-Object -First 1
     } elseif ($inIAM) {
@@ -449,7 +459,10 @@ foreach ($normalizedName in $allGroupNames) {
         $vraProjectGroups | Where-Object { $_.NormalizedName -eq $normalizedName } | Select-Object -First 1
     }
 
-    $projMatch = $vraProjectGroups | Where-Object { $_.NormalizedName -eq $normalizedName } | Select-Object -First 1
+    # Get ALL project matches for this group — not just first
+    $projMatches  = $vraProjectGroups | Where-Object { $_.NormalizedName -eq $normalizedName }
+    $projectNames = if ($projMatches) { ($projMatches | Select-Object -ExpandProperty ProjectName | Sort-Object -Unique) -join " | " } else { "N/A" }
+    $projectRoles = if ($projMatches) { ($projMatches | Select-Object -ExpandProperty Role | Sort-Object -Unique) -join " | " } else { "N/A" }
 
     $status = if     ($inVIDM -and $inIAM -and $inProject)           { "Fully Matched" }
               elseif ($inVIDM -and $inIAM -and -not $inProject)      { "In IAM not assigned to Project" }
@@ -458,7 +471,7 @@ foreach ($normalizedName in $allGroupNames) {
               elseif (-not $inVIDM -and ($inIAM -or $inProject))     { "Missing from vIDM" }
               else                                                     { "Unknown" }
 
-    # Lookup using clean name (original casing, no domain prefix/suffix)
+    # Lookup using clean name — original casing, domain stripped
     $adDN = $adResults[$sourceObj.CleanName]
     if (-not $adDN) { $adDN = "Not Found" }
 
@@ -469,8 +482,8 @@ foreach ($normalizedName in $allGroupNames) {
         InvRAEnterprise = if ($inIAM)     { "YES" } else { "NO" }
         InvRAProjects   = if ($inProject) { "YES" } else { "NO" }
         Status          = $status
-        ProjectName     = if ($projMatch) { $projMatch.ProjectName } else { "N/A" }
-        ProjectRole     = if ($projMatch) { $projMatch.Role }        else { "N/A" }
+        ProjectNames    = $projectNames
+        ProjectRoles    = $projectRoles
         AD_DN           = $adDN
     })
 }
