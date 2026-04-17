@@ -63,7 +63,7 @@ $adDomains = @(
 )
 
 # ── Parallel threads for AD lookup ────────────────────────────────────────────
-$adParallelThreads = 10
+$adParallelThreads = 5
 
 # ── Email Settings ────────────────────────────────────────────────────────────
 $SendEmail    = $true
@@ -143,33 +143,44 @@ $adLookupScript = {
     Import-Module ActiveDirectory -ErrorAction Stop
 
     foreach ($domain in $Domains) {
-        try {
-            # Try exact match first — fastest and most accurate
-            $result = Get-ADGroup `
-                -Server $domain `
-                -Filter "Name -eq '$GroupName'" `
-                -Properties DistinguishedName `
-                -ErrorAction Stop |
-                Select-Object -First 1
+        $attempts = 0
+        while ($attempts -lt 3) {
+            try {
+                $attempts++
 
-            # Fall back to trailing wildcard if exact match returns nothing
-            if (-not $result) {
+                # Try exact match first — fastest and most accurate
                 $result = Get-ADGroup `
                     -Server $domain `
-                    -Filter "Name -like '$GroupName*'" `
+                    -Filter "Name -eq '$GroupName'" `
                     -Properties DistinguishedName `
                     -ErrorAction Stop |
                     Select-Object -First 1
-            }
 
-            if ($result) {
-                return [PSCustomObject]@{
-                    Name = $GroupName
-                    DN   = $result.DistinguishedName
+                # Fall back to trailing wildcard if exact match returns nothing
+                if (-not $result) {
+                    $result = Get-ADGroup `
+                        -Server $domain `
+                        -Filter "Name -like '$GroupName*'" `
+                        -Properties DistinguishedName `
+                        -ErrorAction Stop |
+                        Select-Object -First 1
                 }
+
+                if ($result) {
+                    return [PSCustomObject]@{
+                        Name = $GroupName
+                        DN   = $result.DistinguishedName
+                    }
+                }
+
+                break
+            }
+            catch {
+                # Retry up to 3 times with delay before giving up
+                if ($attempts -ge 3) { break }
+                Start-Sleep -Milliseconds 500
             }
         }
-        catch { }
     }
 
     return [PSCustomObject]@{
