@@ -148,10 +148,14 @@ $adLookupScript = {
             try {
                 $attempts++
 
+                # Build filter string explicitly to ensure variable expands in runspace
+                $filterExact    = "Name -eq '$GroupName'"
+                $filterWildcard = "Name -like '$GroupName*'"
+
                 # Try exact match first — fastest and most accurate
                 $result = Get-ADGroup `
                     -Server $domain `
-                    -Filter "Name -eq '$GroupName'" `
+                    -Filter $filterExact `
                     -Properties DistinguishedName `
                     -ErrorAction Stop |
                     Select-Object -First 1
@@ -160,7 +164,7 @@ $adLookupScript = {
                 if (-not $result) {
                     $result = Get-ADGroup `
                         -Server $domain `
-                        -Filter "Name -like '$GroupName*'" `
+                        -Filter $filterWildcard `
                         -Properties DistinguishedName `
                         -ErrorAction Stop |
                         Select-Object -First 1
