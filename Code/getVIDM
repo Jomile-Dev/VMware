@@ -135,6 +135,7 @@ function Get-CleanGroupName {
 
 # AD lookup scriptblock — runs inside each runspace
 # ActiveDirectory module imported explicitly since runspaces start blank
+# Uses Get-ADGroup with -Filter and -Like for consistent results
 $adLookupScript = {
     param([string]$GroupName, [string[]]$Domains)
 
@@ -143,9 +144,9 @@ $adLookupScript = {
 
     foreach ($domain in $Domains) {
         try {
-            $result = Get-ADObject `
-                -LDAPFilter "(&(objectClass=group)(cn=$GroupName))" `
-                -Server "$($domain):3268" `
+            $result = Get-ADGroup `
+                -Server $domain `
+                -Filter "Name -like '*$GroupName*'" `
                 -Properties DistinguishedName `
                 -ErrorAction Stop |
                 Select-Object -First 1
