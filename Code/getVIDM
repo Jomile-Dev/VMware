@@ -133,109 +133,52 @@ function Get-CleanGroupName {
     return $Name.Trim()
 }
 
-# AD lookup scriptblock — runs inside each runspace
-# ActiveDirectory module imported explicitly since runspaces start blank
-# Uses Get-ADGroup with -Filter and -Like for consistent results
-$adLookupScript = {
-    param([string]$GroupName, [string[]]$Domains)
+# AD lookup — same method that works when called manually
+# Loops through each group one at a time using Get-ADGroup directly
+function Get-ADGroupDNParallel {
+    param(
+        [string[]]$GroupNames,
+        [string[]]$Domains,
+        [int]$Threads = 5
+    )
 
-    # Must import AD module — runspaces don't inherit parent session modules
-    Import-Module ActiveDirectory -ErrorAction Stop
+    $results = @{}
 
-    foreach ($domain in $Domains) {
-        $attempts = 0
-        while ($attempts -lt 3) {
+    foreach ($name in $GroupNames) {
+        $found = $false
+        foreach ($domain in $Domains) {
             try {
-                $attempts++
-
-                # Build filter string explicitly to ensure variable expands in runspace
-                $filterExact    = "Name -eq '$GroupName'"
-                $filterWildcard = "Name -like '$GroupName*'"
-
-                # Try exact match first — fastest and most accurate
+                # Exact match first
                 $result = Get-ADGroup `
                     -Server $domain `
-                    -Filter $filterExact `
+                    -Filter "Name -eq '$name'" `
                     -Properties DistinguishedName `
                     -ErrorAction Stop |
                     Select-Object -First 1
 
-                # Fall back to trailing wildcard if exact match returns nothing
+                # Trailing wildcard fallback
                 if (-not $result) {
                     $result = Get-ADGroup `
                         -Server $domain `
-                        -Filter $filterWildcard `
+                        -Filter "Name -like '$name*'" `
                         -Properties DistinguishedName `
                         -ErrorAction Stop |
                         Select-Object -First 1
                 }
 
                 if ($result) {
-                    return [PSCustomObject]@{
-                        Name = $GroupName
-                        DN   = $result.DistinguishedName
-                    }
+                    $results[$name] = $result.DistinguishedName
+                    $found = $true
+                    break
                 }
-
-                break
             }
-            catch {
-                # Retry up to 3 times with delay before giving up
-                if ($attempts -ge 3) { break }
-                Start-Sleep -Milliseconds 500
-            }
+            catch { }
+        }
+
+        if (-not $found) {
+            $results[$name] = "Not Found"
         }
     }
-
-    return [PSCustomObject]@{
-        Name = $GroupName
-        DN   = "Not Found"
-    }
-}
-
-# Run parallel AD lookups using runspaces
-function Get-ADGroupDNParallel {
-    param(
-        [string[]]$GroupNames,
-        [string[]]$Domains,
-        [int]$Threads = 10
-    )
-
-    $pool = [RunspaceFactory]::CreateRunspacePool(1, $Threads)
-    $pool.Open()
-
-    $jobs = foreach ($name in $GroupNames) {
-        $ps = [PowerShell]::Create()
-        $ps.RunspacePool = $pool
-        [void]$ps.AddScript($adLookupScript)
-        [void]$ps.AddArgument($name)
-        [void]$ps.AddArgument($Domains)
-
-        [PSCustomObject]@{
-            Name   = $name
-            Handle = $ps.BeginInvoke()
-            PS     = $ps
-        }
-    }
-
-    $results = @{}
-    foreach ($job in $jobs) {
-        try {
-            $result = $job.PS.EndInvoke($job.Handle)
-            if ($result -and $result[0]) {
-                $results[$result[0].Name] = $result[0].DN
-            }
-        }
-        catch {
-            $results[$job.Name] = "Not Found"
-        }
-        finally {
-            $job.PS.Dispose()
-        }
-    }
-
-    $pool.Close()
-    $pool.Dispose()
 
     return $results
 }
