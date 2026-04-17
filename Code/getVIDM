@@ -570,32 +570,4 @@ try {
 }
 catch {
     Write-Log "Failed to delete CSV: $($_.Exception.Message)" "ERROR"
-}# ── Test settings ─────────────────────────────────────────────────────────────
-$adDomain  = "domain1.com"
-$testGroup = "YourActualGroupName"    # paste a real group name here — no .gs or .us
-
-# ── Test 1: Exact match ───────────────────────────────────────────────────────
-Write-Host "`n=== Test 1: Exact match ===" -ForegroundColor Cyan
-$start = Get-Date
-$result = Get-ADGroup -Server $adDomain -Filter "Name -eq '$testGroup'" -Properties DistinguishedName
-Write-Host "Time  : $((Get-Date) - $start)" -ForegroundColor Yellow
-Write-Host "Result: $($result.DistinguishedName)" -ForegroundColor Green
-
-# ── Test 2: Wildcard both sides ───────────────────────────────────────────────
-Write-Host "`n=== Test 2: Wildcard *name* ===" -ForegroundColor Cyan
-$start = Get-Date
-$result = Get-ADGroup -Server $adDomain -Filter "Name -like '*$testGroup*'" -Properties DistinguishedName | Select-Object -First 1
-Write-Host "Time  : $((Get-Date) - $start)" -ForegroundColor Yellow
-Write-Host "Result: $($result.DistinguishedName)" -ForegroundColor Green
-
-# ── Test 3: Wildcard end only ─────────────────────────────────────────────────
-Write-Host "`n=== Test 3: Wildcard name* ===" -ForegroundColor Cyan
-$start = Get-Date
-$result = Get-ADGroup -Server $adDomain -Filter "Name -like '$testGroup*'" -Properties DistinguishedName | Select-Object -First 1
-Write-Host "Time  : $((Get-Date) - $start)" -ForegroundColor Yellow
-Write-Host "Result: $($result.DistinguishedName)" -ForegroundColor Green
-
-# ── Test 4: Via Global Catalog port 3268 ──────────────────────────────────────
-Write-Host "`n=== Test 4: Global Catalog port 3268 ===" -ForegroundColor Cyan
-$start = Get-Date
-$result = Get-ADGroup -Server "$($adDomain):3268" -
+}
