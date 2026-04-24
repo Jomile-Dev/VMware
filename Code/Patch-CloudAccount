@@ -1,0 +1,161 @@
+# =============================================================================
+# Patch-CloudAccount-Certificate.ps1
+# Resolves: Remote Connect to Console error after vCenter Certificate updates
+# Automatically retrieves SHA-256 certificate thumbprint and patches Cloud Accounts
+# Note: The code is intentionally manual and deals with ONE request at a time
+#       so there is hardly any room for mistakes.
+# =============================================================================
+
+# --- Environment Selection ---
+$environments = @{
+    "1" = "vra-env1.example.com"
+    "2" = "vra-env2.example.com"
+    "3" = "vra-env3.example.com"
+}
+
+Write-Host "Select the environment:"
+$environments.GetEnumerator() | ForEach-Object { Write-Host "$($_.Key): $($_.Value)" }
+$selection = Read-Host "Enter the number of the environment"
+
+if (-not $environments.ContainsKey($selection)) {
+    Write-Host "❌ Invalid selection. Exiting."
+    return
+}
+
+$baseUrl = $environments[$selection]
+Write-Host "`n✅ Selected environment: $baseUrl"
+
+# --- Function: Auto-retrieve SHA-256 thumbprint from endpoint ---
+function Get-CertificateThumbprintSHA256 {
+    param([string]$Url)
+
+    $request = [System.Net.HttpWebRequest]::Create($Url)
+    $request.AllowAutoRedirect = $false
+    $request.ServerCertificateValidationCallback = { $true }
+    $request.Timeout = 10000
+
+    try {
+        $response = $request.GetResponse()
+        $response.Close()
+    } catch {
+        # Connection may fail but we still capture the cert from the handshake
+    }
+
+    $cert = $request.ServicePoint.Certificate
+    if (-not $cert) {
+        throw "Could not retrieve certificate from $Url"
+    }
+
+    $cert2 = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($cert)
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    $hashBytes = $sha256.ComputeHash($cert2.RawData)
+    $thumbprint = ($hashBytes | ForEach-Object { $_.ToString("X2") }) -join ""
+
+    return $thumbprint
+}
+
+# --- Step 1: Prompt for credentials ---
+$credential = Get-Credential
+$username = $credential.UserName
+$pass = $credential.Password
+$password = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
+    [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($pass)
+)
+
+# --- Step 2: Get refresh token ---
+$refreshUrl = "https://$baseUrl/csp/gateway/am/api/login?access_token"
+$refreshBody = @{
+    username = $username
+    password = $password
+} | ConvertTo-Json -Depth 2
+
+$headers = @{
+    "Accept"       = "application/json"
+    "Content-Type" = "application/json"
+}
+
+try {
+    $refreshResponse = Invoke-RestMethod -Uri $refreshUrl -Method Post -Body $refreshBody -Headers $headers
+    $refreshToken = $refreshResponse.refresh_token
+    Write-Host "`nRefresh Token: $refreshToken"
+} catch {
+    Write-Host "❌ Failed to get refresh token."
+    Write-Host "Error: $($_.Exception.Message)"
+    return
+}
+
+# --- Step 3: Exchange refresh token for access token ---
+$tokenUrl = "https://$baseUrl/iaas/api/login"
+$tokenBody = @{
+    refreshToken = $refreshToken
+} | ConvertTo-Json -Depth 2
+
+try {
+    $tokenResponse = Invoke-RestMethod -Uri $tokenUrl -Method Post -Body $tokenBody -Headers $headers
+    $accessToken = $tokenResponse.token
+    Write-Host "`n✅ Access Token: $accessToken"
+} catch {
+    Write-Host "❌ Failed to get access token."
+    Write-Host "Error: $($_.Exception.Message)"
+    return
+}
+
+# --- Step 4: List Cloud Accounts ---
+$cloudAccountsUrl = "https://$baseUrl/iaas/api/cloud-accounts"
+$authHeaders = @{
+    "Accept"        = "application/json"
+    "Authorization" = "Bearer $accessToken"
+}
+
+try {
+    $cloudAccounts = Invoke-RestMethod -Uri $cloudAccountsUrl -Method Get -Headers $authHeaders
+    Write-Host "`nAvailable Cloud Accounts:"
+    $cloudAccounts.content | ForEach-Object {
+        Write-Host "ID: $($_.id) | Name: $($_.name) | Type: $($_.cloudAccountType)"
+    }
+} catch {
+    Write-Host "❌ Failed to retrieve Cloud Accounts."
+    Write-Host "Error: $($_.Exception.Message)"
+    return
+}
+
+# --- Step 5: Auto-retrieve certificate thumbprint ---
+Write-Host "`n--- Certificate Thumbprint Retrieval ---"
+try {
+    $thumbprint = Get-CertificateThumbprintSHA256 -Url "https://$baseUrl"
+    Write-Host "✅ Auto-retrieved SHA-256 thumbprint: $thumbprint"
+} catch {
+    Write-Host "⚠️  Auto-retrieval failed: $($_.Exception.Message)"
+    $thumbprint = Read-Host "Enter the certificate thumbprint manually"
+}
+
+# --- Step 6: Patch selected Cloud Account ---
+$choice = Read-Host "`nDo you want to patch a Cloud Account with certificate thumbprint? (y/n)"
+if ($choice -eq "y") {
+    $cloudAccountId = Read-Host "Enter the Cloud Account ID"
+
+    $patchUrl = "https://$baseUrl/iaas/api/cloud-accounts/$cloudAccountId"
+    $patchBody = @{
+        customProperties = @{
+            acceptSelfSignedCertificate = "true"
+            certificateThumbprint      = $thumbprint
+        }
+        endpointProperties = @{
+            certificateThumbprint = $thumbprint
+        }
+    } | ConvertTo-Json -Depth 3
+
+    $patchHeaders = @{
+        "Accept"        = "application/json"
+        "Content-Type"  = "application/json"
+        "Authorization" = "Bearer $accessToken"
+    }
+
+    try {
+        Invoke-RestMethod -Uri $patchUrl -Method Patch -Body $patchBody -Headers $patchHeaders
+        Write-Host "`n✅ Cloud Account patched successfully."
+    } catch {
+        Write-Host "❌ Failed to patch Cloud Account."
+        Write-Host "Error: $($_.Exception.Message)"
+    }
+}
