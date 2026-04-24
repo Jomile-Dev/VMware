@@ -2,30 +2,30 @@
 # Patch-CloudAccount-Certificate.ps1
 # Resolves: Remote Connect to Console error after vCenter Certificate updates
 # Automatically retrieves SHA-256 certificate thumbprint and patches Cloud Accounts
-# Note: The code is intentionally manual and deals with ONE request at a time
-#       so there is hardly any room for mistakes.
+#
+# Flow:
+#   1. Select vRA environment
+#   2. Enter credentials
+#   3. Authenticate and get access token
+#   4. Pull all vSphere cloud accounts from vRA
+#   5. For each cloud account, extract the vCenter FQDN, fetch its cert
+#      thumbprint, and patch the cloud account
 # =============================================================================
 
-# --- Environment Selection ---
+# =============================================================================
+# CONFIGURATION - Update these with your vRA environment FQDNs
+# =============================================================================
+
 $environments = @{
     "1" = "vra-env1.example.com"
     "2" = "vra-env2.example.com"
     "3" = "vra-env3.example.com"
 }
 
-Write-Host "Select the environment:"
-$environments.GetEnumerator() | ForEach-Object { Write-Host "$($_.Key): $($_.Value)" }
-$selection = Read-Host "Enter the number of the environment"
+# =============================================================================
+# FUNCTIONS
+# =============================================================================
 
-if (-not $environments.ContainsKey($selection)) {
-    Write-Host "❌ Invalid selection. Exiting."
-    return
-}
-
-$baseUrl = $environments[$selection]
-Write-Host "`n✅ Selected environment: $baseUrl"
-
-# --- Function: Auto-retrieve SHA-256 thumbprint from endpoint ---
 function Get-CertificateThumbprintSHA256 {
     param([string]$Url)
 
@@ -54,7 +54,24 @@ function Get-CertificateThumbprintSHA256 {
     return $thumbprint
 }
 
-# --- Step 1: Prompt for credentials ---
+# =============================================================================
+# EXECUTION
+# =============================================================================
+
+# --- Step 1: Select environment ---
+Write-Host "Select the environment:"
+$environments.GetEnumerator() | Sort-Object Key | ForEach-Object { Write-Host "$($_.Key): $($_.Value)" }
+$selection = Read-Host "Enter the number of the environment"
+
+if (-not $environments.ContainsKey($selection)) {
+    Write-Host "❌ Invalid selection. Exiting."
+    return
+}
+
+$baseUrl = $environments[$selection]
+Write-Host "`n✅ Selected environment: $baseUrl"
+
+# --- Step 2: Prompt for credentials ---
 $credential = Get-Credential
 $username = $credential.UserName
 $pass = $credential.Password
@@ -62,7 +79,7 @@ $password = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
     [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($pass)
 )
 
-# --- Step 2: Get refresh token ---
+# --- Step 3: Get refresh token ---
 $refreshUrl = "https://$baseUrl/csp/gateway/am/api/login?access_token"
 $refreshBody = @{
     username = $username
@@ -84,7 +101,7 @@ try {
     return
 }
 
-# --- Step 3: Exchange refresh token for access token ---
+# --- Step 4: Exchange refresh token for access token ---
 $tokenUrl = "https://$baseUrl/iaas/api/login"
 $tokenBody = @{
     refreshToken = $refreshToken
@@ -100,8 +117,8 @@ try {
     return
 }
 
-# --- Step 4: List Cloud Accounts ---
-$cloudAccountsUrl = "https://$baseUrl/iaas/api/cloud-accounts"
+# --- Step 5: Pull all vSphere cloud accounts ---
+$cloudAccountsUrl = "https://$baseUrl/iaas/api/cloud-accounts-vsphere"
 $authHeaders = @{
     "Accept"        = "application/json"
     "Authorization" = "Bearer $accessToken"
@@ -109,32 +126,77 @@ $authHeaders = @{
 
 try {
     $cloudAccounts = Invoke-RestMethod -Uri $cloudAccountsUrl -Method Get -Headers $authHeaders
-    Write-Host "`nAvailable Cloud Accounts:"
-    $cloudAccounts.content | ForEach-Object {
-        Write-Host "ID: $($_.id) | Name: $($_.name) | Type: $($_.cloudAccountType)"
-    }
+    $vsphereAccounts = $cloudAccounts.content
 } catch {
-    Write-Host "❌ Failed to retrieve Cloud Accounts."
+    Write-Host "❌ Failed to retrieve vSphere Cloud Accounts."
     Write-Host "Error: $($_.Exception.Message)"
     return
 }
 
-# --- Step 5: Auto-retrieve certificate thumbprint ---
-Write-Host "`n--- Certificate Thumbprint Retrieval ---"
-try {
-    $thumbprint = Get-CertificateThumbprintSHA256 -Url "https://$baseUrl"
-    Write-Host "✅ Auto-retrieved SHA-256 thumbprint: $thumbprint"
-} catch {
-    Write-Host "⚠️  Auto-retrieval failed: $($_.Exception.Message)"
-    $thumbprint = Read-Host "Enter the certificate thumbprint manually"
+if (-not $vsphereAccounts -or $vsphereAccounts.Count -eq 0) {
+    Write-Host "❌ No vSphere Cloud Accounts found."
+    return
 }
 
-# --- Step 6: Patch selected Cloud Account ---
-$choice = Read-Host "`nDo you want to patch a Cloud Account with certificate thumbprint? (y/n)"
-if ($choice -eq "y") {
-    $cloudAccountId = Read-Host "Enter the Cloud Account ID"
+Write-Host "`nDiscovered vSphere Cloud Accounts:"
+Write-Host "-----------------------------------------"
+foreach ($account in $vsphereAccounts) {
+    $vcHost = $account.hostName
+    if (-not $vcHost) {
+        $vcHost = $account.customProperties.hostName
+    }
+    Write-Host "Name: $($account.name) | ID: $($account.id) | vCenter: $vcHost"
+}
+Write-Host "-----------------------------------------"
 
-    $patchUrl = "https://$baseUrl/iaas/api/cloud-accounts/$cloudAccountId"
+# --- Step 6: For each cloud account, fetch cert and patch ---
+Write-Host "`n========================================="
+Write-Host "Patching Cloud Accounts..."
+Write-Host "========================================="
+
+$patchHeaders = @{
+    "Accept"        = "application/json"
+    "Content-Type"  = "application/json"
+    "Authorization" = "Bearer $accessToken"
+}
+
+$successCount = 0
+$failCount = 0
+
+foreach ($account in $vsphereAccounts) {
+    $accountName = $account.name
+    $accountId = $account.id
+
+    # Extract the vCenter FQDN from the cloud account
+    $vcenterHost = $account.hostName
+    if (-not $vcenterHost) {
+        $vcenterHost = $account.customProperties.hostName
+    }
+
+    Write-Host "`n--- $accountName ---"
+    Write-Host "Cloud Account ID: $accountId"
+
+    if (-not $vcenterHost) {
+        Write-Host "⚠️  Could not determine vCenter hostname - skipping."
+        $failCount++
+        continue
+    }
+
+    Write-Host "vCenter: $vcenterHost"
+
+    # Retrieve thumbprint from the vCenter
+    try {
+        $thumbprint = Get-CertificateThumbprintSHA256 -Url "https://$vcenterHost"
+        Write-Host "✅ Thumbprint: $thumbprint"
+    } catch {
+        Write-Host "❌ Failed to retrieve certificate from $vcenterHost - skipping."
+        Write-Host "Error: $($_.Exception.Message)"
+        $failCount++
+        continue
+    }
+
+    # Patch the Cloud Account
+    $patchUrl = "https://$baseUrl/iaas/api/cloud-accounts/$accountId"
     $patchBody = @{
         customProperties = @{
             acceptSelfSignedCertificate = "true"
@@ -145,17 +207,17 @@ if ($choice -eq "y") {
         }
     } | ConvertTo-Json -Depth 3
 
-    $patchHeaders = @{
-        "Accept"        = "application/json"
-        "Content-Type"  = "application/json"
-        "Authorization" = "Bearer $accessToken"
-    }
-
     try {
         Invoke-RestMethod -Uri $patchUrl -Method Patch -Body $patchBody -Headers $patchHeaders
-        Write-Host "`n✅ Cloud Account patched successfully."
+        Write-Host "✅ Patched successfully."
+        $successCount++
     } catch {
-        Write-Host "❌ Failed to patch Cloud Account."
+        Write-Host "❌ Failed to patch."
         Write-Host "Error: $($_.Exception.Message)"
+        $failCount++
     }
 }
+
+Write-Host "`n========================================="
+Write-Host "Done. Success: $successCount | Failed: $failCount"
+Write-Host "========================================="
