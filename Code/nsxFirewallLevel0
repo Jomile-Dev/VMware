@@ -1,4 +1,506 @@
-# Connect to your NSX Manager if not already connected
+# ============================================================================
+# CONFIGURATION - Update these values for your environment
+# ============================================================================
+
+# NSX Manager
+$NSXManager       = "nsx-manager.company.com"
+
+# Authentication Mode: "Local" or "vIDM"
+#   Local = NSX local admin / basic auth via credential XML
+#   vIDM  = vIDM/Workspace ONE SSO - authenticates via /api/session/create
+$AuthMode          = "Local"
+
+# vIDM Domain - the AD domain shown in the vIDM login dropdown.
+# Only used when AuthMode = "vIDM".
+# Use the NETBIOS/short name as shown in the dropdown (e.g. "COMPANY")
+$vIDMDomain        = "COMPANY"
+
+# Credential XML - stores encrypted credentials tied to this user + machine.
+# To create the credential file for the first time, run:
+#   Get-Credential | Export-Clixml -Path "C:\Scripts\Creds\nsx_cred.xml"
+# The file can ONLY be decrypted by the same user on the same machine.
+# For vIDM: just enter your sAMAccountName (e.g. jsmith), NOT user@domain.
+$CredentialPath    = "C:\Scripts\Creds\nsx_cred.xml"
+
+# Output - set this to wherever you want the CSV saved
+$OutputFolder      = "C:\Scripts\Reports"
+if (-not (Test-Path $OutputFolder)) { New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null }
+$CSVFileName       = "NSX_DFW_FrontEnd_Audit_$(Get-Date -Format 'yyyy-MM-dd_HHmmss').csv"
+$CSVPath           = Join-Path $OutputFolder $CSVFileName
+
+# Email Configuration
+$SendEmail         = $true                          # Set to $false to disable email
+$EmailTo           = "admin@company.com"            # Recipient email
+$EmailFrom         = "vmware-reports@company.com"   # Sender email
+$EmailSubject      = "NSX DFW FrontEnd Policy Audit - $(Get-Date -Format 'yyyy-MM-dd')"
+$SMTPServer        = "mail.company.com"             # Your SMTP server
+$SMTPPort          = 465                             # SSL port (465 for SSL, 587 for TLS)
+$UseSSL            = $true                           # Use SSL encryption
+
+# Rule name filter - change this if your naming convention differs
+$RuleNameFilter    = "In-ANY-FrontEnd"
+
+# ============================================================================
+# SSL CERTIFICATE BYPASS (PowerShell 5.1 compatible)
+# Trusts all certs for this session - required for self-signed NSX certs.
+# ============================================================================
+if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
+    Add-Type @"
+        using System.Net;
+        using System.Security.Cryptography.X509Certificates;
+        public class TrustAllCertsPolicy : ICertificatePolicy {
+            public bool CheckValidationResult(
+                ServicePoint srvPoint, X509Certificate certificate,
+                WebRequest request, int certificateProblem) { return true; }
+        }
+"@
+}
+[System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+[System.Net.ServicePointManager]::SecurityProtocol  = [System.Net.SecurityProtocolType]::Tls12
+
+# ============================================================================
+# FUNCTIONS
+# ============================================================================
+
+function Import-NSXCredential {
+    param(
+        [string]$Path
+    )
+
+    if (-not (Test-Path $Path)) {
+        Write-Host "[INFO] Credential file not found at: $Path" -ForegroundColor Yellow
+        Write-Host "       Creating new credential file. You will be prompted for credentials." -ForegroundColor Yellow
+
+        # Ensure the directory exists
+        $credDir = Split-Path $Path -Parent
+        if (-not (Test-Path $credDir)) {
+            New-Item -ItemType Directory -Path $credDir -Force | Out-Null
+        }
+
+        $cred = Get-Credential -Message "Enter NSX Manager credentials (local admin or vIDM user)"
+        $cred | Export-Clixml -Path $Path
+        Write-Host "[OK] Credentials saved to: $Path" -ForegroundColor Green
+        Write-Host "     (Encrypted - only $($env:USERNAME) on $($env:COMPUTERNAME) can decrypt)" -ForegroundColor Gray
+        return $cred
+    }
+
+    try {
+        $cred = Import-Clixml -Path $Path
+        Write-Host "[OK] Credentials imported from: $Path" -ForegroundColor Green
+        return $cred
+    }
+    catch {
+        Write-Error "Failed to import credentials from $Path. Was it created by a different user or machine? $_"
+        throw
+    }
+}
+
+
+function Connect-NSXManager {
+    param(
+        [string]$Server,
+        [PSCredential]$Credential,
+        [ValidateSet("Local","vIDM")]
+        [string]$AuthMode = "Local"
+    )
+
+    $headers = @{
+        "Content-Type"  = "application/json"
+        "Accept"        = "application/json"
+    }
+
+    if ($AuthMode -eq "Local") {
+        # --- Local / Basic Auth ---
+        $pair   = "{0}:{1}" -f $Credential.UserName, $Credential.GetNetworkCredential().Password
+        $bytes  = [System.Text.Encoding]::ASCII.GetBytes($pair)
+        $base64 = [System.Convert]::ToBase64String($bytes)
+        $headers["Authorization"] = "Basic $base64"
+
+        Write-Host "[INFO] Authenticating to NSX Manager (Local/Basic)..." -ForegroundColor Cyan
+    }
+    else {
+        # --- vIDM / Session Auth ---
+        # NSX uses /api/session/create which returns a JSESSIONID cookie and
+        # X-XSRF-TOKEN header. Subsequent calls must include both.
+        # The username is built as: sAMAccountName@vIDMDomain (from config).
+        Write-Host "[INFO] Authenticating to NSX Manager via vIDM session..." -ForegroundColor Cyan
+
+        $sessionUri  = "https://${Server}/api/session/create"
+        $rawUser     = $Credential.UserName
+        $password    = $Credential.GetNetworkCredential().Password
+
+        # Strip any domain info from the credential to get the bare sAMAccountName.
+        # Handles: DOMAIN\user, user@whatever.com, or just user
+        if ($rawUser -match '^(.+)\\(.+)$') {
+            $samName = $Matches[2]
+        }
+        elseif ($rawUser -match '^([^@]+)@') {
+            $samName = $Matches[1]
+        }
+        else {
+            $samName = $rawUser
+        }
+
+        # Try multiple username formats - different vIDM configs expect different things
+        $usernamesToTry = @(
+            $samName                             # just sAMAccountName (most common for vIDM)
+            "${samName}@${vIDMDomain}"            # user@COMPANY
+            "${vIDMDomain}\${samName}"            # COMPANY\user
+        )
+
+        $authenticated = $false
+        foreach ($username in $usernamesToTry) {
+            Write-Host "[INFO] Trying: $username" -ForegroundColor Cyan
+
+            $body = "j_username=$([uri]::EscapeDataString($username))&j_password=$([uri]::EscapeDataString($password))"
+
+            try {
+                $sessionResponse = Invoke-WebRequest -Uri $sessionUri `
+                    -Method Post `
+                    -ContentType "application/x-www-form-urlencoded" `
+                    -Body $body `
+                    -SessionVariable "nsxSession" `
+                    -ErrorAction Stop
+
+                # Extract the XSRF token from the response header
+                $xsrfToken = $sessionResponse.Headers["X-XSRF-TOKEN"]
+
+                if (-not $xsrfToken) {
+                    Write-Host "[WARN] No X-XSRF-TOKEN returned for '$username', trying next format..." -ForegroundColor Yellow
+                    continue
+                }
+
+                $headers["X-XSRF-TOKEN"] = $xsrfToken
+                $script:NSXWebSession = $nsxSession
+                $authenticated = $true
+
+                Write-Host "[OK] vIDM session established with: $username" -ForegroundColor Green
+                break
+            }
+            catch {
+                Write-Host "[FAIL] '$username' - $($_.Exception.Message)" -ForegroundColor DarkYellow
+                continue
+            }
+        }
+
+        if (-not $authenticated) {
+            Write-Host ""
+            Write-Host "============================================================" -ForegroundColor Red
+            Write-Host " vIDM SESSION AUTH FAILED - ALL FORMATS REJECTED" -ForegroundColor Red
+            Write-Host "============================================================" -ForegroundColor Red
+            Write-Host "  NSX Manager : $Server" -ForegroundColor Yellow
+            Write-Host "  vIDM Domain : $vIDMDomain" -ForegroundColor Yellow
+            Write-Host "  Formats tried:" -ForegroundColor Yellow
+            foreach ($u in $usernamesToTry) {
+                Write-Host "    - $u" -ForegroundColor Gray
+            }
+            Write-Host ""
+            Write-Host "Common fixes:" -ForegroundColor Yellow
+            Write-Host "  1. Verify you can log into NSX via browser with 'Sign in with vIDM'" -ForegroundColor Yellow
+            Write-Host "     using the same username and password" -ForegroundColor Yellow
+            Write-Host "  2. Check `$vIDMDomain matches the domain in the vIDM dropdown" -ForegroundColor Yellow
+            Write-Host "     (try FQDN like company.local OR short name like COMPANY)" -ForegroundColor Yellow
+            Write-Host "  3. Re-create credential file with just your sAMAccountName:" -ForegroundColor Yellow
+            Write-Host "       Get-Credential | Export-Clixml -Path '$CredentialPath'" -ForegroundColor Yellow
+            Write-Host "  4. Check NSX: System > Identity & Access > vIDM is active" -ForegroundColor Yellow
+            Write-Host "============================================================" -ForegroundColor Red
+            throw "vIDM authentication failed. See diagnostic output above."
+        }
+    }
+
+    # --- Test connectivity regardless of auth mode ---
+    $testUri = "https://${Server}/policy/api/v1/infra"
+    try {
+        $null = Invoke-NSXRestMethod -Uri $testUri -Headers $headers
+        Write-Host "[OK] Connected to NSX Manager: $Server (Auth: $AuthMode)" -ForegroundColor Green
+    }
+    catch {
+        Write-Error "Authentication succeeded but API test failed on $Server. $_"
+        throw
+    }
+
+    return $headers
+}
+
+
+function Invoke-NSXRestMethod {
+    param(
+        [string]$Uri,
+        [hashtable]$Headers,
+        [string]$Method = "Get"
+    )
+
+    $params = @{
+        Uri                  = $Uri
+        Headers              = $Headers
+        Method               = $Method
+        ErrorAction          = "Stop"
+    }
+
+    if ($script:NSXWebSession) {
+        $params["WebSession"] = $script:NSXWebSession
+    }
+
+    return (Invoke-RestMethod @params)
+}
+
+
+function Get-DFWPolicies {
+    param(
+        [string]$Server,
+        [hashtable]$Headers
+    )
+
+    $uri      = "https://${Server}/policy/api/v1/infra/domains/default/security-policies"
+    $policies = @()
+    $cursor   = $null
+
+    do {
+        $requestUri = if ($cursor) { "${uri}?cursor=${cursor}" } else { $uri }
+        $response   = Invoke-NSXRestMethod -Uri $requestUri -Headers $Headers
+
+        if ($response.results) {
+            $policies += $response.results
+        }
+
+        $cursor = $response.cursor
+    } while ($cursor)
+
+    Write-Host "[OK] Retrieved $($policies.Count) DFW security policies" -ForegroundColor Green
+    return $policies
+}
+
+
+function Get-DFWRules {
+    param(
+        [string]$Server,
+        [hashtable]$Headers,
+        [string]$PolicyId
+    )
+
+    $uri   = "https://${Server}/policy/api/v1/infra/domains/default/security-policies/${PolicyId}/rules"
+    $rules = @()
+    $cursor = $null
+
+    do {
+        $requestUri = if ($cursor) { "${uri}?cursor=${cursor}" } else { $uri }
+        $response   = Invoke-NSXRestMethod -Uri $requestUri -Headers $Headers
+
+        if ($response.results) {
+            $rules += $response.results
+        }
+
+        $cursor = $response.cursor
+    } while ($cursor)
+
+    return $rules
+}
+
+
+function Resolve-ServiceName {
+    param(
+        [string]$Server,
+        [hashtable]$Headers,
+        [string]$ServicePath
+    )
+
+    # "ANY" is represented by the absence of service entries or the path "/infra/services/ANY"
+    if ([string]::IsNullOrWhiteSpace($ServicePath) -or $ServicePath -eq "ANY") {
+        return "ANY"
+    }
+
+    # Use script-scoped cache
+    if (-not $script:ServiceCache) {
+        $script:ServiceCache = @{}
+    }
+
+    if ($script:ServiceCache.ContainsKey($ServicePath)) {
+        return $script:ServiceCache[$ServicePath]
+    }
+
+    try {
+        $uri     = "https://${Server}/policy/api/v1${ServicePath}"
+        $svc     = Invoke-NSXRestMethod -Uri $uri -Headers $Headers
+        $name    = $svc.display_name
+        $script:ServiceCache[$ServicePath] = $name
+        return $name
+    }
+    catch {
+        # If lookup fails, return the raw path as a fallback
+        $script:ServiceCache[$ServicePath] = $ServicePath
+        return $ServicePath
+    }
+}
+
+
+function Classify-Rule {
+    # Classifies a DFW rule into audit categories:
+    #   1. Action=Drop  + Services != ANY  -> "Investigate Further"
+    #   2. Action=Allow + Services = ANY   -> "Level 0 Firewall"
+    #   3. Action=Allow + Services present -> "Level 1"
+    param(
+        [string]$Action,
+        [string[]]$ServiceNames
+    )
+
+    $hasOnlyAny = ($ServiceNames.Count -eq 0) -or
+                  ($ServiceNames.Count -eq 1 -and $ServiceNames[0] -eq "ANY")
+
+    if ($Action -eq "DROP" -and -not $hasOnlyAny) {
+        return "Investigate Further"
+    }
+    elseif ($Action -eq "ALLOW" -and $hasOnlyAny) {
+        return "Level 0 Firewall"
+    }
+    elseif ($Action -eq "ALLOW" -and -not $hasOnlyAny) {
+        return "Level 1"
+    }
+    else {
+        return "Level 1"
+    }
+}
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host " NSX Distributed Firewall - FrontEnd Policy Audit"           -ForegroundColor Cyan
+Write-Host " $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"                 -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host ""
+
+# --- Import Credentials ---
+$NSXCredential = Import-NSXCredential -Path $CredentialPath
+
+# --- Connect ---
+$script:NSXWebSession = $null
+$Headers = Connect-NSXManager -Server $NSXManager -Credential $NSXCredential -AuthMode $AuthMode
+
+# --- Pull Policies & Rules ---
+$allPolicies = Get-DFWPolicies -Server $NSXManager -Headers $Headers
+$auditResults = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+$script:ServiceCache = @{}
+$ruleCount = 0
+
+foreach ($policy in $allPolicies) {
+    $rules = Get-DFWRules -Server $NSXManager -Headers $Headers -PolicyId $policy.id
+
+    foreach ($rule in $rules) {
+        # Only process rules matching our naming convention
+        if ($rule.display_name -notlike "*${RuleNameFilter}*") {
+            continue
+        }
+
+        $ruleCount++
+
+        # Resolve service paths to display names
+        $serviceEntries = $rule.services
+        $serviceNames   = @()
+
+        if (-not $serviceEntries -or $serviceEntries.Count -eq 0 -or $serviceEntries -contains "ANY") {
+            $serviceNames = @("ANY")
+        }
+        else {
+            foreach ($svcPath in $serviceEntries) {
+                $serviceNames += Resolve-ServiceName -Server $NSXManager -Headers $Headers -ServicePath $svcPath
+            }
+        }
+
+        $serviceDisplay = ($serviceNames | Sort-Object) -join "; "
+        $action         = $rule.action.ToUpper()
+        $classification = Classify-Rule -Action $action -ServiceNames $serviceNames
+
+        $auditResults.Add([PSCustomObject]@{
+            PolicyName      = $policy.display_name
+            PolicyId        = $policy.id
+            RuleName        = $rule.display_name
+            RuleId          = $rule.id
+            Action          = $action
+            Services        = $serviceDisplay
+            Classification  = $classification
+            SourceGroups    = ($rule.source_groups    -join "; ")
+            DestGroups      = ($rule.destination_groups -join "; ")
+            Scope           = ($rule.scope             -join "; ")
+            Disabled        = $rule.disabled
+            SequenceNumber  = $rule.sequence_number
+        })
+    }
+}
+
+Write-Host ""
+Write-Host "[OK] Found $ruleCount '$RuleNameFilter' rules across $($allPolicies.Count) policies" -ForegroundColor Green
+
+# --- Summary ---
+$investigate = ($auditResults | Where-Object Classification -eq "Investigate Further").Count
+$level0      = ($auditResults | Where-Object Classification -eq "Level 0 Firewall").Count
+$level1      = ($auditResults | Where-Object Classification -eq "Level 1").Count
+
+Write-Host ""
+Write-Host "--- Classification Summary ---" -ForegroundColor Yellow
+Write-Host "  Investigate Further : $investigate  (Drop rule + specific services)" -ForegroundColor Red
+Write-Host "  Level 0 Firewall    : $level0  (Action Allow + Any services)" -ForegroundColor DarkYellow
+Write-Host "  Level 1             : $level1  (Action Allow + specific services)" -ForegroundColor Green
+Write-Host ""
+
+# --- Export CSV ---
+if ($auditResults.Count -gt 0) {
+    $auditResults | Export-Csv -Path $CSVPath -NoTypeInformation -Encoding UTF8
+    Write-Host "[OK] CSV exported to: $CSVPath" -ForegroundColor Green
+}
+else {
+    Write-Host "[WARN] No matching rules found. CSV not created." -ForegroundColor Yellow
+}
+
+# --- Send Email ---
+if ($SendEmail -and $auditResults.Count -gt 0) {
+    Write-Host ""
+    Write-Host "Sending email report..." -ForegroundColor Cyan
+
+    $body = @"
+NSX Distributed Firewall - FrontEnd Policy Audit
+Report Date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+NSX Manager: $NSXManager
+
+Classification Summary (rules matching '$RuleNameFilter'):
+  - Investigate Further : $investigate  (Drop rule + specific services)
+  - Level 0 Firewall    : $level0  (Action Allow + Any services)
+  - Level 1             : $level1  (Action Allow + specific services)
+
+Total '$RuleNameFilter' rules: $ruleCount
+
+The full audit detail is attached as a CSV file.
+"@
+
+    $mailParams = @{
+        To          = $EmailTo
+        From        = $EmailFrom
+        Subject     = $EmailSubject
+        Body        = $body
+        SmtpServer  = $SMTPServer
+        Port        = $SMTPPort
+        Attachments = $CSVPath
+    }
+
+    if ($UseSSL) { $mailParams.UseSsl = $true }
+
+    try {
+        Send-MailMessage @mailParams -ErrorAction Stop
+        Write-Host "[OK] Email sent to $EmailTo" -ForegroundColor Green
+    }
+    catch {
+        Write-Warning "Failed to send email: $_"
+        Write-Host "The CSV has still been saved locally at: $CSVPath" -ForegroundColor Yellow
+    }
+}
+elseif (-not $SendEmail) {
+    Write-Host "[INFO] Email sending is disabled. Set `$SendEmail = `$true to enable." -ForegroundColor Gray
+}
+
+Write-Host ""
+Write-Host "Audit complete." -ForegroundColor Cyan# Connect to your NSX Manager if not already connected
 # Connect-NsxtServer -Server <NSX-Mgr-IP>
 
 $targetRuleName = "In-Any-FRONTEND"
