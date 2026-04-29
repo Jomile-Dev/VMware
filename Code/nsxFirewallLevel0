@@ -1,0 +1,362 @@
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    NSX-T Distributed Firewall Policy Audit Report
+.DESCRIPTION
+    Connects to NSX Manager, pulls all DFW policies and rules under
+    Security > Policy Management > Distributed Firewall, classifies each
+    "In-ANY-FrontEnd" rule into one of three categories, exports to CSV,
+    and optionally emails the report.
+
+    Categories:
+      - "Investigate Further"  : Action=Drop  + Services != "ANY"
+      - "Level 0 Firewall"    : Action=Allow + Services = "ANY" (no specific services)
+      - "Good, Level 1"       : Action=Allow + Services has specific entries
+
+.NOTES
+    Requires network access to NSX Manager API (Policy API).
+    Tested against NSX-T 3.x / 4.x and NSX in VCF 5.x.
+#>
+
+# ============================================================================
+# CONFIGURATION — Update these values for your environment
+# ============================================================================
+
+# NSX Manager
+$NSXManager       = "nsx-manager.company.com"
+$NSXUsername       = "admin"
+$NSXPassword       = "YourPasswordHere"           # Or use Get-Credential below
+
+# Output
+$OutputFolder      = $PSScriptRoot                 # Same folder as this script
+$CSVFileName       = "NSX_DFW_FrontEnd_Audit_$(Get-Date -Format 'yyyy-MM-dd_HHmmss').csv"
+$CSVPath           = Join-Path $OutputFolder $CSVFileName
+
+# Email Configuration
+$SendEmail         = $true                          # Set to $false to disable email
+$EmailTo           = "admin@company.com"            # Recipient email
+$EmailFrom         = "vmware-reports@company.com"   # Sender email
+$EmailSubject      = "NSX DFW FrontEnd Policy Audit - $(Get-Date -Format 'yyyy-MM-dd')"
+$SMTPServer        = "mail.company.com"             # Your SMTP server
+$SMTPPort          = 465                             # SSL port (465 for SSL, 587 for TLS)
+$UseSSL            = $true                           # Use SSL encryption
+$SMTPCredentials   = $null                           # Set to (Get-Credential) if auth required
+
+# Rule name filter — change this if your naming convention differs
+$RuleNameFilter    = "In-ANY-FrontEnd"
+
+# ============================================================================
+# FUNCTIONS
+# ============================================================================
+
+function Connect-NSXManager {
+    <#
+    .SYNOPSIS
+        Creates a base64 auth header and tests connectivity to NSX Manager.
+    #>
+    param(
+        [string]$Server,
+        [string]$Username,
+        [string]$Password
+    )
+
+    $pair      = "${Username}:${Password}"
+    $bytes     = [System.Text.Encoding]::ASCII.GetBytes($pair)
+    $base64    = [System.Convert]::ToBase64String($bytes)
+
+    $headers = @{
+        "Authorization" = "Basic $base64"
+        "Content-Type"  = "application/json"
+        "Accept"        = "application/json"
+    }
+
+    # Test connectivity
+    $uri = "https://${Server}/policy/api/v1/infra"
+    try {
+        $null = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -SkipCertificateCheck -ErrorAction Stop
+        Write-Host "[OK] Connected to NSX Manager: $Server" -ForegroundColor Green
+    }
+    catch {
+        Write-Error "Failed to connect to NSX Manager at $Server. $_"
+        throw
+    }
+
+    return $headers
+}
+
+
+function Get-DFWPolicies {
+    <#
+    .SYNOPSIS
+        Retrieves all DFW security policies from the NSX Policy API.
+    #>
+    param(
+        [string]$Server,
+        [hashtable]$Headers
+    )
+
+    $uri      = "https://${Server}/policy/api/v1/infra/domains/default/security-policies"
+    $policies = @()
+    $cursor   = $null
+
+    do {
+        $requestUri = if ($cursor) { "${uri}?cursor=${cursor}" } else { $uri }
+        $response   = Invoke-RestMethod -Uri $requestUri -Headers $Headers -Method Get -SkipCertificateCheck
+
+        if ($response.results) {
+            $policies += $response.results
+        }
+
+        $cursor = $response.cursor
+    } while ($cursor)
+
+    Write-Host "[OK] Retrieved $($policies.Count) DFW security policies" -ForegroundColor Green
+    return $policies
+}
+
+
+function Get-DFWRules {
+    <#
+    .SYNOPSIS
+        Retrieves all rules for a given security policy.
+    #>
+    param(
+        [string]$Server,
+        [hashtable]$Headers,
+        [string]$PolicyId
+    )
+
+    $uri   = "https://${Server}/policy/api/v1/infra/domains/default/security-policies/${PolicyId}/rules"
+    $rules = @()
+    $cursor = $null
+
+    do {
+        $requestUri = if ($cursor) { "${uri}?cursor=${cursor}" } else { $uri }
+        $response   = Invoke-RestMethod -Uri $requestUri -Headers $Headers -Method Get -SkipCertificateCheck
+
+        if ($response.results) {
+            $rules += $response.results
+        }
+
+        $cursor = $response.cursor
+    } while ($cursor)
+
+    return $rules
+}
+
+
+function Resolve-ServiceName {
+    <#
+    .SYNOPSIS
+        Resolves an NSX service path to its display name.
+        Caches results to avoid duplicate API calls.
+    #>
+    param(
+        [string]$Server,
+        [hashtable]$Headers,
+        [string]$ServicePath
+    )
+
+    # "ANY" is represented by the absence of service entries or the path "/infra/services/ANY"
+    if ([string]::IsNullOrWhiteSpace($ServicePath) -or $ServicePath -eq "ANY") {
+        return "ANY"
+    }
+
+    # Use script-scoped cache
+    if (-not $script:ServiceCache) {
+        $script:ServiceCache = @{}
+    }
+
+    if ($script:ServiceCache.ContainsKey($ServicePath)) {
+        return $script:ServiceCache[$ServicePath]
+    }
+
+    try {
+        $uri     = "https://${Server}/policy/api/v1${ServicePath}"
+        $svc     = Invoke-RestMethod -Uri $uri -Headers $Headers -Method Get -SkipCertificateCheck
+        $name    = $svc.display_name
+        $script:ServiceCache[$ServicePath] = $name
+        return $name
+    }
+    catch {
+        # If lookup fails, return the raw path as a fallback
+        $script:ServiceCache[$ServicePath] = $ServicePath
+        return $ServicePath
+    }
+}
+
+
+function Classify-Rule {
+    <#
+    .SYNOPSIS
+        Classifies a DFW rule into one of three audit categories.
+
+        1. Action=Drop  + Services != ANY   → "Investigate Further"
+        2. Action=Allow + Services = ANY    → "Level 0 Firewall"
+        3. Action=Allow + Services present  → "Good, Level 1"
+    #>
+    param(
+        [string]$Action,
+        [string[]]$ServiceNames
+    )
+
+    $hasOnlyAny = ($ServiceNames.Count -eq 0) -or
+                  ($ServiceNames.Count -eq 1 -and $ServiceNames[0] -eq "ANY")
+
+    if ($Action -eq "DROP" -and -not $hasOnlyAny) {
+        return "Investigate Further"
+    }
+    elseif ($Action -eq "ALLOW" -and $hasOnlyAny) {
+        return "Level 0 Firewall"
+    }
+    elseif ($Action -eq "ALLOW" -and -not $hasOnlyAny) {
+        return "Good, Level 1"
+    }
+    else {
+        return "Uncategorized"
+    }
+}
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host " NSX Distributed Firewall — FrontEnd Policy Audit"           -ForegroundColor Cyan
+Write-Host " $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"                 -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host ""
+
+# --- Connect ---
+$Headers = Connect-NSXManager -Server $NSXManager -Username $NSXUsername -Password $NSXPassword
+
+# --- Pull Policies & Rules ---
+$allPolicies = Get-DFWPolicies -Server $NSXManager -Headers $Headers
+$auditResults = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+$script:ServiceCache = @{}
+$ruleCount = 0
+
+foreach ($policy in $allPolicies) {
+    $rules = Get-DFWRules -Server $NSXManager -Headers $Headers -PolicyId $policy.id
+
+    foreach ($rule in $rules) {
+        # Filter to only rules matching our naming convention
+        if ($rule.display_name -notlike "*${RuleNameFilter}*") {
+            continue
+        }
+
+        $ruleCount++
+
+        # Resolve service paths to display names
+        $serviceEntries = $rule.services
+        $serviceNames   = @()
+
+        if (-not $serviceEntries -or $serviceEntries.Count -eq 0 -or $serviceEntries -contains "ANY") {
+            $serviceNames = @("ANY")
+        }
+        else {
+            foreach ($svcPath in $serviceEntries) {
+                $serviceNames += Resolve-ServiceName -Server $NSXManager -Headers $Headers -ServicePath $svcPath
+            }
+        }
+
+        $serviceDisplay = ($serviceNames | Sort-Object) -join "; "
+        $action         = $rule.action.ToUpper()
+        $classification = Classify-Rule -Action $action -ServiceNames $serviceNames
+
+        $auditResults.Add([PSCustomObject]@{
+            PolicyName      = $policy.display_name
+            PolicyId        = $policy.id
+            RuleName        = $rule.display_name
+            RuleId          = $rule.id
+            Action          = $action
+            Services        = $serviceDisplay
+            Classification  = $classification
+            SourceGroups    = ($rule.source_groups    -join "; ")
+            DestGroups      = ($rule.destination_groups -join "; ")
+            Scope           = ($rule.scope             -join "; ")
+            Disabled        = $rule.disabled
+            SequenceNumber  = $rule.sequence_number
+        })
+    }
+}
+
+Write-Host ""
+Write-Host "[OK] Found $ruleCount matching '$RuleNameFilter' rules across $($allPolicies.Count) policies" -ForegroundColor Green
+
+# --- Summary ---
+$investigate = ($auditResults | Where-Object Classification -eq "Investigate Further").Count
+$level0      = ($auditResults | Where-Object Classification -eq "Level 0 Firewall").Count
+$level1      = ($auditResults | Where-Object Classification -eq "Good, Level 1").Count
+$uncat       = ($auditResults | Where-Object Classification -eq "Uncategorized").Count
+
+Write-Host ""
+Write-Host "--- Classification Summary ---" -ForegroundColor Yellow
+Write-Host "  Investigate Further : $investigate" -ForegroundColor Red
+Write-Host "  Level 0 Firewall    : $level0"      -ForegroundColor DarkYellow
+Write-Host "  Good, Level 1       : $level1"       -ForegroundColor Green
+if ($uncat -gt 0) {
+    Write-Host "  Uncategorized       : $uncat"    -ForegroundColor Gray
+}
+Write-Host ""
+
+# --- Export CSV ---
+if ($auditResults.Count -gt 0) {
+    $auditResults | Export-Csv -Path $CSVPath -NoTypeInformation -Encoding UTF8
+    Write-Host "[OK] CSV exported to: $CSVPath" -ForegroundColor Green
+}
+else {
+    Write-Host "[WARN] No matching rules found. CSV not created." -ForegroundColor Yellow
+}
+
+# --- Send Email ---
+if ($SendEmail -and $auditResults.Count -gt 0) {
+    Write-Host ""
+    Write-Host "Sending email report..." -ForegroundColor Cyan
+
+    $body = @"
+NSX Distributed Firewall — FrontEnd Policy Audit
+Report Date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+NSX Manager: $NSXManager
+
+Classification Summary:
+  - Investigate Further : $investigate  (Drop + specific services — review these)
+  - Level 0 Firewall    : $level0  (Allow + ANY services — broad allow rules)
+  - Good, Level 1       : $level1  (Allow + specific services — properly scoped)
+$(if ($uncat -gt 0) { "  - Uncategorized       : $uncat" })
+
+Total matching rules: $($auditResults.Count)
+
+The full audit detail is attached as a CSV file.
+"@
+
+    $mailParams = @{
+        To          = $EmailTo
+        From        = $EmailFrom
+        Subject     = $EmailSubject
+        Body        = $body
+        SmtpServer  = $SMTPServer
+        Port        = $SMTPPort
+        Attachments = $CSVPath
+    }
+
+    if ($UseSSL)            { $mailParams.UseSsl    = $true }
+    if ($SMTPCredentials)   { $mailParams.Credential = $SMTPCredentials }
+
+    try {
+        Send-MailMessage @mailParams -ErrorAction Stop
+        Write-Host "[OK] Email sent to $EmailTo" -ForegroundColor Green
+    }
+    catch {
+        Write-Warning "Failed to send email: $_"
+        Write-Host "The CSV has still been saved locally at: $CSVPath" -ForegroundColor Yellow
+    }
+}
+elseif (-not $SendEmail) {
+    Write-Host "[INFO] Email sending is disabled. Set `$SendEmail = `$true to enable." -ForegroundColor Gray
+}
+
+Write-Host ""
+Write-Host "Audit complete." -ForegroundColor Cyan
