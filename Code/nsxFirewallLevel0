@@ -338,6 +338,7 @@ function Classify-Rule {
     #   1. Action=Drop  + Services != ANY  -> "Investigate Further"
     #   2. Action=Allow + Services = ANY   -> "Level 0 Firewall"
     #   3. Action=Allow + Services present -> "Level 1"
+    #   4. Everything else                 -> "Completed Apps"
     param(
         [string]$Action,
         [string[]]$ServiceNames
@@ -356,7 +357,7 @@ function Classify-Rule {
         return "Level 1"
     }
     else {
-        return "Level 1"
+        return "Completed Apps"
     }
 }
 
@@ -437,12 +438,14 @@ Write-Host "[OK] Found $ruleCount '$RuleNameFilter' rules across $($allPolicies.
 $investigate = ($auditResults | Where-Object Classification -eq "Investigate Further").Count
 $level0      = ($auditResults | Where-Object Classification -eq "Level 0 Firewall").Count
 $level1      = ($auditResults | Where-Object Classification -eq "Level 1").Count
+$completed   = ($auditResults | Where-Object Classification -eq "Completed Apps").Count
 
 Write-Host ""
 Write-Host "--- Classification Summary ---" -ForegroundColor Yellow
 Write-Host "  Investigate Further : $investigate  (Drop rule + specific services)" -ForegroundColor Red
 Write-Host "  Level 0 Firewall    : $level0  (Action Allow + Any services)" -ForegroundColor DarkYellow
 Write-Host "  Level 1             : $level1  (Action Allow + specific services)" -ForegroundColor Green
+Write-Host "  Completed Apps      : $completed" -ForegroundColor Cyan
 Write-Host ""
 
 # --- Export CSV ---
@@ -468,6 +471,7 @@ Classification Summary (rules matching '$RuleNameFilter'):
   - Investigate Further : $investigate  (Drop rule + specific services)
   - Level 0 Firewall    : $level0  (Action Allow + Any services)
   - Level 1             : $level1  (Action Allow + specific services)
+  - Completed Apps      : $completed
 
 Total '$RuleNameFilter' rules: $ruleCount
 
