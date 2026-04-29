@@ -17,8 +17,8 @@ $AuthMode          = "Local"
 # The file can ONLY be decrypted by the same user on the same machine.
 $CredentialPath    = "C:\Scripts\Creds\nsx_cred.xml"
 
-# Output — falls back to C:\Temp if running unsaved (e.g. pasted into ISE)
-$OutputFolder      = if ($PSScriptRoot) { $PSScriptRoot } else { "C:\Temp" }
+# Output — set this to wherever you want the CSV saved
+$OutputFolder      = "C:\Scripts\Reports"
 if (-not (Test-Path $OutputFolder)) { New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null }
 $CSVFileName       = "NSX_DFW_FrontEnd_Audit_$(Get-Date -Format 'yyyy-MM-dd_HHmmss').csv"
 $CSVPath           = Join-Path $OutputFolder $CSVFileName
@@ -31,7 +31,6 @@ $EmailSubject      = "NSX DFW FrontEnd Policy Audit - $(Get-Date -Format 'yyyy-M
 $SMTPServer        = "mail.company.com"             # Your SMTP server
 $SMTPPort          = 465                             # SSL port (465 for SSL, 587 for TLS)
 $UseSSL            = $true                           # Use SSL encryption
-$SMTPCredentials   = $null                           # Set to (Get-Credential) if auth required
 
 # Rule name filter — change this if your naming convention differs
 $RuleNameFilter    = "In-ANY-FrontEnd"
@@ -186,7 +185,6 @@ function Connect-NSXManager {
             Write-Host "  3. Verify the account can log into NSX via browser ('Sign in with vIDM')" -ForegroundColor Yellow
             Write-Host "  4. Check that vIDM integration is active in NSX: System > Identity & Access > vIDM" -ForegroundColor Yellow
             throw
-        }
         }
     }
 
@@ -471,8 +469,7 @@ The full audit detail is attached as a CSV file.
         Attachments = $CSVPath
     }
 
-    if ($UseSSL)            { $mailParams.UseSsl    = $true }
-    if ($SMTPCredentials)   { $mailParams.Credential = $SMTPCredentials }
+    if ($UseSSL) { $mailParams.UseSsl = $true }
 
     try {
         Send-MailMessage @mailParams -ErrorAction Stop
