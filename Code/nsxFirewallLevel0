@@ -8,13 +8,19 @@ $NSXManager       = "nsx-manager.company.com"
 # Authentication Mode: "Local" or "vIDM"
 #   Local = NSX local admin / basic auth via credential XML
 #   vIDM  = vIDM/Workspace ONE SSO — authenticates via /api/session/create
-#           using the vIDM-backed user (e.g. user@corp.local)
 $AuthMode          = "Local"
+
+# vIDM Domain — the AD domain shown in the vIDM login dropdown.
+# Only used when AuthMode = "vIDM". The script sends: sAMAccountName@vIDMDomain
+# This should match exactly what appears in the vIDM domain dropdown,
+# NOT necessarily the user's UPN suffix or NETBIOS domain.
+$vIDMDomain        = "company.local"
 
 # Credential XML — stores encrypted credentials tied to this user + machine.
 # To create the credential file for the first time, run:
 #   Get-Credential | Export-Clixml -Path "C:\Scripts\Creds\nsx_cred.xml"
 # The file can ONLY be decrypted by the same user on the same machine.
+# For vIDM: just enter your sAMAccountName (e.g. jsmith), NOT user@domain.
 $CredentialPath    = "C:\Scripts\Creds\nsx_cred.xml"
 
 # Output — set this to wherever you want the CSV saved
@@ -117,37 +123,29 @@ function Connect-NSXManager {
         # --- vIDM / Session Auth ---
         # NSX uses /api/session/create which returns a JSESSIONID cookie and
         # X-XSRF-TOKEN header. Subsequent calls must include both.
-        #
-        # IMPORTANT: vIDM requires the username in user@domain format (UPN).
-        #   - If your credential was saved as DOMAIN\user, we convert it automatically.
-        #   - If it was saved as just "user" with no domain, you need to re-create
-        #     the credential XML with the full user@domain.local format:
-        #       Get-Credential | Export-Clixml -Path "C:\Scripts\Creds\nsx_cred.xml"
-        #     When prompted, enter: user@domain.local
+        # The username is built as: sAMAccountName@vIDMDomain (from config).
         Write-Host "[INFO] Authenticating to NSX Manager via vIDM session..." -ForegroundColor Cyan
 
         $sessionUri  = "https://${Server}/api/session/create"
         $rawUser     = $Credential.UserName
         $password    = $Credential.GetNetworkCredential().Password
 
-        # Convert DOMAIN\user to user@domain if needed
+        # Strip any domain info from the credential to get the bare sAMAccountName.
+        # Handles: DOMAIN\user, user@whatever.com, or just user
         if ($rawUser -match '^(.+)\\(.+)$') {
-            $domain   = $Matches[1]
-            $samName  = $Matches[2]
-            $username = "${samName}@${domain}"
-            Write-Host "[INFO] Converted DOMAIN\user format to: $username" -ForegroundColor Yellow
+            $samName = $Matches[2]
+        }
+        elseif ($rawUser -match '^([^@]+)@') {
+            $samName = $Matches[1]
         }
         else {
-            $username = $rawUser
+            $samName = $rawUser
         }
+
+        # Build the username using the vIDM domain from config
+        $username = "${samName}@${vIDMDomain}"
 
         Write-Host "[INFO] Authenticating as: $username" -ForegroundColor Cyan
-
-        # Warn if username has no @ — vIDM will almost certainly reject it
-        if ($username -notlike "*@*") {
-            Write-Warning "Username '$username' has no domain suffix. vIDM typically requires user@domain.local format."
-            Write-Warning "If auth fails, re-create credentials: Get-Credential | Export-Clixml -Path '$CredentialPath'"
-        }
 
         # The session endpoint expects form-encoded body
         $body = "j_username=$([uri]::EscapeDataString($username))&j_password=$([uri]::EscapeDataString($password))"
