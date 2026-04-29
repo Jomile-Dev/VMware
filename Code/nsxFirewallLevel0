@@ -36,15 +36,28 @@ $SMTPCredentials   = $null                           # Set to (Get-Credential) i
 $RuleNameFilter    = "In-ANY-FrontEnd"
 
 # ============================================================================
+# SSL CERTIFICATE BYPASS (PowerShell 5.1 compatible)
+# Trusts all certs for this session — required for self-signed NSX certs.
+# ============================================================================
+if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
+    Add-Type @"
+        using System.Net;
+        using System.Security.Cryptography.X509Certificates;
+        public class TrustAllCertsPolicy : ICertificatePolicy {
+            public bool CheckValidationResult(
+                ServicePoint srvPoint, X509Certificate certificate,
+                WebRequest request, int certificateProblem) { return true; }
+        }
+"@
+}
+[System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+[System.Net.ServicePointManager]::SecurityProtocol  = [System.Net.SecurityProtocolType]::Tls12
+
+# ============================================================================
 # FUNCTIONS
 # ============================================================================
 
 function Import-NSXCredential {
-    <#
-    .SYNOPSIS
-        Imports credentials from an encrypted XML file created by Export-Clixml.
-        If the file doesn't exist, prompts to create it.
-    #>
     param(
         [string]$Path
     )
@@ -79,12 +92,6 @@ function Import-NSXCredential {
 
 
 function Connect-NSXManager {
-    <#
-    .SYNOPSIS
-        Authenticates to NSX Manager using either Local (basic auth) or vIDM
-        (session-based auth via /api/session/create). Returns headers for
-        subsequent API calls.
-    #>
     param(
         [string]$Server,
         [PSCredential]$Credential,
@@ -124,7 +131,6 @@ function Connect-NSXManager {
                 -Method Post `
                 -ContentType "application/x-www-form-urlencoded" `
                 -Body $body `
-                -SkipCertificateCheck `
                 -SessionVariable "nsxSession" `
                 -ErrorAction Stop
 
@@ -165,11 +171,6 @@ function Connect-NSXManager {
 
 
 function Invoke-NSXRestMethod {
-    <#
-    .SYNOPSIS
-        Wrapper around Invoke-RestMethod that automatically includes the
-        vIDM WebSession (JSESSIONID cookie) when available.
-    #>
     param(
         [string]$Uri,
         [hashtable]$Headers,
@@ -180,7 +181,6 @@ function Invoke-NSXRestMethod {
         Uri                  = $Uri
         Headers              = $Headers
         Method               = $Method
-        SkipCertificateCheck = $true
         ErrorAction          = "Stop"
     }
 
@@ -193,10 +193,6 @@ function Invoke-NSXRestMethod {
 
 
 function Get-DFWPolicies {
-    <#
-    .SYNOPSIS
-        Retrieves all DFW security policies from the NSX Policy API.
-    #>
     param(
         [string]$Server,
         [hashtable]$Headers
@@ -223,10 +219,6 @@ function Get-DFWPolicies {
 
 
 function Get-DFWRules {
-    <#
-    .SYNOPSIS
-        Retrieves all rules for a given security policy.
-    #>
     param(
         [string]$Server,
         [hashtable]$Headers,
@@ -253,11 +245,6 @@ function Get-DFWRules {
 
 
 function Resolve-ServiceName {
-    <#
-    .SYNOPSIS
-        Resolves an NSX service path to its display name.
-        Caches results to avoid duplicate API calls.
-    #>
     param(
         [string]$Server,
         [hashtable]$Headers,
@@ -294,14 +281,10 @@ function Resolve-ServiceName {
 
 
 function Classify-Rule {
-    <#
-    .SYNOPSIS
-        Classifies a DFW rule into one of three audit categories.
-
-        1. Action=Drop  + Services != ANY   → "Investigate Further"
-        2. Action=Allow + Services = ANY    → "Level 0 Firewall"
-        3. Action=Allow + Services present  → "Good, Level 1"
-    #>
+    # Classifies a DFW rule into one of three audit categories:
+    #   1. Action=Drop  + Services != ANY   → "Investigate Further"
+    #   2. Action=Allow + Services = ANY    → "Level 0 Firewall"
+    #   3. Action=Allow + Services present  → "Good, Level 1"
     param(
         [string]$Action,
         [string[]]$ServiceNames
