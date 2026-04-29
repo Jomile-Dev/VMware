@@ -1,5 +1,5 @@
 # ============================================================================
-# CONFIGURATION — Update these values for your environment
+# CONFIGURATION - Update these values for your environment
 # ============================================================================
 
 # NSX Manager
@@ -7,22 +7,22 @@ $NSXManager       = "nsx-manager.company.com"
 
 # Authentication Mode: "Local" or "vIDM"
 #   Local = NSX local admin / basic auth via credential XML
-#   vIDM  = vIDM/Workspace ONE SSO — authenticates via /api/session/create
+#   vIDM  = vIDM/Workspace ONE SSO - authenticates via /api/session/create
 $AuthMode          = "Local"
 
-# vIDM Domain — the AD domain shown in the vIDM login dropdown.
+# vIDM Domain - the AD domain shown in the vIDM login dropdown.
 # Only used when AuthMode = "vIDM".
 # Use the NETBIOS/short name as shown in the dropdown (e.g. "COMPANY")
 $vIDMDomain        = "COMPANY"
 
-# Credential XML — stores encrypted credentials tied to this user + machine.
+# Credential XML - stores encrypted credentials tied to this user + machine.
 # To create the credential file for the first time, run:
 #   Get-Credential | Export-Clixml -Path "C:\Scripts\Creds\nsx_cred.xml"
 # The file can ONLY be decrypted by the same user on the same machine.
 # For vIDM: just enter your sAMAccountName (e.g. jsmith), NOT user@domain.
 $CredentialPath    = "C:\Scripts\Creds\nsx_cred.xml"
 
-# Output — set this to wherever you want the CSV saved
+# Output - set this to wherever you want the CSV saved
 $OutputFolder      = "C:\Scripts\Reports"
 if (-not (Test-Path $OutputFolder)) { New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null }
 $CSVFileName       = "NSX_DFW_FrontEnd_Audit_$(Get-Date -Format 'yyyy-MM-dd_HHmmss').csv"
@@ -37,12 +37,12 @@ $SMTPServer        = "mail.company.com"             # Your SMTP server
 $SMTPPort          = 465                             # SSL port (465 for SSL, 587 for TLS)
 $UseSSL            = $true                           # Use SSL encryption
 
-# Rule name filter — change this if your naming convention differs
+# Rule name filter - change this if your naming convention differs
 $RuleNameFilter    = "In-ANY-FrontEnd"
 
 # ============================================================================
 # SSL CERTIFICATE BYPASS (PowerShell 5.1 compatible)
-# Trusts all certs for this session — required for self-signed NSX certs.
+# Trusts all certs for this session - required for self-signed NSX certs.
 # ============================================================================
 if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
     Add-Type @"
@@ -80,7 +80,7 @@ function Import-NSXCredential {
         $cred = Get-Credential -Message "Enter NSX Manager credentials (local admin or vIDM user)"
         $cred | Export-Clixml -Path $Path
         Write-Host "[OK] Credentials saved to: $Path" -ForegroundColor Green
-        Write-Host "     (Encrypted — only $($env:USERNAME) on $($env:COMPUTERNAME) can decrypt)" -ForegroundColor Gray
+        Write-Host "     (Encrypted - only $($env:USERNAME) on $($env:COMPUTERNAME) can decrypt)" -ForegroundColor Gray
         return $cred
     }
 
@@ -141,11 +141,11 @@ function Connect-NSXManager {
             $samName = $rawUser
         }
 
-        # Try multiple username formats — different vIDM configs expect different things
+        # Try multiple username formats - different vIDM configs expect different things
         $usernamesToTry = @(
-            "${samName}@${vIDMDomain}"          # user@COMPANY
-            $samName                             # just sAMAccountName
-            "${vIDMDomain}\${samName}"           # COMPANY\user
+            $samName                             # just sAMAccountName (most common for vIDM)
+            "${samName}@${vIDMDomain}"            # user@COMPANY
+            "${vIDMDomain}\${samName}"            # COMPANY\user
         )
 
         $authenticated = $false
@@ -178,7 +178,7 @@ function Connect-NSXManager {
                 break
             }
             catch {
-                Write-Host "[FAIL] '$username' — $($_.Exception.Message)" -ForegroundColor DarkYellow
+                Write-Host "[FAIL] '$username' - $($_.Exception.Message)" -ForegroundColor DarkYellow
                 continue
             }
         }
@@ -186,7 +186,7 @@ function Connect-NSXManager {
         if (-not $authenticated) {
             Write-Host ""
             Write-Host "============================================================" -ForegroundColor Red
-            Write-Host " vIDM SESSION AUTH FAILED — ALL FORMATS REJECTED" -ForegroundColor Red
+            Write-Host " vIDM SESSION AUTH FAILED - ALL FORMATS REJECTED" -ForegroundColor Red
             Write-Host "============================================================" -ForegroundColor Red
             Write-Host "  NSX Manager : $Server" -ForegroundColor Yellow
             Write-Host "  vIDM Domain : $vIDMDomain" -ForegroundColor Yellow
@@ -334,10 +334,10 @@ function Resolve-ServiceName {
 
 
 function Classify-Rule {
-    # Classifies a DFW rule into one of three audit categories:
-    #   1. Action=Drop  + Services != ANY   → "Investigate Further"
-    #   2. Action=Allow + Services = ANY    → "Level 0 Firewall"
-    #   3. Action=Allow + Services present  → "Good, Level 1"
+    # Classifies a DFW rule into audit categories:
+    #   1. Action=Drop  + Services != ANY  -> "Investigate Further"
+    #   2. Action=Allow + Services = ANY   -> "Level 0 Firewall"
+    #   3. Action=Allow + Services present -> "Level 1"
     param(
         [string]$Action,
         [string[]]$ServiceNames
@@ -353,10 +353,10 @@ function Classify-Rule {
         return "Level 0 Firewall"
     }
     elseif ($Action -eq "ALLOW" -and -not $hasOnlyAny) {
-        return "Good, Level 1"
+        return "Level 1"
     }
     else {
-        return "Uncategorized"
+        return "Level 1"
     }
 }
 
@@ -366,7 +366,7 @@ function Classify-Rule {
 # ============================================================================
 
 Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host " NSX Distributed Firewall — FrontEnd Policy Audit"           -ForegroundColor Cyan
+Write-Host " NSX Distributed Firewall - FrontEnd Policy Audit"           -ForegroundColor Cyan
 Write-Host " $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"                 -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host ""
@@ -389,12 +389,10 @@ foreach ($policy in $allPolicies) {
     $rules = Get-DFWRules -Server $NSXManager -Headers $Headers -PolicyId $policy.id
 
     foreach ($rule in $rules) {
-        # Filter to only rules matching our naming convention
-        if ($rule.display_name -notlike "*${RuleNameFilter}*") {
-            continue
-        }
-
         $ruleCount++
+
+        # Check if rule matches our naming convention
+        $matchesFilter = $rule.display_name -like "*${RuleNameFilter}*"
 
         # Resolve service paths to display names
         $serviceEntries = $rule.services
@@ -411,7 +409,14 @@ foreach ($policy in $allPolicies) {
 
         $serviceDisplay = ($serviceNames | Sort-Object) -join "; "
         $action         = $rule.action.ToUpper()
-        $classification = Classify-Rule -Action $action -ServiceNames $serviceNames
+
+        # Only classify rules matching the filter; others marked N/A
+        if ($matchesFilter) {
+            $classification = Classify-Rule -Action $action -ServiceNames $serviceNames
+        }
+        else {
+            $classification = "N/A"
+        }
 
         $auditResults.Add([PSCustomObject]@{
             PolicyName      = $policy.display_name
@@ -431,22 +436,24 @@ foreach ($policy in $allPolicies) {
 }
 
 Write-Host ""
-Write-Host "[OK] Found $ruleCount matching '$RuleNameFilter' rules across $($allPolicies.Count) policies" -ForegroundColor Green
+Write-Host "[OK] Found $ruleCount total rules across $($allPolicies.Count) policies" -ForegroundColor Green
 
 # --- Summary ---
-$investigate = ($auditResults | Where-Object Classification -eq "Investigate Further").Count
-$level0      = ($auditResults | Where-Object Classification -eq "Level 0 Firewall").Count
-$level1      = ($auditResults | Where-Object Classification -eq "Good, Level 1").Count
-$uncat       = ($auditResults | Where-Object Classification -eq "Uncategorized").Count
+$matchedCount = ($auditResults | Where-Object Classification -ne "N/A").Count
+$investigate  = ($auditResults | Where-Object Classification -eq "Investigate Further").Count
+$level0       = ($auditResults | Where-Object Classification -eq "Level 0 Firewall").Count
+$level1       = ($auditResults | Where-Object Classification -eq "Level 1").Count
+$naCount      = ($auditResults | Where-Object Classification -eq "N/A").Count
 
 Write-Host ""
 Write-Host "--- Classification Summary ---" -ForegroundColor Yellow
-Write-Host "  Investigate Further : $investigate" -ForegroundColor Red
-Write-Host "  Level 0 Firewall    : $level0"      -ForegroundColor DarkYellow
-Write-Host "  Good, Level 1       : $level1"       -ForegroundColor Green
-if ($uncat -gt 0) {
-    Write-Host "  Uncategorized       : $uncat"    -ForegroundColor Gray
-}
+Write-Host "  Total rules            : $ruleCount" -ForegroundColor Cyan
+Write-Host "  Matching '$RuleNameFilter' : $matchedCount" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "  Investigate Further    : $investigate  (Drop rule + specific services)" -ForegroundColor Red
+Write-Host "  Level 0 Firewall       : $level0  (Action Allow + Any services)" -ForegroundColor DarkYellow
+Write-Host "  Level 1                : $level1  (Action Allow + specific services)" -ForegroundColor Green
+Write-Host "  N/A (other rules)      : $naCount" -ForegroundColor Gray
 Write-Host ""
 
 # --- Export CSV ---
@@ -464,17 +471,17 @@ if ($SendEmail -and $auditResults.Count -gt 0) {
     Write-Host "Sending email report..." -ForegroundColor Cyan
 
     $body = @"
-NSX Distributed Firewall — FrontEnd Policy Audit
+NSX Distributed Firewall - FrontEnd Policy Audit
 Report Date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
 NSX Manager: $NSXManager
 
-Classification Summary:
-  - Investigate Further : $investigate  (Drop + specific services — review these)
-  - Level 0 Firewall    : $level0  (Allow + ANY services — broad allow rules)
-  - Good, Level 1       : $level1  (Allow + specific services — properly scoped)
-$(if ($uncat -gt 0) { "  - Uncategorized       : $uncat" })
+Classification Summary (rules matching '$RuleNameFilter'):
+  - Investigate Further : $investigate  (Drop rule + specific services)
+  - Level 0 Firewall    : $level0  (Action Allow + Any services)
+  - Level 1             : $level1  (Action Allow + specific services)
 
-Total matching rules: $($auditResults.Count)
+Total rules in DFW: $ruleCount
+Matching '$RuleNameFilter': $matchedCount
 
 The full audit detail is attached as a CSV file.
 "@
