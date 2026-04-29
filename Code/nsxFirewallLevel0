@@ -1,21 +1,29 @@
-# Connect to your NSX Manager
+# Connect to your NSX Manager if not already connected
 # Connect-NsxtServer -Server <NSX-Mgr-IP>
 
 $targetRuleName = "In-Any-FRONTEND"
+$targetCategory = "Application"
+
+# Retrieve all security policies
 $allPolicies = Get-NsxtPolicy -Path "/infra/domains/default/security-policies"
 
-$policiesWithoutRule = foreach ($policy in $allPolicies) {
-    # Check if any rule within the current policy matches the name
-    $match = $policy.rules | Where-Object { $_.display_name -eq $targetRuleName }
-    
-    if ($null -eq $match) {
-        [PSCustomObject]@{
-            PolicyName = $policy.display_name
-            Path       = $policy.path
-            Category   = $policy.category
+$appPoliciesMissingRule = foreach ($policy in $allPolicies) {
+    # Filter for the Application category first
+    if ($policy.category -eq $targetCategory) {
+        
+        # Check if the rule is absent
+        $match = $policy.rules | Where-Object { $_.display_name -eq $targetRuleName }
+        
+        if ($null -eq $match) {
+            [PSCustomObject]@{
+                PolicyName = $policy.display_name
+                Category   = $policy.category
+                RuleCount  = $policy.rules.Count
+                Path       = $policy.path
+            }
         }
     }
 }
 
-# Display the results
-$policiesWithoutRule | Out-GridView
+# Output results to a searchable table
+$appPoliciesMissingRule | Out-GridView -Title "Application Policies Missing $targetRuleName"
