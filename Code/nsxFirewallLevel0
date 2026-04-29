@@ -1,13 +1,21 @@
-# Get all DFW policies
-$policies = Get-NsxtPolicySecurityPolicy
+# Connect to your NSX Manager
+# Connect-NsxtServer -Server <NSX-Mgr-IP>
 
-# Filter policies that DO NOT contain the rule
-$result = foreach ($policy in $policies) {
-    $rules = Get-NsxtPolicySecurityRule -SecurityPolicyId $policy.Id
+$targetRuleName = "In-Any-FRONTEND"
+$allPolicies = Get-NsxtPolicy -Path "/infra/domains/default/security-policies"
+
+$policiesWithoutRule = foreach ($policy in $allPolicies) {
+    # Check if any rule within the current policy matches the name
+    $match = $policy.rules | Where-Object { $_.display_name -eq $targetRuleName }
     
-    if ($rules.DisplayName -notcontains "In-Any-FRONTEND") {
-        $policy
+    if ($null -eq $match) {
+        [PSCustomObject]@{
+            PolicyName = $policy.display_name
+            Path       = $policy.path
+            Category   = $policy.category
+        }
     }
 }
 
-$result | Select DisplayName, Id
+# Display the results
+$policiesWithoutRule | Out-GridView
