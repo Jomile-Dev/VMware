@@ -495,10 +495,16 @@ The full audit detail is attached as a CSV file.
     try {
         Send-MailMessage @mailParams -ErrorAction Stop
         Write-Host "[OK] Email sent to $EmailTo" -ForegroundColor Green
+
+        # Cleanup - delete CSV after successful email
+        if (Test-Path $CSVPath) {
+            Remove-Item -Path $CSVPath -Force
+            Write-Host "[OK] CSV cleaned up: $CSVPath" -ForegroundColor Green
+        }
     }
     catch {
         Write-Warning "Failed to send email: $_"
-        Write-Host "The CSV has still been saved locally at: $CSVPath" -ForegroundColor Yellow
+        Write-Host "The CSV has been kept at: $CSVPath" -ForegroundColor Yellow
     }
 }
 elseif (-not $SendEmail) {
