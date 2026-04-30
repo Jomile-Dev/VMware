@@ -1,0 +1,251 @@
+# VMware VM Hardware Version Inventory Report
+# Requires VMware PowerCLI module
+
+#Requires -Modules VMware.VimAutomation.Core
+
+# Configuration
+$ReportPath = "C:\VM_Hardware_Inventory_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+
+# Email Configuration
+$SendEmail      = $true
+$EmailTo        = "admin@company.com"                # Update - comma-separate for multiple: "a@co.com", "b@co.com"
+$EmailFrom      = "vmware-inventory@company.com"     # Update
+$EmailSubject   = "VMware VM Hardware Version Inventory — $(Get-Date -Format 'yyyy-MM-dd')"
+$SMTPServer     = "smtp.company.com"                  # Update
+$SMTPPort       = 25
+$UseSSL         = $false
+$SMTPCredentials = $null                              # Set if SMTP requires auth
+
+# Connect to multiple vCenter servers
+$vCenterServers = @("vc01", "vc02", "vc03", "vc04")  # Update with your vCenter servers
+$Credential = Get-Credential -Message "Enter vCenter credentials"
+
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host "VMware VM Hardware Version Inventory" -ForegroundColor Cyan
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host ""
+
+Write-Host "Connecting to vCenter servers..." -ForegroundColor Cyan
+$connectedServers = @()
+$connectionErrors = @()
+
+foreach ($vCenter in $vCenterServers) {
+    try {
+        $connection = Connect-VIServer -Server $vCenter -Credential $Credential -ErrorAction Stop -WarningAction SilentlyContinue -Force
+        if ($connection) {
+            $connectedServers += $connection
+            Write-Host "  Connected to $vCenter" -ForegroundColor Green
+        }
+    }
+    catch {
+        Write-Host "  FAILED: Could not connect to $vCenter - $_" -ForegroundColor Red
+        $connectionErrors += "$vCenter : $_"
+    }
+}
+
+# Verify we're connected to at least one vCenter
+if ($connectedServers.Count -eq 0) {
+    Write-Host "ERROR: No vCenter connections established. Exiting." -ForegroundColor Red
+    exit
+}
+
+Write-Host "Connected to $($connectedServers.Count) vCenter(s)" -ForegroundColor Green
+Write-Host ""
+
+# Initialize results array
+$results = @()
+$totalVMCount = 0
+
+# Retrieve VMs from all vCenters
+Write-Host "Retrieving VM inventory from all vCenters..." -ForegroundColor Cyan
+
+foreach ($vCenter in $connectedServers) {
+    Write-Host "`nProcessing vCenter: $($vCenter.Name)" -ForegroundColor Yellow
+    
+    try {
+        # Get all VMs at once
+        $vms = Get-VM -Server $vCenter -ErrorAction Stop
+        Write-Host "  Found $($vms.Count) VMs" -ForegroundColor Gray
+        
+        # Get all VM views in one call
+        Write-Host "  Retrieving VM details..." -ForegroundColor Gray
+        $vmViews = Get-View -ViewType VirtualMachine -Server $vCenter -Property Name,Config.Version,Runtime.PowerState -ErrorAction Stop
+        
+        # Build VM view lookup hash by name
+        $vmViewHash = @{}
+        foreach ($vmView in $vmViews) {
+            $vmViewHash[$vmView.Name] = $vmView
+        }
+        
+        Write-Host "  Processing VM data..." -ForegroundColor Gray
+        $vmCounter = 0
+        foreach ($vm in $vms) {
+            $vmCounter++
+            
+            # Show progress every 100 VMs
+            if ($vmCounter % 100 -eq 0) {
+                Write-Host "    Processed $vmCounter of $($vms.Count) VMs..." -ForegroundColor Gray
+            }
+            
+            try {
+                # Lookup VM view from hash by name
+                $vmView = $vmViewHash[$vm.Name]
+                
+                if (-not $vmView) {
+                    throw "VM view not found"
+                }
+                
+                # Get hardware version
+                $hwVersion = "Unknown"
+                if ($vmView.Config -and $vmView.Config.Version) {
+                    $hwVersion = $vmView.Config.Version
+                }
+                
+                # Get network names
+                $networkNames = "None"
+                $networkAdapters = Get-NetworkAdapter -VM $vm -Server $vCenter -ErrorAction SilentlyContinue
+                if ($networkAdapters) {
+                    $networkList = $networkAdapters | Select-Object -ExpandProperty NetworkName | Where-Object { $_ }
+                    if ($networkList) {
+                        $networkNames = ($networkList | Select-Object -Unique) -join ", "
+                    }
+                }
+                
+                # Create result object
+                $result = [PSCustomObject]@{
+                    VMName                 = $vm.Name
+                    vCenter                = $vCenter.Name
+                    PowerState             = $vm.PowerState
+                    CurrentHardwareVersion = $hwVersion
+                    Networks               = $networkNames
+                }
+                
+                $results += $result
+                $totalVMCount++
+            }
+            catch {
+                # Add minimal info for failed VM
+                $result = [PSCustomObject]@{
+                    VMName                 = $vm.Name
+                    vCenter                = $vCenter.Name
+                    PowerState             = $vm.PowerState
+                    CurrentHardwareVersion = "Error"
+                    Networks               = "Error"
+                }
+                
+                $results += $result
+                $totalVMCount++
+            }
+        }
+        
+        Write-Host "  Completed processing $($vms.Count) VMs from $($vCenter.Name)" -ForegroundColor Green
+    }
+    catch {
+        Write-Host "  Error retrieving VMs from $($vCenter.Name): $_" -ForegroundColor Red
+    }
+}
+
+# Generate report
+Write-Host "`n========================================" -ForegroundColor Cyan
+Write-Host "Generating Report..." -ForegroundColor Cyan
+Write-Host "========================================" -ForegroundColor Cyan
+
+$results | Export-Csv -Path $ReportPath -NoTypeInformation
+Write-Host "Report saved to: $ReportPath" -ForegroundColor Green
+
+# Build statistics strings (used for both console and email)
+$versionGroups = $results | Where-Object { $_.CurrentHardwareVersion -ne "Error" } | Group-Object CurrentHardwareVersion | Sort-Object Name
+$vcenterGroups = $results | Group-Object vCenter | Sort-Object Name
+$powerGroups   = $results | Group-Object PowerState | Sort-Object Name
+
+# Console output
+Write-Host "`nInventory Statistics:" -ForegroundColor Cyan
+Write-Host "  Total VMs: $totalVMCount" -ForegroundColor White
+
+Write-Host "`nVMs by Hardware Version:" -ForegroundColor Cyan
+foreach ($group in $versionGroups) {
+    Write-Host "  $($group.Name): $($group.Count) VMs" -ForegroundColor White
+}
+
+Write-Host "`nVMs by vCenter:" -ForegroundColor Cyan
+foreach ($group in $vcenterGroups) {
+    Write-Host "  $($group.Name): $($group.Count) VMs" -ForegroundColor White
+}
+
+Write-Host "`nPower State:" -ForegroundColor Cyan
+foreach ($group in $powerGroups) {
+    Write-Host "  $($group.Name): $($group.Count) VMs" -ForegroundColor White
+}
+
+# --- Send Email ---
+if ($SendEmail -and $results.Count -gt 0) {
+    Write-Host "`nSending email report..." -ForegroundColor Cyan
+
+    # Build version breakdown
+    $versionBreakdown = ($versionGroups | ForEach-Object { "  - $($_.Name): $($_.Count) VMs" }) -join "`n"
+
+    # Build vCenter breakdown
+    $vcenterBreakdown = ($vcenterGroups | ForEach-Object { "  - $($_.Name): $($_.Count) VMs" }) -join "`n"
+
+    # Build power state breakdown
+    $powerBreakdown = ($powerGroups | ForEach-Object { "  - $($_.Name): $($_.Count) VMs" }) -join "`n"
+
+    $body = @"
+VMware VM Hardware Version Inventory
+Report Date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+vCenters Queried: $($vCenterServers -join ', ')
+Connected: $($connectedServers.Count) of $($vCenterServers.Count)
+
+Inventory Statistics:
+  Total VMs: $totalVMCount
+
+VMs by Hardware Version:
+$versionBreakdown
+
+VMs by vCenter:
+$vcenterBreakdown
+
+Power State:
+$powerBreakdown
+
+The full inventory detail is attached as a CSV file.
+"@
+
+    $mailParams = @{
+        To          = $EmailTo
+        From        = $EmailFrom
+        Subject     = $EmailSubject
+        Body        = $body
+        SmtpServer  = $SMTPServer
+        Port        = $SMTPPort
+        Attachments = $ReportPath
+    }
+
+    if ($UseSSL)            { $mailParams.UseSsl     = $true }
+    if ($SMTPCredentials)   { $mailParams.Credential = $SMTPCredentials }
+
+    try {
+        Send-MailMessage @mailParams -ErrorAction Stop
+        Write-Host "[OK] Email sent to $EmailTo" -ForegroundColor Green
+
+        # Cleanup - delete CSV after successful email
+        if (Test-Path $ReportPath) {
+            Remove-Item -Path $ReportPath -Force
+            Write-Host "[OK] CSV cleaned up: $ReportPath" -ForegroundColor Green
+        }
+    }
+    catch {
+        Write-Warning "Failed to send email: $_"
+        Write-Host "The CSV has been kept at: $ReportPath" -ForegroundColor Yellow
+    }
+}
+elseif (-not $SendEmail) {
+    Write-Host "[INFO] Email sending is disabled. Set `$SendEmail = `$true to enable." -ForegroundColor Gray
+}
+
+# Disconnect from all vCenter servers
+Write-Host "`nDisconnecting from vCenter servers..." -ForegroundColor Cyan
+Disconnect-VIServer -Server * -Confirm:$false -ErrorAction SilentlyContinue
+Write-Host "Disconnected from all vCenter servers" -ForegroundColor Green
+
+Write-Host "`nInventory collection complete!" -ForegroundColor Green
