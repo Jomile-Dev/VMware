@@ -87,17 +87,18 @@ foreach ($vc in $vCenterServers) {
             $cluster = "No cluster"
         }
 
+        # ── Tools version (dotted format e.g. 12.3.5) ────────────────────────
+        $toolsVer = $vm.Guest.ToolsVersion
+        if (-not $toolsVer) { $toolsVer = "Not available" }
+
         $allResults.Add([PSCustomObject]@{
-            vCenter          = $vc
-            VMName           = $vm.Name
-            Cluster          = $cluster
-            PowerState       = $vm.PowerState
-            GuestOS          = $vm.ExtensionData.Config.GuestFullName
-            ToolsVersion     = $vm.ExtensionData.Guest.ToolsVersion
-            ToolsStatus      = $vm.ExtensionData.Guest.ToolsVersionStatus2
-            ToolsRunning     = $vm.ExtensionData.Guest.ToolsRunningStatus
-            ToolsInstallType = $vm.ExtensionData.Guest.ToolsInstallType
-            Host             = $vmHost.Name
+            vCenter      = $vc
+            VMName       = $vm.Name
+            Cluster      = $cluster
+            PowerState   = $vm.PowerState
+            GuestOS      = $vm.ExtensionData.Config.GuestFullName
+            ToolsVersion = $toolsVer
+            ToolsRunning = $vm.ExtensionData.Guest.ToolsRunningStatus
         })
     }
 
@@ -111,7 +112,7 @@ foreach ($vc in $vCenterServers) {
 # ── Display summary in console ────────────────────────────────────────────────
 Write-Host "========================================" -ForegroundColor DarkGray
 Write-Host "Total VMs collected: $($allResults.Count)" -ForegroundColor Cyan
-$allResults | Format-Table vCenter, VMName, PowerState, ToolsVersion, ToolsStatus -AutoSize
+$allResults | Format-Table vCenter, VMName, PowerState, ToolsVersion, ToolsRunning -AutoSize
 
 # ── Export CSV ────────────────────────────────────────────────────────────────
 try {
@@ -127,15 +128,14 @@ catch {
 $TotalVMs  = $allResults.Count
 $PoweredOn = ($allResults | Where-Object PowerState -eq 'PoweredOn').Count
 
-$ByStatus = ($allResults | Group-Object ToolsStatus | Sort-Object Count -Descending |
-    ForEach-Object { "  {0,-40} {1,6}" -f $_.Name, $_.Count }) -join "`n"
-
 $ByVersion = ($allResults | Group-Object ToolsVersion | Sort-Object Count -Descending |
-    Select-Object -First 10 |
-    ForEach-Object { "  {0,-40} {1,6}" -f $_.Name, $_.Count }) -join "`n"
+    ForEach-Object { "  {0,-25} {1,6} VMs" -f $_.Name, $_.Count }) -join "`n"
+
+$ByRunning = ($allResults | Group-Object ToolsRunning | Sort-Object Count -Descending |
+    ForEach-Object { "  {0,-25} {1,6} VMs" -f $_.Name, $_.Count }) -join "`n"
 
 $ByvCenter = ($allResults | Group-Object vCenter | Sort-Object Name |
-    ForEach-Object { "  {0,-40} {1,6}" -f $_.Name, $_.Count }) -join "`n"
+    ForEach-Object { "  {0,-40} {1,6} VMs" -f $_.Name, $_.Count }) -join "`n"
 
 $Body = @"
 VM Tools Version Report — $(Get-Date -Format 'yyyy-MM-dd HH:mm')
@@ -147,11 +147,11 @@ OVERVIEW
   Powered Off          : $($TotalVMs - $PoweredOn)
   vCenters Queried     : $($vCenterServers.Count) ($($vCenterServers -join ', '))
 
-TOOLS STATUS BREAKDOWN
-$ByStatus
-
-TOP TOOLS VERSIONS (by count)
+VMs PER TOOLS VERSION
 $ByVersion
+
+TOOLS RUNNING STATUS
+$ByRunning
 
 VMs PER VCENTER
 $ByvCenter
