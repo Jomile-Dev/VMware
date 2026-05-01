@@ -1,0 +1,227 @@
+# =============================================================================
+# Get-VMToolsReport.ps1
+# Retrieves VM Tools version, status, and related info for all VMs
+# across multiple vCenter servers. Emails CSV report then cleans up.
+# Requires: VMware PowerCLI (VMware.PowerCLI module)
+# =============================================================================
+
+# ── Configuration — edit these before running ─────────────────────────────────
+$vCenterServers = @(
+    "vcenter1.yourdomain.com",
+    "vcenter2.yourdomain.com"
+)
+$CredPath   = "C:\Creds\vcenter_cred.xml"
+$ExportPath = "C:\Reports\VMToolsReport_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+
+# Email Configuration
+$SendEmail    = $true
+$EmailTo      = "admin@company.com"                # Update - comma-separate for multiple: "a@co.com", "b@co.com"
+$EmailFrom    = "vmware-reports@company.com"       # Update
+$EmailSubject = "VM Tools Version Report — $(Get-Date -Format 'yyyy-MM-dd')"
+$SMTPServer   = "smtp.company.com"                 # Update
+$SMTPPort     = 25
+$UseSSL       = $false
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Load credentials ──────────────────────────────────────────────────────────
+if (-not (Test-Path $CredPath)) {
+    Write-Error "Credential file not found at: $CredPath"
+    Write-Host "To create it, run:" -ForegroundColor Yellow
+    Write-Host "  Get-Credential | Export-Clixml -Path '$CredPath'" -ForegroundColor Yellow
+    exit 1
+}
+
+try {
+    $cred = Import-Clixml -Path $CredPath
+    Write-Host "Credentials loaded.`n" -ForegroundColor Green
+}
+catch {
+    Write-Error "Failed to load credentials: $_"
+    exit 1
+}
+
+# ── Ensure export folder exists ───────────────────────────────────────────────
+$exportDir = Split-Path $ExportPath -Parent
+if (-not (Test-Path $exportDir)) {
+    New-Item -ItemType Directory -Path $exportDir -Force | Out-Null
+    Write-Host "Created folder: $exportDir" -ForegroundColor DarkGray
+}
+
+# ── Use a List for performance with large VM counts ───────────────────────────
+$allResults = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+# ── Loop through each vCenter ─────────────────────────────────────────────────
+foreach ($vc in $vCenterServers) {
+
+    Write-Host "========================================" -ForegroundColor DarkGray
+    Write-Host "Connecting to: $vc" -ForegroundColor Cyan
+
+    try {
+        Connect-VIServer -Server $vc -Credential $cred -ErrorAction Stop | Out-Null
+        Write-Host "Connected.`n" -ForegroundColor Green
+    }
+    catch {
+        Write-Warning "Could not connect to $vc — skipping. Error: $_"
+        continue
+    }
+
+    # ── Get all VMs on this vCenter ───────────────────────────────────────────
+    $vms = Get-VM -Server $vc -WarningAction SilentlyContinue
+
+    if (-not $vms) {
+        Write-Warning "No VMs found on $vc."
+        Disconnect-VIServer -Server $vc -Confirm:$false
+        continue
+    }
+
+    Write-Host "Found $($vms.Count) VM(s) on $vc. Collecting data..." -ForegroundColor Cyan
+
+    foreach ($vm in $vms) {
+
+        # ── Cluster (safe — standalone hosts return "No cluster") ─────────────
+        try {
+            $vmHost  = Get-VMHost -VM $vm -Server $vc -ErrorAction Stop
+            $cluster = (Get-Cluster -VMHost $vmHost -ErrorAction Stop).Name
+        }
+        catch {
+            $cluster = "No cluster"
+        }
+
+        # ── Tools version (dotted format e.g. 12.3.5) ────────────────────────
+        $toolsVer = $vm.Guest.ToolsVersion
+        if (-not $toolsVer) { $toolsVer = "Not available" }
+
+        $allResults.Add([PSCustomObject]@{
+            vCenter      = $vc
+            VMName       = $vm.Name
+            Cluster      = $cluster
+            PowerState   = $vm.PowerState
+            GuestOS      = $vm.ExtensionData.Config.GuestFullName
+            ToolsVersion = $toolsVer
+            ToolsRunning = $vm.ExtensionData.Guest.ToolsRunningStatus
+        })
+    }
+
+    Write-Host "Finished $vc.`n" -ForegroundColor Green
+
+    # ── Disconnect from this vCenter before moving to next ────────────────────
+    Disconnect-VIServer -Server $vc -Confirm:$false
+    Write-Host "Disconnected from $vc.`n" -ForegroundColor DarkGray
+}
+
+# ── Display summary in console ────────────────────────────────────────────────
+Write-Host "========================================" -ForegroundColor DarkGray
+Write-Host "Total VMs collected: $($allResults.Count)" -ForegroundColor Cyan
+$allResults | Format-Table vCenter, VMName, PowerState, ToolsVersion, ToolsRunning -AutoSize
+
+# ── Export CSV ────────────────────────────────────────────────────────────────
+try {
+    $allResults | Export-Csv -Path $ExportPath -NoTypeInformation -Encoding UTF8
+    Write-Host "[OK] Report saved to: $ExportPath`n" -ForegroundColor Green
+}
+catch {
+    Write-Warning "Could not export CSV: $_"
+    exit 1
+}
+
+# ── Build HTML email body ─────────────────────────────────────────────────────
+$TotalVMs  = $allResults.Count
+$PoweredOn = ($allResults | Where-Object PowerState -eq 'PoweredOn').Count
+
+# Helper: build HTML table rows from grouped data
+function ConvertTo-HtmlRows {
+    param([object[]]$Groups, [string]$Col1Header, [string]$Col2Header)
+
+    $rows = foreach ($g in $Groups) {
+        "<tr><td style='padding:4px 16px 4px 8px;'>$($g.Name)</td><td style='padding:4px 8px;text-align:right;'>$($g.Count)</td></tr>"
+    }
+
+    @"
+<table style="border-collapse:collapse;font-family:Consolas,'Courier New',monospace;font-size:14px;">
+<tr style="background:#4472C4;color:#fff;font-weight:bold;">
+<td style="padding:6px 16px 6px 8px;">$Col1Header</td>
+<td style="padding:6px 8px;text-align:right;">$Col2Header</td>
+</tr>
+$($rows -join "`n")
+</table>
+"@
+}
+
+$versionGroups = $allResults | Group-Object ToolsVersion | Sort-Object Count -Descending
+$runningGroups = $allResults | Group-Object ToolsRunning | Sort-Object Count -Descending
+$vcenterGroups = $allResults | Group-Object vCenter      | Sort-Object Name
+
+$versionTable = ConvertTo-HtmlRows -Groups $versionGroups -Col1Header "Tools Version" -Col2Header "Count"
+$runningTable = ConvertTo-HtmlRows -Groups $runningGroups -Col1Header "Running Status" -Col2Header "Count"
+$vcenterTable = ConvertTo-HtmlRows -Groups $vcenterGroups -Col1Header "vCenter" -Col2Header "Count"
+
+$Body = @"
+<html>
+<body style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#222;">
+
+<h2 style="margin-bottom:4px;">VM Tools Version Report</h2>
+<p style="color:#666;margin-top:0;">$(Get-Date -Format 'yyyy-MM-dd HH:mm')</p>
+
+<table style="border-collapse:collapse;font-size:14px;margin-bottom:24px;">
+<tr><td style="padding:3px 16px 3px 0;font-weight:bold;">Total VMs</td><td>$TotalVMs</td></tr>
+<tr><td style="padding:3px 16px 3px 0;font-weight:bold;">Powered On</td><td>$PoweredOn</td></tr>
+<tr><td style="padding:3px 16px 3px 0;font-weight:bold;">Powered Off</td><td>$($TotalVMs - $PoweredOn)</td></tr>
+<tr><td style="padding:3px 16px 3px 0;font-weight:bold;">vCenters Queried</td><td>$($vCenterServers.Count) ($($vCenterServers -join ', '))</td></tr>
+</table>
+
+<h3 style="margin-bottom:6px;">VMs by Tools Version</h3>
+$versionTable
+
+<br/>
+
+<h3 style="margin-bottom:6px;">Tools Running Status</h3>
+$runningTable
+
+<br/>
+
+<h3 style="margin-bottom:6px;">VMs per vCenter</h3>
+$vcenterTable
+
+<br/>
+<p style="color:#666;">Full details in the attached CSV.</p>
+
+</body>
+</html>
+"@
+
+# ── Send email with CSV attachment ────────────────────────────────────────────
+if ($SendEmail) {
+
+    $mailParams = @{
+        To          = $EmailTo
+        From        = $EmailFrom
+        Subject     = $EmailSubject
+        Body        = $Body
+        BodyAsHtml  = $true
+        SmtpServer  = $SMTPServer
+        Port        = $SMTPPort
+        Attachments = $ExportPath
+    }
+
+    if ($UseSSL) { $mailParams.UseSsl = $true }
+
+    try {
+        Send-MailMessage @mailParams -ErrorAction Stop
+        Write-Host "[OK] Email sent to $EmailTo" -ForegroundColor Green
+
+        # Cleanup - delete CSV after successful email
+        if (Test-Path $ExportPath) {
+            Remove-Item -Path $ExportPath -Force
+            Write-Host "[OK] CSV cleaned up: $ExportPath" -ForegroundColor Green
+        }
+    }
+    catch {
+        Write-Warning "Failed to send email: $_"
+        Write-Host "The CSV has been kept at: $ExportPath" -ForegroundColor Yellow
+    }
+}
+elseif (-not $SendEmail) {
+    Write-Host "[INFO] Email sending is disabled. Set `$SendEmail = `$true to enable." -ForegroundColor Gray
+}
+
+Write-Host "`nReport complete." -ForegroundColor Cyan
