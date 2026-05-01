@@ -13,12 +13,14 @@ $vCenterServers = @(
 $CredPath   = "C:\Creds\vcenter_cred.xml"
 $ExportPath = "C:\Reports\VMToolsReport_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
 
-# Email settings
-$SmtpServer   = "smtp.yourdomain.com"
-$SmtpPort     = 25
-$EmailFrom    = "vcenter-reports@yourdomain.com"
-$EmailTo      = @("team@yourdomain.com")
+# Email Configuration
+$SendEmail    = $true
+$EmailTo      = "admin@company.com"                # Update - comma-separate for multiple: "a@co.com", "b@co.com"
+$EmailFrom    = "vmware-reports@company.com"       # Update
 $EmailSubject = "VM Tools Version Report — $(Get-Date -Format 'yyyy-MM-dd')"
+$SMTPServer   = "smtp.company.com"                 # Update
+$SMTPPort     = 25
+$UseSSL       = $false
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Load credentials ──────────────────────────────────────────────────────────
@@ -114,7 +116,7 @@ $allResults | Format-Table vCenter, VMName, PowerState, ToolsVersion, ToolsStatu
 # ── Export CSV ────────────────────────────────────────────────────────────────
 try {
     $allResults | Export-Csv -Path $ExportPath -NoTypeInformation -Encoding UTF8
-    Write-Host "Report saved to: $ExportPath`n" -ForegroundColor Green
+    Write-Host "[OK] Report saved to: $ExportPath`n" -ForegroundColor Green
 }
 catch {
     Write-Warning "Could not export CSV: $_"
@@ -159,31 +161,37 @@ Full details in the attached CSV.
 "@
 
 # ── Send email with CSV attachment ────────────────────────────────────────────
-Write-Host "Sending email to $($EmailTo -join ', ') ..." -NoNewline
+if ($SendEmail) {
 
-try {
-    $MailParams = @{
-        From        = $EmailFrom
+    $mailParams = @{
         To          = $EmailTo
+        From        = $EmailFrom
         Subject     = $EmailSubject
         Body        = $Body
-        SmtpServer  = $SmtpServer
-        Port        = $SmtpPort
+        SmtpServer  = $SMTPServer
+        Port        = $SMTPPort
         Attachments = $ExportPath
-        Priority    = 'Normal'
     }
 
-    Send-MailMessage @MailParams -ErrorAction Stop
-    Write-Host " Sent" -ForegroundColor Green
+    if ($UseSSL) { $mailParams.UseSsl = $true }
+
+    try {
+        Send-MailMessage @mailParams -ErrorAction Stop
+        Write-Host "[OK] Email sent to $EmailTo" -ForegroundColor Green
+
+        # Cleanup - delete CSV after successful email
+        if (Test-Path $ExportPath) {
+            Remove-Item -Path $ExportPath -Force
+            Write-Host "[OK] CSV cleaned up: $ExportPath" -ForegroundColor Green
+        }
+    }
+    catch {
+        Write-Warning "Failed to send email: $_"
+        Write-Host "The CSV has been kept at: $ExportPath" -ForegroundColor Yellow
+    }
 }
-catch {
-    Write-Warning "Failed to send email: $_"
+elseif (-not $SendEmail) {
+    Write-Host "[INFO] Email sending is disabled. Set `$SendEmail = `$true to enable." -ForegroundColor Gray
 }
 
-# ── Cleanup ───────────────────────────────────────────────────────────────────
-if (Test-Path $ExportPath) {
-    Remove-Item -Path $ExportPath -Force
-    Write-Host "Cleaned up temp CSV.`n" -ForegroundColor Green
-}
-
-Write-Host "Report complete." -ForegroundColor Cyan
+Write-Host "`nReport complete." -ForegroundColor Cyan
