@@ -166,54 +166,8 @@ $vmProcessingScript = {
         $securePassword = ConvertTo-SecureString -String $password -AsPlainText -Force
         $jobCredential = New-Object System.Management.Automation.PSCredential($username, $securePassword)
         
-        $moduleLoaded = $false
-        $retryCount = 0
-        $originalVerbosePreference     = $VerbosePreference
-        $originalInformationPreference = $InformationPreference
-        $originalWarningPreference     = $WarningPreference
-        $VerbosePreference     = "SilentlyContinue"
-        $InformationPreference = "SilentlyContinue" 
-        $WarningPreference     = "SilentlyContinue"
-        
-        while (-not $moduleLoaded -and $retryCount -lt 3) {
-            try {
-                $null = Import-Module VMware.PowerCLI -Force -Global -ErrorAction Stop -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
-                $null = Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
-                $null = Set-PowerCLIConfiguration -DisplayDeprecationWarnings $false -Confirm:$false -Scope Session -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
-                $null = Set-PowerCLIConfiguration -ParticipateInCEIP $false -Confirm:$false -Scope Session -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
-                $null = Set-PowerCLIConfiguration -DefaultVIServerMode Single -Confirm:$false -Scope Session -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
-                $null = Set-PowerCLIConfiguration -WebOperationTimeoutSeconds 300 -Confirm:$false -Scope Session -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
-                $moduleLoaded = $true
-                Add-ProgressLog "INITIALIZED - PowerCLI loaded successfully" "SUCCESS"
-            } catch {
-                if (Get-Module -ListAvailable -Name VMware.VimAutomation.Core) {
-                    try {
-                        $null = Import-Module VMware.VimAutomation.Core -Force -Global -ErrorAction Stop -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
-                        $null = Import-Module VMware.VimAutomation.Common -Force -Global -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
-                        $null = Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
-                        $null = Set-PowerCLIConfiguration -DisplayDeprecationWarnings $false -Confirm:$false -Scope Session -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
-                        $null = Set-PowerCLIConfiguration -ParticipateInCEIP $false -Confirm:$false -Scope Session -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
-                        $null = Set-PowerCLIConfiguration -DefaultVIServerMode Single -Confirm:$false -Scope Session -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
-                        $moduleLoaded = $true
-                        Add-ProgressLog "INITIALIZED - PowerCLI legacy modules loaded" "SUCCESS"
-                    } catch {
-                        $retryCount++
-                        Add-ProgressLog "MODULE_RETRY - Legacy import attempt $retryCount failed: $($_.Exception.Message)" "WARN"
-                        Start-Sleep -Seconds 2
-                    }
-                } else {
-                    throw "PowerCLI modules not found"
-                }
-            }
-        }
-        
-        $VerbosePreference     = $originalVerbosePreference
-        $InformationPreference = $originalInformationPreference
-        $WarningPreference     = $originalWarningPreference
-        
-        if (-not $moduleLoaded) {
-            throw "Failed to load PowerCLI after 3 attempts"
-        }
+        # PowerCLI is pre-loaded via -InitializationScript on Start-Job - no need to import here
+        Add-ProgressLog "INITIALIZED - PowerCLI already loaded via InitializationScript" "SUCCESS"
         
         $result = [PSCustomObject]@{
             Type                    = "FinalResult"
@@ -369,7 +323,6 @@ $vmProcessingScript = {
         
         # ---- PHASE 2: Reconfigure ----
         Add-ProgressLog "CONFIG_START - Beginning VM reconfiguration" "INFO"
-        Start-Sleep -Seconds 8
         
         $targetCPUs    = [int]$vmData.CPUCountAfter
         $targetMemoryGB = [int]$vmData.MemoryGBAfter
@@ -692,6 +645,21 @@ function Collect-JobResult {
 }
 
 # ---- Launch all jobs ----
+# Pre-load PowerCLI once per job via InitializationScript — avoids 30-60s import inside each job
+$initScript = {
+    $null = Import-Module VMware.PowerCLI -Force -Global -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
+    if (-not (Get-Module -Name VMware.VimAutomation.Core)) {
+        # Fallback to legacy modules if VMware.PowerCLI meta-module isn't available
+        $null = Import-Module VMware.VimAutomation.Core  -Force -Global -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
+        $null = Import-Module VMware.VimAutomation.Common -Force -Global -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
+    }
+    $null = Set-PowerCLIConfiguration -InvalidCertificateAction Ignore      -Confirm:$false -Scope Session -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
+    $null = Set-PowerCLIConfiguration -DisplayDeprecationWarnings $false     -Confirm:$false -Scope Session -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
+    $null = Set-PowerCLIConfiguration -ParticipateInCEIP $false              -Confirm:$false -Scope Session -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
+    $null = Set-PowerCLIConfiguration -DefaultVIServerMode Single            -Confirm:$false -Scope Session -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
+    $null = Set-PowerCLIConfiguration -WebOperationTimeoutSeconds 300        -Confirm:$false -Scope Session -ErrorAction SilentlyContinue -WarningAction SilentlyContinue -InformationAction SilentlyContinue -Verbose:$false 6>$null 3>$null 2>$null
+}
+
 Write-Host "`nLaunching jobs for $($VMList.Count) VMs..." -ForegroundColor Cyan
 
 foreach ($vmEntry in $VMList) {
@@ -715,7 +683,7 @@ foreach ($vmEntry in $VMList) {
     # Launch the new job
     Write-Host "`nDEBUG: Starting job $jobCounter for $($vmEntry.VMName) with $($finalServerArray.Count) servers" -ForegroundColor Gray
     try {
-        $job = Start-Job -ScriptBlock $vmProcessingScript -ArgumentList $vmEntry, $finalServerArray, $Username, $Password, $jobCounter
+        $job = Start-Job -InitializationScript $initScript -ScriptBlock $vmProcessingScript -ArgumentList $vmEntry, $finalServerArray, $Username, $Password, $jobCounter
         $jobs += [PSCustomObject]@{
             Job       = $job
             VMName    = $vmEntry.VMName
