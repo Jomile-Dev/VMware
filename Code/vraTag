@@ -433,18 +433,10 @@ if ($SendEmail) {
 "@
 
     try {
-        $smtpCredPath = "$resultsDir\smtp_cred.xml"
-        if (Test-Path $smtpCredPath) {
-            $smtpCred = Import-Clixml -Path $smtpCredPath
-        } else {
-            $smtpCred = Get-Credential -Message "Enter SMTP credentials (will be saved encrypted)"
-            $smtpCred | Export-Clixml -Path $smtpCredPath
-        }
-
         Send-MailMessage -From $EmailFrom -To $EmailTo -Subject $EmailSubject `
             -Body $emailBody -BodyAsHtml `
             -SmtpServer $SMTPServer -Port $SMTPPort `
-            -UseSsl:$UseSSL -Credential $smtpCred `
+            -UseSsl:$UseSSL `
             -Attachments $resultsPath -ErrorAction Stop
 
         Write-Log "Email sent to $EmailTo" -Color Green
