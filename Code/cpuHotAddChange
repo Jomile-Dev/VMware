@@ -291,7 +291,7 @@ $vmProcessingScript = {
             $shutdownStart   = Get-Date
             
             while ($targetVM -and $targetVM.PowerState -ne "PoweredOff" -and (Get-Date) -lt $shutdownTimeout) {
-                Start-Sleep -Seconds 5
+                Start-Sleep -Seconds 2
                 try {
                     $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
                     $elapsed  = [math]::Round(((Get-Date) - $shutdownStart).TotalSeconds)
@@ -344,7 +344,7 @@ $vmProcessingScript = {
             $taskInfo = Get-View $task -ErrorAction Stop
             $timeout  = (Get-Date).AddMinutes(5)
             while ($taskInfo.Info.State -eq "running" -and (Get-Date) -lt $timeout) {
-                Start-Sleep -Seconds 5
+                Start-Sleep -Seconds 2
                 $taskInfo.UpdateViewData()
             }
             
@@ -393,7 +393,6 @@ $vmProcessingScript = {
         
         # ---- PHASE 3: Power On ----
         Add-ProgressLog "POWERON_START - Initiating startup sequence" "INFO"
-        Start-Sleep -Seconds 3
         
         try {
             $targetVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
@@ -693,7 +692,7 @@ foreach ($vmEntry in $VMList) {
         Write-Host "LAUNCHED JOB $jobCounter → $($vmEntry.VMName)" -ForegroundColor Cyan -BackgroundColor DarkBlue
         Write-Host "   CPU: $($vmEntry.CPUCountBefore) → $($vmEntry.CPUCountAfter) | Memory: $($vmEntry.MemoryGBBefore)GB → $($vmEntry.MemoryGBAfter)GB" -ForegroundColor White
         $jobCounter++
-        Start-Sleep -Milliseconds 500
+        Start-Sleep -Milliseconds 100
     } catch {
         Write-Error "FAILED to start job for $($vmEntry.VMName): $($_.Exception.Message)"
     }
