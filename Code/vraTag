@@ -1,8 +1,14 @@
 # VMware Aria Automation - Bulk CMDB Relations Extractor
-# Fetches the update_cmdb_relations Day 2 action form data for all Cloud.vSphere.Machine resources
+# Calls the vRO form external-values endpoint to retrieve CMDB data for all VMs
 
 $vraServer = "vra.yourdomain.com"
+$projectId = "YOUR-PROJECT-ID-HERE"
 $resultsDir = "C:\Logs"
+
+# vRO action URIs - update these to match your environment
+$showVmDetailsUri    = "somethingsomething.something.wrappers/showVmDetails"
+$getVmAppsUri        = "somethingsomething.something.returns/getVmApplications"
+$getCagAppsUri       = "somethingsomething.something.returns/getCagApplications"
 
 function Write-Log {
     param($Message, $Color = "White")
@@ -55,16 +61,38 @@ function Get-AllDeployments {
     return $allDeployments
 }
 
-# Get the form/schema data for the update_cmdb_relations action on a resource
-function Get-CMDBRelationsData {
-    param($DeploymentId, $ResourceId)
+# Call the vRO form external-values endpoint for a specific VM
+function Get-VMCMDBData {
+    param($VMName)
 
-    $actionId = "Cloud.vSphere.Machine.custom.update_cmdb_relations"
+    $uri = "https://$vraServer/form-service/api/forms/renderer/external-values?projectId=$projectId"
+
+    $body = @(
+        @{
+            uri        = $showVmDetailsUri
+            parameters = @{
+                vmName = $VMName
+            }
+            useResultsFromRequestId = -1
+        },
+        @{
+            uri        = $getVmAppsUri
+            parameters = @{
+                vmName = $VMName
+            }
+            useResultsFromRequestId = -1
+        },
+        @{
+            uri        = $getCagAppsUri
+            parameters = @{
+                vmName = $VMName
+            }
+            useResultsFromRequestId = -1
+        }
+    ) | ConvertTo-Json -Depth 5
 
     try {
-        # Get the action request schema - this is what populates the form in the UI
-        $uri = "https://$vraServer/deployment/api/deployments/$DeploymentId/resources/$ResourceId/actions/$actionId"
-        $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers
+        $response = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body
         return $response
     }
     catch {
@@ -73,9 +101,35 @@ function Get-CMDBRelationsData {
     }
 }
 
+# Parse the app-application tags from the response
+function Parse-CMDBResponse {
+    param($Response, $VMName)
+
+    $applications = @()
+
+    foreach ($result in $Response) {
+        $requestId = $result.requestId
+
+        if ($result.data -is [array]) {
+            foreach ($item in $result.data) {
+                if ($item.scope -eq "app-application") {
+                    $applications += [PSCustomObject]@{
+                        VMName      = [string]$VMName
+                        Scope       = [string]$item.scope
+                        Tag         = [string]$item.tag
+                        RequestId   = [string]$requestId
+                    }
+                }
+            }
+        }
+    }
+
+    return $applications
+}
+
 # Main processing
 $allDeployments = Get-AllDeployments
-Write-Log "`n=== FETCHING CMDB RELATIONS DATA ===" -Color Cyan
+Write-Log "`n=== FETCHING CMDB DATA ===" -Color Cyan
 
 $results = [System.Collections.Generic.List[object]]::new()
 $vmCount = 0
@@ -91,64 +145,76 @@ foreach ($dep in $allDeployments) {
 
     foreach ($machine in $machines) {
         $vmCount++
-        Write-Log "  VM: $($machine.name)" -Color White
+        $vmName = $machine.name
+        Write-Log "  VM: $vmName" -Color White
 
-        $actionData = Get-CMDBRelationsData -DeploymentId $dep.id -ResourceId $machine.id
+        $response = Get-VMCMDBData -VMName $vmName
 
-        if (-not $actionData) {
-            Write-Log "    Action not available or failed" -Color Red
+        if (-not $response) {
             $failCount++
             $results.Add([PSCustomObject]@{
                 DeploymentName = [string]$dep.name
                 DeploymentId   = [string]$dep.id
-                VMName         = [string]$machine.name
+                VMName         = [string]$vmName
                 ResourceId     = [string]$machine.id
-                Status         = [string]"Failed/Unavailable"
-                RawData        = [string]""
+                Scope          = [string]"N/A"
+                Tag            = [string]"N/A"
+                RequestId      = [string]"N/A"
+                Status         = [string]"Failed"
             })
             continue
         }
 
         $successCount++
+        $parsed = Parse-CMDBResponse -Response $response -VMName $vmName
 
-        # Dump the full schema response as JSON for review
-        $jsonData = $actionData | ConvertTo-Json -Depth 10 -Compress
+        if ($parsed.Count -eq 0) {
+            Write-Log "    No app-application data found" -Color Gray
+            $results.Add([PSCustomObject]@{
+                DeploymentName = [string]$dep.name
+                DeploymentId   = [string]$dep.id
+                VMName         = [string]$vmName
+                ResourceId     = [string]$machine.id
+                Scope          = [string]"app-application"
+                Tag            = [string]"(none)"
+                RequestId      = [string]"N/A"
+                Status         = [string]"No Data"
+            })
+        }
+        else {
+            foreach ($app in $parsed) {
+                Write-Log "    $($app.Tag)" -Color Green
+                $results.Add([PSCustomObject]@{
+                    DeploymentName = [string]$dep.name
+                    DeploymentId   = [string]$dep.id
+                    VMName         = [string]$vmName
+                    ResourceId     = [string]$machine.id
+                    Scope          = [string]$app.Scope
+                    Tag            = [string]$app.Tag
+                    RequestId      = [string]$app.RequestId
+                    Status         = [string]"Success"
+                })
+            }
+        }
 
-        Write-Log "    Retrieved action data" -Color Green
-
-        # Build a result row with the raw JSON so you can inspect the structure
-        $results.Add([PSCustomObject]@{
-            DeploymentName = [string]$dep.name
-            DeploymentId   = [string]$dep.id
-            VMName         = [string]$machine.name
-            ResourceId     = [string]$machine.id
-            Status         = [string]"Success"
-            RawData        = [string]$jsonData
-        })
-
-        Start-Sleep -Milliseconds 200
+        Start-Sleep -Milliseconds 300
     }
 }
 
 # Summary
 Write-Log "`n=== SUMMARY ===" -Color Cyan
 Write-Log "Deployments scanned: $($allDeployments.Count)" -Color White
-Write-Log "VMs found:           $vmCount" -Color White
-Write-Log "Data retrieved:      $successCount" -Color Green
-Write-Log "Failed/Unavailable:  $failCount" -Color Red
+Write-Log "VMs processed:       $vmCount" -Color White
+Write-Log "Successful:          $successCount" -Color Green
+Write-Log "Failed:              $failCount" -Color Red
+
+$uniqueApps = ($results | Where-Object { $_.Tag -ne "(none)" -and $_.Tag -ne "N/A" } | Select-Object -ExpandProperty Tag -Unique)
+Write-Log "Unique applications: $($uniqueApps.Count)" -Color Yellow
+foreach ($app in $uniqueApps) {
+    Write-Log "  $app" -Color Gray
+}
 
 # Export results
 $resultsPath = "$resultsDir\CMDBRelations_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
 $results | Export-Csv -Path $resultsPath -NoTypeInformation
 Write-Log "`nResults saved: $resultsPath" -Color White
-
-# Also dump full JSON per VM for easier inspection
-$jsonDir = "$resultsDir\CMDBRelations_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
-New-Item -ItemType Directory -Path $jsonDir -Force | Out-Null
-
-foreach ($result in ($results | Where-Object { $_.Status -eq "Success" })) {
-    $safeName = $result.VMName -replace '[\\/:*?"<>|]', '_'
-    $jsonPath = "$jsonDir\$safeName.json"
-    $result.RawData | Out-File -FilePath $jsonPath -Encoding UTF8
-}
-Write-Log "JSON files saved: $jsonDir" -Color White
