@@ -144,7 +144,9 @@ foreach ($dep in $allDeployments) {
 
     foreach ($machine in $machines) {
         $vmCount++
-        $vmName = $machine.name
+        $vmName = if ($machine.properties.resourceName) { $machine.properties.resourceName }
+                  elseif ($machine.properties.hostname) { $machine.properties.hostname }
+                  else { $machine.name }
         Write-Log "  VM: $vmName" -Color White
 
         $response = Get-VMCMDBData -VMName $vmName -ProjectId $dep.projectId
