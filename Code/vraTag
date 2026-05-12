@@ -5,6 +5,9 @@
 $vraServer  = "vra.yourdomain.com"
 $resultsDir = "C:\Logs"
 
+# Point this to the CSV from vraGetAllDeployment - set to $null to fetch live from API
+$inputCsvPath = "C:\Logs\vRA_Deployments_Export.csv"
+
 # Email Configuration
 $SendEmail    = $true
 $EmailTo      = "admin@company.com"
@@ -221,76 +224,91 @@ $scriptBlock = {
     }
 }
 
-# Create and run the runspace pool
-Write-Log "`n=== PROCESSING $($vmQueue.Count) VMs (10 parallel threads) ===" -Color Cyan
+# Process in batches with timeout per job
+$batchSize = 10
+$jobTimeoutSeconds = 120
+Write-Log "`n=== PROCESSING $($vmQueue.Count) VMs (batches of $batchSize, ${jobTimeoutSeconds}s timeout) ===" -Color Cyan
 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
-$runspacePool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, 10)
-$runspacePool.Open()
-
-$jobs = [System.Collections.Generic.List[object]]::new()
-
-foreach ($vm in $vmQueue) {
-    $ps = [PowerShell]::Create().AddScript($scriptBlock)
-    $ps.AddArgument($vraServer)       | Out-Null
-    $ps.AddArgument($authToken)       | Out-Null
-    $ps.AddArgument($showVmDetailsUri)| Out-Null
-    $ps.AddArgument($getVmAppsUri)    | Out-Null
-    $ps.AddArgument($vm.VMName)       | Out-Null
-    $ps.AddArgument($vm.ProjectId)    | Out-Null
-    $ps.AddArgument($vm.ProjectName)  | Out-Null
-    $ps.AddArgument($vm.DeploymentName) | Out-Null
-    $ps.RunspacePool = $runspacePool
-
-    $jobs.Add(@{
-        PowerShell = $ps
-        Handle     = $ps.BeginInvoke()
-        VMName     = $vm.VMName
-    })
-}
-
-# Collect results with progress
 $results = [System.Collections.Generic.List[object]]::new()
 $completed = 0
 $successCount = 0
 $failCount = 0
 
-foreach ($job in $jobs) {
-    $result = $job.PowerShell.EndInvoke($job.Handle)
-    $job.PowerShell.Dispose()
+for ($batchStart = 0; $batchStart -lt $vmQueue.Count; $batchStart += $batchSize) {
+    $batchEnd = [Math]::Min($batchStart + $batchSize, $vmQueue.Count)
+    $batch = $vmQueue.GetRange($batchStart, $batchEnd - $batchStart)
 
-    $completed++
+    $runspacePool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $batchSize)
+    $runspacePool.Open()
 
-    if ($result) {
-        foreach ($r in $result) {
-            if ($r.Status -eq "Success") {
-                $successCount++
-                $matchColor = switch ($r.CompareResult) {
-                    "Match"    { "Green" }
-                    "Mismatch" { "Red" }
-                    default    { "Gray" }
-                }
-                Write-Log "[$completed/$($vmQueue.Count)] $($r.VMName) | $($r.AppApplication) | $($r.CompareResult)" -Color $matchColor
-            }
-            else {
-                $failCount++
-                Write-Log "[$completed/$($vmQueue.Count)] $($r.VMName) | FAILED" -Color Red
-            }
+    $jobs = [System.Collections.Generic.List[object]]::new()
 
-            $results.Add([PSCustomObject]@{
-                DeploymentName = [string]$r.DeploymentName
-                VMName         = [string]$r.VMName
-                AppApplication = [string]$r.AppApplication
-                InfraOS        = [string]$r.InfraOS
-                AppLayer       = [string]$r.AppLayer
-                VMApplications = [string]$r.VMApplications
-                CompareResult  = [string]$r.CompareResult
-            })
-        }
+    foreach ($vm in $batch) {
+        $ps = [PowerShell]::Create().AddScript($scriptBlock)
+        $ps.AddArgument($vraServer)          | Out-Null
+        $ps.AddArgument($authToken)          | Out-Null
+        $ps.AddArgument($showVmDetailsUri)   | Out-Null
+        $ps.AddArgument($getVmAppsUri)       | Out-Null
+        $ps.AddArgument($vm.VMName)          | Out-Null
+        $ps.AddArgument($vm.ProjectId)       | Out-Null
+        $ps.AddArgument($vm.ProjectName)     | Out-Null
+        $ps.AddArgument($vm.DeploymentName)  | Out-Null
+        $ps.RunspacePool = $runspacePool
+
+        $jobs.Add(@{
+            PowerShell = $ps
+            Handle     = $ps.BeginInvoke()
+            VMName     = $vm.VMName
+        })
     }
-}
 
-if ($runspacePool) { $runspacePool.Close(); $runspacePool.Dispose() }
+    # Collect results with timeout
+    foreach ($job in $jobs) {
+        $completed++
+
+        if ($job.Handle.AsyncWaitHandle.WaitOne($jobTimeoutSeconds * 1000)) {
+            $result = $job.PowerShell.EndInvoke($job.Handle)
+
+            if ($result) {
+                foreach ($r in $result) {
+                    if ($r.Status -eq "Success") {
+                        $successCount++
+                        $matchColor = switch ($r.CompareResult) {
+                            "Match"    { "Green" }
+                            "Mismatch" { "Red" }
+                            default    { "Gray" }
+                        }
+                        Write-Log "[$completed/$($vmQueue.Count)] $($r.VMName) | $($r.AppApplication) | $($r.CompareResult)" -Color $matchColor
+                    }
+                    else {
+                        $failCount++
+                        Write-Log "[$completed/$($vmQueue.Count)] $($r.VMName) | FAILED" -Color Red
+                    }
+
+                    $results.Add([PSCustomObject]@{
+                        DeploymentName = [string]$r.DeploymentName
+                        VMName         = [string]$r.VMName
+                        AppApplication = [string]$r.AppApplication
+                        InfraOS        = [string]$r.InfraOS
+                        AppLayer       = [string]$r.AppLayer
+                        VMApplications = [string]$r.VMApplications
+                        CompareResult  = [string]$r.CompareResult
+                    })
+                }
+            }
+        }
+        else {
+            $failCount++
+            Write-Log "[$completed/$($vmQueue.Count)] $($job.VMName) | TIMEOUT" -Color Red
+            $job.PowerShell.Stop()
+        }
+
+        $job.PowerShell.Dispose()
+    }
+
+    if ($runspacePool) { $runspacePool.Close(); $runspacePool.Dispose() }
+}
 $stopwatch.Stop()
 
 # Summary
