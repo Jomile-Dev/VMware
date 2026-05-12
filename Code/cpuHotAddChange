@@ -622,19 +622,18 @@ function Flush-JobProgress {
 # ---- Helper: print running status summary ----
 $lastSummaryUpdate = Get-Date
 function Print-StatusSummary {
-    param($jobs, $processedJobs, $results, $scriptStartTime)
+    param($jobList, $processedList, $resultList, $totalVMs, $startTime)
     
-    $completed    = $processedJobs.Count
-    $running      = ($jobs | Where-Object { $_.Job.State -eq 'Running' }).Count
-    $total        = $jobs.Count
-    $remaining    = $total - $completed
-    $elapsedTotal = [math]::Round(((Get-Date) - $scriptStartTime).TotalMinutes, 1)
-    $successCount = ($results | Where-Object { $_.Status -eq 'Success' }).Count
+    $completed    = $processedList.Count
+    $running      = @($jobList | Where-Object { $_.Job.State -eq 'Running' }).Count
+    $remaining    = $totalVMs - $completed
+    $elapsedTotal = [math]::Round(((Get-Date) - $startTime).TotalMinutes, 1)
+    $successCount = @($resultList | Where-Object { $_.Status -eq 'Success' }).Count
     
     Write-Host "`n$('=' * 60)" -ForegroundColor Yellow
     Write-Host "*** STATUS UPDATE - $elapsedTotal min elapsed ***" -ForegroundColor Yellow -BackgroundColor DarkYellow
     Write-Host "$('=' * 60)" -ForegroundColor Yellow
-    Write-Host "Progress    : $completed of $total VMs completed" -ForegroundColor Green
+    Write-Host "Progress    : $completed of $totalVMs VMs completed" -ForegroundColor Green
     Write-Host "Running     : $running jobs active" -ForegroundColor Cyan
     Write-Host "Remaining   : $remaining VMs" -ForegroundColor Yellow
     if ($completed -gt 0) {
@@ -643,15 +642,58 @@ function Print-StatusSummary {
     }
     if ($running -gt 0) {
         Write-Host "`nCurrently processing:" -ForegroundColor Cyan
-        $jobs | Where-Object { $_.Job.State -eq 'Running' } | ForEach-Object {
-            $elapsed = [math]::Round(((Get-Date) - $_.StartTime).TotalMinutes, 1)
-            Write-Host "   • $($_.VMName) (Job $($_.JobId) - ${elapsed}m elapsed)" -ForegroundColor White
+        $jobList | Where-Object { $_.Job.State -eq 'Running' } | ForEach-Object {
+            $el = [math]::Round(((Get-Date) - $_.StartTime).TotalMinutes, 1)
+            Write-Host "   • $($_.VMName) (Job $($_.JobId) - ${el}m elapsed)" -ForegroundColor White
         }
     }
     Write-Host "$('=' * 60)" -ForegroundColor Yellow
 }
 
-# ---- Launch + monitor loop ----
+# ---- Helper: collect and display result from a completed job ----
+function Collect-JobResult {
+    param($completedJob, $jobList, [ref]$resultList, [ref]$processedList, $seenEntries)
+    
+    $jobInfo = $jobList | Where-Object { $_.Job.Id -eq $completedJob.Id }
+    if (-not $jobInfo) { return }
+    
+    # Flush any final progress lines
+    Flush-JobProgress -jobList @($jobInfo) -seenEntries $seenEntries
+    
+    Write-Host "`n$('=' * 50)" -ForegroundColor Magenta
+    Write-Host "JOB COMPLETE: $($jobInfo.VMName)" -ForegroundColor Magenta -BackgroundColor DarkMagenta
+    Write-Host "$('=' * 50)" -ForegroundColor Magenta
+    
+    try {
+        $jobOutput = Receive-Job -Job $completedJob -ErrorAction Stop
+        $vmResult  = $jobOutput | Where-Object { $_.Type -eq "FinalResult" } | Select-Object -Last 1
+        if ($vmResult) {
+            $resultList.Value  += $vmResult
+            $duration           = [math]::Round(((Get-Date) - $jobInfo.StartTime).TotalMinutes, 2)
+            if ($vmResult.Status -eq "Success") {
+                Write-Host "✓ SUCCESS: $($vmResult.VMName)" -ForegroundColor Green
+                Write-Host "  CPUs: $($vmResult.OriginalCPUCount) → $($vmResult.NewCPUCount) | Memory: $($vmResult.OriginalMemoryGB)GB → $($vmResult.NewMemoryGB)GB" -ForegroundColor Green
+                Write-Host "  Final Power State: $($vmResult.FinalPowerState)" -ForegroundColor Green
+                Write-Host "  Time: $duration minutes" -ForegroundColor Green
+            } else {
+                Write-Host "✗ FAILED: $($vmResult.VMName) - $($vmResult.ErrorMessage)" -ForegroundColor Red
+                Write-Host "  Final Power State: $($vmResult.FinalPowerState)" -ForegroundColor Yellow
+                Write-Host "  Time: $duration minutes" -ForegroundColor Red
+            }
+        } else {
+            Write-Warning "No FinalResult found for VM: $($jobInfo.VMName)"
+        }
+    } catch {
+        Write-Warning "Error collecting job $($completedJob.Id): $_"
+    }
+    
+    Remove-Job -Job $completedJob -Force
+    $processedList.Value += $completedJob.Id
+}
+
+# ---- Launch all jobs ----
+Write-Host "`nLaunching jobs for $($VMList.Count) VMs..." -ForegroundColor Cyan
+
 foreach ($vmEntry in $VMList) {
     
     # Wait for a free slot, flushing progress the whole time
@@ -659,47 +701,13 @@ foreach ($vmEntry in $VMList) {
         Start-Sleep -Seconds 1
         Flush-JobProgress -jobList $jobs -seenEntries $seenLogEntries
         
-        # Process any newly completed jobs
         $completedJobs = Get-Job | Where-Object { $_.State -ne 'Running' -and $_.Id -notin $processedJobs }
-        foreach ($completedJob in $completedJobs) {
-            $jobInfo = $jobs | Where-Object { $_.Job.Id -eq $completedJob.Id }
-            if ($jobInfo) {
-                # Flush final progress from this job
-                Flush-JobProgress -jobList @($jobInfo) -seenEntries $seenLogEntries
-                
-                Write-Host "`n$('=' * 50)" -ForegroundColor Magenta
-                Write-Host "JOB COMPLETE: $($jobInfo.VMName)" -ForegroundColor Magenta -BackgroundColor DarkMagenta
-                Write-Host "$('=' * 50)" -ForegroundColor Magenta
-                
-                try {
-                    $jobOutput = Receive-Job -Job $completedJob -ErrorAction Stop
-                    $vmResult  = $jobOutput | Where-Object { $_.Type -eq "FinalResult" } | Select-Object -Last 1
-                    if ($vmResult) {
-                        $results  += $vmResult
-                        $duration  = [math]::Round(((Get-Date) - $jobInfo.StartTime).TotalMinutes, 2)
-                        if ($vmResult.Status -eq "Success") {
-                            Write-Host "✓ SUCCESS: $($vmResult.VMName)" -ForegroundColor Green
-                            Write-Host "  CPUs: $($vmResult.OriginalCPUCount) → $($vmResult.NewCPUCount) | Memory: $($vmResult.OriginalMemoryGB)GB → $($vmResult.NewMemoryGB)GB" -ForegroundColor Green
-                            Write-Host "  Final Power State: $($vmResult.FinalPowerState)" -ForegroundColor Green
-                            Write-Host "  Time: $duration minutes" -ForegroundColor Green
-                        } else {
-                            Write-Host "✗ FAILED: $($vmResult.VMName) - $($vmResult.ErrorMessage)" -ForegroundColor Red
-                            Write-Host "  Final Power State: $($vmResult.FinalPowerState)" -ForegroundColor Yellow
-                            Write-Host "  Time: $duration minutes" -ForegroundColor Red
-                        }
-                    }
-                } catch {
-                    Write-Warning "Error processing job $($completedJob.Id): $_"
-                }
-                
-                Remove-Job -Job $completedJob -Force
-                $processedJobs += $completedJob.Id
-            }
+        foreach ($cj in $completedJobs) {
+            Collect-JobResult -completedJob $cj -jobList $jobs -resultList ([ref]$results) -processedList ([ref]$processedJobs) -seenEntries $seenLogEntries
         }
         
-        # Periodic summary while waiting for a free slot
         if (((Get-Date) - $lastSummaryUpdate).TotalSeconds -ge 20) {
-            Print-StatusSummary -jobs $jobs -processedJobs $processedJobs -results $results -scriptStartTime $scriptStartTime
+            Print-StatusSummary -jobList $jobs -processedList $processedJobs -resultList $results -totalVMs $VMList.Count -startTime $scriptStartTime
             $lastSummaryUpdate = Get-Date
         }
     }
@@ -714,7 +722,7 @@ foreach ($vmEntry in $VMList) {
             JobId     = $jobCounter
             StartTime = Get-Date
         }
-        Write-Host "`nLAUNCHED JOB $jobCounter → $($vmEntry.VMName)" -ForegroundColor Cyan -BackgroundColor DarkBlue
+        Write-Host "LAUNCHED JOB $jobCounter → $($vmEntry.VMName)" -ForegroundColor Cyan -BackgroundColor DarkBlue
         Write-Host "   CPU: $($vmEntry.CPUCountBefore) → $($vmEntry.CPUCountAfter) | Memory: $($vmEntry.MemoryGBBefore)GB → $($vmEntry.MemoryGBAfter)GB" -ForegroundColor White
         $jobCounter++
         Start-Sleep -Milliseconds 500
@@ -724,55 +732,29 @@ foreach ($vmEntry in $VMList) {
 }
 
 Write-Host "`n$('=' * 80)" -ForegroundColor Green
-Write-Host "ALL JOBS LAUNCHED - MONITORING UNTIL COMPLETE" -ForegroundColor Green
+Write-Host "ALL $($VMList.Count) JOBS LAUNCHED - WAITING FOR COMPLETION" -ForegroundColor Green
 Write-Host "$('=' * 80)" -ForegroundColor Green
 
-# ---- Final drain loop: wait for all remaining jobs ----
-while ($jobs.Count -gt $processedJobs.Count) {
+# ---- Drain loop: wait for all remaining jobs to finish ----
+# Use $VMList.Count as the target so we're never comparing against a stale $jobs array
+while ($processedJobs.Count -lt $VMList.Count) {
     Start-Sleep -Seconds 1
     Flush-JobProgress -jobList $jobs -seenEntries $seenLogEntries
     
     $completedJobs = Get-Job | Where-Object { $_.State -ne 'Running' -and $_.Id -notin $processedJobs }
-    foreach ($completedJob in $completedJobs) {
-        $jobInfo = $jobs | Where-Object { $_.Job.Id -eq $completedJob.Id }
-        if ($jobInfo) {
-            Flush-JobProgress -jobList @($jobInfo) -seenEntries $seenLogEntries
-            
-            Write-Host "`n$('=' * 50)" -ForegroundColor Magenta
-            Write-Host "JOB COMPLETE: $($jobInfo.VMName)" -ForegroundColor Magenta -BackgroundColor DarkMagenta
-            Write-Host "$('=' * 50)" -ForegroundColor Magenta
-            
-            try {
-                $jobOutput = Receive-Job -Job $completedJob -ErrorAction Stop
-                $vmResult  = $jobOutput | Where-Object { $_.Type -eq "FinalResult" } | Select-Object -Last 1
-                if ($vmResult) {
-                    $results  += $vmResult
-                    $duration  = [math]::Round(((Get-Date) - $jobInfo.StartTime).TotalMinutes, 2)
-                    if ($vmResult.Status -eq "Success") {
-                        Write-Host "✓ SUCCESS: $($vmResult.VMName)" -ForegroundColor Green
-                        Write-Host "  CPUs: $($vmResult.OriginalCPUCount) → $($vmResult.NewCPUCount) | Memory: $($vmResult.OriginalMemoryGB)GB → $($vmResult.NewMemoryGB)GB" -ForegroundColor Green
-                        Write-Host "  Final Power State: $($vmResult.FinalPowerState)" -ForegroundColor Green
-                        Write-Host "  Time: $duration minutes" -ForegroundColor Green
-                    } else {
-                        Write-Host "✗ FAILED: $($vmResult.VMName) - $($vmResult.ErrorMessage)" -ForegroundColor Red
-                        Write-Host "  Final Power State: $($vmResult.FinalPowerState)" -ForegroundColor Yellow
-                        Write-Host "  Time: $duration minutes" -ForegroundColor Red
-                    }
-                } else {
-                    Write-Warning "No FinalResult found for VM: $($jobInfo.VMName)"
-                }
-            } catch {
-                Write-Warning "Error collecting job $($completedJob.Id): $_"
-            }
-            
-            Remove-Job -Job $completedJob -Force
-            $processedJobs += $completedJob.Id
-        }
+    foreach ($cj in $completedJobs) {
+        Collect-JobResult -completedJob $cj -jobList $jobs -resultList ([ref]$results) -processedList ([ref]$processedJobs) -seenEntries $seenLogEntries
     }
     
     if (((Get-Date) - $lastSummaryUpdate).TotalSeconds -ge 20) {
-        Print-StatusSummary -jobs $jobs -processedJobs $processedJobs -results $results -scriptStartTime $scriptStartTime
+        Print-StatusSummary -jobList $jobs -processedList $processedJobs -resultList $results -totalVMs $VMList.Count -startTime $scriptStartTime
         $lastSummaryUpdate = Get-Date
+    }
+    
+    # Safety exit: if no jobs exist at all (all failed to launch), don't loop forever
+    if ((Get-Job).Count -eq 0 -and $processedJobs.Count -eq 0) {
+        Write-Warning "No jobs found - all Start-Job calls may have failed. Exiting monitor loop."
+        break
     }
 }
 
