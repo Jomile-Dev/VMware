@@ -1,13 +1,14 @@
 # VMware Aria Automation - Bulk CMDB Relations Extractor
 # Calls the vRO form external-values endpoint to retrieve CMDB data for all VMs
+# Uses runspace pooling for parallel execution (ISE compatible)
 
-$vraServer = "vra.yourdomain.com"
+$vraServer  = "vra.yourdomain.com"
 $resultsDir = "C:\Logs"
+$maxThreads = 10  # Number of parallel API calls - adjust based on vRA capacity
 
 # vRO action URIs - update these to match your environment
-$showVmDetailsUri    = "somethingsomething.something.wrappers/showVmDetails"
-$getVmAppsUri        = "somethingsomething.something.returns/getVmApplications"
-$getCagAppsUri       = "somethingsomething.something.returns/getCagApplications"
+$showVmDetailsUri = "somethingsomething.something.wrappers/showVmDetails"
+$getVmAppsUri     = "somethingsomething.something.returns/getVmApplications"
 
 function Write-Log {
     param($Message, $Color = "White")
@@ -30,18 +31,21 @@ $authBody = @{
 $authResponse = Invoke-RestMethod -Uri "https://$vraServer/csp/gateway/am/api/login" `
     -Method Post -Headers @{"Content-Type"="application/json"} -Body $authBody
 
-$headers = @{
-    "Authorization" = "Bearer $($authResponse.cspAuthToken)"
-    "Content-Type"  = "application/json"
-}
+$authToken = $authResponse.cspAuthToken
 Write-Log "Authentication successful!" -Color Green
 
 # Get all deployments with pagination
 function Get-AllDeployments {
     Write-Log "Fetching all deployments..." -Color Cyan
+
+    $headers = @{
+        "Authorization" = "Bearer $authToken"
+        "Content-Type"  = "application/json"
+    }
+
     $allDeployments = @()
     $page = 0
-    $size = 100
+    $size = 200  # Larger page size to reduce round trips
 
     do {
         $uri = "https://$vraServer/deployment/api/deployments?page=$page&size=$size&expand=resources"
@@ -60,22 +64,66 @@ function Get-AllDeployments {
     return $allDeployments
 }
 
-# Normalise application name for comparison (lowercase, strip underscores, spaces, special chars)
+# Normalise application name for comparison
 function Normalize-AppName {
     param($Name)
     if (-not $Name) { return "" }
     return ($Name.ToLower().Trim() -replace '[_\s\-\.]+', '')
 }
 
-# Call the vRO form external-values endpoint for a specific VM
-function Get-VMCMDBData {
-    param($VMName, $ProjectId, $ProjectName)
+# Build the work queue - collect all VMs to process
+$allDeployments = Get-AllDeployments
 
-    $uri = "https://$vraServer/form-service/api/forms/renderer/external-values?projectId=$ProjectId"
+Write-Log "`n=== BUILDING VM QUEUE ===" -Color Cyan
+$vmQueue = [System.Collections.Generic.List[hashtable]]::new()
+
+foreach ($dep in $allDeployments) {
+    # Skip failed or deleted deployments
+    if ($dep.status -and $dep.status -in @("DELETE_SUCCESSFUL", "FAILED", "DELETE_INPROGRESS")) {
+        continue
+    }
+
+    $machines = @($dep.resources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" })
+    if ($machines.Count -eq 0) { continue }
+
+    foreach ($machine in $machines) {
+        # Skip failed or missing VMs
+        if ($machine.state -and $machine.state -notin @("OK", "STARTED", "")) {
+            continue
+        }
+
+        $vmName = if ($machine.properties.resourceName) { $machine.properties.resourceName }
+                  elseif ($machine.properties.hostname) { $machine.properties.hostname }
+                  else { $machine.name }
+
+        $vmQueue.Add(@{
+            DeploymentName = $dep.name
+            VMName         = $vmName
+            ProjectId      = $dep.projectId
+            ProjectName    = $dep.projectName
+        })
+    }
+}
+
+Write-Log "VMs to process: $($vmQueue.Count)" -Color Cyan
+
+# Scriptblock that runs in each runspace
+$scriptBlock = {
+    param($VraServer, $AuthToken, $ShowVmDetailsUri, $GetVmAppsUri, $VMName, $ProjectId, $ProjectName, $DeploymentName)
+
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+
+    $headers = @{
+        "Authorization" = "Bearer $AuthToken"
+        "Content-Type"  = "application/json"
+    }
+
+    $uri = "https://$VraServer/form-service/api/forms/renderer/external-values?projectId=$ProjectId"
 
     $bodyArray = @(
         @{
-            uri                     = $showVmDetailsUri
+            uri                     = $ShowVmDetailsUri
             dataSource              = "scriptAction"
             parameters              = @(
                 @{ name = "vmName"; value = $VMName }
@@ -90,7 +138,7 @@ function Get-VMCMDBData {
             requestId               = 1
         },
         @{
-            uri                     = $getVmAppsUri
+            uri                     = $GetVmAppsUri
             dataSource              = "scriptAction"
             parameters              = @(
                 @{ name = "vmName";      value = $VMName },
@@ -103,139 +151,153 @@ function Get-VMCMDBData {
         }
     )
 
-    # Force proper JSON array serialisation in PS 5.1
     $body = "[" + (($bodyArray | ForEach-Object { $_ | ConvertTo-Json -Depth 5 -Compress }) -join ",") + "]"
 
     try {
         $response = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body
-        return $response
-    }
-    catch {
-        Write-Log "    Error: $($_.Exception.Message)" -Color Red
-        return $null
-    }
-}
 
-# Parse the response into a single row per VM
-function Parse-CMDBResponse {
-    param($Response)
+        $appApplication = ""
+        $infraOs        = ""
+        $appLayer       = ""
+        $vmApplications = ""
 
-    $appApplication = ""
-    $infraOs        = ""
-    $appLayer       = ""
-    $vmApplications = ""
-
-    foreach ($result in $Response) {
-        switch ($result.requestId) {
-            # requestId 1 - scope/tag objects
-            1 {
-                if ($result.data -is [array]) {
-                    foreach ($item in $result.data) {
-                        if ($item.scope -and $item.tag) {
-                            switch ($item.scope) {
-                                "app-application" { $appApplication = $item.tag }
-                                "infra-os"        { $infraOs = $item.tag }
-                                "app-layer"       { $appLayer = $item.tag }
+        foreach ($result in $response) {
+            switch ($result.requestId) {
+                1 {
+                    if ($result.data -is [array]) {
+                        foreach ($item in $result.data) {
+                            if ($item.scope -and $item.tag) {
+                                switch ($item.scope) {
+                                    "app-application" { $appApplication = $item.tag }
+                                    "infra-os"        { $infraOs = $item.tag }
+                                    "app-layer"       { $appLayer = $item.tag }
+                                }
                             }
                         }
                     }
                 }
-            }
-            # requestId 2 - VM applications (plain string array)
-            2 {
-                if ($result.data -is [array]) {
-                    $vmApplications = ($result.data | Where-Object { $_ -and $_ -notmatch "^---" }) -join "; "
+                2 {
+                    if ($result.data -is [array]) {
+                        $vmApplications = ($result.data | Where-Object { $_ -and $_ -notmatch "^---" }) -join "; "
+                    }
                 }
             }
         }
+
+        # Normalise and compare
+        $norm1 = if ($appApplication) { ($appApplication.ToLower().Trim() -replace '[_\s\-\.]+', '') } else { "" }
+        $norm2 = if ($vmApplications) { ($vmApplications.ToLower().Trim() -replace '[_\s\-\.]+', '') } else { "" }
+        $match = if ($norm1 -and $norm2) {
+            if ($norm1 -eq $norm2) { "Match" } else { "Mismatch" }
+        } else { "Missing Data" }
+
+        return [PSCustomObject]@{
+            DeploymentName = $DeploymentName
+            VMName         = $VMName
+            AppApplication = $appApplication
+            InfraOS        = $infraOs
+            AppLayer       = $appLayer
+            VMApplications = $vmApplications
+            CompareResult  = $match
+            Status         = "Success"
+        }
     }
-
-    # Compare request 1 (app-application tag) vs request 2 (VM applications) after normalising
-    $norm1 = Normalize-AppName -Name $appApplication
-    $norm2 = Normalize-AppName -Name $vmApplications
-    $match = if ($norm1 -and $norm2) {
-        if ($norm1 -eq $norm2) { "Match" } else { "Mismatch" }
-    } else { "Missing Data" }
-
-    return [PSCustomObject]@{
-        AppApplication  = [string]$appApplication
-        InfraOS         = [string]$infraOs
-        AppLayer        = [string]$appLayer
-        VMApplications  = [string]$vmApplications
-        CompareResult   = [string]$match
+    catch {
+        return [PSCustomObject]@{
+            DeploymentName = $DeploymentName
+            VMName         = $VMName
+            AppApplication = ""
+            InfraOS        = ""
+            AppLayer       = ""
+            VMApplications = ""
+            CompareResult  = ""
+            Status         = "Failed: $($_.Exception.Message)"
+        }
     }
 }
 
-# Main processing
-$allDeployments = Get-AllDeployments
-Write-Log "`n=== FETCHING CMDB DATA ===" -Color Cyan
+# Create and run the runspace pool
+Write-Log "`n=== PROCESSING $($vmQueue.Count) VMs ($maxThreads parallel threads) ===" -Color Cyan
+$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
+$runspacePool = [RunspaceFactory]::CreateRunspacePool(1, $maxThreads)
+$runspacePool.Open()
+
+$jobs = [System.Collections.Generic.List[object]]::new()
+
+foreach ($vm in $vmQueue) {
+    $ps = [PowerShell]::Create().AddScript($scriptBlock)
+    $ps.AddArgument($vraServer)
+    $ps.AddArgument($authToken)
+    $ps.AddArgument($showVmDetailsUri)
+    $ps.AddArgument($getVmAppsUri)
+    $ps.AddArgument($vm.VMName)
+    $ps.AddArgument($vm.ProjectId)
+    $ps.AddArgument($vm.ProjectName)
+    $ps.AddArgument($vm.DeploymentName)
+    $ps.RunspacePool = $runspacePool
+
+    $jobs.Add(@{
+        PowerShell = $ps
+        Handle     = $ps.BeginInvoke()
+        VMName     = $vm.VMName
+    })
+}
+
+# Collect results with progress
 $results = [System.Collections.Generic.List[object]]::new()
-$vmCount = 0
+$completed = 0
 $successCount = 0
 $failCount = 0
 
-foreach ($dep in $allDeployments) {
-    # Skip failed or deleted deployments
-    if ($dep.status -and $dep.status -in @("DELETE_SUCCESSFUL", "FAILED", "DELETE_INPROGRESS")) {
-        continue
-    }
+foreach ($job in $jobs) {
+    $result = $job.PowerShell.EndInvoke($job.Handle)
+    $job.PowerShell.Dispose()
 
-    $machines = @($dep.resources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" })
+    $completed++
 
-    if ($machines.Count -eq 0) { continue }
+    if ($result) {
+        foreach ($r in $result) {
+            if ($r.Status -eq "Success") {
+                $successCount++
+                $matchColor = switch ($r.CompareResult) {
+                    "Match"    { "Green" }
+                    "Mismatch" { "Red" }
+                    default    { "Gray" }
+                }
+                Write-Log "[$completed/$($vmQueue.Count)] $($r.VMName) | $($r.AppApplication) | $($r.CompareResult)" -Color $matchColor
+            }
+            else {
+                $failCount++
+                Write-Log "[$completed/$($vmQueue.Count)] $($r.VMName) | FAILED" -Color Red
+            }
 
-    Write-Log "`nDeployment: $($dep.name) [$($dep.status)]" -Color Yellow
-
-    foreach ($machine in $machines) {
-        # Skip failed or missing VMs
-        if ($machine.state -and $machine.state -notin @("OK", "STARTED", "")) {
-            Write-Log "  VM: $($machine.name) - Skipped ($($machine.state))" -Color Gray
-            continue
+            $results.Add([PSCustomObject]@{
+                DeploymentName = [string]$r.DeploymentName
+                VMName         = [string]$r.VMName
+                AppApplication = [string]$r.AppApplication
+                InfraOS        = [string]$r.InfraOS
+                AppLayer       = [string]$r.AppLayer
+                VMApplications = [string]$r.VMApplications
+                CompareResult  = [string]$r.CompareResult
+            })
         }
-
-        $vmCount++
-        $vmName = if ($machine.properties.resourceName) { $machine.properties.resourceName }
-                  elseif ($machine.properties.hostname) { $machine.properties.hostname }
-                  else { $machine.name }
-        Write-Log "  VM: $vmName" -Color White
-
-        $response = Get-VMCMDBData -VMName $vmName -ProjectId $dep.projectId -ProjectName $dep.projectName
-
-        if (-not $response) {
-            $failCount++
-            continue
-        }
-
-        $successCount++
-        $parsed = Parse-CMDBResponse -Response $response
-
-        $matchColor = if ($parsed.CompareResult -eq "Match") { "Green" }
-                      elseif ($parsed.CompareResult -eq "Mismatch") { "Red" }
-                      else { "Gray" }
-
-        Write-Log "    App: $($parsed.AppApplication) | VM Apps: $($parsed.VMApplications) | $($parsed.CompareResult)" -Color $matchColor
-
-        $results.Add([PSCustomObject]@{
-            DeploymentName  = [string]$dep.name
-            VMName          = [string]$vmName
-            AppApplication  = [string]$parsed.AppApplication
-            InfraOS         = [string]$parsed.InfraOS
-            AppLayer        = [string]$parsed.AppLayer
-            VMApplications  = [string]$parsed.VMApplications
-            CompareResult   = [string]$parsed.CompareResult
-        })
-
-        Start-Sleep -Milliseconds 300
     }
 }
 
+$runspacePool.Close()
+$runspacePool.Dispose()
+$stopwatch.Stop()
+
 # Summary
 Write-Log "`n=== SUMMARY ===" -Color Cyan
-Write-Log "Deployments scanned: $($allDeployments.Count)" -Color White
-Write-Log "VMs processed:       $vmCount" -Color White
-Write-Log "Successful:          $successCount" -Color Green
-Write-Log "Failed:              $failCount" -Color Red
+Write-Log "VMs processed: $($vmQueue.Count)" -Color White
+Write-Log "Successful:    $successCount" -Color Green
+Write-Log "Failed:        $failCount" -Color Red
+Write-Log "Matches:       $(($results | Where-Object { $_.CompareResult -eq 'Match' }).Count)" -Color Green
+Write-Log "Mismatches:    $(($results | Where-Object { $_.CompareResult -eq 'Mismatch' }).Count)" -Color Red
+Write-Log "Missing Data:  $(($results | Where-Object { $_.CompareResult -eq 'Missing Data' }).Count)" -Color Gray
+Write-Log "Time elapsed:  $($stopwatch.Elapsed.ToString('hh\:mm\:ss'))" -Color White
 
 # Export results
 $resultsPath = "$resultsDir\CMDBRelations_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
