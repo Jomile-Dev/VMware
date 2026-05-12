@@ -4,7 +4,6 @@
 
 $vraServer  = "vra.yourdomain.com"
 $resultsDir = "C:\Logs"
-$maxThreads = 10  # Number of parallel API calls - adjust based on vRA capacity
 
 # vRO action URIs - update these to match your environment
 $showVmDetailsUri = "somethingsomething.something.wrappers/showVmDetails"
@@ -217,10 +216,10 @@ $scriptBlock = {
 }
 
 # Create and run the runspace pool
-Write-Log "`n=== PROCESSING $($vmQueue.Count) VMs ($maxThreads parallel threads) ===" -Color Cyan
+Write-Log "`n=== PROCESSING $($vmQueue.Count) VMs (10 parallel threads) ===" -Color Cyan
 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
-$runspacePool = [RunspaceFactory]::CreateRunspacePool(1, $maxThreads)
+$runspacePool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, 10)
 $runspacePool.Open()
 
 $jobs = [System.Collections.Generic.List[object]]::new()
@@ -285,8 +284,7 @@ foreach ($job in $jobs) {
     }
 }
 
-$runspacePool.Close()
-$runspacePool.Dispose()
+if ($runspacePool) { $runspacePool.Close(); $runspacePool.Dispose() }
 $stopwatch.Stop()
 
 # Summary
