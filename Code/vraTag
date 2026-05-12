@@ -2,7 +2,6 @@
 # Calls the vRO form external-values endpoint to retrieve CMDB data for all VMs
 
 $vraServer = "vra.yourdomain.com"
-$projectId = "YOUR-PROJECT-ID-HERE"
 $resultsDir = "C:\Logs"
 
 # vRO action URIs - update these to match your environment
@@ -63,9 +62,9 @@ function Get-AllDeployments {
 
 # Call the vRO form external-values endpoint for a specific VM
 function Get-VMCMDBData {
-    param($VMName)
+    param($VMName, $ProjectId)
 
-    $uri = "https://$vraServer/form-service/api/forms/renderer/external-values?projectId=$projectId"
+    $uri = "https://$vraServer/form-service/api/forms/renderer/external-values?projectId=$ProjectId"
 
     $body = @(
         @{
@@ -148,7 +147,7 @@ foreach ($dep in $allDeployments) {
         $vmName = $machine.name
         Write-Log "  VM: $vmName" -Color White
 
-        $response = Get-VMCMDBData -VMName $vmName
+        $response = Get-VMCMDBData -VMName $vmName -ProjectId $dep.projectId
 
         if (-not $response) {
             $failCount++
