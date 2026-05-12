@@ -1,0 +1,141 @@
+# VMware Aria Automation - Day 2 Action Lister
+# Lists all available Day 2 actions for Cloud.vSphere.Machine resources across deployments
+
+$vraServer = "vra.yourdomain.com"
+$resultsDir = "C:\Logs"
+
+function Write-Log {
+    param($Message, $Color = "White")
+    Write-Host $Message -ForegroundColor $Color
+}
+
+# Configure TLS 1.2
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+[System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+
+# Authenticate to VMware Aria
+Write-Log "=== AUTHENTICATION ===" -Color Cyan
+$credential = Get-Credential -Message "Enter VMware Aria Automation credentials"
+
+$authBody = @{
+    username = $credential.UserName
+    password = $credential.GetNetworkCredential().Password
+} | ConvertTo-Json
+
+$authResponse = Invoke-RestMethod -Uri "https://$vraServer/csp/gateway/am/api/login" `
+    -Method Post -Headers @{"Content-Type"="application/json"} -Body $authBody
+
+$headers = @{
+    "Authorization" = "Bearer $($authResponse.cspAuthToken)"
+    "Content-Type"  = "application/json"
+}
+Write-Log "Authentication successful!" -Color Green
+
+# Get all deployments with pagination
+function Get-AllDeployments {
+    Write-Log "Fetching all deployments..." -Color Cyan
+    $allDeployments = @()
+    $page = 0
+    $size = 100
+
+    do {
+        $uri = "https://$vraServer/deployment/api/deployments?page=$page&size=$size&expand=resources"
+        Write-Log "  Page $($page + 1)..." -Color Gray
+
+        $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers
+        $deployments = if ($response.content) { $response.content } else { $response }
+        $allDeployments += $deployments
+
+        $hasMore = ($response.totalPages -and $page -lt $response.totalPages - 1) -or
+                   ($deployments.Count -eq $size)
+        $page++
+    } while ($hasMore)
+
+    Write-Log "Total deployments: $($allDeployments.Count)" -Color Cyan
+    return $allDeployments
+}
+
+# Get available Day 2 actions for a resource
+function Get-ResourceActions {
+    param($DeploymentId, $ResourceId)
+
+    try {
+        $uri = "https://$vraServer/deployment/api/deployments/$DeploymentId/resources/$ResourceId/actions"
+        $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers
+        return $response
+    }
+    catch {
+        Write-Log "    Error fetching actions: $($_.Exception.Message)" -Color Red
+        return $null
+    }
+}
+
+# Main processing
+$allDeployments = Get-AllDeployments
+Write-Log "`n=== LISTING DAY 2 ACTIONS ===" -Color Cyan
+
+$results = [System.Collections.Generic.List[object]]::new()
+$vmCount = 0
+
+foreach ($dep in $allDeployments) {
+    $machines = @($dep.resources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" })
+
+    if ($machines.Count -eq 0) { continue }
+
+    Write-Log "`nDeployment: $($dep.name)" -Color Yellow
+
+    foreach ($machine in $machines) {
+        $vmCount++
+        Write-Log "  VM: $($machine.name)" -Color White
+
+        $actions = Get-ResourceActions -DeploymentId $dep.id -ResourceId $machine.id
+
+        if (-not $actions) {
+            Write-Log "    No actions available" -Color Gray
+            $results.Add([PSCustomObject]@{
+                DeploymentName = [string]$dep.name
+                DeploymentId   = [string]$dep.id
+                VMName         = [string]$machine.name
+                ResourceId     = [string]$machine.id
+                ActionId       = [string]"N/A"
+                ActionName     = [string]"No actions available"
+                Description    = [string]""
+            })
+            continue
+        }
+
+        foreach ($action in $actions) {
+            Write-Log "    $($action.id) - $($action.name)" -Color Gray
+
+            $results.Add([PSCustomObject]@{
+                DeploymentName = [string]$dep.name
+                DeploymentId   = [string]$dep.id
+                VMName         = [string]$machine.name
+                ResourceId     = [string]$machine.id
+                ActionId       = [string]$action.id
+                ActionName     = [string]$action.name
+                Description    = [string]$action.description
+            })
+        }
+
+        Start-Sleep -Milliseconds 200
+    }
+}
+
+# Summary
+$uniqueActions = ($results | Where-Object { $_.ActionId -ne "N/A" } | Select-Object -ExpandProperty ActionId -Unique)
+
+Write-Log "`n=== SUMMARY ===" -Color Cyan
+Write-Log "Deployments scanned: $($allDeployments.Count)" -Color White
+Write-Log "VMs found:           $vmCount" -Color White
+Write-Log "Unique actions:      $($uniqueActions.Count)" -Color White
+
+Write-Log "`nAvailable action types:" -Color Yellow
+foreach ($actionId in $uniqueActions) {
+    Write-Log "  $actionId" -Color Gray
+}
+
+# Export results
+$resultsPath = "$resultsDir\Day2Actions_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+$results | Export-Csv -Path $resultsPath -NoTypeInformation
+Write-Log "`nResults saved: $resultsPath" -Color White
