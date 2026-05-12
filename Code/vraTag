@@ -5,6 +5,15 @@
 $vraServer  = "vra.yourdomain.com"
 $resultsDir = "C:\Logs"
 
+# Email Configuration
+$SendEmail    = $true
+$EmailTo      = "admin@company.com"
+$EmailFrom    = "vmware-reports@company.com"
+$EmailSubject = "CMDB Relations Comparison Report - $(Get-Date -Format 'yyyy-MM-dd')"
+$SMTPServer   = "mail.company.com"
+$SMTPPort     = 465
+$UseSSL       = $true
+
 # vRO action URIs - update these to match your environment
 $showVmDetailsUri = "somethingsomething.something.wrappers/showVmDetails"
 $getVmAppsUri     = "somethingsomething.something.returns/getVmApplications"
@@ -226,14 +235,14 @@ $jobs = [System.Collections.Generic.List[object]]::new()
 
 foreach ($vm in $vmQueue) {
     $ps = [PowerShell]::Create().AddScript($scriptBlock)
-    $ps.AddArgument($vraServer)
-    $ps.AddArgument($authToken)
-    $ps.AddArgument($showVmDetailsUri)
-    $ps.AddArgument($getVmAppsUri)
-    $ps.AddArgument($vm.VMName)
-    $ps.AddArgument($vm.ProjectId)
-    $ps.AddArgument($vm.ProjectName)
-    $ps.AddArgument($vm.DeploymentName)
+    $ps.AddArgument($vraServer)       | Out-Null
+    $ps.AddArgument($authToken)       | Out-Null
+    $ps.AddArgument($showVmDetailsUri)| Out-Null
+    $ps.AddArgument($getVmAppsUri)    | Out-Null
+    $ps.AddArgument($vm.VMName)       | Out-Null
+    $ps.AddArgument($vm.ProjectId)    | Out-Null
+    $ps.AddArgument($vm.ProjectName)  | Out-Null
+    $ps.AddArgument($vm.DeploymentName) | Out-Null
     $ps.RunspacePool = $runspacePool
 
     $jobs.Add(@{
@@ -301,3 +310,132 @@ Write-Log "Time elapsed:  $($stopwatch.Elapsed.ToString('hh\:mm\:ss'))" -Color W
 $resultsPath = "$resultsDir\CMDBRelations_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
 $results | Export-Csv -Path $resultsPath -NoTypeInformation
 Write-Log "`nResults saved: $resultsPath" -Color White
+
+# Email report
+if ($SendEmail) {
+    Write-Log "`n=== SENDING EMAIL ===" -Color Cyan
+
+    $matchCount    = ($results | Where-Object { $_.CompareResult -eq 'Match' }).Count
+    $mismatchCount = ($results | Where-Object { $_.CompareResult -eq 'Mismatch' }).Count
+    $missingCount  = ($results | Where-Object { $_.CompareResult -eq 'Missing Data' }).Count
+    $totalVMs      = $results.Count
+
+    # Build mismatch detail rows
+    $mismatchRows = ""
+    $mismatches = @($results | Where-Object { $_.CompareResult -eq 'Mismatch' })
+    foreach ($m in $mismatches) {
+        $mismatchRows += @"
+        <tr>
+            <td style="padding:6px 12px; border:1px solid #ddd;">$($m.DeploymentName)</td>
+            <td style="padding:6px 12px; border:1px solid #ddd;">$($m.VMName)</td>
+            <td style="padding:6px 12px; border:1px solid #ddd;">$($m.AppApplication)</td>
+            <td style="padding:6px 12px; border:1px solid #ddd;">$($m.VMApplications)</td>
+        </tr>
+"@
+    }
+
+    # Build missing data rows
+    $missingRows = ""
+    $missingData = @($results | Where-Object { $_.CompareResult -eq 'Missing Data' })
+    foreach ($m in $missingData) {
+        $missingRows += @"
+        <tr>
+            <td style="padding:6px 12px; border:1px solid #ddd;">$($m.DeploymentName)</td>
+            <td style="padding:6px 12px; border:1px solid #ddd;">$($m.VMName)</td>
+            <td style="padding:6px 12px; border:1px solid #ddd;">$($m.AppApplication)</td>
+            <td style="padding:6px 12px; border:1px solid #ddd;">$($m.VMApplications)</td>
+        </tr>
+"@
+    }
+
+    $emailBody = @"
+<html>
+<body style="font-family: Segoe UI, Arial, sans-serif; color: #333;">
+    <h2 style="color: #2c3e50;">CMDB Relations Comparison Report</h2>
+    <p>Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | Duration: $($stopwatch.Elapsed.ToString('hh\:mm\:ss'))</p>
+
+    <h3 style="color: #2c3e50;">Summary</h3>
+    <table style="border-collapse:collapse; margin-bottom:20px;">
+        <tr style="background:#2c3e50; color:white;">
+            <th style="padding:8px 16px; border:1px solid #ddd; text-align:left;">Category</th>
+            <th style="padding:8px 16px; border:1px solid #ddd; text-align:right;">Count</th>
+        </tr>
+        <tr style="background:#e8f5e9;">
+            <td style="padding:6px 16px; border:1px solid #ddd;">Match</td>
+            <td style="padding:6px 16px; border:1px solid #ddd; text-align:right; color:green; font-weight:bold;">$matchCount</td>
+        </tr>
+        <tr style="background:#ffebee;">
+            <td style="padding:6px 16px; border:1px solid #ddd;">Mismatch</td>
+            <td style="padding:6px 16px; border:1px solid #ddd; text-align:right; color:red; font-weight:bold;">$mismatchCount</td>
+        </tr>
+        <tr style="background:#f5f5f5;">
+            <td style="padding:6px 16px; border:1px solid #ddd;">Missing Data</td>
+            <td style="padding:6px 16px; border:1px solid #ddd; text-align:right; color:gray; font-weight:bold;">$missingCount</td>
+        </tr>
+        <tr style="background:#e3f2fd;">
+            <td style="padding:6px 16px; border:1px solid #ddd; font-weight:bold;">Total VMs</td>
+            <td style="padding:6px 16px; border:1px solid #ddd; text-align:right; font-weight:bold;">$totalVMs</td>
+        </tr>
+        <tr>
+            <td style="padding:6px 16px; border:1px solid #ddd;">Failed API Calls</td>
+            <td style="padding:6px 16px; border:1px solid #ddd; text-align:right;">$failCount</td>
+        </tr>
+    </table>
+
+    $(if ($mismatchCount -gt 0) { @"
+    <h3 style="color: #c0392b;">Mismatched VMs ($mismatchCount)</h3>
+    <table style="border-collapse:collapse; margin-bottom:20px;">
+        <tr style="background:#c0392b; color:white;">
+            <th style="padding:8px 12px; border:1px solid #ddd; text-align:left;">Deployment</th>
+            <th style="padding:8px 12px; border:1px solid #ddd; text-align:left;">VM Name</th>
+            <th style="padding:8px 12px; border:1px solid #ddd; text-align:left;">App (CMDB Tag)</th>
+            <th style="padding:8px 12px; border:1px solid #ddd; text-align:left;">App (VM Lookup)</th>
+        </tr>
+        $mismatchRows
+    </table>
+"@})
+
+    $(if ($missingCount -gt 0) { @"
+    <h3 style="color: #7f8c8d;">VMs with Missing Data ($missingCount)</h3>
+    <table style="border-collapse:collapse; margin-bottom:20px;">
+        <tr style="background:#7f8c8d; color:white;">
+            <th style="padding:8px 12px; border:1px solid #ddd; text-align:left;">Deployment</th>
+            <th style="padding:8px 12px; border:1px solid #ddd; text-align:left;">VM Name</th>
+            <th style="padding:8px 12px; border:1px solid #ddd; text-align:left;">App (CMDB Tag)</th>
+            <th style="padding:8px 12px; border:1px solid #ddd; text-align:left;">App (VM Lookup)</th>
+        </tr>
+        $missingRows
+    </table>
+"@})
+
+    <p style="color:#888; font-size:12px;">Full results attached as CSV. This is an automated report.</p>
+</body>
+</html>
+"@
+
+    try {
+        $smtpCredPath = "$resultsDir\smtp_cred.xml"
+        if (Test-Path $smtpCredPath) {
+            $smtpCred = Import-Clixml -Path $smtpCredPath
+        } else {
+            $smtpCred = Get-Credential -Message "Enter SMTP credentials (will be saved encrypted)"
+            $smtpCred | Export-Clixml -Path $smtpCredPath
+        }
+
+        Send-MailMessage -From $EmailFrom -To $EmailTo -Subject $EmailSubject `
+            -Body $emailBody -BodyAsHtml `
+            -SmtpServer $SMTPServer -Port $SMTPPort `
+            -UseSsl:$UseSSL -Credential $smtpCred `
+            -Attachments $resultsPath -ErrorAction Stop
+
+        Write-Log "Email sent to $EmailTo" -Color Green
+
+        # Clean up CSV after sending
+        Remove-Item -Path $resultsPath -Force
+        Write-Log "CSV cleaned up" -Color Gray
+    }
+    catch {
+        Write-Log "Failed to send email: $($_.Exception.Message)" -Color Red
+        Write-Log "CSV retained: $resultsPath" -Color Yellow
+    }
+}
