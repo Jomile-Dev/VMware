@@ -1,441 +1,337 @@
-# VMware Aria Automation - Bulk CMDB Relations Extractor
-# Calls the vRO form external-values endpoint to retrieve CMDB data for all VMs
-# Uses runspace pooling for parallel execution (ISE compatible)
+# VMware Cluster Capacity Analysis Script - N-2 Version
+# Calculates cluster capacity based on N-2 availability model
 
-$vraServer  = "vra.yourdomain.com"
-$resultsDir = "C:\Logs"
+# Connection to multiple vCenter Servers
+$vCenterServers = @(
+    "vcenter1.domain.com",
+    "vcenter2.domain.com", 
+    "vcenter3.domain.com"
+)
+
+# Configuration - Modify these values as needed
+$CpuOvercommitRatio = 3.0             # 3:1 CPU overcommit ratio
 
 # Email Configuration
-$SendEmail    = $true
-$EmailTo      = "admin@company.com"
-$EmailFrom    = "vmware-reports@company.com"
-$EmailSubject = "CMDB Relations Comparison Report - $(Get-Date -Format 'yyyy-MM-dd')"
-$SMTPServer   = "mail.company.com"
-$SMTPPort     = 465
-$UseSSL       = $true
+$SendEmail = $true                     # Set to $false to disable email
+$EmailTo = "admin@company.com"         # Recipient email
+$EmailFrom = "vmware-reports@company.com" # Sender email
+$EmailSubject = "VMware Cluster Capacity Analysis (N-2) - $(Get-Date -Format 'yyyy-MM-dd')"
+$SMTPServer = "mail.company.com"       # Your SMTP server
+$SMTPPort = 465                        # SSL port (465 for SSL, 587 for TLS)
+$UseSSL = $true                        # Use SSL encryption
+$SMTPCredentials = $null               # No SMTP authentication required
 
-# vRO action URIs - update these to match your environment
-$showVmDetailsUri = "somethingsomething.something.wrappers/showVmDetails"
-$getVmAppsUri     = "somethingsomething.something.returns/getVmApplications"
+# Get credentials once at the start
+Write-Host "Please enter your vCenter credentials:" -ForegroundColor Yellow
+$Credential = Get-Credential
 
-function Write-Log {
-    param($Message, $Color = "White")
-    Write-Host $Message -ForegroundColor $Color
-}
+# Suppress certificate warnings (optional)
+Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session
 
-# Configure TLS 1.2
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-[System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+# Initialize results collection for email
+$allResults = @()
+$connectedServers = @()
 
-# Authenticate to VMware Aria
-Write-Log "=== AUTHENTICATION ===" -Color Cyan
-$credential = Get-Credential -Message "Enter VMware Aria Automation credentials"
-
-$authBody = @{
-    username = $credential.UserName
-    password = $credential.GetNetworkCredential().Password
-} | ConvertTo-Json
-
-$authResponse = Invoke-RestMethod -Uri "https://$vraServer/csp/gateway/am/api/login" `
-    -Method Post -Headers @{"Content-Type"="application/json"} -Body $authBody
-
-$authToken = $authResponse.cspAuthToken
-Write-Log "Authentication successful!" -Color Green
-
-# Get all deployments with pagination
-function Get-AllDeployments {
-    Write-Log "Fetching all deployments..." -Color Cyan
-
-    $headers = @{
-        "Authorization" = "Bearer $authToken"
-        "Content-Type"  = "application/json"
+try {
+    # Connect to vCenter Servers
+    Write-Host "Connecting to vCenter Servers:" -ForegroundColor Green
+    
+    foreach ($server in $vCenterServers) {
+        if (-not [string]::IsNullOrWhiteSpace($server)) {
+            $cleanServer = $server.Trim()
+            if ($cleanServer -ne "") {
+                Write-Host "  Attempting connection to: $cleanServer" -ForegroundColor Cyan
+                try {
+                    $connection = Connect-VIServer -Server $cleanServer -Credential $Credential -ErrorAction Stop
+                    Write-Host "    ✓ Connected successfully" -ForegroundColor Green
+                    $connectedServers += $connection
+                } catch {
+                    Write-Host "    ✗ Failed to connect: $($_.Exception.Message)" -ForegroundColor Red
+                    continue
+                }
+            }
+        }
     }
 
-    $allDeployments = @()
-    $page = 0
-    $size = 200  # Larger page size to reduce round trips
-
-    do {
-        $uri = "https://$vraServer/deployment/api/deployments?page=$page&size=$size&expand=resources"
-        Write-Log "  Page $($page + 1)..." -Color Gray
-
-        $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers
-        $deployments = if ($response.content) { $response.content } else { $response }
-        $allDeployments += $deployments
-
-        $hasMore = ($response.totalPages -and $page -lt $response.totalPages - 1) -or
-                   ($deployments.Count -eq $size)
-        $page++
-    } while ($hasMore)
-
-    Write-Log "Total deployments: $($allDeployments.Count)" -Color Cyan
-    return $allDeployments
-}
-
-# Normalise application name for comparison
-function Normalize-AppName {
-    param($Name)
-    if (-not $Name) { return "" }
-    return ($Name.ToLower().Trim() -replace '[_\s\-\.]+', '')
-}
-
-# Build the work queue - collect all VMs to process
-$allDeployments = Get-AllDeployments
-
-Write-Log "`n=== BUILDING VM QUEUE ===" -Color Cyan
-$vmQueue = [System.Collections.Generic.List[hashtable]]::new()
-
-foreach ($dep in $allDeployments) {
-    # Skip failed or deleted deployments
-    if ($dep.status -and $dep.status -in @("DELETE_SUCCESSFUL", "FAILED", "DELETE_INPROGRESS")) {
-        continue
+    if ($connectedServers.Count -eq 0) {
+        throw "No vCenter servers connected. Exiting."
     }
 
-    $machines = @($dep.resources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" })
-    if ($machines.Count -eq 0) { continue }
-
-    foreach ($machine in $machines) {
-        # Skip failed or missing VMs
-        if ($machine.state -and $machine.state -notin @("OK", "STARTED", "")) {
+    Write-Host "`nAnalyzing cluster capacity across all vCenter servers (N-2 model)..." -ForegroundColor Yellow
+    
+    # Process each vCenter server individually
+    foreach ($vCenterConnection in $connectedServers) {
+        $vCenterName = $vCenterConnection.Name
+        Write-Host "`n=== Processing vCenter: $vCenterName ===" -ForegroundColor Magenta
+        
+        # Get clusters from THIS specific vCenter
+        $clusters = Get-Cluster -Server $vCenterConnection | Where-Object { $_.HAEnabled -eq $true }
+        
+        if ($clusters.Count -eq 0) {
+            Write-Host "  No HA-enabled clusters found on $vCenterName" -ForegroundColor Yellow
             continue
         }
-
-        $vmName = if ($machine.properties.resourceName) { $machine.properties.resourceName }
-                  elseif ($machine.properties.hostname) { $machine.properties.hostname }
-                  else { $machine.name }
-
-        $vmQueue.Add(@{
-            DeploymentName = $dep.name
-            VMName         = $vmName
-            ProjectId      = $dep.projectId
-            ProjectName    = $dep.projectName
-        })
-    }
-}
-
-Write-Log "VMs to process: $($vmQueue.Count)" -Color Cyan
-
-# Scriptblock that runs in each runspace
-$scriptBlock = {
-    param($VraServer, $AuthToken, $ShowVmDetailsUri, $GetVmAppsUri, $VMName, $ProjectId, $ProjectName, $DeploymentName)
-
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
-
-    $headers = @{
-        "Authorization" = "Bearer $AuthToken"
-        "Content-Type"  = "application/json"
-    }
-
-    $uri = "https://$VraServer/form-service/api/forms/renderer/external-values?projectId=$ProjectId"
-
-    $bodyArray = @(
-        @{
-            uri                     = $ShowVmDetailsUri
-            dataSource              = "scriptAction"
-            parameters              = @(
-                @{ name = "vmName"; value = $VMName }
-            )
-            useResultsFromRequestId = -1
-            fieldType               = @{ dataType = "complex" }
-            fields                  = @(
-                @{ label = "Scope"; type = @{ dataType = "string" }; id = "scope" },
-                @{ label = "Tag";   type = @{ dataType = "string" }; id = "tag" }
-            )
-            isMultiple              = $true
-            requestId               = 1
-        },
-        @{
-            uri                     = $GetVmAppsUri
-            dataSource              = "scriptAction"
-            parameters              = @(
-                @{ name = "vmName";      value = $VMName },
-                @{ name = "projectName"; value = $ProjectName }
-            )
-            useResultsFromRequestId = -1
-            fieldType               = @{ dataType = "string" }
-            isMultiple              = $true
-            requestId               = 2
-        }
-    )
-
-    $body = "[" + (($bodyArray | ForEach-Object { $_ | ConvertTo-Json -Depth 5 -Compress }) -join ",") + "]"
-
-    try {
-        $response = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body
-
-        $appApplication = ""
-        $infraOs        = ""
-        $appLayer       = ""
-        $vmApplications = ""
-
-        foreach ($result in $response) {
-            switch ($result.requestId) {
-                1 {
-                    if ($result.data -is [array]) {
-                        foreach ($item in $result.data) {
-                            if ($item.scope -and $item.tag) {
-                                switch ($item.scope) {
-                                    "app-application" { $appApplication = $item.tag }
-                                    "infra-os"        { $infraOs = $item.tag }
-                                    "app-layer"       { $appLayer = $item.tag }
-                                }
-                            }
-                        }
-                    }
-                }
-                2 {
-                    if ($result.data -is [array]) {
-                        $vmApplications = ($result.data | Where-Object { $_ -and $_ -notmatch "^---" }) -join "; "
-                    }
-                }
+        
+        foreach ($cluster in $clusters) {
+            Write-Host "  Processing Cluster: $($cluster.Name)" -ForegroundColor Cyan
+            
+            # Get all connected hosts in cluster
+            $hosts = $cluster | Get-VMHost | Where-Object { $_.ConnectionState -eq "Connected" -and $_.PowerState -eq "PoweredOn" }
+            $totalHosts = [int]$hosts.Count
+            
+            if ($totalHosts -lt 3) {
+                Write-Host "    Insufficient hosts for N-2 analysis (need at least 3)" -ForegroundColor Yellow
+                continue
             }
-        }
-
-        # Normalise and compare
-        $norm1 = if ($appApplication) { ($appApplication.ToLower().Trim() -replace '[_\s\-\.]+', '') } else { "" }
-        $norm2 = if ($vmApplications) { ($vmApplications.ToLower().Trim() -replace '[_\s\-\.]+', '') } else { "" }
-        $match = if ($norm1 -and $norm2) {
-            if ($norm1 -eq $norm2) { "Match" } else { "Mismatch" }
-        } else { "Missing Data" }
-
-        return [PSCustomObject]@{
-            DeploymentName = $DeploymentName
-            VMName         = $VMName
-            AppApplication = $appApplication
-            InfraOS        = $infraOs
-            AppLayer       = $appLayer
-            VMApplications = $vmApplications
-            CompareResult  = $match
-            Status         = "Success"
-        }
-    }
-    catch {
-        return [PSCustomObject]@{
-            DeploymentName = $DeploymentName
-            VMName         = $VMName
-            AppApplication = ""
-            InfraOS        = ""
-            AppLayer       = ""
-            VMApplications = ""
-            CompareResult  = ""
-            Status         = "Failed: $($_.Exception.Message)"
-        }
-    }
-}
-
-# Create and run the runspace pool
-Write-Log "`n=== PROCESSING $($vmQueue.Count) VMs (10 parallel threads) ===" -Color Cyan
-$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-
-$runspacePool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, 10)
-$runspacePool.Open()
-
-$jobs = [System.Collections.Generic.List[object]]::new()
-
-foreach ($vm in $vmQueue) {
-    $ps = [PowerShell]::Create().AddScript($scriptBlock)
-    $ps.AddArgument($vraServer)       | Out-Null
-    $ps.AddArgument($authToken)       | Out-Null
-    $ps.AddArgument($showVmDetailsUri)| Out-Null
-    $ps.AddArgument($getVmAppsUri)    | Out-Null
-    $ps.AddArgument($vm.VMName)       | Out-Null
-    $ps.AddArgument($vm.ProjectId)    | Out-Null
-    $ps.AddArgument($vm.ProjectName)  | Out-Null
-    $ps.AddArgument($vm.DeploymentName) | Out-Null
-    $ps.RunspacePool = $runspacePool
-
-    $jobs.Add(@{
-        PowerShell = $ps
-        Handle     = $ps.BeginInvoke()
-        VMName     = $vm.VMName
-    })
-}
-
-# Collect results with progress
-$results = [System.Collections.Generic.List[object]]::new()
-$completed = 0
-$successCount = 0
-$failCount = 0
-
-foreach ($job in $jobs) {
-    $result = $job.PowerShell.EndInvoke($job.Handle)
-    $job.PowerShell.Dispose()
-
-    $completed++
-
-    if ($result) {
-        foreach ($r in $result) {
-            if ($r.Status -eq "Success") {
-                $successCount++
-                $matchColor = switch ($r.CompareResult) {
-                    "Match"    { "Green" }
-                    "Mismatch" { "Red" }
-                    default    { "Gray" }
-                }
-                Write-Log "[$completed/$($vmQueue.Count)] $($r.VMName) | $($r.AppApplication) | $($r.CompareResult)" -Color $matchColor
+            
+            # Calculate total cluster resources - convert to proper numeric types
+            $totalCpuMhz = [double](($hosts | Measure-Object -Property CpuTotalMhz -Sum).Sum)
+            $totalMemoryMB = [double](($hosts | Measure-Object -Property MemoryTotalMB -Sum).Sum)
+            $totalCpuCores = [int](($hosts | Measure-Object -Property NumCpu -Sum).Sum)
+            
+            # Calculate N-2 usable capacity (remove any 2 hosts)
+            # Use average host capacity for N-2 calculation
+            $avgCpuMhzPerHost = [double]($totalCpuMhz / $totalHosts)
+            $avgMemoryMBPerHost = [double]($totalMemoryMB / $totalHosts)
+            $avgCpuCoresPerHost = [double]($totalCpuCores / $totalHosts)
+            
+            $n2CpuMhz = [double]($totalCpuMhz - (2 * $avgCpuMhzPerHost))
+            $n2MemoryMB = [double]($totalMemoryMB - (2 * $avgMemoryMBPerHost))
+            $n2CpuCores = [int]($totalCpuCores - (2 * $avgCpuCoresPerHost))
+            
+            # Calculate N-2 usable CPU cores with overcommit
+            $n2UsableCpuCores = [double]($n2CpuCores * $CpuOvercommitRatio)
+            
+            # Get vSAN datastore info if available
+            $vSanDatastore = $cluster | Get-Datastore | Where-Object { $_.Type -eq "vsan" } | Select-Object -First 1
+            $totalvSanTB = 0
+            $n2vSanUsableTB = 0
+            $vSanUsedTB = 0
+            
+            if ($vSanDatastore) {
+                $totalvSanTB = [math]::Round($vSanDatastore.CapacityGB / 1024, 2)  # Convert to TB
+                $vSanUsedTB = [math]::Round(($vSanDatastore.CapacityGB - $vSanDatastore.FreeSpaceGB) / 1024, 2)  # Used space in TB
+                # For vSAN N-2, lose ~2 hosts worth of capacity
+                $avgStoragePerHostTB = $totalvSanTB / $totalHosts
+                $n2vSanUsableTB = [math]::Round($totalvSanTB - (2 * $avgStoragePerHostTB), 2)
             }
-            else {
-                $failCount++
-                Write-Log "[$completed/$($vmQueue.Count)] $($r.VMName) | FAILED" -Color Red
+            
+            # Get ALL VMs in the cluster (regardless of power state)
+            $allVMs = $cluster | Get-VM
+            $totalVMs = [int]$allVMs.Count
+            $poweredOnVMs = $allVMs | Where-Object { $_.PowerState -eq "PoweredOn" }
+            $poweredOnCount = [int]$poweredOnVMs.Count
+            $poweredOffCount = $totalVMs - $poweredOnCount
+            
+            # Calculate VM resource demands using ONLY powered-on VMs (allocated resources)
+            $allocatedCpuCores = [int](($poweredOnVMs | Measure-Object -Property NumCpu -Sum).Sum)
+            $allocatedMemoryMB = [double](($poweredOnVMs | Measure-Object -Property MemoryMB -Sum).Sum)
+            
+            # Calculate vCPU to pCPU ratio
+            $vCpuToPcpuRatio = [math]::Round([double]$allocatedCpuCores / [double]$totalCpuCores, 2)
+            
+            # Calculate total usable CPU cores with 3:1 overcommit
+            $totalUsableCpuCores = [double]($totalCpuCores * $CpuOvercommitRatio)
+            
+            # Calculate utilisation percentages against N-2 usable capacity
+            $n2CpuUtilPct = if ($n2UsableCpuCores -gt 0) { [math]::Round(([double]$allocatedCpuCores / [double]$n2UsableCpuCores) * 100, 2) } else { 0 }
+            $n2MemUtilPct = if ($n2MemoryMB -gt 0) { [math]::Round(($allocatedMemoryMB / $n2MemoryMB) * 100, 2) } else { 0 }
+            $n2vSanUtilPct = if ($n2vSanUsableTB -gt 0) { [math]::Round(($vSanUsedTB / $n2vSanUsableTB) * 100, 2) } else { 0 }
+            
+            # Create the cluster result object
+            $clusterResult = @{
+                vCenter = $vCenterName
+                Cluster = [string]$cluster.Name
+                TotalHosts = $totalHosts
+                TotalVMs = $totalVMs
+                PoweredOnVMs = $poweredOnCount
+                PoweredOffVMs = $poweredOffCount
+                vCpuToPcpuRatio = "$($vCpuToPcpuRatio):1"
+                
+                # Currently assigned/used resources (from powered-on VMs only)
+                vCPU_Assigned = $allocatedCpuCores
+                Memory_Assigned_GB = [math]::Round($allocatedMemoryMB / 1024, 2)      # Convert to GB
+                vSAN_Used_TB = if ($vSanUsedTB -gt 0) { $vSanUsedTB } else { 0 }
+                
+                # Total capacity (without N-2)
+                Total_CPU_Cores = $totalCpuCores
+                Total_CPU_Usable = $totalUsableCpuCores
+                Total_Memory_GB = [math]::Round($totalMemoryMB / 1024, 2)    # Convert to GB
+                Total_vSAN_TB = if ($totalvSanTB -gt 0) { $totalvSanTB } else { 0 }
+                
+                # N-2 capacity
+                N2_CPU_Cores = $n2CpuCores
+                N2_CPU_Usable = $n2UsableCpuCores
+                N2_Memory_GB = [math]::Round($n2MemoryMB / 1024, 2)         # Convert to GB
+                N2_vSAN_Usable_TB = if ($n2vSanUsableTB -gt 0) { $n2vSanUsableTB } else { 0 }
+                
+                # Utilisation against N-2 usable capacity
+                N2_CPU_Util = "$($n2CpuUtilPct)%"
+                N2_Memory_Util = "$($n2MemUtilPct)%"
+                N2_vSAN_Util = if ($n2vSanUsableTB -gt 0) { "$($n2vSanUtilPct)%" } else { "N/A" }
             }
-
-            $results.Add([PSCustomObject]@{
-                DeploymentName = [string]$r.DeploymentName
-                VMName         = [string]$r.VMName
-                AppApplication = [string]$r.AppApplication
-                InfraOS        = [string]$r.InfraOS
-                AppLayer       = [string]$r.AppLayer
-                VMApplications = [string]$r.VMApplications
-                CompareResult  = [string]$r.CompareResult
-            })
+            
+            $allResults += $clusterResult
+            Write-Host "    ✓ Analysis complete" -ForegroundColor Green
         }
     }
-}
-
-if ($runspacePool) { $runspacePool.Close(); $runspacePool.Dispose() }
-$stopwatch.Stop()
-
-# Summary
-Write-Log "`n=== SUMMARY ===" -Color Cyan
-Write-Log "VMs processed: $($vmQueue.Count)" -Color White
-Write-Log "Successful:    $successCount" -Color Green
-Write-Log "Failed:        $failCount" -Color Red
-Write-Log "Matches:       $(($results | Where-Object { $_.CompareResult -eq 'Match' }).Count)" -Color Green
-Write-Log "Mismatches:    $(($results | Where-Object { $_.CompareResult -eq 'Mismatch' }).Count)" -Color Red
-Write-Log "Missing Data:  $(($results | Where-Object { $_.CompareResult -eq 'Missing Data' }).Count)" -Color Gray
-Write-Log "Time elapsed:  $($stopwatch.Elapsed.ToString('hh\:mm\:ss'))" -Color White
-
-# Export results
-$resultsPath = "$resultsDir\CMDBRelations_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
-$results | Export-Csv -Path $resultsPath -NoTypeInformation
-Write-Log "`nResults saved: $resultsPath" -Color White
-
-# Email report
-if ($SendEmail) {
-    Write-Log "`n=== SENDING EMAIL ===" -Color Cyan
-
-    $matchCount    = ($results | Where-Object { $_.CompareResult -eq 'Match' }).Count
-    $mismatchCount = ($results | Where-Object { $_.CompareResult -eq 'Mismatch' }).Count
-    $missingCount  = ($results | Where-Object { $_.CompareResult -eq 'Missing Data' }).Count
-    $totalVMs      = $results.Count
-
-    # Build mismatch detail rows
-    $mismatchRows = ""
-    $mismatches = @($results | Where-Object { $_.CompareResult -eq 'Mismatch' })
-    foreach ($m in $mismatches) {
-        $mismatchRows += @"
-        <tr>
-            <td style="padding:6px 12px; border:1px solid #ddd;">$($m.DeploymentName)</td>
-            <td style="padding:6px 12px; border:1px solid #ddd;">$($m.VMName)</td>
-            <td style="padding:6px 12px; border:1px solid #ddd;">$($m.AppApplication)</td>
-            <td style="padding:6px 12px; border:1px solid #ddd;">$($m.VMApplications)</td>
-        </tr>
-"@
-    }
-
-    # Build missing data rows
-    $missingRows = ""
-    $missingData = @($results | Where-Object { $_.CompareResult -eq 'Missing Data' })
-    foreach ($m in $missingData) {
-        $missingRows += @"
-        <tr>
-            <td style="padding:6px 12px; border:1px solid #ddd;">$($m.DeploymentName)</td>
-            <td style="padding:6px 12px; border:1px solid #ddd;">$($m.VMName)</td>
-            <td style="padding:6px 12px; border:1px solid #ddd;">$($m.AppApplication)</td>
-            <td style="padding:6px 12px; border:1px solid #ddd;">$($m.VMApplications)</td>
-        </tr>
-"@
-    }
-
-    $emailBody = @"
+    
+    # Sort results by vCenter name first, then by Cluster name
+    $sortedResults = $allResults | Sort-Object { $_.vCenter }, { $_.Cluster }
+    
+    # Send email report if configured
+    if ($SendEmail -and $sortedResults.Count -gt 0) {
+        Write-Host "`nGenerating email report..." -ForegroundColor Green
+        
+        # Create HTML email content
+        $htmlBody = @"
+<!DOCTYPE html>
 <html>
-<body style="font-family: Segoe UI, Arial, sans-serif; color: #333;">
-    <h2 style="color: #2c3e50;">CMDB Relations Comparison Report</h2>
-    <p>Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | Duration: $($stopwatch.Elapsed.ToString('hh\:mm\:ss'))</p>
+<head>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        h1 { color: #2E8B57; }
+        h2 { color: #4682B4; margin-top: 30px; }
+        h3 { color: #333; margin-top: 20px; }
+        table { border-collapse: collapse; width: 100%; margin: 15px 0; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        th { background-color: #f2f2f2; font-weight: bold; }
+        .summary { background-color: #f5f5f5; padding: 10px; margin: 20px 0; }
+        .small-text { font-size: 0.9em; }
+        .center-text { text-align: center; }
+    </style>
+</head>
+<body>
+    <h1>VMware Cluster Capacity Analysis Report (N-2 Model)</h1>
+    <p><strong>Generated:</strong> $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</p>
+    <p><strong>vCenter Servers Analyzed:</strong> $($connectedServers.Count) ($($connectedServers.Name -join ', '))</p>
+    
+    <div class="summary">
+        <h3>Analysis Parameters</h3>
+        <ul>
+            <li>CPU Overcommit Ratio: $($CpuOvercommitRatio):1</li>
+            <li>VM counts include all VMs (powered-on and powered-off)</li>
+            <li>Resource utilization based on powered-on VMs only</li>
+        </ul>
+    </div>
 
-    <h3 style="color: #2c3e50;">Summary</h3>
-    <table style="border-collapse:collapse; margin-bottom:20px;">
-        <tr style="background:#2c3e50; color:white;">
-            <th style="padding:8px 16px; border:1px solid #ddd; text-align:left;">Category</th>
-            <th style="padding:8px 16px; border:1px solid #ddd; text-align:right;">Count</th>
-        </tr>
-        <tr style="background:#e8f5e9;">
-            <td style="padding:6px 16px; border:1px solid #ddd;">Match</td>
-            <td style="padding:6px 16px; border:1px solid #ddd; text-align:right; color:green; font-weight:bold;">$matchCount</td>
-        </tr>
-        <tr style="background:#ffebee;">
-            <td style="padding:6px 16px; border:1px solid #ddd;">Mismatch</td>
-            <td style="padding:6px 16px; border:1px solid #ddd; text-align:right; color:red; font-weight:bold;">$mismatchCount</td>
-        </tr>
-        <tr style="background:#f5f5f5;">
-            <td style="padding:6px 16px; border:1px solid #ddd;">Missing Data</td>
-            <td style="padding:6px 16px; border:1px solid #ddd; text-align:right; color:gray; font-weight:bold;">$missingCount</td>
-        </tr>
-        <tr style="background:#e3f2fd;">
-            <td style="padding:6px 16px; border:1px solid #ddd; font-weight:bold;">Total VMs</td>
-            <td style="padding:6px 16px; border:1px solid #ddd; text-align:right; font-weight:bold;">$totalVMs</td>
+    <h2>Cluster Capacity Analysis - N-2 Model</h2>
+    <table>
+        <tr>
+            <th rowspan="2">vCenter</th>
+            <th rowspan="2">Cluster</th>
+            <th rowspan="2">Total<br>Hosts</th>
+            <th colspan="3" style="background-color: #e8f4f8; text-align: center;">VM Counts</th>
+            <th rowspan="2">vCPU:pCPU<br>Ratio</th>
+            <th colspan="3" style="background-color: #fff3cd; text-align: center;">Currently Assigned/Used</th>
+            <th colspan="3" style="background-color: #e6f3ff; text-align: center;">Total Cluster Capacity</th>
+            <th colspan="3" style="background-color: #ffe6e6; text-align: center;">Total Usable Capacity N-2</th>
+            <th colspan="3" style="background-color: #f0f8e6; text-align: center;">Utilisation % N-2</th>
         </tr>
         <tr>
-            <td style="padding:6px 16px; border:1px solid #ddd;">Failed API Calls</td>
-            <td style="padding:6px 16px; border:1px solid #ddd; text-align:right;">$failCount</td>
+            <th class="small-text" style="background-color: #e8f4f8;">Total<br>VMs</th>
+            <th class="small-text" style="background-color: #e8f4f8;">Powered<br>On</th>
+            <th class="small-text" style="background-color: #e8f4f8;">Powered<br>Off</th>
+            <th class="small-text" style="background-color: #fff3cd;">vCPU<br>Assigned</th>
+            <th class="small-text" style="background-color: #fff3cd;">Memory<br>Assigned (GB)</th>
+            <th class="small-text" style="background-color: #fff3cd;">vSAN<br>Used (TB)</th>
+            <th class="small-text" style="background-color: #e6f3ff;">CPU Cores<br>(w/ 3:1)</th>
+            <th class="small-text" style="background-color: #e6f3ff;">Memory<br>(GB)</th>
+            <th class="small-text" style="background-color: #e6f3ff;">vSAN<br>(TB)</th>
+            <th class="small-text" style="background-color: #ffe6e6;">CPU Cores<br>(w/ 3:1)</th>
+            <th class="small-text" style="background-color: #ffe6e6;">Memory<br>(GB)</th>
+            <th class="small-text" style="background-color: #ffe6e6;">vSAN<br>(TB)</th>
+            <th class="small-text" style="background-color: #f0f8e6;">CPU</th>
+            <th class="small-text" style="background-color: #f0f8e6;">Memory</th>
+            <th class="small-text" style="background-color: #f0f8e6;">vSAN</th>
         </tr>
+"@
+        
+        foreach ($result in $sortedResults) {
+            $totalvSanDisplay = if ($result.Total_vSAN_TB -gt 0) { $result.Total_vSAN_TB } else { "N/A" }
+            $n2vSanDisplay = if ($result.N2_vSAN_Usable_TB -gt 0) { $result.N2_vSAN_Usable_TB } else { "N/A" }
+            $vSanUsedDisplay = if ($result.vSAN_Used_TB -gt 0) { $result.vSAN_Used_TB } else { "N/A" }
+            
+            $htmlBody += "<tr>"
+            $htmlBody += "<td>$($result.vCenter)</td>"
+            $htmlBody += "<td>$($result.Cluster)</td>"
+            $htmlBody += "<td class='center-text'>$($result.TotalHosts)</td>"
+            # VM counts
+            $htmlBody += "<td style='background-color: #f0f8fc; text-align: center;'>$($result.TotalVMs)</td>"
+            $htmlBody += "<td style='background-color: #f0f8fc; text-align: center;'>$($result.PoweredOnVMs)</td>"
+            $htmlBody += "<td style='background-color: #f0f8fc; text-align: center;'>$($result.PoweredOffVMs)</td>"
+            $htmlBody += "<td class='center-text'>$($result.vCpuToPcpuRatio)</td>"
+            # Currently assigned/used resources
+            $htmlBody += "<td style='background-color: #fffbf0; text-align: center;'>$($result.vCPU_Assigned)</td>"
+            $htmlBody += "<td style='background-color: #fffbf0; text-align: center;'>$($result.Memory_Assigned_GB)</td>"
+            $htmlBody += "<td style='background-color: #fffbf0; text-align: center;'>$vSanUsedDisplay</td>"
+            # Total capacity (with overcommit - should be higher than N-2)
+            $htmlBody += "<td style='background-color: #f9fdff; text-align: center;'>$($result.Total_CPU_Usable)</td>"
+            $htmlBody += "<td style='background-color: #f9fdff; text-align: center;'>$($result.Total_Memory_GB)</td>"
+            $htmlBody += "<td style='background-color: #f9fdff; text-align: center;'>$totalvSanDisplay</td>"
+            # N-2 capacity
+            $htmlBody += "<td style='background-color: #fff9f9; text-align: center;'>$($result.N2_CPU_Usable)</td>"
+            $htmlBody += "<td style='background-color: #fff9f9; text-align: center;'>$($result.N2_Memory_GB)</td>"
+            $htmlBody += "<td style='background-color: #fff9f9; text-align: center;'>$n2vSanDisplay</td>"
+            # Utilisation against N-2 usable capacity
+            $htmlBody += "<td style='background-color: #f8fdf8; text-align: center;'>$($result.N2_CPU_Util)</td>"
+            $htmlBody += "<td style='background-color: #f8fdf8; text-align: center;'>$($result.N2_Memory_Util)</td>"
+            $htmlBody += "<td style='background-color: #f8fdf8; text-align: center;'>$($result.N2_vSAN_Util)</td>"
+            $htmlBody += "</tr>"
+        }
+        
+        $htmlBody += @"
     </table>
 
-    $(if ($mismatchCount -gt 0) { @"
-    <h3 style="color: #c0392b;">Mismatched VMs ($mismatchCount)</h3>
-    <table style="border-collapse:collapse; margin-bottom:20px;">
-        <tr style="background:#c0392b; color:white;">
-            <th style="padding:8px 12px; border:1px solid #ddd; text-align:left;">Deployment</th>
-            <th style="padding:8px 12px; border:1px solid #ddd; text-align:left;">VM Name</th>
-            <th style="padding:8px 12px; border:1px solid #ddd; text-align:left;">App (CMDB Tag)</th>
-            <th style="padding:8px 12px; border:1px solid #ddd; text-align:left;">App (VM Lookup)</th>
-        </tr>
-        $mismatchRows
-    </table>
-"@})
+    <div class="summary">
+        <h3>Notes</h3>
+        <ul>
+            <li><strong>VM Counts:</strong> Total VMs includes all VMs (powered-on and powered-off) in each cluster</li>
+            <li><strong>Currently Assigned/Used:</strong> Resource usage from powered-on VMs only</li>
+            <li><strong>Total Cluster Capacity:</strong> The total/maximum amount of resources within a cluster (all hosts)</li>
+            <li><strong>Usable Capacity:</strong> The amount of usable compute storage with 2 hosts down</li>
+            <li><strong>Utilisation % (N-2):</strong> Currently assigned resources / Total usable capacity (N-2)</li>
+            <li>CPU capacity includes $($CpuOvercommitRatio):1 overcommit ratio for both total and N-2 calculations</li>
+            <li>vSAN N-2 capacity is calculated based on average storage per host</li>
+            <li>Utilisation percentages indicate capacity stress in a 2-host failure scenario</li>
+        </ul>
+    </div>
 
-    $(if ($missingCount -gt 0) { @"
-    <h3 style="color: #7f8c8d;">VMs with Missing Data ($missingCount)</h3>
-    <table style="border-collapse:collapse; margin-bottom:20px;">
-        <tr style="background:#7f8c8d; color:white;">
-            <th style="padding:8px 12px; border:1px solid #ddd; text-align:left;">Deployment</th>
-            <th style="padding:8px 12px; border:1px solid #ddd; text-align:left;">VM Name</th>
-            <th style="padding:8px 12px; border:1px solid #ddd; text-align:left;">App (CMDB Tag)</th>
-            <th style="padding:8px 12px; border:1px solid #ddd; text-align:left;">App (VM Lookup)</th>
-        </tr>
-        $missingRows
-    </table>
-"@})
-
-    <p style="color:#888; font-size:12px;">Full results attached as CSV. This is an automated report.</p>
+    <p><em>VMware Capacity Analysis Script (N-2 Model)</em></p>
 </body>
 </html>
 "@
-
-    try {
-        $smtpCredPath = "$resultsDir\smtp_cred.xml"
-        if (Test-Path $smtpCredPath) {
-            $smtpCred = Import-Clixml -Path $smtpCredPath
-        } else {
-            $smtpCred = Get-Credential -Message "Enter SMTP credentials (will be saved encrypted)"
-            $smtpCred | Export-Clixml -Path $smtpCredPath
+        
+        try {
+            $emailParams = @{
+                To = $EmailTo
+                From = $EmailFrom
+                Subject = $EmailSubject
+                Body = $htmlBody
+                BodyAsHtml = $true
+                SmtpServer = $SMTPServer
+                Port = $SMTPPort
+                UseSsl = $UseSSL
+            }
+            
+            Send-MailMessage @emailParams
+            Write-Host "✓ Email report sent successfully to $EmailTo" -ForegroundColor Green
+            
+        } catch {
+            Write-Host "✗ Failed to send email: $($_.Exception.Message)" -ForegroundColor Red
         }
-
-        Send-MailMessage -From $EmailFrom -To $EmailTo -Subject $EmailSubject `
-            -Body $emailBody -BodyAsHtml `
-            -SmtpServer $SMTPServer -Port $SMTPPort `
-            -UseSsl:$UseSSL -Credential $smtpCred `
-            -Attachments $resultsPath -ErrorAction Stop
-
-        Write-Log "Email sent to $EmailTo" -Color Green
-
-        # Clean up CSV after sending
-        Remove-Item -Path $resultsPath -Force
-        Write-Log "CSV cleaned up" -Color Gray
+    } elseif ($sortedResults.Count -eq 0) {
+        Write-Host "`nNo clusters found to analyze across all vCenter servers." -ForegroundColor Yellow
     }
-    catch {
-        Write-Log "Failed to send email: $($_.Exception.Message)" -Color Red
-        Write-Log "CSV retained: $resultsPath" -Color Yellow
+    
+} catch {
+    Write-Error "Error: $($_.Exception.Message)"
+} finally {
+    # Disconnect from vCenter
+    if ($global:DefaultVIServers) {
+        Write-Host "`nDisconnecting from vCenter..." -ForegroundColor Green
+        Disconnect-VIServer -Server * -Confirm:$false
     }
 }
+
+Write-Host "`nN-2 capacity analysis complete!" -ForegroundColor Green
