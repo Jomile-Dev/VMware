@@ -60,6 +60,13 @@ function Get-AllDeployments {
     return $allDeployments
 }
 
+# Normalise application name for comparison (lowercase, strip underscores, spaces, special chars)
+function Normalize-AppName {
+    param($Name)
+    if (-not $Name) { return "" }
+    return ($Name.ToLower().Trim() -replace '[_\s\-\.]+', '')
+}
+
 # Call the vRO form external-values endpoint for a specific VM
 function Get-VMCMDBData {
     param($VMName, $ProjectId, $ProjectName)
@@ -93,25 +100,11 @@ function Get-VMCMDBData {
             fieldType               = @{ dataType = "string" }
             isMultiple              = $true
             requestId               = 2
-        },
-        @{
-            uri                     = $getCagAppsUri
-            dataSource              = "scriptAction"
-            parameters              = @(
-                @{ name = "projectName"; value = $ProjectName }
-            )
-            useResultsFromRequestId = -1
-            fieldType               = @{ dataType = "string" }
-            isMultiple              = $true
-            requestId               = 3
         }
     )
 
     # Force proper JSON array serialisation in PS 5.1
     $body = "[" + (($bodyArray | ForEach-Object { $_ | ConvertTo-Json -Depth 5 -Compress }) -join ",") + "]"
-
-    # Uncomment the line below to debug the payload being sent
-    # Write-Log "    Payload: $body" -Color Gray
 
     try {
         $response = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body
@@ -123,30 +116,54 @@ function Get-VMCMDBData {
     }
 }
 
-# Parse the app-application tags from the response
+# Parse the response into a single row per VM
 function Parse-CMDBResponse {
-    param($Response, $VMName)
+    param($Response)
 
-    $applications = @()
+    $appApplication = ""
+    $infraOs        = ""
+    $appLayer       = ""
+    $vmApplications = ""
 
     foreach ($result in $Response) {
-        $requestId = $result.requestId
-
-        if ($result.data -is [array]) {
-            foreach ($item in $result.data) {
-                if ($item.scope -eq "app-application") {
-                    $applications += [PSCustomObject]@{
-                        VMName      = [string]$VMName
-                        Scope       = [string]$item.scope
-                        Tag         = [string]$item.tag
-                        RequestId   = [string]$requestId
+        switch ($result.requestId) {
+            # requestId 1 - scope/tag objects
+            1 {
+                if ($result.data -is [array]) {
+                    foreach ($item in $result.data) {
+                        if ($item.scope -and $item.tag) {
+                            switch ($item.scope) {
+                                "app-application" { $appApplication = $item.tag }
+                                "infra-os"        { $infraOs = $item.tag }
+                                "app-layer"       { $appLayer = $item.tag }
+                            }
+                        }
                     }
+                }
+            }
+            # requestId 2 - VM applications (plain string array)
+            2 {
+                if ($result.data -is [array]) {
+                    $vmApplications = ($result.data | Where-Object { $_ -and $_ -notmatch "^---" }) -join "; "
                 }
             }
         }
     }
 
-    return $applications
+    # Compare request 1 (app-application tag) vs request 2 (VM applications) after normalising
+    $norm1 = Normalize-AppName -Name $appApplication
+    $norm2 = Normalize-AppName -Name $vmApplications
+    $match = if ($norm1 -and $norm2) {
+        if ($norm1 -eq $norm2) { "Match" } else { "Mismatch" }
+    } else { "Missing Data" }
+
+    return [PSCustomObject]@{
+        AppApplication  = [string]$appApplication
+        InfraOS         = [string]$infraOs
+        AppLayer        = [string]$appLayer
+        VMApplications  = [string]$vmApplications
+        CompareResult   = [string]$match
+    }
 }
 
 # Main processing
@@ -159,13 +176,24 @@ $successCount = 0
 $failCount = 0
 
 foreach ($dep in $allDeployments) {
+    # Skip failed or deleted deployments
+    if ($dep.status -and $dep.status -in @("DELETE_SUCCESSFUL", "FAILED", "DELETE_INPROGRESS")) {
+        continue
+    }
+
     $machines = @($dep.resources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" })
 
     if ($machines.Count -eq 0) { continue }
 
-    Write-Log "`nDeployment: $($dep.name)" -Color Yellow
+    Write-Log "`nDeployment: $($dep.name) [$($dep.status)]" -Color Yellow
 
     foreach ($machine in $machines) {
+        # Skip failed or missing VMs
+        if ($machine.state -and $machine.state -notin @("OK", "STARTED", "")) {
+            Write-Log "  VM: $($machine.name) - Skipped ($($machine.state))" -Color Gray
+            continue
+        }
+
         $vmCount++
         $vmName = if ($machine.properties.resourceName) { $machine.properties.resourceName }
                   elseif ($machine.properties.hostname) { $machine.properties.hostname }
@@ -176,50 +204,27 @@ foreach ($dep in $allDeployments) {
 
         if (-not $response) {
             $failCount++
-            $results.Add([PSCustomObject]@{
-                DeploymentName = [string]$dep.name
-                DeploymentId   = [string]$dep.id
-                VMName         = [string]$vmName
-                ResourceId     = [string]$machine.id
-                Scope          = [string]"N/A"
-                Tag            = [string]"N/A"
-                RequestId      = [string]"N/A"
-                Status         = [string]"Failed"
-            })
             continue
         }
 
         $successCount++
-        $parsed = Parse-CMDBResponse -Response $response -VMName $vmName
+        $parsed = Parse-CMDBResponse -Response $response
 
-        if ($parsed.Count -eq 0) {
-            Write-Log "    No app-application data found" -Color Gray
-            $results.Add([PSCustomObject]@{
-                DeploymentName = [string]$dep.name
-                DeploymentId   = [string]$dep.id
-                VMName         = [string]$vmName
-                ResourceId     = [string]$machine.id
-                Scope          = [string]"app-application"
-                Tag            = [string]"(none)"
-                RequestId      = [string]"N/A"
-                Status         = [string]"No Data"
-            })
-        }
-        else {
-            foreach ($app in $parsed) {
-                Write-Log "    $($app.Tag)" -Color Green
-                $results.Add([PSCustomObject]@{
-                    DeploymentName = [string]$dep.name
-                    DeploymentId   = [string]$dep.id
-                    VMName         = [string]$vmName
-                    ResourceId     = [string]$machine.id
-                    Scope          = [string]$app.Scope
-                    Tag            = [string]$app.Tag
-                    RequestId      = [string]$app.RequestId
-                    Status         = [string]"Success"
-                })
-            }
-        }
+        $matchColor = if ($parsed.CompareResult -eq "Match") { "Green" }
+                      elseif ($parsed.CompareResult -eq "Mismatch") { "Red" }
+                      else { "Gray" }
+
+        Write-Log "    App: $($parsed.AppApplication) | VM Apps: $($parsed.VMApplications) | $($parsed.CompareResult)" -Color $matchColor
+
+        $results.Add([PSCustomObject]@{
+            DeploymentName  = [string]$dep.name
+            VMName          = [string]$vmName
+            AppApplication  = [string]$parsed.AppApplication
+            InfraOS         = [string]$parsed.InfraOS
+            AppLayer        = [string]$parsed.AppLayer
+            VMApplications  = [string]$parsed.VMApplications
+            CompareResult   = [string]$parsed.CompareResult
+        })
 
         Start-Sleep -Milliseconds 300
     }
@@ -231,12 +236,6 @@ Write-Log "Deployments scanned: $($allDeployments.Count)" -Color White
 Write-Log "VMs processed:       $vmCount" -Color White
 Write-Log "Successful:          $successCount" -Color Green
 Write-Log "Failed:              $failCount" -Color Red
-
-$uniqueApps = ($results | Where-Object { $_.Tag -ne "(none)" -and $_.Tag -ne "N/A" } | Select-Object -ExpandProperty Tag -Unique)
-Write-Log "Unique applications: $($uniqueApps.Count)" -Color Yellow
-foreach ($app in $uniqueApps) {
-    Write-Log "  $app" -Color Gray
-}
 
 # Export results
 $resultsPath = "$resultsDir\CMDBRelations_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
