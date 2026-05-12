@@ -224,6 +224,465 @@ $scriptBlock = {
     }
 }
 
+# Process with single runspace pool and timeout per job
+$poolSize = 20
+$jobTimeoutSeconds = 120
+Write-Log "`n=== PROCESSING $($vmQueue.Count) VMs ($poolSize parallel threads, ${jobTimeoutSeconds}s timeout) ===" -Color Cyan
+$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+$runspacePool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $poolSize)
+$runspacePool.Open()
+
+$results = [System.Collections.Generic.List[object]]::new()
+$jobs = [System.Collections.Generic.List[object]]::new()
+$completed = 0
+$successCount = 0
+$failCount = 0
+
+# Queue all jobs
+foreach ($vm in $vmQueue) {
+    $ps = [PowerShell]::Create().AddScript($scriptBlock)
+    $ps.AddArgument($vraServer)          | Out-Null
+    $ps.AddArgument($authToken)          | Out-Null
+    $ps.AddArgument($showVmDetailsUri)   | Out-Null
+    $ps.AddArgument($getVmAppsUri)       | Out-Null
+    $ps.AddArgument($vm.VMName)          | Out-Null
+    $ps.AddArgument($vm.ProjectId)       | Out-Null
+    $ps.AddArgument($vm.ProjectName)     | Out-Null
+    $ps.AddArgument($vm.DeploymentName)  | Out-Null
+    $ps.RunspacePool = $runspacePool
+
+    $jobs.Add(@{
+        PowerShell = $ps
+        Handle     = $ps.BeginInvoke()
+        VMName     = $vm.VMName
+    })
+}
+
+# Collect results with timeout
+foreach ($job in $jobs) {
+    $completed++
+
+    if ($job.Handle.AsyncWaitHandle.WaitOne($jobTimeoutSeconds * 1000)) {
+        $result = $job.PowerShell.EndInvoke($job.Handle)
+
+        if ($result) {
+            foreach ($r in $result) {
+                if ($r.Status -eq "Success") {
+                    $successCount++
+                    $matchColor = switch ($r.CompareResult) {
+                        "Match"    { "Green" }
+                        "Mismatch" { "Red" }
+                        default    { "Gray" }
+                    }
+
+                    # Show what was returned for Missing Data so you can see what's empty
+                    if ($r.CompareResult -eq "Missing Data") {
+                        $tagVal = if ($r.AppApplication) { $r.AppApplication } else { "(empty)" }
+                        $appVal = if ($r.VMApplications) { $r.VMApplications } else { "(empty)" }
+                        Write-Log "[$completed/$($vmQueue.Count)] $($r.VMName) | Tag: $tagVal | Apps: $appVal | Missing Data" -Color Gray
+                    }
+                    else {
+                        Write-Log "[$completed/$($vmQueue.Count)] $($r.VMName) | $($r.AppApplication) | $($r.CompareResult)" -Color $matchColor
+                    }
+                }
+                else {
+                    $failCount++
+                    Write-Log "[$completed/$($vmQueue.Count)] $($r.VMName) | FAILED - $($r.Status)" -Color Red
+                }
+
+                $results.Add([PSCustomObject]@{
+                    DeploymentName = [string]$r.DeploymentName
+                    VMName         = [string]$r.VMName
+                    AppApplication = [string]$r.AppApplication
+                    InfraOS        = [string]$r.InfraOS
+                    AppLayer       = [string]$r.AppLayer
+                    VMApplications = [string]$r.VMApplications
+                    CompareResult  = [string]$r.CompareResult
+                })
+            }
+        }
+    }
+    else {
+        $failCount++
+        Write-Log "[$completed/$($vmQueue.Count)] $($job.VMName) | TIMEOUT after ${jobTimeoutSeconds}s" -Color Red
+        $job.PowerShell.Stop()
+    }
+
+    $job.PowerShell.Dispose()
+}
+
+if ($runspacePool) { $runspacePool.Close(); $runspacePool.Dispose() }
+$stopwatch.Stop()
+
+# Summary
+Write-Log "`n=== SUMMARY ===" -Color Cyan
+Write-Log "VMs processed: $($vmQueue.Count)" -Color White
+Write-Log "Successful:    $successCount" -Color Green
+Write-Log "Failed:        $failCount" -Color Red
+Write-Log "Matches:       $(($results | Where-Object { $_.CompareResult -eq 'Match' }).Count)" -Color Green
+Write-Log "Mismatches:    $(($results | Where-Object { $_.CompareResult -eq 'Mismatch' }).Count)" -Color Red
+Write-Log "Missing Data:  $(($results | Where-Object { $_.CompareResult -eq 'Missing Data' }).Count)" -Color Gray
+Write-Log "Time elapsed:  $($stopwatch.Elapsed.ToString('hh\:mm\:ss'))" -Color White
+
+# Export results
+$resultsPath = "$resultsDir\CMDBRelations_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+$results | Export-Csv -Path $resultsPath -NoTypeInformation
+Write-Log "`nResults saved: $resultsPath" -Color White
+
+# Email report
+if ($SendEmail) {
+    Write-Log "`n=== SENDING EMAIL ===" -Color Cyan
+
+    $matchCount    = ($results | Where-Object { $_.CompareResult -eq 'Match' }).Count
+    $mismatchCount = ($results | Where-Object { $_.CompareResult -eq 'Mismatch' }).Count
+    $missingCount  = ($results | Where-Object { $_.CompareResult -eq 'Missing Data' }).Count
+    $totalVMs      = $results.Count
+
+    # Build mismatch detail rows
+    $mismatchRows = ""
+    $mismatches = @($results | Where-Object { $_.CompareResult -eq 'Mismatch' })
+    foreach ($m in $mismatches) {
+        $mismatchRows += @"
+        <tr>
+            <td style="padding:6px 12px; border:1px solid #ddd;">$($m.DeploymentName)</td>
+            <td style="padding:6px 12px; border:1px solid #ddd;">$($m.VMName)</td>
+            <td style="padding:6px 12px; border:1px solid #ddd;">$($m.AppApplication)</td>
+            <td style="padding:6px 12px; border:1px solid #ddd;">$($m.VMApplications)</td>
+        </tr>
+"@
+    }
+
+    # Build missing data rows
+    $missingRows = ""
+    $missingData = @($results | Where-Object { $_.CompareResult -eq 'Missing Data' })
+    foreach ($m in $missingData) {
+        $missingRows += @"
+        <tr>
+            <td style="padding:6px 12px; border:1px solid #ddd;">$($m.DeploymentName)</td>
+            <td style="padding:6px 12px; border:1px solid #ddd;">$($m.VMName)</td>
+            <td style="padding:6px 12px; border:1px solid #ddd;">$($m.AppApplication)</td>
+            <td style="padding:6px 12px; border:1px solid #ddd;">$($m.VMApplications)</td>
+        </tr>
+"@
+    }
+
+    $emailBody = @"
+<html>
+<body style="font-family: Segoe UI, Arial, sans-serif; color: #333;">
+    <h2 style="color: #2c3e50;">CMDB Relations Comparison Report</h2>
+    <p>Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | Duration: $($stopwatch.Elapsed.ToString('hh\:mm\:ss'))</p>
+
+    <h3 style="color: #2c3e50;">Summary</h3>
+    <table style="border-collapse:collapse; margin-bottom:20px;">
+        <tr style="background:#2c3e50; color:white;">
+            <th style="padding:8px 16px; border:1px solid #ddd; text-align:left;">Category</th>
+            <th style="padding:8px 16px; border:1px solid #ddd; text-align:right;">Count</th>
+        </tr>
+        <tr style="background:#e8f5e9;">
+            <td style="padding:6px 16px; border:1px solid #ddd;">Match</td>
+            <td style="padding:6px 16px; border:1px solid #ddd; text-align:right; color:green; font-weight:bold;">$matchCount</td>
+        </tr>
+        <tr style="background:#ffebee;">
+            <td style="padding:6px 16px; border:1px solid #ddd;">Mismatch</td>
+            <td style="padding:6px 16px; border:1px solid #ddd; text-align:right; color:red; font-weight:bold;">$mismatchCount</td>
+        </tr>
+        <tr style="background:#f5f5f5;">
+            <td style="padding:6px 16px; border:1px solid #ddd;">Missing Data</td>
+            <td style="padding:6px 16px; border:1px solid #ddd; text-align:right; color:gray; font-weight:bold;">$missingCount</td>
+        </tr>
+        <tr style="background:#e3f2fd;">
+            <td style="padding:6px 16px; border:1px solid #ddd; font-weight:bold;">Total VMs</td>
+            <td style="padding:6px 16px; border:1px solid #ddd; text-align:right; font-weight:bold;">$totalVMs</td>
+        </tr>
+        <tr>
+            <td style="padding:6px 16px; border:1px solid #ddd;">Failed API Calls</td>
+            <td style="padding:6px 16px; border:1px solid #ddd; text-align:right;">$failCount</td>
+        </tr>
+    </table>
+
+    $(if ($mismatchCount -gt 0) { @"
+    <h3 style="color: #c0392b;">Mismatched VMs ($mismatchCount)</h3>
+    <table style="border-collapse:collapse; margin-bottom:20px;">
+        <tr style="background:#c0392b; color:white;">
+            <th style="padding:8px 12px; border:1px solid #ddd; text-align:left;">Deployment</th>
+            <th style="padding:8px 12px; border:1px solid #ddd; text-align:left;">VM Name</th>
+            <th style="padding:8px 12px; border:1px solid #ddd; text-align:left;">App (CMDB Tag)</th>
+            <th style="padding:8px 12px; border:1px solid #ddd; text-align:left;">App (VM Lookup)</th>
+        </tr>
+        $mismatchRows
+    </table>
+"@})
+
+    $(if ($missingCount -gt 0) { @"
+    <h3 style="color: #7f8c8d;">VMs with Missing Data ($missingCount)</h3>
+    <table style="border-collapse:collapse; margin-bottom:20px;">
+        <tr style="background:#7f8c8d; color:white;">
+            <th style="padding:8px 12px; border:1px solid #ddd; text-align:left;">Deployment</th>
+            <th style="padding:8px 12px; border:1px solid #ddd; text-align:left;">VM Name</th>
+            <th style="padding:8px 12px; border:1px solid #ddd; text-align:left;">App (CMDB Tag)</th>
+            <th style="padding:8px 12px; border:1px solid #ddd; text-align:left;">App (VM Lookup)</th>
+        </tr>
+        $missingRows
+    </table>
+"@})
+
+    <p style="color:#888; font-size:12px;">Full results attached as CSV. This is an automated report.</p>
+</body>
+</html>
+"@
+
+    try {
+        $smtpCredPath = "$resultsDir\smtp_cred.xml"
+        if (Test-Path $smtpCredPath) {
+            $smtpCred = Import-Clixml -Path $smtpCredPath
+        } else {
+            $smtpCred = Get-Credential -Message "Enter SMTP credentials (will be saved encrypted)"
+            $smtpCred | Export-Clixml -Path $smtpCredPath
+        }
+
+        Send-MailMessage -From $EmailFrom -To $EmailTo -Subject $EmailSubject `
+            -Body $emailBody -BodyAsHtml `
+            -SmtpServer $SMTPServer -Port $SMTPPort `
+            -UseSsl:$UseSSL -Credential $smtpCred `
+            -Attachments $resultsPath -ErrorAction Stop
+
+        Write-Log "Email sent to $EmailTo" -Color Green
+
+        # Clean up CSV after sending
+        Remove-Item -Path $resultsPath -Force
+        Write-Log "CSV cleaned up" -Color Gray
+    }
+    catch {
+        Write-Log "Failed to send email: $($_.Exception.Message)" -Color Red
+        Write-Log "CSV retained: $resultsPath" -Color Yellow
+    }
+}# VMware Aria Automation - Bulk CMDB Relations Extractor
+# Calls the vRO form external-values endpoint to retrieve CMDB data for all VMs
+# Uses runspace pooling for parallel execution (ISE compatible)
+
+$vraServer  = "vra.yourdomain.com"
+$resultsDir = "C:\Logs"
+
+# Point this to the CSV from vraGetAllDeployment - set to $null to fetch live from API
+$inputCsvPath = "C:\Logs\vRA_Deployments_Export.csv"
+
+# Email Configuration
+$SendEmail    = $true
+$EmailTo      = "admin@company.com"
+$EmailFrom    = "vmware-reports@company.com"
+$EmailSubject = "CMDB Relations Comparison Report - $(Get-Date -Format 'yyyy-MM-dd')"
+$SMTPServer   = "mail.company.com"
+$SMTPPort     = 465
+$UseSSL       = $true
+
+# vRO action URIs - update these to match your environment
+$showVmDetailsUri = "somethingsomething.something.wrappers/showVmDetails"
+$getVmAppsUri     = "somethingsomething.something.returns/getVmApplications"
+
+function Write-Log {
+    param($Message, $Color = "White")
+    Write-Host $Message -ForegroundColor $Color
+}
+
+# Configure TLS 1.2
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+[System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+
+# Authenticate to VMware Aria
+Write-Log "=== AUTHENTICATION ===" -Color Cyan
+$credential = Get-Credential -Message "Enter VMware Aria Automation credentials"
+
+$authBody = @{
+    username = $credential.UserName
+    password = $credential.GetNetworkCredential().Password
+} | ConvertTo-Json
+
+$authResponse = Invoke-RestMethod -Uri "https://$vraServer/csp/gateway/am/api/login" `
+    -Method Post -Headers @{"Content-Type"="application/json"} -Body $authBody
+
+$authToken = $authResponse.cspAuthToken
+Write-Log "Authentication successful!" -Color Green
+
+# Normalise application name for comparison
+function Normalize-AppName {
+    param($Name)
+    if (-not $Name) { return "" }
+    return ($Name.ToLower().Trim() -replace '[_\s\-\.]+', '')
+}
+
+# Fetch all deployments with resources in one pass (size=1000, same as working export script)
+Write-Log "`n=== FETCHING DEPLOYMENTS ===" -Color Cyan
+
+$headers = @{
+    "Authorization" = "Bearer $authToken"
+    "Content-Type"  = "application/json"
+}
+
+$vmQueue = [System.Collections.Generic.List[hashtable]]::new()
+$page = 0
+$size = 1000
+$totalProcessed = 0
+$skippedCount = 0
+
+do {
+    $uri = "https://$vraServer/deployment/api/deployments?page=$page&size=$size&expand=resources"
+    Write-Log "  Page $($page + 1)..." -Color Gray
+
+    $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers
+    $deployments = if ($response.content) { $response.content } else { $response }
+
+    foreach ($dep in $deployments) {
+        # Skip deleted/failed deployments
+        if ($dep.status -and $dep.status -in @("DELETE_SUCCESSFUL", "FAILED", "DELETE_INPROGRESS")) {
+            $skippedCount++
+            continue
+        }
+
+        $machines = @($dep.resources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" })
+        if ($machines.Count -eq 0) { continue }
+
+        foreach ($machine in $machines) {
+            # Skip failed or missing VMs
+            if ($machine.state -and $machine.state -notin @("OK", "STARTED", "")) { continue }
+
+            $vmName = if ($machine.properties.resourceName) { $machine.properties.resourceName }
+                      elseif ($machine.properties.hostname) { $machine.properties.hostname }
+                      else { $machine.name }
+
+            $vmQueue.Add(@{
+                DeploymentName = $dep.name
+                VMName         = $vmName
+                ProjectId      = $dep.projectId
+                ProjectName    = $dep.projectName
+            })
+        }
+    }
+
+    $totalProcessed += $deployments.Count
+    $page++
+
+    $hasMore = if ($response.totalPages) {
+        $page -lt $response.totalPages
+    } elseif ($response.totalElements) {
+        $totalProcessed -lt $response.totalElements
+    } else {
+        $deployments.Count -eq $size
+    }
+} while ($hasMore)
+
+Write-Log "Scanned: $totalProcessed deployments (skipped $skippedCount deleted/failed)" -Color Cyan
+Write-Log "VMs to process: $($vmQueue.Count)" -Color Cyan
+
+# Scriptblock that runs in each runspace
+$scriptBlock = {
+    param($VraServer, $AuthToken, $ShowVmDetailsUri, $GetVmAppsUri, $VMName, $ProjectId, $ProjectName, $DeploymentName)
+
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+
+    $headers = @{
+        "Authorization" = "Bearer $AuthToken"
+        "Content-Type"  = "application/json"
+    }
+
+    $uri = "https://$VraServer/form-service/api/forms/renderer/external-values?projectId=$ProjectId"
+
+    $bodyArray = @(
+        @{
+            uri                     = $ShowVmDetailsUri
+            dataSource              = "scriptAction"
+            parameters              = @(
+                @{ name = "vmName"; value = $VMName }
+            )
+            useResultsFromRequestId = -1
+            fieldType               = @{ dataType = "complex" }
+            fields                  = @(
+                @{ label = "Scope"; type = @{ dataType = "string" }; id = "scope" },
+                @{ label = "Tag";   type = @{ dataType = "string" }; id = "tag" }
+            )
+            isMultiple              = $true
+            requestId               = 1
+        },
+        @{
+            uri                     = $GetVmAppsUri
+            dataSource              = "scriptAction"
+            parameters              = @(
+                @{ name = "vmName";      value = $VMName },
+                @{ name = "projectName"; value = $ProjectName }
+            )
+            useResultsFromRequestId = -1
+            fieldType               = @{ dataType = "string" }
+            isMultiple              = $true
+            requestId               = 2
+        }
+    )
+
+    $body = "[" + (($bodyArray | ForEach-Object { $_ | ConvertTo-Json -Depth 5 -Compress }) -join ",") + "]"
+
+    try {
+        $response = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body
+
+        $appApplication = ""
+        $infraOs        = ""
+        $appLayer       = ""
+        $vmApplications = ""
+
+        foreach ($result in $response) {
+            switch ($result.requestId) {
+                1 {
+                    if ($result.data -is [array]) {
+                        foreach ($item in $result.data) {
+                            if ($item.scope -and $item.tag) {
+                                switch ($item.scope) {
+                                    "app-application" { $appApplication = $item.tag }
+                                    "infra-os"        { $infraOs = $item.tag }
+                                    "app-layer"       { $appLayer = $item.tag }
+                                }
+                            }
+                        }
+                    }
+                }
+                2 {
+                    if ($result.data -is [array]) {
+                        $vmApplications = ($result.data | Where-Object { $_ -and $_ -notmatch "^---" }) -join "; "
+                    }
+                }
+            }
+        }
+
+        # Normalise and compare
+        $norm1 = if ($appApplication) { ($appApplication.ToLower().Trim() -replace '[_\s\-\.]+', '') } else { "" }
+        $norm2 = if ($vmApplications) { ($vmApplications.ToLower().Trim() -replace '[_\s\-\.]+', '') } else { "" }
+        $match = if ($norm1 -and $norm2) {
+            if ($norm1 -eq $norm2) { "Match" } else { "Mismatch" }
+        } else { "Missing Data" }
+
+        return [PSCustomObject]@{
+            DeploymentName = $DeploymentName
+            VMName         = $VMName
+            AppApplication = $appApplication
+            InfraOS        = $infraOs
+            AppLayer       = $appLayer
+            VMApplications = $vmApplications
+            CompareResult  = $match
+            Status         = "Success"
+        }
+    }
+    catch {
+        return [PSCustomObject]@{
+            DeploymentName = $DeploymentName
+            VMName         = $VMName
+            AppApplication = ""
+            InfraOS        = ""
+            AppLayer       = ""
+            VMApplications = ""
+            CompareResult  = ""
+            Status         = "Failed: $($_.Exception.Message)"
+        }
+    }
+}
+
 # Process in batches with timeout per job
 $batchSize = 10
 $jobTimeoutSeconds = 120
