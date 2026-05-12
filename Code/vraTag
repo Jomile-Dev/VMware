@@ -42,49 +42,6 @@ $authResponse = Invoke-RestMethod -Uri "https://$vraServer/csp/gateway/am/api/lo
 $authToken = $authResponse.cspAuthToken
 Write-Log "Authentication successful!" -Color Green
 
-# Get all VM resources directly via the resources API
-function Get-AllVMResources {
-    Write-Log "Fetching all Cloud.vSphere.Machine resources..." -Color Cyan
-
-    $headers = @{
-        "Authorization" = "Bearer $authToken"
-        "Content-Type"  = "application/json"
-    }
-
-    $allResources = @()
-    $page = 0
-    $size = 200
-
-    do {
-        $uri = "https://$vraServer/deployment/api/resources?page=$page&size=$size&`$filter=type eq 'Cloud.vSphere.Machine'"
-        Write-Log "  Page $($page + 1)..." -Color Gray
-
-        $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers
-        $resources = if ($response.content) { $response.content } else { $response }
-        $allResources += $resources
-
-        $hasMore = ($response.totalPages -and $page -lt $response.totalPages - 1) -or
-                   ($resources.Count -eq $size)
-        $page++
-    } while ($hasMore)
-
-    Write-Log "Total VM resources: $($allResources.Count)" -Color Cyan
-    return $allResources
-}
-
-# Get deployment details (lightweight, for project info)
-function Get-DeploymentDetails {
-    param($DeploymentId)
-
-    $headers = @{
-        "Authorization" = "Bearer $authToken"
-        "Content-Type"  = "application/json"
-    }
-
-    $uri = "https://$vraServer/deployment/api/deployments/$DeploymentId"
-    return Invoke-RestMethod -Uri $uri -Method Get -Headers $headers
-}
-
 # Normalise application name for comparison
 function Normalize-AppName {
     param($Name)
@@ -92,66 +49,67 @@ function Normalize-AppName {
     return ($Name.ToLower().Trim() -replace '[_\s\-\.]+', '')
 }
 
-# Fetch all VM resources in one go
-$allVMs = Get-AllVMResources
+# Fetch all deployments with resources in one pass (size=1000, same as working export script)
+Write-Log "`n=== FETCHING DEPLOYMENTS ===" -Color Cyan
 
-# Filter to healthy VMs only
-$activeVMs = @($allVMs | Where-Object {
-    -not $_.state -or $_.state -in @("OK", "STARTED", "")
-})
-Write-Log "Active VMs: $($activeVMs.Count) (skipped $($allVMs.Count - $activeVMs.Count) non-active)" -Color Cyan
+$headers = @{
+    "Authorization" = "Bearer $authToken"
+    "Content-Type"  = "application/json"
+}
 
-# Build deployment lookup cache (avoid re-fetching the same deployment)
-Write-Log "`n=== LOOKING UP DEPLOYMENT DETAILS ===" -Color Cyan
-$depCache = @{}
 $vmQueue = [System.Collections.Generic.List[hashtable]]::new()
-$vmCount = 0
+$page = 0
+$size = 1000
+$totalProcessed = 0
+$skippedCount = 0
 
-foreach ($vm in $activeVMs) {
-    $vmCount++
-    $depId = $vm.deploymentId
+do {
+    $uri = "https://$vraServer/deployment/api/deployments?page=$page&size=$size&expand=resources"
+    Write-Log "  Page $($page + 1)..." -Color Gray
 
-    if (-not $depId) { continue }
+    $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers
+    $deployments = if ($response.content) { $response.content } else { $response }
 
-    # Cache deployment details
-    if (-not $depCache.ContainsKey($depId)) {
-        if ($vmCount % 50 -eq 0) {
-            Write-Log "  Processing VM $vmCount / $($activeVMs.Count)..." -Color Gray
+    foreach ($dep in $deployments) {
+        # Skip deleted/failed deployments
+        if ($dep.status -and $dep.status -in @("DELETE_SUCCESSFUL", "FAILED", "DELETE_INPROGRESS")) {
+            $skippedCount++
+            continue
         }
-        try {
-            $dep = Get-DeploymentDetails -DeploymentId $depId
 
-            # Skip deleted/failed deployments
-            if ($dep.status -and $dep.status -in @("DELETE_SUCCESSFUL", "FAILED", "DELETE_INPROGRESS")) {
-                $depCache[$depId] = $null
-            } else {
-                $depCache[$depId] = @{
-                    Name        = $dep.name
-                    ProjectId   = $dep.projectId
-                    ProjectName = $dep.projectName
-                }
-            }
-        }
-        catch {
-            $depCache[$depId] = $null
+        $machines = @($dep.resources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" })
+        if ($machines.Count -eq 0) { continue }
+
+        foreach ($machine in $machines) {
+            # Skip failed or missing VMs
+            if ($machine.state -and $machine.state -notin @("OK", "STARTED", "")) { continue }
+
+            $vmName = if ($machine.properties.resourceName) { $machine.properties.resourceName }
+                      elseif ($machine.properties.hostname) { $machine.properties.hostname }
+                      else { $machine.name }
+
+            $vmQueue.Add(@{
+                DeploymentName = $dep.name
+                VMName         = $vmName
+                ProjectId      = $dep.projectId
+                ProjectName    = $dep.projectName
+            })
         }
     }
 
-    $depInfo = $depCache[$depId]
-    if (-not $depInfo) { continue }
+    $totalProcessed += $deployments.Count
+    $page++
 
-    $vmName = if ($vm.properties.resourceName) { $vm.properties.resourceName }
-              elseif ($vm.properties.hostname) { $vm.properties.hostname }
-              else { $vm.name }
+    $hasMore = if ($response.totalPages) {
+        $page -lt $response.totalPages
+    } elseif ($response.totalElements) {
+        $totalProcessed -lt $response.totalElements
+    } else {
+        $deployments.Count -eq $size
+    }
+} while ($hasMore)
 
-    $vmQueue.Add(@{
-        DeploymentName = $depInfo.Name
-        VMName         = $vmName
-        ProjectId      = $depInfo.ProjectId
-        ProjectName    = $depInfo.ProjectName
-    })
-}
-
+Write-Log "Scanned: $totalProcessed deployments (skipped $skippedCount deleted/failed)" -Color Cyan
 Write-Log "VMs to process: $($vmQueue.Count)" -Color Cyan
 
 # Scriptblock that runs in each runspace
