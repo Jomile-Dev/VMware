@@ -62,31 +62,48 @@ function Get-AllDeployments {
 
 # Call the vRO form external-values endpoint for a specific VM
 function Get-VMCMDBData {
-    param($VMName, $ProjectId)
+    param($VMName, $ProjectId, $ProjectName)
 
     $uri = "https://$vraServer/form-service/api/forms/renderer/external-values?projectId=$ProjectId"
 
     $bodyArray = @(
         @{
-            uri        = $showVmDetailsUri
-            parameters = @{
-                vmName = $VMName
-            }
+            uri                     = $showVmDetailsUri
+            dataSource              = "scriptAction"
+            parameters              = @(
+                @{ name = "vmName"; value = $VMName }
+            )
             useResultsFromRequestId = -1
+            fieldType               = @{ dataType = "complex" }
+            fields                  = @(
+                @{ label = "Scope"; type = @{ dataType = "string" }; id = "scope" },
+                @{ label = "Tag";   type = @{ dataType = "string" }; id = "tag" }
+            )
+            isMultiple              = $true
+            requestId               = 1
         },
         @{
-            uri        = $getVmAppsUri
-            parameters = @{
-                vmName = $VMName
-            }
+            uri                     = $getVmAppsUri
+            dataSource              = "scriptAction"
+            parameters              = @(
+                @{ name = "vmName";      value = $VMName },
+                @{ name = "projectName"; value = $ProjectName }
+            )
             useResultsFromRequestId = -1
+            fieldType               = @{ dataType = "string" }
+            isMultiple              = $true
+            requestId               = 2
         },
         @{
-            uri        = $getCagAppsUri
-            parameters = @{
-                vmName = $VMName
-            }
+            uri                     = $getCagAppsUri
+            dataSource              = "scriptAction"
+            parameters              = @(
+                @{ name = "projectName"; value = $ProjectName }
+            )
             useResultsFromRequestId = -1
+            fieldType               = @{ dataType = "string" }
+            isMultiple              = $true
+            requestId               = 3
         }
     )
 
@@ -155,7 +172,7 @@ foreach ($dep in $allDeployments) {
                   else { $machine.name }
         Write-Log "  VM: $vmName" -Color White
 
-        $response = Get-VMCMDBData -VMName $vmName -ProjectId $dep.projectId
+        $response = Get-VMCMDBData -VMName $vmName -ProjectId $dep.projectId -ProjectName $dep.projectName
 
         if (-not $response) {
             $failCount++
