@@ -1,5 +1,5 @@
-# VMware Aria Automation - Day 2 Action Lister
-# Lists all available Day 2 actions for Cloud.vSphere.Machine resources across deployments
+# VMware Aria Automation - Bulk CMDB Relations Extractor
+# Fetches the update_cmdb_relations Day 2 action form data for all Cloud.vSphere.Machine resources
 
 $vraServer = "vra.yourdomain.com"
 $resultsDir = "C:\Logs"
@@ -55,27 +55,32 @@ function Get-AllDeployments {
     return $allDeployments
 }
 
-# Get available Day 2 actions for a resource
-function Get-ResourceActions {
+# Get the form/schema data for the update_cmdb_relations action on a resource
+function Get-CMDBRelationsData {
     param($DeploymentId, $ResourceId)
 
+    $actionId = "Cloud.vSphere.Machine.custom.update_cmdb_relations"
+
     try {
-        $uri = "https://$vraServer/deployment/api/deployments/$DeploymentId/resources/$ResourceId/actions"
+        # Get the action request schema - this is what populates the form in the UI
+        $uri = "https://$vraServer/deployment/api/deployments/$DeploymentId/resources/$ResourceId/actions/$actionId"
         $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers
         return $response
     }
     catch {
-        Write-Log "    Error fetching actions: $($_.Exception.Message)" -Color Red
+        Write-Log "    Error: $($_.Exception.Message)" -Color Red
         return $null
     }
 }
 
 # Main processing
 $allDeployments = Get-AllDeployments
-Write-Log "`n=== LISTING DAY 2 ACTIONS ===" -Color Cyan
+Write-Log "`n=== FETCHING CMDB RELATIONS DATA ===" -Color Cyan
 
 $results = [System.Collections.Generic.List[object]]::new()
 $vmCount = 0
+$successCount = 0
+$failCount = 0
 
 foreach ($dep in $allDeployments) {
     $machines = @($dep.resources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" })
@@ -88,54 +93,62 @@ foreach ($dep in $allDeployments) {
         $vmCount++
         Write-Log "  VM: $($machine.name)" -Color White
 
-        $actions = Get-ResourceActions -DeploymentId $dep.id -ResourceId $machine.id
+        $actionData = Get-CMDBRelationsData -DeploymentId $dep.id -ResourceId $machine.id
 
-        if (-not $actions) {
-            Write-Log "    No actions available" -Color Gray
+        if (-not $actionData) {
+            Write-Log "    Action not available or failed" -Color Red
+            $failCount++
             $results.Add([PSCustomObject]@{
                 DeploymentName = [string]$dep.name
                 DeploymentId   = [string]$dep.id
                 VMName         = [string]$machine.name
                 ResourceId     = [string]$machine.id
-                ActionId       = [string]"N/A"
-                ActionName     = [string]"No actions available"
-                Description    = [string]""
+                Status         = [string]"Failed/Unavailable"
+                RawData        = [string]""
             })
             continue
         }
 
-        foreach ($action in $actions) {
-            Write-Log "    $($action.id) - $($action.name)" -Color Gray
+        $successCount++
 
-            $results.Add([PSCustomObject]@{
-                DeploymentName = [string]$dep.name
-                DeploymentId   = [string]$dep.id
-                VMName         = [string]$machine.name
-                ResourceId     = [string]$machine.id
-                ActionId       = [string]$action.id
-                ActionName     = [string]$action.name
-                Description    = [string]$action.description
-            })
-        }
+        # Dump the full schema response as JSON for review
+        $jsonData = $actionData | ConvertTo-Json -Depth 10 -Compress
+
+        Write-Log "    Retrieved action data" -Color Green
+
+        # Build a result row with the raw JSON so you can inspect the structure
+        $results.Add([PSCustomObject]@{
+            DeploymentName = [string]$dep.name
+            DeploymentId   = [string]$dep.id
+            VMName         = [string]$machine.name
+            ResourceId     = [string]$machine.id
+            Status         = [string]"Success"
+            RawData        = [string]$jsonData
+        })
 
         Start-Sleep -Milliseconds 200
     }
 }
 
 # Summary
-$uniqueActions = ($results | Where-Object { $_.ActionId -ne "N/A" } | Select-Object -ExpandProperty ActionId -Unique)
-
 Write-Log "`n=== SUMMARY ===" -Color Cyan
 Write-Log "Deployments scanned: $($allDeployments.Count)" -Color White
 Write-Log "VMs found:           $vmCount" -Color White
-Write-Log "Unique actions:      $($uniqueActions.Count)" -Color White
-
-Write-Log "`nAvailable action types:" -Color Yellow
-foreach ($actionId in $uniqueActions) {
-    Write-Log "  $actionId" -Color Gray
-}
+Write-Log "Data retrieved:      $successCount" -Color Green
+Write-Log "Failed/Unavailable:  $failCount" -Color Red
 
 # Export results
-$resultsPath = "$resultsDir\Day2Actions_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+$resultsPath = "$resultsDir\CMDBRelations_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
 $results | Export-Csv -Path $resultsPath -NoTypeInformation
 Write-Log "`nResults saved: $resultsPath" -Color White
+
+# Also dump full JSON per VM for easier inspection
+$jsonDir = "$resultsDir\CMDBRelations_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+New-Item -ItemType Directory -Path $jsonDir -Force | Out-Null
+
+foreach ($result in ($results | Where-Object { $_.Status -eq "Success" })) {
+    $safeName = $result.VMName -replace '[\\/:*?"<>|]', '_'
+    $jsonPath = "$jsonDir\$safeName.json"
+    $result.RawData | Out-File -FilePath $jsonPath -Encoding UTF8
+}
+Write-Log "JSON files saved: $jsonDir" -Color White
