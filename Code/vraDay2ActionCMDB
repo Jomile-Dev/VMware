@@ -6,13 +6,13 @@ $vraServer  = "vra.yourdomain.com"
 $resultsDir = "C:\Logs"
 
 # Email Configuration
-$SendEmail    = $true
-$EmailTo      = "admin@company.com"
-$EmailFrom    = "vmware-reports@company.com"
-$EmailSubject = "CMDB Relations Comparison Report - $(Get-Date -Format 'yyyy-MM-dd')"
-$SMTPServer   = "mail.company.com"
-$SMTPPort     = 465
-$UseSSL       = $true
+$script:SendEmail    = $true
+$script:EmailTo      = "admin@company.com"
+$script:EmailFrom    = "vmware-reports@company.com"
+$script:EmailSubject = "CMDB Relations Comparison Report - $(Get-Date -Format 'yyyy-MM-dd')"
+$script:SMTPServer   = "mail.company.com"
+$script:SMTPPort     = 465
+$script:UseSSL       = $true
 
 # vRO action URIs - update these to match your environment
 $showVmDetailsUri = "somethingsomething.something.wrappers/showVmDetails"
@@ -344,7 +344,7 @@ $results | Export-Csv -Path $resultsPath -NoTypeInformation
 Write-Log "`nResults saved: $resultsPath" -Color White
 
 # Email report
-if ($SendEmail) {
+if ($script:SendEmail) {
     Write-Log "`n=== SENDING EMAIL ===" -Color Cyan
 
     $matchCount    = @($results | Where-Object { $_.CompareResult -eq 'Match' }).Count
@@ -384,20 +384,20 @@ if ($SendEmail) {
 
     try {
         $emailParams = @{
-            To         = $EmailTo
-            From       = $EmailFrom
-            Subject    = $EmailSubject
+            To         = $script:EmailTo
+            From       = $script:EmailFrom
+            Subject    = $script:EmailSubject
             Body       = $emailBody
             BodyAsHtml = $true
-            SmtpServer = $SMTPServer
-            Port       = $SMTPPort
-            UseSsl     = $UseSSL
+            SmtpServer = $script:SMTPServer
+            Port       = $script:SMTPPort
+            UseSsl     = $script:UseSSL
             Attachments = $resultsPath
         }
 
-        Send-MailMessage @emailParams
+        Send-MailMessage @emailParams -ErrorAction Stop
 
-        Write-Log "Email sent to $EmailTo" -Color Green
+        Write-Log "Email sent to $($script:EmailTo)" -Color Green
 
         # Clean up CSV after sending
         if (Test-Path $resultsPath) {
