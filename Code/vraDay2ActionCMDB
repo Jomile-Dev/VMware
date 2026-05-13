@@ -18,13 +18,6 @@ $UseSSL       = $true
 $showVmDetailsUri = "somethingsomething.something.wrappers/showVmDetails"
 $getVmAppsUri     = "somethingsomething.something.returns/getVmApplications"
 
-# Domain suffixes to strip from VM names (add your domains here)
-$domainSuffixes = @(
-    ".domain",
-    ".domainB",
-    ".domainC"
-)
-
 function Write-Log {
     param($Message, $Color = "White")
     Write-Host $Message -ForegroundColor $Color
@@ -94,17 +87,6 @@ do {
             $vmName = if ($machine.properties.resourceName) { $machine.properties.resourceName }
                       elseif ($machine.properties.hostname) { $machine.properties.hostname }
                       else { $machine.name }
-
-            # Clean VM name: strip known domain suffixes and duplicated name patterns
-            foreach ($suffix in $domainSuffixes) {
-                if ($vmName.ToLower().EndsWith($suffix.ToLower())) {
-                    $vmName = $vmName.Substring(0, $vmName.Length - $suffix.Length)
-                    break
-                }
-            }
-            if ($vmName -match '^([^_]+)(_\1)+$') {
-                $vmName = $matches[1]  # Remove duplicated name (VMName_VMName -> VMName)
-            }
 
             $vmQueue.Add(@{
                 DeploymentName = $dep.name
