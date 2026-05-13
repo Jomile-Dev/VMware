@@ -451,17 +451,35 @@ if ($SendEmail) {
 "@
 
     try {
-        Send-MailMessage -From $EmailFrom -To $EmailTo -Subject $EmailSubject `
-            -Body $emailBody -BodyAsHtml `
-            -SmtpServer $SMTPServer -Port $SMTPPort `
-            -UseSsl:$UseSSL `
-            -Attachments $resultsPath -ErrorAction Stop
+        # Debug - check all params are populated
+        Write-Log "  From: $EmailFrom" -Color Gray
+        Write-Log "  To: $EmailTo" -Color Gray
+        Write-Log "  SMTP: $SMTPServer`:$SMTPPort" -Color Gray
+        Write-Log "  Attachment: $resultsPath (Exists: $(Test-Path $resultsPath))" -Color Gray
+        Write-Log "  Body length: $($emailBody.Length) chars" -Color Gray
+
+        $mailParams = @{
+            From       = $EmailFrom
+            To         = $EmailTo
+            Subject    = $EmailSubject
+            Body       = $emailBody
+            BodyAsHtml = $true
+            SmtpServer = $SMTPServer
+            Port       = $SMTPPort
+        }
+
+        if ($UseSSL) { $mailParams['UseSsl'] = $true }
+        if (Test-Path $resultsPath) { $mailParams['Attachments'] = $resultsPath }
+
+        Send-MailMessage @mailParams -ErrorAction Stop
 
         Write-Log "Email sent to $EmailTo" -Color Green
 
         # Clean up CSV after sending
-        Remove-Item -Path $resultsPath -Force
-        Write-Log "CSV cleaned up" -Color Gray
+        if (Test-Path $resultsPath) {
+            Remove-Item -Path $resultsPath -Force
+            Write-Log "CSV cleaned up" -Color Gray
+        }
     }
     catch {
         Write-Log "Failed to send email: $($_.Exception.Message)" -Color Red
