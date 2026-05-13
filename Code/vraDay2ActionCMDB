@@ -364,6 +364,7 @@ if ($SendEmail) {
 "@
     }
 
+    # Build email body in parts to avoid nested here-string issues in ISE
     $emailBody = @"
 <html>
 <body style="font-family: Segoe UI, Arial, sans-serif; color: #333;">
@@ -393,8 +394,11 @@ if ($SendEmail) {
             <td style="padding:6px 16px; border:1px solid #ddd; text-align:right; font-weight:bold;">$totalVMs</td>
         </tr>
     </table>
+"@
 
-    $(if ($mismatchCount -gt 0) { @"
+    if ($mismatchCount -gt 0) {
+        $emailBody += @"
+
     <h3 style="color: #c0392b;">Mismatched VMs ($mismatchCount)</h3>
     <table style="border-collapse:collapse; margin-bottom:20px;">
         <tr style="background:#c0392b; color:white;">
@@ -405,9 +409,12 @@ if ($SendEmail) {
         </tr>
         $mismatchRows
     </table>
-"@})
+"@
+    }
 
-    $(if ($missingCount -gt 0) { @"
+    if ($missingCount -gt 0) {
+        $emailBody += @"
+
     <h3 style="color: #7f8c8d;">VMs with Missing Data ($missingCount)</h3>
     <table style="border-collapse:collapse; margin-bottom:20px;">
         <tr style="background:#7f8c8d; color:white;">
@@ -418,7 +425,10 @@ if ($SendEmail) {
         </tr>
         $missingRows
     </table>
-"@})
+"@
+    }
+
+    $emailBody += @"
 
 </body>
 </html>
