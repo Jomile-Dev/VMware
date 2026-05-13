@@ -387,20 +387,19 @@ if ($SendEmail) {
 "@
 
     try {
-        $mailParams = @{
-            From       = $EmailFrom
+        $emailParams = @{
             To         = $EmailTo
+            From       = $EmailFrom
             Subject    = $EmailSubject
             Body       = $emailBody
             BodyAsHtml = $true
             SmtpServer = $SMTPServer
             Port       = $SMTPPort
+            UseSsl     = $UseSSL
+            Attachments = $resultsPath
         }
 
-        if ($UseSSL) { $mailParams['UseSsl'] = $true }
-        if (Test-Path $resultsPath) { $mailParams['Attachments'] = $resultsPath }
-
-        Send-MailMessage @mailParams -ErrorAction Stop
+        Send-MailMessage @emailParams
 
         Write-Log "Email sent to $EmailTo" -Color Green
 
