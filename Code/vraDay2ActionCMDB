@@ -347,44 +347,40 @@ Write-Log "`nResults saved: $resultsPath" -Color White
 if ($SendEmail) {
     Write-Log "`n=== SENDING EMAIL ===" -Color Cyan
 
-    $matchCount    = ($results | Where-Object { $_.CompareResult -eq 'Match' }).Count
-    $mismatchCount = ($results | Where-Object { $_.CompareResult -eq 'Mismatch' }).Count
-    $missingCount  = ($results | Where-Object { $_.CompareResult -eq 'Missing Data' }).Count
-    $totalVMs      = $results.Count
+    $matchCount    = @($results | Where-Object { $_.CompareResult -eq 'Match' }).Count
+    $mismatchCount = @($results | Where-Object { $_.CompareResult -eq 'Mismatch' }).Count
+    $missingCount  = @($results | Where-Object { $_.CompareResult -eq 'Missing Data' }).Count
+    $totalVMs      = @($results).Count
+    $generatedAt   = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
 
-    # Build email body - summary table only, full details in CSV attachment
-    $emailBody = @"
-<html>
-<body style="font-family: Segoe UI, Arial, sans-serif; color: #333;">
-    <h2 style="color: #2c3e50;">CMDB Relations Comparison Report</h2>
-    <p>Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</p>
-
-    <h3 style="color: #2c3e50;">Summary</h3>
-    <table style="border-collapse:collapse; margin-bottom:20px;">
-        <tr style="background:#2c3e50; color:white;">
-            <th style="padding:8px 16px; border:1px solid #ddd; text-align:left;">Category</th>
-            <th style="padding:8px 16px; border:1px solid #ddd; text-align:right;">Count</th>
-        </tr>
-        <tr style="background:#e8f5e9;">
-            <td style="padding:6px 16px; border:1px solid #ddd;">Match</td>
-            <td style="padding:6px 16px; border:1px solid #ddd; text-align:right; color:green; font-weight:bold;">$matchCount</td>
-        </tr>
-        <tr style="background:#ffebee;">
-            <td style="padding:6px 16px; border:1px solid #ddd;">Mismatch</td>
-            <td style="padding:6px 16px; border:1px solid #ddd; text-align:right; color:red; font-weight:bold;">$mismatchCount</td>
-        </tr>
-        <tr style="background:#f5f5f5;">
-            <td style="padding:6px 16px; border:1px solid #ddd;">Missing Data</td>
-            <td style="padding:6px 16px; border:1px solid #ddd; text-align:right; color:gray; font-weight:bold;">$missingCount</td>
-        </tr>
-        <tr style="background:#e3f2fd;">
-            <td style="padding:6px 16px; border:1px solid #ddd; font-weight:bold;">Total VMs</td>
-            <td style="padding:6px 16px; border:1px solid #ddd; text-align:right; font-weight:bold;">$totalVMs</td>
-        </tr>
-    </table>
-</body>
-</html>
-"@
+    $emailBody = "<html>"
+    $emailBody += "<body style='font-family: Segoe UI, Arial, sans-serif; color: #333;'>"
+    $emailBody += "<h2 style='color: #2c3e50;'>CMDB Relations Comparison Report</h2>"
+    $emailBody += "<p>Generated: $generatedAt</p>"
+    $emailBody += "<h3 style='color: #2c3e50;'>Summary</h3>"
+    $emailBody += "<table style='border-collapse:collapse; margin-bottom:20px;'>"
+    $emailBody += "<tr style='background:#2c3e50; color:white;'>"
+    $emailBody += "<th style='padding:8px 16px; border:1px solid #ddd; text-align:left;'>Category</th>"
+    $emailBody += "<th style='padding:8px 16px; border:1px solid #ddd; text-align:right;'>Count</th>"
+    $emailBody += "</tr>"
+    $emailBody += "<tr style='background:#e8f5e9;'>"
+    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd;'>Match</td>"
+    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd; text-align:right; color:green; font-weight:bold;'>$matchCount</td>"
+    $emailBody += "</tr>"
+    $emailBody += "<tr style='background:#ffebee;'>"
+    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd;'>Mismatch</td>"
+    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd; text-align:right; color:red; font-weight:bold;'>$mismatchCount</td>"
+    $emailBody += "</tr>"
+    $emailBody += "<tr style='background:#f5f5f5;'>"
+    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd;'>Missing Data</td>"
+    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd; text-align:right; color:gray; font-weight:bold;'>$missingCount</td>"
+    $emailBody += "</tr>"
+    $emailBody += "<tr style='background:#e3f2fd;'>"
+    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd; font-weight:bold;'>Total VMs</td>"
+    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd; text-align:right; font-weight:bold;'>$totalVMs</td>"
+    $emailBody += "</tr>"
+    $emailBody += "</table>"
+    $emailBody += "</body></html>"
 
     try {
         $emailParams = @{
