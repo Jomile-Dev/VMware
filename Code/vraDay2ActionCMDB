@@ -352,35 +352,7 @@ if ($SendEmail) {
     $missingCount  = ($results | Where-Object { $_.CompareResult -eq 'Missing Data' }).Count
     $totalVMs      = $results.Count
 
-    # Build mismatch detail rows
-    $mismatchRows = ""
-    $mismatches = @($results | Where-Object { $_.CompareResult -eq 'Mismatch' })
-    foreach ($m in $mismatches) {
-        $mismatchRows += @"
-        <tr>
-            <td style="padding:6px 12px; border:1px solid #ddd;">$($m.DeploymentName)</td>
-            <td style="padding:6px 12px; border:1px solid #ddd;">$($m.VMName)</td>
-            <td style="padding:6px 12px; border:1px solid #ddd;">$($m.AppApplication)</td>
-            <td style="padding:6px 12px; border:1px solid #ddd;">$($m.CMDBCI)</td>
-        </tr>
-"@
-    }
-
-    # Build missing data rows
-    $missingRows = ""
-    $missingData = @($results | Where-Object { $_.CompareResult -eq 'Missing Data' })
-    foreach ($m in $missingData) {
-        $missingRows += @"
-        <tr>
-            <td style="padding:6px 12px; border:1px solid #ddd;">$($m.DeploymentName)</td>
-            <td style="padding:6px 12px; border:1px solid #ddd;">$($m.VMName)</td>
-            <td style="padding:6px 12px; border:1px solid #ddd;">$($m.AppApplication)</td>
-            <td style="padding:6px 12px; border:1px solid #ddd;">$($m.CMDBCI)</td>
-        </tr>
-"@
-    }
-
-    # Build email body in parts to avoid nested here-string issues in ISE
+    # Build email body - summary table only, full details in CSV attachment
     $emailBody = @"
 <html>
 <body style="font-family: Segoe UI, Arial, sans-serif; color: #333;">
@@ -410,54 +382,11 @@ if ($SendEmail) {
             <td style="padding:6px 16px; border:1px solid #ddd; text-align:right; font-weight:bold;">$totalVMs</td>
         </tr>
     </table>
-"@
-
-    if ($mismatchCount -gt 0) {
-        $emailBody += @"
-
-    <h3 style="color: #c0392b;">Mismatched VMs ($mismatchCount)</h3>
-    <table style="border-collapse:collapse; margin-bottom:20px;">
-        <tr style="background:#c0392b; color:white;">
-            <th style="padding:8px 12px; border:1px solid #ddd; text-align:left;">Deployment</th>
-            <th style="padding:8px 12px; border:1px solid #ddd; text-align:left;">VM Name</th>
-            <th style="padding:8px 12px; border:1px solid #ddd; text-align:left;">App (CMDB Tag)</th>
-            <th style="padding:8px 12px; border:1px solid #ddd; text-align:left;">CMDB CI</th>
-        </tr>
-        $mismatchRows
-    </table>
-"@
-    }
-
-    if ($missingCount -gt 0) {
-        $emailBody += @"
-
-    <h3 style="color: #7f8c8d;">VMs with Missing Data ($missingCount)</h3>
-    <table style="border-collapse:collapse; margin-bottom:20px;">
-        <tr style="background:#7f8c8d; color:white;">
-            <th style="padding:8px 12px; border:1px solid #ddd; text-align:left;">Deployment</th>
-            <th style="padding:8px 12px; border:1px solid #ddd; text-align:left;">VM Name</th>
-            <th style="padding:8px 12px; border:1px solid #ddd; text-align:left;">App (CMDB Tag)</th>
-            <th style="padding:8px 12px; border:1px solid #ddd; text-align:left;">CMDB CI</th>
-        </tr>
-        $missingRows
-    </table>
-"@
-    }
-
-    $emailBody += @"
-
 </body>
 </html>
 "@
 
     try {
-        # Debug - check all params are populated
-        Write-Log "  From: $EmailFrom" -Color Gray
-        Write-Log "  To: $EmailTo" -Color Gray
-        Write-Log "  SMTP: $SMTPServer`:$SMTPPort" -Color Gray
-        Write-Log "  Attachment: $resultsPath (Exists: $(Test-Path $resultsPath))" -Color Gray
-        Write-Log "  Body length: $($emailBody.Length) chars" -Color Gray
-
         $mailParams = @{
             From       = $EmailFrom
             To         = $EmailTo
