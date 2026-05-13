@@ -383,19 +383,16 @@ if ($script:SendEmail) {
     $emailBody += "</body></html>"
 
     try {
-        $emailParams = @{
-            To         = $script:EmailTo
-            From       = $script:EmailFrom
-            Subject    = $script:EmailSubject
-            Body       = $emailBody
-            BodyAsHtml = $true
-            SmtpServer = $script:SMTPServer
-            Port       = $script:SMTPPort
-            UseSsl     = $script:UseSSL
-            Attachments = $resultsPath
-        }
+        Write-Log "DEBUG: To         = [$($script:EmailTo)]" -Color Yellow
+        Write-Log "DEBUG: From       = [$($script:EmailFrom)]" -Color Yellow
+        Write-Log "DEBUG: Subject    = [$($script:EmailSubject)]" -Color Yellow
+        Write-Log "DEBUG: SmtpServer = [$($script:SMTPServer)]" -Color Yellow
+        Write-Log "DEBUG: Port       = [$($script:SMTPPort)]" -Color Yellow
+        Write-Log "DEBUG: UseSsl     = [$($script:UseSSL)]" -Color Yellow
+        Write-Log "DEBUG: Attachment  = [$resultsPath] Exists=$(Test-Path $resultsPath)" -Color Yellow
+        Write-Log "DEBUG: Body null?  = $($emailBody -eq $null) Length=$($emailBody.Length)" -Color Yellow
 
-        Send-MailMessage @emailParams -ErrorAction Stop
+        Send-MailMessage -To $script:EmailTo -From $script:EmailFrom -Subject $script:EmailSubject -Body $emailBody -BodyAsHtml -SmtpServer $script:SMTPServer -Port $script:SMTPPort -UseSsl -Attachments $resultsPath -ErrorAction Stop
 
         Write-Log "Email sent to $($script:EmailTo)" -Color Green
 
