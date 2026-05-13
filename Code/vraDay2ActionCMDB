@@ -18,6 +18,13 @@ $UseSSL       = $true
 $showVmDetailsUri = "somethingsomething.something.wrappers/showVmDetails"
 $getVmAppsUri     = "somethingsomething.something.returns/getVmApplications"
 
+# Domain suffixes to strip from VM names (add your domains here)
+$domainSuffixes = @(
+    ".domain",
+    ".domainB",
+    ".domainC"
+)
+
 function Write-Log {
     param($Message, $Color = "White")
     Write-Host $Message -ForegroundColor $Color
@@ -88,8 +95,13 @@ do {
                       elseif ($machine.properties.hostname) { $machine.properties.hostname }
                       else { $machine.name }
 
-            # Clean VM name: strip domain suffix and duplicated name patterns (e.g. VMName_VMName_VMName.domain)
-            $vmName = ($vmName -split '\.')[0]  # Remove domain suffix
+            # Clean VM name: strip known domain suffixes and duplicated name patterns
+            foreach ($suffix in $domainSuffixes) {
+                if ($vmName.ToLower().EndsWith($suffix.ToLower())) {
+                    $vmName = $vmName.Substring(0, $vmName.Length - $suffix.Length)
+                    break
+                }
+            }
             if ($vmName -match '^([^_]+)(_\1)+$') {
                 $vmName = $matches[1]  # Remove duplicated name (VMName_VMName -> VMName)
             }
@@ -383,6 +395,9 @@ if ($SendEmail) {
     $emailBody += "</body></html>"
 
     try {
+        # Reset SSL callback so it doesn't interfere with SMTP TLS
+        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $null
+
         $emailParams = @{
             To = $EmailTo
             From = $EmailFrom
