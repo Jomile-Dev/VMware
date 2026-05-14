@@ -1,0 +1,122 @@
+# NSX VM Tag Lookup - Standalone Test
+# Run this to debug the 400 error without waiting for the full script
+
+$NSXManager    = "nsx-manager.company.com"
+$NSXCredPath   = "C:\Scripts\Creds\nsx_cred.xml"
+$TestVMName    = "PUT_A_VM_NAME_HERE"
+
+# SSL bypass
+if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
+    Add-Type @"
+        using System.Net;
+        using System.Security.Cryptography.X509Certificates;
+        public class TrustAllCertsPolicy : ICertificatePolicy {
+            public bool CheckValidationResult(
+                ServicePoint srvPoint, X509Certificate certificate,
+                WebRequest request, int certificateProblem) { return true; }
+        }
+"@
+}
+[System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+[System.Net.ServicePointManager]::SecurityProtocol  = [System.Net.SecurityProtocolType]::Tls12
+
+# Auth
+$cred = Import-Clixml -Path $NSXCredPath
+$rawUser = $cred.UserName
+$password = $cred.GetNetworkCredential().Password
+
+if ($rawUser -match '^(.+)\\(.+)$') { $samName = $Matches[2] }
+elseif ($rawUser -match '^([^@]+)@') { $samName = $Matches[1] }
+else { $samName = $rawUser }
+
+Write-Host "Authenticating as: $samName" -ForegroundColor Cyan
+$body = "j_username=$([uri]::EscapeDataString($samName))&j_password=$([uri]::EscapeDataString($password))"
+
+$sessionResponse = Invoke-WebRequest -Uri "https://${NSXManager}/api/session/create" `
+    -Method Post -ContentType "application/x-www-form-urlencoded" `
+    -Body $body -SessionVariable "nsxSession" -UseBasicParsing -ErrorAction Stop
+
+$xsrfToken = $sessionResponse.Headers["X-XSRF-TOKEN"]
+Write-Host "Authenticated! Token: $($xsrfToken.Substring(0,10))..." -ForegroundColor Green
+
+$headers = @{
+    "Content-Type"  = "application/json"
+    "Accept"        = "application/json"
+    "X-XSRF-TOKEN"  = $xsrfToken
+}
+
+# Test 1: Search by display_name
+Write-Host "`n=== TEST 1: display_name search ===" -ForegroundColor Yellow
+$uri1 = "https://${NSXManager}/policy/api/v1/infra/realized-state/virtual-machines?display_name=$TestVMName"
+Write-Host "URI: $uri1" -ForegroundColor Gray
+try {
+    $r1 = Invoke-RestMethod -Uri $uri1 -Headers $headers -WebSession $nsxSession -Method Get
+    Write-Host "Results: $($r1.result_count)" -ForegroundColor Green
+    if ($r1.results) {
+        Write-Host "VM: $($r1.results[0].display_name)" -ForegroundColor White
+        Write-Host "Tags:" -ForegroundColor White
+        foreach ($tag in $r1.results[0].tags) {
+            Write-Host "  scope=$($tag.scope) tag=$($tag.tag)" -ForegroundColor Cyan
+        }
+    }
+}
+catch {
+    Write-Host "FAILED: $($_.Exception.Message)" -ForegroundColor Red
+}
+
+# Test 2: Search with enforcement_point_path
+Write-Host "`n=== TEST 2: with enforcement_point_path ===" -ForegroundColor Yellow
+$uri2 = "https://${NSXManager}/policy/api/v1/infra/realized-state/virtual-machines?display_name=$TestVMName&enforcement_point_path=/infra/sites/default/enforcement-points/default"
+Write-Host "URI: $uri2" -ForegroundColor Gray
+try {
+    $r2 = Invoke-RestMethod -Uri $uri2 -Headers $headers -WebSession $nsxSession -Method Get
+    Write-Host "Results: $($r2.result_count)" -ForegroundColor Green
+    if ($r2.results) {
+        Write-Host "VM: $($r2.results[0].display_name)" -ForegroundColor White
+        Write-Host "Tags:" -ForegroundColor White
+        foreach ($tag in $r2.results[0].tags) {
+            Write-Host "  scope=$($tag.scope) tag=$($tag.tag)" -ForegroundColor Cyan
+        }
+    }
+}
+catch {
+    Write-Host "FAILED: $($_.Exception.Message)" -ForegroundColor Red
+}
+
+# Test 3: List all VMs (first page) and search manually
+Write-Host "`n=== TEST 3: list all VMs (first 20) ===" -ForegroundColor Yellow
+$uri3 = "https://${NSXManager}/policy/api/v1/infra/realized-state/virtual-machines?page_size=20"
+Write-Host "URI: $uri3" -ForegroundColor Gray
+try {
+    $r3 = Invoke-RestMethod -Uri $uri3 -Headers $headers -WebSession $nsxSession -Method Get
+    Write-Host "Total VMs in NSX: $($r3.result_count)" -ForegroundColor Green
+    Write-Host "First 5:" -ForegroundColor White
+    foreach ($vm in ($r3.results | Select-Object -First 5)) {
+        $tagCount = if ($vm.tags) { $vm.tags.Count } else { 0 }
+        Write-Host "  $($vm.display_name) ($tagCount tags)" -ForegroundColor Cyan
+    }
+}
+catch {
+    Write-Host "FAILED: $($_.Exception.Message)" -ForegroundColor Red
+}
+
+# Test 4: Fabric VMs API (alternative)
+Write-Host "`n=== TEST 4: fabric VMs API ===" -ForegroundColor Yellow
+$uri4 = "https://${NSXManager}/api/v1/fabric/virtual-machines?display_name=$TestVMName"
+Write-Host "URI: $uri4" -ForegroundColor Gray
+try {
+    $r4 = Invoke-RestMethod -Uri $uri4 -Headers $headers -WebSession $nsxSession -Method Get
+    Write-Host "Results: $($r4.result_count)" -ForegroundColor Green
+    if ($r4.results) {
+        Write-Host "VM: $($r4.results[0].display_name)" -ForegroundColor White
+        Write-Host "Tags:" -ForegroundColor White
+        foreach ($tag in $r4.results[0].tags) {
+            Write-Host "  scope=$($tag.scope) tag=$($tag.tag)" -ForegroundColor Cyan
+        }
+    }
+}
+catch {
+    Write-Host "FAILED: $($_.Exception.Message)" -ForegroundColor Red
+}
+
+Write-Host "`nDone. Tell me which test worked and I'll update the main script." -ForegroundColor Green
