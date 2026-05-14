@@ -19,10 +19,10 @@ $showVmDetailsUri = "somethingsomething.something.wrappers/showVmDetails"
 $getVmAppsUri     = "somethingsomething.something.returns/getVmApplications"
 
 # NSX Manager Configuration (fallback for VMs with empty AppApplication)
-$nsxManager       = "nsx-manager.company.com"
-$nsxCredPath      = "C:\Scripts\Creds\nsx_cred.xml"
-$nsxAuthMode      = "vIDM"
-$nsxVIDMDomain    = "COMPANY"
+$NSXManager       = "nsx-manager.company.com"
+$NSXAuthMode      = "vIDM"
+$NSXvIDMDomain    = "COMPANY"
+$NSXCredPath      = "C:\Scripts\Creds\nsx_cred.xml"
 
 function Write-Log {
     param($Message, $Color = "White")
@@ -334,83 +334,120 @@ $missingAppVMs = @($results | Where-Object { -not $_.AppApplication })
 if ($missingAppVMs.Count -gt 0) {
     Write-Log "`n=== NSX FALLBACK: $($missingAppVMs.Count) VMs with empty AppApplication ===" -Color Cyan
 
-    # Import NSX credentials
-    if (Test-Path $nsxCredPath) {
-        $nsxCred = Import-Clixml -Path $nsxCredPath
-    } else {
-        $nsxCred = Get-Credential -Message "Enter NSX Manager credentials (vIDM user)"
-        $nsxCredDir = Split-Path $nsxCredPath -Parent
-        if (-not (Test-Path $nsxCredDir)) { New-Item -ItemType Directory -Path $nsxCredDir -Force | Out-Null }
-        $nsxCred | Export-Clixml -Path $nsxCredPath
-    }
-
-    # Authenticate to NSX via vIDM session
-    $nsxHeaders = @{
-        "Content-Type" = "application/json"
-        "Accept"       = "application/json"
-    }
-    $nsxSession = $null
-    $nsxAuthenticated = $false
-
-    if ($nsxAuthMode -eq "vIDM") {
-        $rawUser = $nsxCred.UserName
-        $nsxPassword = $nsxCred.GetNetworkCredential().Password
-
-        if ($rawUser -match '^(.+)\\(.+)$') { $samName = $Matches[2] }
-        elseif ($rawUser -match '^([^@]+)@') { $samName = $Matches[1] }
-        else { $samName = $rawUser }
-
-        $usernamesToTry = @(
-            $samName,
-            "${samName}@${nsxVIDMDomain}",
-            "${nsxVIDMDomain}\${samName}"
+    # NSX Auth functions (from working NSX firewall script)
+    function Connect-NSXManagerFallback {
+        param(
+            [string]$Server,
+            [PSCredential]$Credential,
+            [string]$AuthMode = "Local",
+            [string]$VIDMDomain = ""
         )
 
-        foreach ($username in $usernamesToTry) {
-            Write-Log "  NSX Auth trying: $username" -Color Gray
-            $body = "j_username=$([uri]::EscapeDataString($username))&j_password=$([uri]::EscapeDataString($nsxPassword))"
+        $headers = @{
+            "Content-Type" = "application/json"
+            "Accept"       = "application/json"
+        }
 
-            try {
-                $sessionResponse = Invoke-WebRequest -Uri "https://${nsxManager}/api/session/create" `
-                    -Method Post -ContentType "application/x-www-form-urlencoded" `
-                    -Body $body -SessionVariable "nsxWebSession" -UseBasicParsing -ErrorAction Stop
+        if ($AuthMode -eq "Local") {
+            $pair   = "{0}:{1}" -f $Credential.UserName, $Credential.GetNetworkCredential().Password
+            $bytes  = [System.Text.Encoding]::ASCII.GetBytes($pair)
+            $base64 = [System.Convert]::ToBase64String($bytes)
+            $headers["Authorization"] = "Basic $base64"
+            Write-Log "  NSX authenticating (Local/Basic)..." -Color Cyan
+        }
+        else {
+            Write-Log "  NSX authenticating via vIDM session..." -Color Cyan
+            $sessionUri = "https://${Server}/api/session/create"
+            $rawUser    = $Credential.UserName
+            $password   = $Credential.GetNetworkCredential().Password
 
-                $xsrfToken = $sessionResponse.Headers["X-XSRF-TOKEN"]
-                if ($xsrfToken) {
-                    $nsxHeaders["X-XSRF-TOKEN"] = $xsrfToken
-                    $nsxSession = $nsxWebSession
-                    $nsxAuthenticated = $true
+            if ($rawUser -match '^(.+)\\(.+)$') { $samName = $Matches[2] }
+            elseif ($rawUser -match '^([^@]+)@') { $samName = $Matches[1] }
+            else { $samName = $rawUser }
+
+            $usernamesToTry = @(
+                $rawUser
+                "${VIDMDomain}\${samName}"
+                $samName
+                "${samName}@${VIDMDomain}"
+            )
+
+            $authenticated = $false
+            foreach ($username in $usernamesToTry) {
+                Write-Log "  Trying: $username" -Color Gray
+                $body = "j_username=$([uri]::EscapeDataString($username))&j_password=$([uri]::EscapeDataString($password))"
+
+                try {
+                    $sessionResponse = Invoke-WebRequest -Uri $sessionUri `
+                        -Method Post `
+                        -ContentType "application/x-www-form-urlencoded" `
+                        -Body $body `
+                        -SessionVariable "nsxSession" `
+                        -UseBasicParsing `
+                        -ErrorAction Stop
+
+                    $xsrfToken = $sessionResponse.Headers["X-XSRF-TOKEN"]
+                    if (-not $xsrfToken) {
+                        Write-Log "  No X-XSRF-TOKEN for '$username', trying next..." -Color Yellow
+                        continue
+                    }
+
+                    $headers["X-XSRF-TOKEN"] = $xsrfToken
+                    $script:NSXFallbackSession = $nsxSession
+                    $authenticated = $true
                     Write-Log "  NSX authenticated as: $username" -Color Green
                     break
                 }
+                catch {
+                    Write-Log "  Failed: $username - $($_.Exception.Message)" -Color Yellow
+                    continue
+                }
             }
-            catch {
-                continue
+
+            if (-not $authenticated) {
+                throw "NSX vIDM authentication failed for all username formats"
             }
         }
-    }
-    else {
-        # Local/Basic auth
-        $pair   = "{0}:{1}" -f $nsxCred.UserName, $nsxCred.GetNetworkCredential().Password
-        $base64 = [System.Convert]::ToBase64String([System.Text.Encoding]::ASCII.GetBytes($pair))
-        $nsxHeaders["Authorization"] = "Basic $base64"
-        $nsxAuthenticated = $true
-        Write-Log "  NSX authenticated (Basic)" -Color Green
+
+        # Test connectivity
+        $testUri = "https://${Server}/policy/api/v1/infra"
+        $testParams = @{ Uri = $testUri; Headers = $headers; Method = "Get"; ErrorAction = "Stop" }
+        if ($script:NSXFallbackSession) { $testParams["WebSession"] = $script:NSXFallbackSession }
+        $null = Invoke-RestMethod @testParams
+        Write-Log "  NSX connection verified" -Color Green
+
+        return $headers
     }
 
-    if ($nsxAuthenticated) {
+    # Import NSX credentials
+    $script:NSXFallbackSession = $null
+
+    if (Test-Path $NSXCredPath) {
+        $nsxCred = Import-Clixml -Path $NSXCredPath
+        Write-Log "  Credentials imported from: $NSXCredPath" -Color Green
+    } else {
+        $nsxCred = Get-Credential -Message "Enter NSX Manager credentials"
+        $credDir = Split-Path $NSXCredPath -Parent
+        if (-not (Test-Path $credDir)) { New-Item -ItemType Directory -Path $credDir -Force | Out-Null }
+        $nsxCred | Export-Clixml -Path $NSXCredPath
+        Write-Log "  Credentials saved to: $NSXCredPath" -Color Green
+    }
+
+    try {
+        $nsxHeaders = Connect-NSXManagerFallback -Server $NSXManager -Credential $nsxCred -AuthMode $NSXAuthMode -VIDMDomain $NSXvIDMDomain
+
         $nsxFilled = 0
 
         foreach ($vm in $missingAppVMs) {
             try {
-                $nsxUri = "https://${nsxManager}/policy/api/v1/infra/realized-state/virtual-machines?display_name=$($vm.VMName)"
+                $nsxUri = "https://${NSXManager}/policy/api/v1/infra/realized-state/virtual-machines?display_name=$($vm.VMName)"
 
                 $invokeParams = @{
                     Uri     = $nsxUri
                     Headers = $nsxHeaders
                     Method  = "Get"
                 }
-                if ($nsxSession) { $invokeParams["WebSession"] = $nsxSession }
+                if ($script:NSXFallbackSession) { $invokeParams["WebSession"] = $script:NSXFallbackSession }
 
                 $nsxResponse = Invoke-RestMethod @invokeParams
 
@@ -459,6 +496,9 @@ if ($missingAppVMs.Count -gt 0) {
                         }
                     }
                 }
+                else {
+                    Write-Log "  $($vm.VMName) | Not found in NSX" -Color Gray
+                }
             }
             catch {
                 Write-Log "  $($vm.VMName) | NSX lookup failed: $($_.Exception.Message)" -Color Red
@@ -469,8 +509,9 @@ if ($missingAppVMs.Count -gt 0) {
 
         Write-Log "  NSX filled: $nsxFilled / $($missingAppVMs.Count)" -Color Cyan
     }
-    else {
-        Write-Log "  NSX authentication failed - skipping fallback" -Color Red
+    catch {
+        Write-Log "  NSX authentication failed: $($_.Exception.Message)" -Color Red
+        Write-Log "  Skipping NSX fallback" -Color Yellow
     }
 }
 
