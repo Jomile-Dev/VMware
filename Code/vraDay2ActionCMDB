@@ -29,9 +29,20 @@ function Write-Log {
     Write-Host $Message -ForegroundColor $Color
 }
 
-# Configure TLS 1.2
+# Configure TLS 1.2 and bypass SSL certificate validation
+if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
+    Add-Type @"
+        using System.Net;
+        using System.Security.Cryptography.X509Certificates;
+        public class TrustAllCertsPolicy : ICertificatePolicy {
+            public bool CheckValidationResult(
+                ServicePoint srvPoint, X509Certificate certificate,
+                WebRequest request, int certificateProblem) { return true; }
+        }
+"@
+}
+[System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-[System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
 
 # Authenticate to VMware Aria
 Write-Log "=== AUTHENTICATION ===" -Color Cyan
@@ -570,8 +581,8 @@ if ($SendEmail) {
     $emailBody += "</body></html>"
 
     try {
-        # Reset SSL callback so it doesn't interfere with SMTP TLS
-        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $null
+        # Reset SSL policy so it doesn't interfere with SMTP TLS
+        [System.Net.ServicePointManager]::CertificatePolicy = $null
 
         $emailParams = @{
             To = $EmailTo
