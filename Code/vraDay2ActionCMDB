@@ -234,7 +234,6 @@ $scriptBlock = {
             AppLayer       = $appLayer
             CMDBCI         = $vmApplications
             CompareResult  = $match
-            MatchedApps    = $matchedAppsStr
             Status         = "Success"
         }
     }
@@ -247,7 +246,6 @@ $scriptBlock = {
             AppLayer       = ""
             CMDBCI         = ""
             CompareResult  = ""
-            MatchedApps    = ""
             Status         = "Failed: $($_.Exception.Message)"
         }
     }
@@ -328,7 +326,6 @@ foreach ($job in $jobs) {
                     AppLayer       = [string]$r.AppLayer
                     CMDBCI         = [string]$r.CMDBCI
                     CompareResult  = [string]$r.CompareResult
-                    MatchedApps    = [string]$r.MatchedApps
                 })
             }
         }
@@ -525,7 +522,6 @@ if ($missingAppVMs.Count -gt 0) {
 
                             if ($matchedApps.Count -gt 0) {
                                 $vm.CompareResult = "Match"
-                                $vm.MatchedApps = ($matchedApps | Select-Object -Unique) -join "; "
                             } else {
                                 $vm.CompareResult = "Mismatch"
                             }
