@@ -218,7 +218,11 @@ $scriptBlock = {
                 }
             }
             if ($matchedApps.Count -gt 0) {
-                $match = "Match"
+                if ($appApplications.Count -gt 1) {
+                    $match = "Match - Multiple Tags"
+                } else {
+                    $match = "Match"
+                }
             } else {
                 $match = "Mismatch"
             }
@@ -521,7 +525,11 @@ if ($missingAppVMs.Count -gt 0) {
                             }
 
                             if ($matchedApps.Count -gt 0) {
-                                $vm.CompareResult = "Match"
+                                if ($nsxAppTags.Count -gt 1) {
+                                    $vm.CompareResult = "Match - Multiple Tags"
+                                } else {
+                                    $vm.CompareResult = "Match"
+                                }
                             } else {
                                 $vm.CompareResult = "Mismatch"
                             }
@@ -556,6 +564,7 @@ Write-Log "VMs processed: $($vmQueue.Count)" -Color White
 Write-Log "Successful:    $successCount" -Color Green
 Write-Log "Failed:        $failCount" -Color Red
 Write-Log "Matches:       $(($results | Where-Object { $_.CompareResult -eq 'Match' }).Count)" -Color Green
+Write-Log "Match (Multi): $(($results | Where-Object { $_.CompareResult -eq 'Match - Multiple Tags' }).Count)" -Color Green
 Write-Log "Mismatches:    $(($results | Where-Object { $_.CompareResult -eq 'Mismatch' }).Count)" -Color Red
 Write-Log "Missing Data:  $(($results | Where-Object { $_.CompareResult -eq 'Missing Data' }).Count)" -Color Gray
 Write-Log "Time elapsed:  $($stopwatch.Elapsed.ToString('hh\:mm\:ss'))" -Color White
@@ -569,11 +578,12 @@ Write-Log "`nResults saved: $resultsPath" -Color White
 if ($SendEmail) {
     Write-Log "`n=== SENDING EMAIL ===" -Color Cyan
 
-    $matchCount    = @($results | Where-Object { $_.CompareResult -eq 'Match' }).Count
-    $mismatchCount = @($results | Where-Object { $_.CompareResult -eq 'Mismatch' }).Count
-    $missingCount  = @($results | Where-Object { $_.CompareResult -eq 'Missing Data' }).Count
-    $totalVMs      = @($results).Count
-    $generatedAt   = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $matchCount        = @($results | Where-Object { $_.CompareResult -eq 'Match' }).Count
+    $matchMultiCount   = @($results | Where-Object { $_.CompareResult -eq 'Match - Multiple Tags' }).Count
+    $mismatchCount     = @($results | Where-Object { $_.CompareResult -eq 'Mismatch' }).Count
+    $missingCount      = @($results | Where-Object { $_.CompareResult -eq 'Missing Data' }).Count
+    $totalVMs          = @($results).Count
+    $generatedAt       = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
 
     $emailBody = "<html>"
     $emailBody += "<body style='font-family: Segoe UI, Arial, sans-serif; color: #333;'>"
@@ -588,6 +598,10 @@ if ($SendEmail) {
     $emailBody += "<tr style='background:#e8f5e9;'>"
     $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd;'>Match</td>"
     $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd; text-align:right; color:green; font-weight:bold;'>$matchCount</td>"
+    $emailBody += "</tr>"
+    $emailBody += "<tr style='background:#e8f5e9;'>"
+    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd;'>Match - Multiple Tags</td>"
+    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd; text-align:right; color:green; font-weight:bold;'>$matchMultiCount</td>"
     $emailBody += "</tr>"
     $emailBody += "<tr style='background:#ffebee;'>"
     $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd;'>Mismatch</td>"
