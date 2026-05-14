@@ -366,10 +366,7 @@ if ($missingAppVMs.Count -gt 0) {
             else { $samName = $rawUser }
 
             $usernamesToTry = @(
-                $rawUser
-                "${VIDMDomain}\${samName}"
                 $samName
-                "${samName}@${VIDMDomain}"
             )
 
             $authenticated = $false
@@ -455,7 +452,7 @@ if ($missingAppVMs.Count -gt 0) {
 
         foreach ($vm in $missingAppVMs) {
             try {
-                $nsxUri = "https://${NSXManager}/policy/api/v1/infra/realized-state/virtual-machines?display_name=$($vm.VMName)"
+                $nsxUri = "https://${NSXManager}/api/v1/fabric/virtual-machines?display_name=$($vm.VMName)"
 
                 $invokeParams = @{
                     Uri     = $nsxUri
