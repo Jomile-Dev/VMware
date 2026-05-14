@@ -167,7 +167,7 @@ $scriptBlock = {
     try {
         $response = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body
 
-        $appApplication = ""
+        $appApplications = [System.Collections.ArrayList]::new()
         $infraOs        = ""
         $appLayer       = ""
         $vmApplications = ""
@@ -178,10 +178,14 @@ $scriptBlock = {
                     if ($result.data -is [array]) {
                         foreach ($item in $result.data) {
                             if ($item.scope -and $item.tag) {
-                                switch ($item.scope) {
-                                    "app-application" { $appApplication = $item.tag }
-                                    "infra-os"        { $infraOs = $item.tag }
-                                    "app-layer"       { $appLayer = $item.tag }
+                                if ($item.scope -eq "app-application") {
+                                    [void]$appApplications.Add($item.tag)
+                                }
+                                elseif ($item.scope -eq "infra-os") {
+                                    $infraOs = $item.tag
+                                }
+                                elseif ($item.scope -eq "app-layer") {
+                                    $appLayer = $item.tag
                                 }
                             }
                         }
@@ -195,22 +199,32 @@ $scriptBlock = {
             }
         }
 
-        # Normalise and compare - check each semicolon-separated app for a match
-        $norm1 = if ($appApplication) { ($appApplication.ToLower().Trim() -replace '[_\s\-\.]+', '') } else { "" }
-        
+        $appApplication = ($appApplications | Select-Object -Unique) -join "; "
+
+        # Compare each tag against each CMDB CI entry
         $match = "Missing Data"
-        if ($norm1 -and $vmApplications) {
-            $appList = $vmApplications -split ";\s*"
-            $foundMatch = $false
-            foreach ($app in $appList) {
-                $normApp = ($app.ToLower().Trim() -replace '[_\s\-\.]+', '')
-                if ($normApp -and $norm1 -eq $normApp) {
-                    $foundMatch = $true
-                    break
+        $matchedApps = @()
+
+        if ($appApplications.Count -gt 0 -and $vmApplications) {
+            $ciList = $vmApplications -split ";\s*"
+            foreach ($tag in $appApplications) {
+                $normTag = ($tag.ToLower().Trim() -replace '[_\s\-\.]+', '')
+                foreach ($ci in $ciList) {
+                    $normCI = ($ci.ToLower().Trim() -replace '[_\s\-\.]+', '')
+                    if ($normTag -and $normCI -and $normTag -eq $normCI) {
+                        $matchedApps += $tag
+                        break
+                    }
                 }
             }
-            $match = if ($foundMatch) { "Match" } else { "Mismatch" }
+            if ($matchedApps.Count -gt 0) {
+                $match = "Match"
+            } else {
+                $match = "Mismatch"
+            }
         }
+
+        $matchedAppsStr = ($matchedApps | Select-Object -Unique) -join "; "
 
         return [PSCustomObject]@{
             DeploymentName = $DeploymentName
@@ -220,6 +234,7 @@ $scriptBlock = {
             AppLayer       = $appLayer
             CMDBCI         = $vmApplications
             CompareResult  = $match
+            MatchedApps    = $matchedAppsStr
             Status         = "Success"
         }
     }
@@ -232,6 +247,7 @@ $scriptBlock = {
             AppLayer       = ""
             CMDBCI         = ""
             CompareResult  = ""
+            MatchedApps    = ""
             Status         = "Failed: $($_.Exception.Message)"
         }
     }
@@ -312,6 +328,7 @@ foreach ($job in $jobs) {
                     AppLayer       = [string]$r.AppLayer
                     CMDBCI         = [string]$r.CMDBCI
                     CompareResult  = [string]$r.CompareResult
+                    MatchedApps    = [string]$r.MatchedApps
                 })
             }
         }
@@ -467,13 +484,14 @@ if ($missingAppVMs.Count -gt 0) {
                     $nsxVM = $nsxResponse.results[0]
 
                     if ($nsxVM.tags) {
+                        $nsxAppTags = @()
                         foreach ($tag in $nsxVM.tags) {
                             # Strip ST- prefix from NSX tags for consistency
                             $tagValue = $tag.tag -replace '^ST-', ''
 
                             switch ($tag.scope) {
                                 "app-application" {
-                                    if (-not $vm.AppApplication) { $vm.AppApplication = $tagValue }
+                                    $nsxAppTags += $tagValue
                                 }
                                 "infra-os" {
                                     if (-not $vm.InfraOS) { $vm.InfraOS = $tagValue }
@@ -484,23 +502,32 @@ if ($missingAppVMs.Count -gt 0) {
                             }
                         }
 
-                        if ($vm.AppApplication) {
+                        if ($nsxAppTags.Count -gt 0) {
+                            $vm.AppApplication = ($nsxAppTags | Select-Object -Unique) -join "; "
                             $nsxFilled++
-                            Write-Log "  $($vm.VMName) | NSX Tag: $($vm.AppApplication)" -Color Green
+                            Write-Log "  $($vm.VMName) | NSX Tags: $($vm.AppApplication)" -Color Green
 
-                            # Re-run comparison
-                            $norm1 = ($vm.AppApplication.ToLower().Trim() -replace '[_\s\-\.]+', '')
-                            if ($norm1 -and $vm.CMDBCI) {
-                                $appList = $vm.CMDBCI -split ";\s*"
-                                $foundMatch = $false
-                                foreach ($app in $appList) {
-                                    $normApp = ($app.ToLower().Trim() -replace '[_\s\-\.]+', '')
-                                    if ($normApp -and $norm1 -eq $normApp) {
-                                        $foundMatch = $true
-                                        break
+                            # Re-run comparison with multiple tags
+                            $matchedApps = @()
+                            if ($vm.CMDBCI) {
+                                $ciList = $vm.CMDBCI -split ";\s*"
+                                foreach ($tag in $nsxAppTags) {
+                                    $normTag = ($tag.ToLower().Trim() -replace '[_\s\-\.]+', '')
+                                    foreach ($ci in $ciList) {
+                                        $normCI = ($ci.ToLower().Trim() -replace '[_\s\-\.]+', '')
+                                        if ($normTag -and $normCI -and $normTag -eq $normCI) {
+                                            $matchedApps += $tag
+                                            break
+                                        }
                                     }
                                 }
-                                $vm.CompareResult = if ($foundMatch) { "Match" } else { "Mismatch" }
+                            }
+
+                            if ($matchedApps.Count -gt 0) {
+                                $vm.CompareResult = "Match"
+                                $vm.MatchedApps = ($matchedApps | Select-Object -Unique) -join "; "
+                            } else {
+                                $vm.CompareResult = "Mismatch"
                             }
                         }
                         else {
