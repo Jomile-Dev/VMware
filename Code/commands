@@ -1,0 +1,16 @@
+for store in $(/usr/lib/vmware-vmafd/bin/vecs-cli store list | grep -v TRUSTED_ROOT_CRLS); do
+  echo "=== Store: $store ==="
+  /usr/lib/vmware-vmafd/bin/vecs-cli entry list --store $store --text | grep -E "Alias|Not After"
+done
+
+
+
+echo | openssl s_client -connect localhost:443 2>/dev/null | openssl x509 -noout -dates -subject
+
+
+/usr/lib/vmware-vmafd/bin/vecs-cli entry list --store STS_INTERNAL_SSL_CERT --text | grep -E "Alias|Not After"
+
+  
+/usr/lib/vmware-vmafd/bin/vecs-cli entry list --store MACHINE_SSL_CERT --text | grep "Not After"
+
+/usr/lib/vmware-vmca/bin/certool --getrootca
