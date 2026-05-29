@@ -1,4 +1,9 @@
-sudo zgrep "veeam-service-account-name" /var/log/vmware/vapi/endpoint/endpoint-access.log* | awk '{print $5}' | sort -u
+sudo zgrep -i "veeam" /var/log/vmware/envoy/envoy-access.log* | head -10
 
+sudo zgrep -i "veeam" /var/log/vmware/rhttpproxy/rhttpproxy.log* | head -10
 
-sudo zgrep -i "veeam" /var/log/vmware/vapi/endpoint/endpoint-access.log* | head -5
+sudo zcat /var/log/vmware/envoy/envoy-access.log.1.gz 2>/dev/null | grep -oE '"[^"]*Veeam[^"]*"' | sort -u | head
+
+sudo zgrep -iE "veeam|veaam|VeeamVixProxy" /var/log/vmware/envoy/envoy-access.log* 2>/dev/null | head -10
+
+sudo zgrep -i "veeam" /var/log/vmware/envoy/envoy-access.log* 2>/dev/null | head -3
