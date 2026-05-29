@@ -1,17 +1,3 @@
-sudo /usr/lib/vmware-vpx/scripts/cisreg.py list 2>/dev/null || echo "Try PowerCLI instead"
+sudo zgrep "2026-05-28T19:4" /var/log/vmware/vapi/endpoint/endpoint-access.log.1.gz | grep "<working-tag-UUID>"
 
-# Get a token (you'll need an SSO user password)
-TOKEN=$(curl -k -s -X POST -u 'administrator@vsphere.local' https://localhost/api/session | tr -d '"')
-
-# List all tags and grep for the names
-curl -k -s -H "vmware-api-session-id: $TOKEN" https://localhost/api/cis/tagging/tag | head -50
-
-
-# Search for the working tag in the failure window
-sudo grep "2026-05-28T19:4" /var/log/vmware/vapi/endpoint/endpoint-access.log | grep "<working-tag-UUID>"
-
-# Search for the failing tag in the failure window
-sudo grep "2026-05-28T19:4" /var/log/vmware/vapi/endpoint/endpoint-access.log | grep "<failing-tag-UUID>"
-
-
-sudo grep "2026-05-28T19:4" /var/log/vmware/vapi/endpoint/endpoint-access.log | grep "<veeam-VBR-IP>"
+sudo zgrep "2026-05-28T19:4" /var/log/vmware/vapi/endpoint/endpoint-access.log* | grep "<working-tag-UUID>"
