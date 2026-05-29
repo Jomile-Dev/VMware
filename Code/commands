@@ -1,1 +1,3 @@
-sudo zgrep -E "2026-05-29T<GrpB-HH:MM>" /var/log/vmware/vapi/endpoint/endpoint.log* | grep -iE "error|exception|503|fail"
+TOKEN=$(curl -k -s -X POST -u 'administrator@vsphere.local' https://localhost/api/session | tr -d '"')
+
+curl -k -s -H "vmware-api-session-id: $TOKEN" "https://localhost/api/cis/tagging/tag-association/id:urn:vmomi:InventoryServiceTag:1b91bfa4-f169-43d9-97cf-65d3bbd9e942:GLOBAL?action=list-attached-objects"
