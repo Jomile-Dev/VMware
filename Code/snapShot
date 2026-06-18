@@ -1,6 +1,6 @@
 $vm = Get-VM "VMNAME"
 $vm.ExtensionData.RefreshStorageInfo()
 $vm.ExtensionData.LayoutEx.File |
-    Group-Object Type |
-    Select-Object Name, @{N='SizeGB';E={[math]::Round((($_.Group | Measure-Object Size -Sum).Sum)/1GB,2)}} |
+    Where-Object { $_.Type -eq 'diskExtent' } |
+    Select-Object Name, @{N='SizeGB';E={[math]::Round($_.Size/1GB,2)}} |
     Sort-Object SizeGB -Descending
