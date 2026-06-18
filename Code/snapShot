@@ -1,6 +1,6 @@
 $vm = Get-VM "VMNAME"
 $vm.ExtensionData.RefreshStorageInfo()
 $vm.ExtensionData.LayoutEx.File |
-    Select-Object Name, Type, @{N='SizeGB';E={[math]::Round($_.Size/1GB,2)}} |
-    Sort-Object SizeGB -Descending |
-    Format-Table -AutoSize
+    Group-Object Type |
+    Select-Object Name, @{N='SizeGB';E={[math]::Round((($_.Group | Measure-Object Size -Sum).Sum)/1GB,2)}} |
+    Sort-Object SizeGB -Descending
