@@ -243,6 +243,10 @@ function Get-AllSnapshots {
             $vms = Get-VM | Where-Object { $_.ExtensionData.Snapshot }
             
             foreach ($vm in $vms) {
+                # Refresh storage layout so SizeGB reflects current consumed size,
+                # not the snapshot size at creation time (Broadcom KB 369926)
+                $vm.ExtensionData.RefreshStorageInfo()
+
                 $snapshots = Get-Snapshot -VM $vm
                 
                 foreach ($snap in $snapshots) {
