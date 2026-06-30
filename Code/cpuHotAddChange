@@ -455,12 +455,34 @@ $vmProcessingScript = {
         
         $targetCPUs = [int]$vmData.CPUCountAfter
         $targetMemoryGB = [int]$vmData.MemoryGBAfter
-        # IMPORTANT: Set cores per socket equal to CPU count to ensure only 1 socket
-        $targetCoresPerSocket = $targetCPUs
+
+        # --- Hardware-version aware CPU topology ---
+        # At/above this vmx version, leave topology to vSphere (CoresPerSocket = 0 = auto / "assigned at power on").
+        # Below it, force a single socket (CoresPerSocket = vCPU count) - the original behaviour.
+        $autoTopologyMinVersion = 21   # change to 20 if you want it from the first Virtual Topology release
+
+        $hwVersionNumber = 0
+        $hwVersionString = $null
+        try {
+            $hwVersionString = $targetVM.HardwareVersion          # e.g. "vmx-21" [Inference: PowerCLI property]
+            if (-not $hwVersionString) { $hwVersionString = $targetVM.ExtensionData.Config.Version }
+        } catch { $hwVersionString = $null }
+
+        if ($hwVersionString -match 'vmx-(\d+)') { $hwVersionNumber = [int]$Matches[1] }
+
+        if ($hwVersionNumber -ge $autoTopologyMinVersion) {
+            $targetCoresPerSocket = 0          # vSphere auto topology (default)
+            $forceSingleSocket    = $false
+            Add-ProgressLog "CONFIG_SOCKET - vmx-$hwVersionNumber detected (>= $autoTopologyMinVersion): leaving CPU topology at vSphere default (CoresPerSocket=0, auto)" "INFO"
+        } else {
+            $targetCoresPerSocket = $targetCPUs
+            $forceSingleSocket    = $true
+            $detectedText = if ($hwVersionNumber -gt 0) { "vmx-$hwVersionNumber detected (< $autoTopologyMinVersion)" } else { "vmx version not detected" }
+            Add-ProgressLog "CONFIG_SOCKET - $detectedText : forcing 1 socket ($targetCoresPerSocket cores/socket)" "INFO"
+        }
+
         $configurationSuccessful = $false
         $vmView = $null
-        
-        Add-ProgressLog "CONFIG_SOCKET - Will configure for 1 socket: $targetCPUs CPUs with $targetCoresPerSocket cores per socket" "INFO"
         
         # TRY APPROACH 1: vSphere API (preferred method)
         try {
@@ -480,8 +502,9 @@ $vmProcessingScript = {
             $configSpec.CpuHotAddEnabled = $true
             $configSpec.MemoryHotAddEnabled = $true
             
+            $socketModeText = if ($forceSingleSocket) { "1 (forced)" } else { "auto" }
             $task = $vmView.ReconfigVM($configSpec)
-            Add-ProgressLog "CONFIG_API_TASK - API reconfiguration task submitted (CPU: $targetCPUs, Cores/Socket: $targetCoresPerSocket, Memory: ${targetMemoryGB}GB, Sockets: 1)" "INFO"
+            Add-ProgressLog "CONFIG_API_TASK - API reconfiguration task submitted (CPU: $targetCPUs, Cores/Socket: $targetCoresPerSocket, Memory: ${targetMemoryGB}GB, Sockets: $socketModeText)" "INFO"
             
             # Monitor the task
             $taskInfo = Get-View $task -ErrorAction Stop
@@ -512,9 +535,23 @@ $vmProcessingScript = {
                 # Get fresh VM for cmdlet approach
                 $cmdletVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
                 
-                # Apply CPU and Memory configuration with cores per socket = CPU count (1 socket)
-                Add-ProgressLog "CONFIG_CMDLET_RESOURCES - Setting CPUs to $targetCPUs with $targetCoresPerSocket cores/socket (1 socket) and Memory to ${targetMemoryGB}GB..." "INFO"
-                Set-VM -VM $cmdletVM -NumCpu $targetCPUs -CoresPerSocket $targetCoresPerSocket -MemoryGB $targetMemoryGB -Confirm:$false -ErrorAction Stop
+                # Apply CPU and Memory configuration. Only force cores/socket on older hardware.
+                if ($forceSingleSocket) {
+                    Add-ProgressLog "CONFIG_CMDLET_RESOURCES - Setting CPUs to $targetCPUs with $targetCoresPerSocket cores/socket (1 socket) and Memory to ${targetMemoryGB}GB..." "INFO"
+                } else {
+                    Add-ProgressLog "CONFIG_CMDLET_RESOURCES - Setting CPUs to $targetCPUs (vSphere auto topology, CoresPerSocket left at default) and Memory to ${targetMemoryGB}GB..." "INFO"
+                }
+                $setVmParams = @{
+                    VM          = $cmdletVM
+                    NumCpu      = $targetCPUs
+                    MemoryGB    = $targetMemoryGB
+                    Confirm     = $false
+                    ErrorAction = 'Stop'
+                }
+                # [Unverified] Set-VM -CoresPerSocket 0 is not a documented valid value, so omit the
+                # parameter on vmx-21+ and let vSphere keep/assign the default topology instead.
+                if ($forceSingleSocket) { $setVmParams['CoresPerSocket'] = $targetCoresPerSocket }
+                Set-VM @setVmParams
                 
                 Add-ProgressLog "CONFIG_CMDLET_SUCCESS - CPU and Memory configuration applied successfully via PowerCLI (1 socket configuration)" "SUCCESS"
                 $configurationSuccessful = $true
@@ -655,8 +692,12 @@ $vmProcessingScript = {
             $result.NewCoresPerSocket = $finalConfigVM.CoresPerSocket
             $result.NewMemoryGB = $finalConfigVM.MemoryGB
             
-            # Calculate socket count for logging
-            $socketCount = [math]::Round($result.NewCPUCount / $result.NewCoresPerSocket)
+            # Calculate socket count for logging (guard against auto topology / 0)
+            if ($result.NewCoresPerSocket -and $result.NewCoresPerSocket -gt 0) {
+                $socketCount = [math]::Round($result.NewCPUCount / $result.NewCoresPerSocket)
+            } else {
+                $socketCount = "auto"
+            }
             Add-ProgressLog "FINAL_CONFIG_RETRIEVED - Retrieved actual configuration from VM object" "SUCCESS"
             Add-ProgressLog "FINAL_CONFIG_VERIFICATION - Sockets: $socketCount (CPUs: $($result.NewCPUCount) / Cores per Socket: $($result.NewCoresPerSocket))" "INFO"
         } catch {
@@ -741,6 +782,53 @@ if ($finalServerArray.Count -eq 0) {
 
 Write-Host "Passing $($finalServerArray.Count) servers to jobs: $($finalServerArray -join ', ')" -ForegroundColor Green
 
+# Timer that gates how often the summary prints (seconds)
+$summaryIntervalSeconds = 20
+$lastSummaryUpdate = (Get-Date).AddSeconds(-$summaryIntervalSeconds)  # so the first call always fires
+
+# Reusable status summary - called from BOTH the launch loop and the monitoring loop
+function Show-StatusSummary {
+    param([switch]$Force)
+
+    if (-not $Force -and ((Get-Date) - $script:lastSummaryUpdate).TotalSeconds -lt $summaryIntervalSeconds) {
+        return
+    }
+
+    $completed   = $processedJobs.Count
+    $runningIds  = (Get-Job -State Running).Id
+    $running     = @($runningIds).Count
+    $total       = $VMList.Count          # true total from the very start (not just launched)
+    $launched    = $jobs.Count
+    $remaining   = $total - $completed
+    $elapsedTotal = [math]::Round(((Get-Date) - $scriptStartTime).TotalMinutes, 1)
+    $successCount = @($results | Where-Object { $_.Status -eq 'Success' }).Count
+
+    Write-Host "`n$("=" * 40)" -ForegroundColor Yellow
+    Write-Host "STATUS UPDATE - $elapsedTotal minutes elapsed" -ForegroundColor Yellow -BackgroundColor DarkYellow
+    Write-Host "$("=" * 40)" -ForegroundColor Yellow
+    Write-Host "Completed: $completed/$total" -ForegroundColor Green
+    Write-Host "Launched:  $launched/$total" -ForegroundColor Cyan
+    Write-Host "Running:   $running" -ForegroundColor Cyan
+    Write-Host "Remaining: $remaining VMs left to process" -ForegroundColor Yellow
+    Write-Host "Success Rate: $([math]::Round($successCount / [math]::Max($completed, 1) * 100, 1))%" -ForegroundColor Green
+
+    if ($running -gt 0) {
+        Write-Host "`nCURRENTLY PROCESSING:" -ForegroundColor Cyan
+        $runningJobsInfo = $jobs | Where-Object { $_.Job.Id -in $runningIds }
+        foreach ($rj in $runningJobsInfo) {
+            $e = [math]::Round(((Get-Date) - $rj.StartTime).TotalMinutes, 1)
+            Write-Host "   - $($rj.VMName) (Job $($rj.JobId) - ${e}m)" -ForegroundColor White
+        }
+    }
+    Write-Host "$("=" * 40)" -ForegroundColor Yellow
+    Write-Host ""
+
+    $script:lastSummaryUpdate = Get-Date
+}
+
+# Fire an immediate 0/total readout before any jobs launch
+Show-StatusSummary -Force
+
 # Start jobs in batches with validated server list
 foreach ($vmEntry in $VMList) {
     # Wait for available slot
@@ -812,6 +900,9 @@ foreach ($vmEntry in $VMList) {
                 Write-Host ">>> JOB PROCESSING COMPLETE <<<`n" -ForegroundColor Magenta
             }
         }
+
+        # Show periodic status during the launch phase too
+        Show-StatusSummary
     }
     
     # Start new job with properly formatted server array
@@ -839,6 +930,9 @@ foreach ($vmEntry in $VMList) {
         Write-Error "CRITICAL ERROR: Failed to start job for VM $($vmEntry.VMName): $($_.Exception.Message)"
         Write-Host "Server array being passed: $($finalServerArray -join ', ')" -ForegroundColor Red
     }
+
+    # Status update as jobs are being launched (self-gates to the interval)
+    Show-StatusSummary
 }
 
 Write-Host "`n" + "=" * 80 -ForegroundColor Green
@@ -847,7 +941,7 @@ Write-Host "=" * 80 -ForegroundColor Green
 Write-Host "Active PowerShell jobs: $((Get-Job -State Running).Count)" -ForegroundColor Yellow
 
 # Enhanced job monitoring with comprehensive real-time updates
-$lastSummaryUpdate = Get-Date
+# (lastSummaryUpdate carries over from the launch phase so cadence is continuous)
 
 while ($jobs.Count -gt $processedJobs.Count) {
     # Process real-time updates from all running jobs
@@ -929,36 +1023,8 @@ while ($jobs.Count -gt $processedJobs.Count) {
         }
     }
     
-    # Comprehensive status update every 20 seconds
-    if (((Get-Date) - $lastSummaryUpdate).TotalSeconds -ge 20) {
-        $completed = $processedJobs.Count
-        $running = $runningJobs.Count
-        $total = $jobs.Count
-        $remaining = $total - $completed
-        $elapsedTotal = [math]::Round(((Get-Date) - $scriptStartTime).TotalMinutes, 1)
-        
-        Write-Host "`n" + "=" * 30 -ForegroundColor Yellow
-        Write-Host "COMPREHENSIVE STATUS UPDATE - $elapsedTotal minutes elapsed" -ForegroundColor Yellow -BackgroundColor DarkYellow
-        Write-Host "=" * 30 -ForegroundColor Yellow
-        Write-Host "Completed: $completed/$total" -ForegroundColor Green
-        Write-Host "Running: $running" -ForegroundColor Cyan
-        Write-Host "Remaining: $remaining VMs left to process" -ForegroundColor Yellow
-        Write-Host "Success Rate: $([math]::Round(($results | Where-Object {$_.Status -eq 'Success'}).Count / [math]::Max($completed, 1) * 100, 1))%" -ForegroundColor Green
-        
-        if ($running -gt 0) {
-            Write-Host "`nCURRENTLY PROCESSING:" -ForegroundColor Cyan
-            $runningJobsInfo = $jobs | Where-Object { $_.Job.Id -in $runningJobs.Id }
-            foreach ($runningJob in $runningJobsInfo) {
-                $elapsed = [math]::Round(((Get-Date) - $runningJob.StartTime).TotalMinutes, 1)
-                Write-Host "   • $($runningJob.VMName) (Job $($runningJob.JobId) - ${elapsed}m)" -ForegroundColor White
-            }
-        }
-        
-        Write-Host "=" * 30 -ForegroundColor Yellow
-        Write-Host ""
-        
-        $lastSummaryUpdate = Get-Date
-    }
+    # Comprehensive status update (self-gates to the interval)
+    Show-StatusSummary
     
     Start-Sleep -Seconds 2
 }
