@@ -396,15 +396,10 @@ $vmProcessingScript = {
         $result.OriginalPowerState = $originalPowerState
         Add-ProgressLog "VM_STATE_CAPTURED - Original power state: $originalPowerState (will restore this state after reconfiguration)" "INFO"
         
-        # --- PRE-CHECK: skip VMs already in the desired state ---
-        # Skip when, on vmx >= $autoTopologyMinVersion, CPU and memory already match the targets
-        # and both hot-add flags are already enabled. Avoids an unnecessary shutdown/reboot.
-        #
-        # IMPORTANT: cores-per-socket is deliberately NOT used in the skip decision. The config
-        # property Config.Hardware.NumCoresPerSocket reads back as the effective value (typically 1)
-        # even when the VM is on "Assigned at power on", so auto vs manual cannot be reliably told
-        # apart on a powered-on VM. The reconfig path still sets it to 0 (Assigned at power on) for
-        # any vmx-21+ VM that is NOT skipped.
+        # --- Determine hardware (vmx) version ---
+        # Skip logic was removed by design: "Assigned at power on" cannot be reliably distinguished
+        # from a manual cores-per-socket value on a powered-on VM, so every VM is reconfigured to
+        # guarantee correct topology (vmx-21+ -> Assigned at power on; older -> CoresPerSocket = vCPU).
         $autoTopologyMinVersion = 21   # change to 20 if you want it from the first Virtual Topology release
 
         $hwVersionString = $null
@@ -415,35 +410,7 @@ $vmProcessingScript = {
         } catch { $hwVersionString = $null }
         if ($hwVersionString -match 'vmx-(\d+)') { $hwVersionNumber = [int]$Matches[1] }
 
-        # Current state reads [Inference: vSphere API properties via PowerCLI]
-        $currentCPU            = [int]$targetVM.NumCpu
-        $currentMemoryGB       = [int]$targetVM.MemoryGB
-        $currentCpuHotAdd      = [bool]$targetVM.ExtensionData.Config.CpuHotAddEnabled
-        $currentMemHotAdd      = [bool]$targetVM.ExtensionData.Config.MemoryHotAddEnabled
-        $currentCoresPerSocket = [int]$targetVM.ExtensionData.Config.Hardware.NumCoresPerSocket  # effective value (read-only, for reporting)
-
-        $cpuMatches = $currentCPU -eq [int]$vmData.CPUCountAfter
-        $memMatches = $currentMemoryGB -eq [int]$vmData.MemoryGBAfter
-
-        if ($cpuMatches -and $memMatches -and $currentCpuHotAdd -and $currentMemHotAdd -and $hwVersionNumber -ge $autoTopologyMinVersion) {
-            Add-ProgressLog "SKIP_CHECK - Already in desired state (vmx-$hwVersionNumber, CPU: $currentCPU, Mem: ${currentMemoryGB}GB, HotAdd CPU/Mem: on). Skipping - no shutdown or reconfig. (Cores/Socket left as-is - not reliably detectable.)" "SUCCESS"
-
-            $result.Status                 = "Skipped"
-            $result.NewCPUCount            = $currentCPU
-            $result.NewCoresPerSocket      = $currentCoresPerSocket
-            $result.NewMemoryGB            = $currentMemoryGB
-            $result.NewCPUHotAddEnabled    = $true
-            $result.NewMemoryHotAddEnabled = $true
-            $result.FinalPowerState        = $targetVM.PowerState
-            $result.EndTime                = Get-Date
-            $result.ProcessingTimeMinutes  = [math]::Round(($result.EndTime - $result.StartTime).TotalMinutes, 2)
-            $result.ProgressLog            = $progressLog
-
-            Write-Output $result
-            return
-        }
-
-        Add-ProgressLog "SKIP_CHECK - VM needs changes (CPU match: $cpuMatches, Mem match: $memMatches, HotAdd CPU: $currentCpuHotAdd, HotAdd Mem: $currentMemHotAdd, vmx-$hwVersionNumber). Proceeding." "INFO"
+        Add-ProgressLog "HW_VERSION - Detected vmx-$hwVersionNumber. Proceeding with reconfiguration (no skip)." "INFO"
 
         # PHASE 1: Shutdown if needed with null checks
         if ($targetVM -and $targetVM.PowerState -eq "PoweredOn") {
@@ -582,14 +549,19 @@ $vmProcessingScript = {
             try {
                 Add-ProgressLog "CONFIG_CMDLET_START - Using PowerCLI cmdlets for configuration..." "INFO"
                 
-                # Get fresh VM for cmdlet approach
-                $cmdletVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction Stop
+                # Get fresh VM for cmdlet approach (by MoRef Id for multi-vCenter robustness)
+                $cmdletVM = $null
+                try { $cmdletVM = Get-VM -Id $targetVM.Id -ErrorAction Stop } catch { $cmdletVM = $null }
+                if (-not $cmdletVM) {
+                    $cmdletVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction SilentlyContinue
+                }
+                if (-not $cmdletVM) { throw "Could not re-acquire VM '$($vmData.VMName)' for cmdlet reconfig" }
                 
                 # Apply CPU and Memory configuration. Only force cores/socket on older hardware.
                 if ($forceSingleSocket) {
                     Add-ProgressLog "CONFIG_CMDLET_RESOURCES - Setting CPUs to $targetCPUs with $targetCoresPerSocket cores/socket (1 socket) and Memory to ${targetMemoryGB}GB..." "INFO"
                 } else {
-                    Add-ProgressLog "CONFIG_CMDLET_RESOURCES - Setting CPUs to $targetCPUs (vSphere auto topology, CoresPerSocket left at default) and Memory to ${targetMemoryGB}GB..." "INFO"
+                    Add-ProgressLog "CONFIG_CMDLET_RESOURCES - Setting CPUs to $targetCPUs and Memory to ${targetMemoryGB}GB (topology set to Assigned at power on separately below)..." "INFO"
                 }
                 $setVmParams = @{
                     VM          = $cmdletVM
@@ -598,12 +570,32 @@ $vmProcessingScript = {
                     Confirm     = $false
                     ErrorAction = 'Stop'
                 }
-                # [Unverified] Set-VM -CoresPerSocket 0 is not a documented valid value, so omit the
-                # parameter on vmx-21+ and let vSphere keep/assign the default topology instead.
+                # [Unverified] Set-VM -CoresPerSocket 0 is not a documented valid value, so for vmx-21+
+                # we set CPU/mem here and apply topology=0 via a small API reconfig immediately after.
                 if ($forceSingleSocket) { $setVmParams['CoresPerSocket'] = $targetCoresPerSocket }
                 Set-VM @setVmParams
                 
-                Add-ProgressLog "CONFIG_CMDLET_SUCCESS - CPU and Memory configuration applied successfully via PowerCLI (1 socket configuration)" "SUCCESS"
+                # vmx-21+: guarantee "Assigned at power on" (NumCoresPerSocket = 0) via API, since the
+                # cmdlet cannot express it. This keeps the correctness guarantee even on the fallback path.
+                if (-not $forceSingleSocket) {
+                    try {
+                        $topoVM = $null
+                        try { $topoVM = Get-VM -Id $targetVM.Id -ErrorAction Stop } catch { $topoVM = $null }
+                        if (-not $topoVM) { $topoVM = Get-VM -Name $vmData.VMName -Server $vmServer -ErrorAction SilentlyContinue }
+                        if ($topoVM -and $topoVM.ExtensionData) {
+                            $topoSpec = New-Object VMware.Vim.VirtualMachineConfigSpec
+                            $topoSpec.NumCoresPerSocket = 0
+                            $topoVM.ExtensionData.ReconfigVM($topoSpec) | Out-Null
+                            Add-ProgressLog "CONFIG_CMDLET_TOPOLOGY - Cores/Socket set to Assigned at power on (0) via API" "SUCCESS"
+                        } else {
+                            Add-ProgressLog "CONFIG_CMDLET_TOPOLOGY - WARNING: could not re-acquire VM to set topology; cores/socket may NOT be Assigned at power on - check this VM manually" "WARN"
+                        }
+                    } catch {
+                        Add-ProgressLog "CONFIG_CMDLET_TOPOLOGY - WARNING: failed to set Assigned at power on: $($_.Exception.Message) - check this VM manually" "WARN"
+                    }
+                }
+                
+                Add-ProgressLog "CONFIG_CMDLET_SUCCESS - CPU and Memory configuration applied successfully via PowerCLI" "SUCCESS"
                 $configurationSuccessful = $true
                 
                 # TRY to enable hot add (if this fails, it's not critical)
