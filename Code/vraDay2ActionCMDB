@@ -30,6 +30,12 @@ $DebugReviewVMName = ""
 # a full review run.
 $DebugReviewOnly = $false
 
+# Set $true to run a one-time, read-only probe that asks vRO (by action NAME)
+# which module getCagApplications / returnApplicationVms actually live in and
+# whether they're reachable via the Action REST API. Writes vro_action_probe.json.
+# Turn on when a call fails with "not resolved in module".
+$ProbeVroActions = $false
+
 # Replay mode: set to a previous CMDBRelations_*.csv to SKIP the slow main match
 # pool + NSX fallback and run ONLY the review phase against those saved rows.
 # The quick deployment fetch still runs (it supplies ProjectId/ProjectName). "" = normal run.
@@ -645,6 +651,50 @@ $reviewVMs = @($results | Where-Object { $_.AppApplication })
 if ($DebugReviewOnly -and $DebugReviewVMName) {
     $reviewVMs = @($reviewVMs | Where-Object { $_.VMName -eq $DebugReviewVMName })
     Write-Log "DEBUG-ONLY review: restricted to '$DebugReviewVMName' ($($reviewVMs.Count) VM)" -Color Yellow
+}
+
+# ---------------------------------------------------------------------
+# vRO ACTION PROBE (read-only). Set $ProbeVroActions = $true to ask vRO,
+# by NAME, which module each review action lives in and whether it is
+# reachable via the Action REST API. Writes C:\Logs\vro_action_probe.json
+# and prints each action's real module + href, then continues.
+# Use this when a call fails with "not resolved in module".
+# ---------------------------------------------------------------------
+if ($ProbeVroActions) {
+    Write-Log "`n=== vRO ACTION PROBE ===" -Color Cyan
+    $probeHeaders = @{ "Authorization" = "Bearer $authToken"; "Accept" = "application/json" }
+    $probeOut = @{}
+    foreach ($pair in @(
+        @{ label = "getCagApplications";   uri = $getCagAppsUri },
+        @{ label = "returnApplicationVms"; uri = $returnAppVmsUri }
+    )) {
+        $mod  = $pair.uri.Substring(0, $pair.uri.LastIndexOf('/'))
+        $nm   = $pair.uri.Substring($pair.uri.LastIndexOf('/') + 1)
+        Write-Log "  Probing '$nm' (expected module '$mod')..." -Color Gray
+        try {
+            $enc = [uri]::EscapeDataString($nm)
+            $searchUri = "https://$vraServer/vco/api/actions?conditions=name=$enc"
+            $res = Invoke-RestMethod -Uri $searchUri -Method Get -Headers $probeHeaders -ErrorAction Stop
+            $found = @()
+            foreach ($item in $res.link) {
+                $href = ($item.attributes | Where-Object { $_.name -eq 'itemHref' }).value
+                $fqn  = ($item.attributes | Where-Object { $_.name -eq 'fully.qualified.name' -or $_.name -eq 'name' }).value
+                if ($href) { $found += [PSCustomObject]@{ href = $href; attrs = $item.attributes } }
+                Write-Log "     -> href: $href" -Color DarkGray
+            }
+            if (-not $found) { Write-Log "     -> vRO returned NO action named '$nm'." -Color Red }
+            $probeOut[$nm] = $res
+        }
+        catch {
+            Write-Log "     -> probe failed: $($_.Exception.Message)" -Color Red
+            $probeOut[$nm] = @{ error = $_.Exception.Message }
+        }
+    }
+    try {
+        $probePath = Join-Path $resultsDir "vro_action_probe.json"
+        $probeOut | ConvertTo-Json -Depth 20 | Out-File -FilePath $probePath -Encoding UTF8
+        Write-Log "  Probe written to $probePath" -Color Green
+    } catch { Write-Log "  Could not write probe file: $($_.Exception.Message)" -Color Yellow }
 }
 
 if ($reviewVMs.Count -gt 0) {
