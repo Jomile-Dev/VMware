@@ -15,15 +15,20 @@ $SMTPPort     = 465
 $UseSSL       = $true
 
 # vRO action URIs - update these to match your environment
-$showVmDetailsUri = "somethingsomething.something.wrappers/showVmDetails"
-$getVmAppsUri     = "somethingsomething.something.returns/getVmApplications"
-$getCagAppsUri    = "somethingsomething.something.returns/getCagApplications"
-$returnAppVmsUri  = "somethingsomething.something.returns/returnApplicationVms"
+$showVmDetailsUri = "something.something.something.wrappers/showVmDetails"
+$getVmAppsUri     = "something.something.something.returns/getVmApplications"
+$getCagAppsUri    = "something.something.something.returns/getCagApplications"
+$returnAppVmsUri  = "something.something.something.returns/returnApplicationVms"
 
 # Debug: set this to ONE VMName to dump the raw review-phase response to
 # $resultsDir\review_raw_<vm>.json so you can see exactly what the two review
 # actions return. Leave "" to disable.
 $DebugReviewVMName = ""
+
+# When $true AND $DebugReviewVMName is set, the review phase processes ONLY that one
+# VM (1 job instead of 932) so its raw JSON dump appears in seconds. Leave $false for
+# a full review run.
+$DebugReviewOnly = $false
 
 # Replay mode: set to a previous CMDBRelations_*.csv to SKIP the slow main match
 # pool + NSX fallback and run ONLY the review phase against those saved rows.
@@ -634,6 +639,13 @@ foreach ($item in $results) {
 
 # Only VMs that resolved a tag can be reviewed (skip failed / empty rows)
 $reviewVMs = @($results | Where-Object { $_.AppApplication })
+
+# Debug fast-path: restrict the review to the single debug VM so its raw JSON
+# dump lands in seconds instead of after all VMs are processed.
+if ($DebugReviewOnly -and $DebugReviewVMName) {
+    $reviewVMs = @($reviewVMs | Where-Object { $_.VMName -eq $DebugReviewVMName })
+    Write-Log "DEBUG-ONLY review: restricted to '$DebugReviewVMName' ($($reviewVMs.Count) VM)" -Color Yellow
+}
 
 if ($reviewVMs.Count -gt 0) {
     Write-Log "Reviewing $($reviewVMs.Count) VMs with a resolved app tag..." -Color Gray
