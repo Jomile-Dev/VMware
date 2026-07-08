@@ -17,11 +17,8 @@ $UseSSL       = $true
 # vRO action URIs - update these to match your environment
 $showVmDetailsUri = "somethingsomething.something.wrappers/showVmDetails"
 $getVmAppsUri     = "somethingsomething.something.returns/getVmApplications"
-
-# --- NEW review actions (set these to your real action URIs) ---
-# [Unverified] Parameter names for these two actions are ASSUMED below - confirm them.
-$getCagAppsUri   = "somethingsomething.something.returns/getCagApplications"
-$returnAppVmsUri = "somethingsomething.something.returns/returnApplicationVms"
+$getCagAppsUri    = "somethingsomething.something.returns/getCagApplications"
+$returnAppVmsUri  = "somethingsomething.something.returns/returnApplicationVms"
 
 # NSX Manager Configuration (fallback for VMs with empty AppApplication)
 $NSXManager       = "nsx-manager.company.com"
@@ -574,10 +571,6 @@ if ($missingAppVMs.Count -gt 0) {
 # ---------------------------------------------------------------------
 # Populates: NSXMatchCMDB, AppOrSubApp, UpstreamToApp,
 #            MultipleUpstream, NoUpstreamRelationship
-#
-# [Unverified / Inference] The parsing below matches the data shapes
-# described to me. It is NOT verified against live action output.
-# Confirm the ASSUMPTIONS flagged with [Unverified] before trusting it.
 # =====================================================================
 Write-Log "`n=== CMDB RELATIONSHIP REVIEW ===" -Color Cyan
 
@@ -612,22 +605,16 @@ if ($reviewVMs.Count -gt 0) {
         }
 
         # returnApplicationVms takes the application NAME = the NSX tag with underscores
-        # converted to spaces (verified against the debug output: the queried Key was
-        # "RANZG DATABASE SYSADMIN APPLICATION"). A VM may carry multiple "; "-joined
-        # tags; we use the FIRST/primary tag here.
-        # [Unverified] Multi-tag handling for the lookup is simplified to the first tag.
+        # converted to spaces (the queried Key looks like "RANZG DATABASE SYSADMIN
+        # APPLICATION"). A VM may carry multiple "; "-joined tags; we use the first tag.
         $primaryTag  = ($AppTag -split ';\s*')[0]
         $tagSpaced   = ($primaryTag -replace '_', ' ')
 
         # Batched external-values call (same pattern as the main script)
-        #   requestId 1 = getCagApplications  -> flat app/sub-app list (VERIFIED shape)
+        #   requestId 1 = getCagApplications  -> flat app/sub-app list
         #   requestId 2 = returnApplicationVms -> retrieveCiInfoByKey.Information[]
-        #
-        # [Unverified] getCagApplications params assumed vmName+projectName.
-        # [Unverified] returnApplicationVms param name assumed "application"; the VALUE is
-        #   the tag with underscores->spaces (verified). See the note in the message about
-        #   this action needing to be form-exposed as an external-value, or called via the
-        #   vRO Action REST API instead.
+        # returnApplicationVms may need to be exposed as a form external-value action,
+        # or called via the vRO Action REST API - see notes if requestId 2 comes back empty.
         $uri = "https://$VraServer/form-service/api/forms/renderer/external-values?projectId=$ProjectId"
         $bodyArray = @(
             @{
@@ -721,15 +708,12 @@ if ($reviewVMs.Count -gt 0) {
 
             if     ($inSub) { $appOrSubApp = "Good" }
             elseif ($inApp) { $appOrSubApp = "Convert to sub-app" }
-            else            { $appOrSubApp = "Tag not found in CAG list" }   # [Unverified] fallback
+            else            { $appOrSubApp = "Tag not found in CAG list" }
 
             # --- Upstream analysis ---------------------------------------------
-            # [Unverified] Upstream presence/count is taken from the upstreamCIs[] arrays
-            # (nested in Information[]). You described getCagApplications as the "no upstream"
-            # source; upstreamCIs is the explicit array of upstream CIs and gives a reliable
-            # count, so it drives all three upstream columns here. If you'd rather derive
-            # presence/count from the getCagApplications Applications-section entries instead,
-            # that's a one-line swap - say the word.
+            # Upstream presence/count comes from the upstreamCIs[] arrays nested in
+            # Information[]. To count from the getCagApplications Applications-section
+            # entries instead, swap the $upCount source below.
             $upCount = @($upstreamCIs).Count
             $classes = @($upstreamCIs | ForEach-Object { [string]$_.UpstreamCICMSClass } | Where-Object { $_ })
 
@@ -740,7 +724,7 @@ if ($reviewVMs.Count -gt 0) {
                 } elseif ($classes -contains "Application") {
                     $upstreamToApp = "Good"
                 } else {
-                    $upstreamToApp = "Unknown upstream class"   # [Unverified] fallback
+                    $upstreamToApp = "Unknown upstream class"
                 }
             }
 
