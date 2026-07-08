@@ -92,6 +92,17 @@ $size = 1000
 $totalProcessed = 0
 $skippedCount = 0
 
+# Read the project NAME directly off the deployment (shown as "Project" in the vRA
+# GUI). Different vRA versions expose it under slightly different fields, so check
+# each likely spelling and use whichever is populated.
+function Resolve-ProjectName {
+    param($Dep)
+    if ($Dep.projectName)  { return [string]$Dep.projectName }
+    if ($Dep.project.name) { return [string]$Dep.project.name }
+    if ($Dep.project)      { return [string]$Dep.project }   # some versions: project = the name string
+    return ""
+}
+
 do {
     $uri = "https://$vraServer/deployment/api/deployments?page=$page&size=$size&expand=resources"
     Write-Log "  Page $($page + 1)..." -Color Gray
@@ -120,8 +131,8 @@ do {
             $vmQueue.Add(@{
                 DeploymentName = $dep.name
                 VMName         = $vmName
-                ProjectId      = $dep.projectId
-                ProjectName    = $dep.projectName
+                ProjectId      = if ($dep.projectId) { [string]$dep.projectId } elseif ($dep.project.id) { [string]$dep.project.id } else { "" }
+                ProjectName    = Resolve-ProjectName -Dep $dep
             })
         }
     }
