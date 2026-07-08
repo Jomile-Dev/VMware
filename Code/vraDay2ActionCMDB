@@ -289,8 +289,10 @@ if ($ReplayFromCsv) {
     $results = [System.Collections.Generic.List[object]]::new()
     foreach ($row in (Import-Csv -Path $ReplayFromCsv)) {
         $results.Add([PSCustomObject]@{
-            DeploymentName         = [string]$row.DeploymentName
             VMName                 = [string]$row.VMName
+            ProjectName            = [string]$row.ProjectName
+            DeploymentName         = [string]$row.DeploymentName
+            ProjectId              = [string]$row.ProjectId
             AppApplication         = [string]$row.AppApplication
             InfraOS                = [string]$row.InfraOS
             AppLayer               = [string]$row.AppLayer
@@ -336,9 +338,11 @@ foreach ($vm in $vmQueue) {
     $ps.RunspacePool = $runspacePool
 
     $jobs.Add(@{
-        PowerShell = $ps
-        Handle     = $ps.BeginInvoke()
-        VMName     = $vm.VMName
+        PowerShell  = $ps
+        Handle      = $ps.BeginInvoke()
+        VMName      = $vm.VMName
+        ProjectId   = $vm.ProjectId
+        ProjectName = $vm.ProjectName
     })
 }
 
@@ -375,8 +379,10 @@ foreach ($job in $jobs) {
                 }
 
                 $results.Add([PSCustomObject]@{
-                    DeploymentName        = [string]$r.DeploymentName
                     VMName                = [string]$r.VMName
+                    ProjectName           = [string]$job.ProjectName
+                    DeploymentName        = [string]$r.DeploymentName
+                    ProjectId             = [string]$job.ProjectId
                     AppApplication        = [string]$r.AppApplication
                     InfraOS               = [string]$r.InfraOS
                     AppLayer              = [string]$r.AppLayer
@@ -677,10 +683,11 @@ if ($ProbeVroActions) {
             $res = Invoke-RestMethod -Uri $searchUri -Method Get -Headers $probeHeaders -ErrorAction Stop
             $found = @()
             foreach ($item in $res.link) {
-                $href = ($item.attributes | Where-Object { $_.name -eq 'itemHref' }).value
-                $fqn  = ($item.attributes | Where-Object { $_.name -eq 'fully.qualified.name' -or $_.name -eq 'name' }).value
-                if ($href) { $found += [PSCustomObject]@{ href = $href; attrs = $item.attributes } }
-                Write-Log "     -> href: $href" -Color DarkGray
+                $href = $item.href
+                $fqn  = ($item.attributes | Where-Object { $_.name -eq 'fqn' }).value
+                if ($href) { $found += [PSCustomObject]@{ href = $href; fqn = $fqn } }
+                Write-Log "     -> fqn: $fqn" -Color DarkGray
+                Write-Log "        href: $href" -Color DarkGray
             }
             if (-not $found) { Write-Log "     -> vRO returned NO action named '$nm'." -Color Red }
             $probeOut[$nm] = $res
@@ -810,12 +817,22 @@ if ($reviewVMs.Count -gt 0) {
                 applicationName = $tagSpaced
             }
 
-            # Debug dump: write BOTH raw execution responses for the targeted VM.
+            # Debug dump: write BOTH raw execution responses for the targeted VM,
+            # plus the exact inputs sent, so an empty result shows immediately whether
+            # an input (e.g. projectName) went in blank.
             if ($DebugVMName -and $VMName -eq $DebugVMName) {
                 try {
                     $dbgPath = Join-Path $ResultsDir ("review_raw_" + ($VMName -replace '[^\w\.\-]', '_') + ".json")
-                    @{ requestId1_getCagApplications = $cagExec; requestId2_returnApplicationVms = $vmsExec } |
-                        ConvertTo-Json -Depth 20 | Out-File -FilePath $dbgPath -Encoding UTF8
+                    @{
+                        inputs = @{
+                            VMName          = $VMName
+                            projectName     = $ProjectName
+                            phaseOutEnabled = $true
+                            applicationName = $tagSpaced
+                        }
+                        requestId1_getCagApplications   = $cagExec
+                        requestId2_returnApplicationVms = $vmsExec
+                    } | ConvertTo-Json -Depth 20 | Out-File -FilePath $dbgPath -Encoding UTF8
                 } catch { }
             }
 
@@ -964,10 +981,13 @@ if ($reviewVMs.Count -gt 0) {
         $ps.AddArgument($getCagAppsUri)    | Out-Null
         $ps.AddArgument($returnAppVmsUri)  | Out-Null
         $ps.AddArgument($item.VMName)      | Out-Null
-        # ProjectId/ProjectName are not stored on the result row; resolve from the lookup
+        # Prefer the row's own ProjectId/ProjectName (present in replay CSV and in
+        # normal-run rows); fall back to the queue lookup only if the row is blank.
         $q = $queueByVMName[$item.VMName]
-        $ps.AddArgument($(if ($q) { $q.ProjectId }   else { "" })) | Out-Null
-        $ps.AddArgument($(if ($q) { $q.ProjectName } else { "" })) | Out-Null
+        $projId   = if ($item.ProjectId)   { $item.ProjectId }   elseif ($q) { $q.ProjectId }   else { "" }
+        $projName = if ($item.ProjectName) { $item.ProjectName } elseif ($q) { $q.ProjectName } else { "" }
+        $ps.AddArgument($projId)   | Out-Null
+        $ps.AddArgument($projName) | Out-Null
         $ps.AddArgument($item.AppApplication) | Out-Null
         $ps.AddArgument($idx)              | Out-Null
         $ps.AddArgument($DebugReviewVMName) | Out-Null
