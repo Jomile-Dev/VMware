@@ -20,6 +20,16 @@ $getVmAppsUri     = "somethingsomething.something.returns/getVmApplications"
 $getCagAppsUri    = "somethingsomething.something.returns/getCagApplications"
 $returnAppVmsUri  = "somethingsomething.something.returns/returnApplicationVms"
 
+# Debug: set this to ONE VMName to dump the raw review-phase response to
+# $resultsDir\review_raw_<vm>.json so you can see exactly what the two review
+# actions return. Leave "" to disable.
+$DebugReviewVMName = ""
+
+# Replay mode: set to a previous CMDBRelations_*.csv to SKIP the slow main match
+# pool + NSX fallback and run ONLY the review phase against those saved rows.
+# The quick deployment fetch still runs (it supplies ProjectId/ProjectName). "" = normal run.
+$ReplayFromCsv = ""
+
 # NSX Manager Configuration (fallback for VMs with empty AppApplication)
 $NSXManager       = "nsx-manager.company.com"
 $NSXAuthMode      = "vIDM"
@@ -257,11 +267,40 @@ $scriptBlock = {
     }
 }
 
-# Process with single runspace pool and timeout per job
-$poolSize = 30
+# Shared settings (used by both the main match pool and the review phase)
+$poolSize = 50
 $jobTimeoutSeconds = 120
-Write-Log "`n=== PROCESSING $($vmQueue.Count) VMs ($poolSize parallel threads, ${jobTimeoutSeconds}s timeout) ===" -Color Cyan
 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+if ($ReplayFromCsv) {
+    # REPLAY MODE: skip the slow per-VM match pool + NSX fallback; load prior results.
+    Write-Log "`n=== REPLAY MODE: loading results from $ReplayFromCsv ===" -Color Cyan
+    $results = [System.Collections.Generic.List[object]]::new()
+    foreach ($row in (Import-Csv -Path $ReplayFromCsv)) {
+        $results.Add([PSCustomObject]@{
+            DeploymentName         = [string]$row.DeploymentName
+            VMName                 = [string]$row.VMName
+            AppApplication         = [string]$row.AppApplication
+            InfraOS                = [string]$row.InfraOS
+            AppLayer               = [string]$row.AppLayer
+            CMDBCI                 = [string]$row.CMDBCI
+            CompareResult          = [string]$row.CompareResult
+            NSXMatchCMDB           = [string]$row.NSXMatchCMDB
+            AppOrSubApp            = ""
+            UpstreamToApp          = ""
+            MultipleUpstream       = ""
+            NoUpstreamRelationship = ""
+            Decommissioned         = ""
+        })
+    }
+    $successCount = $results.Count
+    $failCount    = 0
+    Write-Log "  Loaded $($results.Count) rows - running review phase only" -Color Green
+}
+else {
+
+# Process with single runspace pool and timeout per job
+Write-Log "`n=== PROCESSING $($vmQueue.Count) VMs ($poolSize parallel threads, ${jobTimeoutSeconds}s timeout) ===" -Color Cyan
 
 $runspacePool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $poolSize)
 $runspacePool.Open()
@@ -338,6 +377,7 @@ foreach ($job in $jobs) {
                     UpstreamToApp         = ""
                     MultipleUpstream      = ""
                     NoUpstreamRelationship = ""
+                    Decommissioned        = ""
                 })
             }
         }
@@ -566,6 +606,8 @@ if ($missingAppVMs.Count -gt 0) {
     }
 }
 
+}  # end of normal-run branch (main match pool + NSX fallback); skipped in replay mode
+
 # =====================================================================
 # CMDB RELATIONSHIP REVIEW PHASE
 # ---------------------------------------------------------------------
@@ -578,6 +620,9 @@ Write-Log "`n=== CMDB RELATIONSHIP REVIEW ===" -Color Cyan
 # NSX Tag = CMDB naming  -> Good
 # NSX Tag <> CMDB naming  -> No match, review to modify relationship or segment
 foreach ($item in $results) {
+    # On replay from a CSV that has no CompareResult column, keep the NSXMatchCMDB
+    # value already loaded rather than blanking it.
+    if (-not $item.CompareResult) { continue }
     switch ($item.CompareResult) {
         "Match"                { $item.NSXMatchCMDB = "Good" }
         "Match - Multiple Tags" { $item.NSXMatchCMDB = "Good" }
@@ -594,7 +639,7 @@ if ($reviewVMs.Count -gt 0) {
     Write-Log "Reviewing $($reviewVMs.Count) VMs with a resolved app tag..." -Color Gray
 
     $reviewScriptBlock = {
-        param($VraServer, $AuthToken, $GetCagUri, $ReturnAppVmsUri, $VMName, $ProjectId, $ProjectName, $AppTag, $RowIndex)
+        param($VraServer, $AuthToken, $GetCagUri, $ReturnAppVmsUri, $VMName, $ProjectId, $ProjectName, $AppTag, $RowIndex, $DebugVMName, $ResultsDir)
 
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
@@ -647,9 +692,18 @@ if ($reviewVMs.Count -gt 0) {
         $upstreamToApp    = ""
         $multipleUpstream = ""
         $noUpstream       = ""
+        $decommissioned   = ""
 
         try {
             $response = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body
+
+            # Debug dump: write the raw response for the targeted VM so its shape is visible
+            if ($DebugVMName -and $VMName -eq $DebugVMName) {
+                try {
+                    $dbgPath = Join-Path $ResultsDir ("review_raw_" + ($VMName -replace '[^\w\.\-]', '_') + ".json")
+                    $response | ConvertTo-Json -Depth 15 | Out-File -FilePath $dbgPath -Encoding UTF8
+                } catch { }
+            }
 
             $cagData     = $null
             $upstreamCIs = @()      # aggregated across all Information[] entries
@@ -733,13 +787,21 @@ if ($reviewVMs.Count -gt 0) {
             elseif ($upCount -eq 1) { $multipleUpstream = "Good" }
             else                    { $multipleUpstream = "No upstream" }
 
-            # No Upstream Relationship (your described sequence):
-            #   if no upstream -> look at the CI Status from returnApplicationVms
-            #       Disposed/Retired -> disposed sub-app note
-            #       otherwise        -> fix-upstream note
+            # Decommissioned check - applies to EITHER an app or a sub-app, regardless
+            # of upstream. Status comes from returnApplicationVms (looked up by the NSX tag).
+            $isDisposed = @($ciStatuses | Where-Object { $_ -match '(?i)dispos|retir' }).Count -gt 0
+            if ($isDisposed) {
+                if ($appOrSubApp -eq "Convert to sub-app") {
+                    $decommissioned = "App decommissioned (disposed/retired)"
+                } else {
+                    $decommissioned = "Sub-app decommissioned (disposed/retired)"
+                }
+            }
+
+            # No Upstream Relationship:
+            #   if no upstream -> disposed CI gets the disposed note, otherwise the fix note
             #   if it has an upstream -> leave blank
             if ($upCount -eq 0) {
-                $isDisposed = @($ciStatuses | Where-Object { $_ -match '(?i)dispos|retir' }).Count -gt 0
                 if ($isDisposed) {
                     $noUpstream = "Show no upstream, disposed subapp, review"
                 } else {
@@ -753,6 +815,7 @@ if ($reviewVMs.Count -gt 0) {
                 UpstreamToApp          = $upstreamToApp
                 MultipleUpstream       = $multipleUpstream
                 NoUpstreamRelationship = $noUpstream
+                Decommissioned         = $decommissioned
                 Error                  = ""
             }
         }
@@ -763,6 +826,7 @@ if ($reviewVMs.Count -gt 0) {
                 UpstreamToApp          = ""
                 MultipleUpstream       = ""
                 NoUpstreamRelationship = ""
+                Decommissioned         = ""
                 Error                  = $_.Exception.Message
             }
         }
@@ -780,6 +844,13 @@ if ($reviewVMs.Count -gt 0) {
     $indexOf = @{}
     for ($i = 0; $i -lt $results.Count; $i++) { $indexOf[$results[$i]] = $i }
 
+    # Build a VMName -> queue-entry lookup ONCE (first occurrence wins, matching the
+    # previous "Select-Object -First 1" behaviour). Replaces a per-VM Where-Object scan.
+    $queueByVMName = @{}
+    foreach ($qv in $vmQueue) {
+        if (-not $queueByVMName.ContainsKey($qv.VMName)) { $queueByVMName[$qv.VMName] = $qv }
+    }
+
     foreach ($item in $reviewVMs) {
         $idx = $indexOf[$item]
         $ps = [PowerShell]::Create().AddScript($reviewScriptBlock)
@@ -788,12 +859,14 @@ if ($reviewVMs.Count -gt 0) {
         $ps.AddArgument($getCagAppsUri)    | Out-Null
         $ps.AddArgument($returnAppVmsUri)  | Out-Null
         $ps.AddArgument($item.VMName)      | Out-Null
-        # ProjectId/ProjectName are not stored on the result row; resolve from the queue
-        $q = $vmQueue | Where-Object { $_.VMName -eq $item.VMName } | Select-Object -First 1
+        # ProjectId/ProjectName are not stored on the result row; resolve from the lookup
+        $q = $queueByVMName[$item.VMName]
         $ps.AddArgument($(if ($q) { $q.ProjectId }   else { "" })) | Out-Null
         $ps.AddArgument($(if ($q) { $q.ProjectName } else { "" })) | Out-Null
         $ps.AddArgument($item.AppApplication) | Out-Null
         $ps.AddArgument($idx)              | Out-Null
+        $ps.AddArgument($DebugReviewVMName) | Out-Null
+        $ps.AddArgument($resultsDir)       | Out-Null
         $ps.RunspacePool = $reviewPool
 
         $reviewJobs.Add(@{
@@ -815,6 +888,7 @@ if ($reviewVMs.Count -gt 0) {
                     $row.UpstreamToApp          = $o.UpstreamToApp
                     $row.MultipleUpstream       = $o.MultipleUpstream
                     $row.NoUpstreamRelationship = $o.NoUpstreamRelationship
+                    $row.Decommissioned         = $o.Decommissioned
                     if ($o.Error) {
                         Write-Log "  [$rDone/$($reviewJobs.Count)] $($job.VMName) | review error: $($o.Error)" -Color Yellow
                     } else {
@@ -850,11 +924,12 @@ Write-Log "Convert to sub-app:     $(($results | Where-Object { $_.AppOrSubApp -
 Write-Log "Upstream needs review:  $(($results | Where-Object { $_.UpstreamToApp -eq 'Review Upstream Relationship' }).Count)" -Color Yellow
 Write-Log "Multiple upstreams:     $(($results | Where-Object { $_.MultipleUpstream -like 'Review*' }).Count)" -Color Yellow
 Write-Log "No upstream:            $(($results | Where-Object { $_.NoUpstreamRelationship -like 'Show no upstream*' }).Count)" -Color Yellow
+Write-Log "Decommissioned:         $(($results | Where-Object { $_.Decommissioned }).Count)" -Color Yellow
 Write-Log "Time elapsed:  $($stopwatch.Elapsed.ToString('hh\:mm\:ss'))" -Color White
 
 # Export results
 $resultsPath = "$resultsDir\CMDBRelations_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
-$results | Export-Csv -Path $resultsPath -NoTypeInformation
+$results | Select-Object * -ExcludeProperty CompareResult | Export-Csv -Path $resultsPath -NoTypeInformation
 Write-Log "`nResults saved: $resultsPath" -Color White
 
 # Email report
