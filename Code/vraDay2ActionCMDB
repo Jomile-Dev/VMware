@@ -667,38 +667,66 @@ if ($reviewVMs.Count -gt 0) {
         $primaryTag  = ($AppTag -split ';\s*')[0]
         $tagSpaced   = ($primaryTag -replace '_', ' ')
 
-        # Batched external-values call (same pattern as the main script)
-        #   requestId 1 = getCagApplications  -> flat app/sub-app list
-        #   requestId 2 = returnApplicationVms -> retrieveCiInfoByKey.Information[]
-        # returnApplicationVms may need to be exposed as a form external-value action,
-        # or called via the vRO Action REST API - see notes if requestId 2 comes back empty.
-        $uri = "https://$VraServer/form-service/api/forms/renderer/external-values?projectId=$ProjectId"
-        $bodyArray = @(
-            @{
-                uri        = $GetCagUri
-                dataSource = "scriptAction"
-                parameters = @(
-                    @{ name = "projectName";     value = $ProjectName },
-                    @{ name = "phaseOutEnabled"; value = $true }
-                )
-                useResultsFromRequestId = -1
-                fieldType  = @{ dataType = "string" }
-                isMultiple = $true
-                requestId  = 1
-            },
-            @{
-                uri        = $ReturnAppVmsUri
-                dataSource = "scriptAction"
-                parameters = @(
-                    @{ name = "applicationName"; value = $tagSpaced }
-                )
-                useResultsFromRequestId = -1
-                fieldType  = @{ dataType = "complex" }
-                isMultiple = $true
-                requestId  = 2
+        # These two actions are NOT exposed as form external-values, so they are
+        # called directly against the embedded-vRO Action REST API, resolved by
+        # MODULE PATH + ACTION NAME (never the numeric action ID, which can change).
+        #   $GetCagUri       = "module.path/getCagApplications"
+        #   $ReturnAppVmsUri = "module.path/returnApplicationVms"
+        # Embedded vRO base = https://<vraServer>/vco/api ; the vRA bearer token is
+        # accepted. Each call POSTs to:
+        #   /vco/api/categories/<module>/actions/<name>/executions
+        # with a { parameters:[ {name,type,value:{<type>:{value}}} ] } body, then
+        # reads the execution result out of .value.
+        function Invoke-VroAction {
+            param($VraServer, $Bearer, $ModuleAndName, $Inputs)
+            $module = $ModuleAndName.Substring(0, $ModuleAndName.LastIndexOf('/'))
+            $name   = $ModuleAndName.Substring($ModuleAndName.LastIndexOf('/') + 1)
+            $h = @{ "Authorization" = "Bearer $Bearer"; "Accept" = "application/json"; "Content-Type" = "application/json" }
+
+            $paramArr = @()
+            foreach ($k in $Inputs.Keys) {
+                $val = $Inputs[$k]
+                if ($val -is [bool]) {
+                    $paramArr += @{ name = $k; type = "boolean"; value = @{ boolean = @{ value = $val } } }
+                } else {
+                    $paramArr += @{ name = $k; type = "string";  value = @{ string  = @{ value = "$val" } } }
+                }
             }
-        )
-        $body = "[" + (($bodyArray | ForEach-Object { $_ | ConvertTo-Json -Depth 6 -Compress }) -join ",") + "]"
+            $b = @{ parameters = $paramArr } | ConvertTo-Json -Depth 10
+
+            $encModule = [uri]::EscapeDataString($module)
+            $encName   = [uri]::EscapeDataString($name)
+            $execUri   = "https://$VraServer/vco/api/categories/$encModule/actions/$encName/executions"
+
+            try {
+                return Invoke-RestMethod -Uri $execUri -Method Post -Headers $h -Body $b -ErrorAction Stop
+            }
+            catch {
+                # Fallback: resolve current href by name, then execute that.
+                $searchUri = "https://$VraServer/vco/api/actions?conditions=name=$encName"
+                $search = Invoke-RestMethod -Uri $searchUri -Method Get -Headers $h -ErrorAction Stop
+                $href = $null
+                foreach ($item in $search.link) {
+                    $hv = ($item.attributes | Where-Object { $_.name -eq 'itemHref' }).value
+                    if ($hv) { if ($hv -like "*$module*") { $href = $hv; break }; if (-not $href) { $href = $hv } }
+                }
+                if (-not $href) { throw "vRO action '$name' not resolvable in module '$module'." }
+                return Invoke-RestMethod -Uri (($href.TrimEnd('/')) + "/executions") -Method Post -Headers $h -Body $b -ErrorAction Stop
+            }
+        }
+
+        # vRO execution result unwrap: string -> .value.string.value ;
+        # array -> .value.array.elements[].string.value ; object -> .value.<type>...
+        function Get-VroResult {
+            param($Exec)
+            if ($null -eq $Exec) { return $null }
+            $v = $Exec.value
+            if ($null -eq $v) { return $Exec }
+            if ($v.string) { return $v.string.value }
+            if ($v.array)  { return @($v.array.elements | ForEach-Object { if ($_.string) { $_.string.value } else { $_ } }) }
+            if ($v.properties) { return $v.properties }   # composite / complex return
+            return $v
+        }
 
         $appOrSubApp      = ""
         $upstreamToApp    = ""
@@ -707,44 +735,45 @@ if ($reviewVMs.Count -gt 0) {
         $decommissioned   = ""
 
         try {
-            $response = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body
+            # --- Call 1: getCagApplications (projectName + phaseOutEnabled) ---
+            $cagExec = Invoke-VroAction -VraServer $VraServer -Bearer $AuthToken -ModuleAndName $GetCagUri -Inputs @{
+                projectName     = $ProjectName
+                phaseOutEnabled = $true
+            }
 
-            # Debug dump: write the raw response for the targeted VM so its shape is visible
+            # --- Call 2: returnApplicationVms (applicationName = spaced tag) ---
+            $vmsExec = Invoke-VroAction -VraServer $VraServer -Bearer $AuthToken -ModuleAndName $ReturnAppVmsUri -Inputs @{
+                applicationName = $tagSpaced
+            }
+
+            # Debug dump: write BOTH raw execution responses for the targeted VM.
             if ($DebugVMName -and $VMName -eq $DebugVMName) {
                 try {
                     $dbgPath = Join-Path $ResultsDir ("review_raw_" + ($VMName -replace '[^\w\.\-]', '_') + ".json")
-                    $response | ConvertTo-Json -Depth 15 | Out-File -FilePath $dbgPath -Encoding UTF8
+                    @{ requestId1_getCagApplications = $cagExec; requestId2_returnApplicationVms = $vmsExec } |
+                        ConvertTo-Json -Depth 20 | Out-File -FilePath $dbgPath -Encoding UTF8
                 } catch { }
             }
 
-            $cagData     = $null
-            $upstreamCIs = @()      # aggregated across all Information[] entries
-            $ciStatuses  = @()      # Status of each matched CI
+            $cagData     = Get-VroResult -Exec $cagExec   # expected: flat string array
+            $upstreamCIs = @()
+            $ciStatuses  = @()
 
-            foreach ($result in $response) {
-                switch ($result.requestId) {
-                    1 { $cagData = $result.data }
-                    2 {
-                        # returnApplicationVms returns: retrieveCiInfoByKey.Information[]
-                        # Each Information entry carries CmsClass, Status, and a nested
-                        # upstreamCIs[] array. Unwrap defensively for the external-values
-                        # wrapper (.data / .value / single-element array).
-                        $payload = $result.data
-                        if ($payload -is [array] -and $payload.Count -eq 1) { $payload = $payload[0] }
+            # returnApplicationVms result: retrieveCiInfoByKey.Information[] with nested
+            # upstreamCIs[] and Status. Unwrap defensively for whatever Get-VroResult returns.
+            $payload = Get-VroResult -Exec $vmsExec
+            if ($payload -is [array] -and $payload.Count -eq 1) { $payload = $payload[0] }
 
-                        $ciRoot = $null
-                        if     ($payload.retrieveCiInfoByKey)       { $ciRoot = $payload.retrieveCiInfoByKey }
-                        elseif ($payload.value.retrieveCiInfoByKey) { $ciRoot = $payload.value.retrieveCiInfoByKey }
-                        elseif ($payload.Information)               { $ciRoot = $payload }
-                        elseif ($payload.value.Information)         { $ciRoot = $payload.value }
+            $ciRoot = $null
+            if     ($payload.retrieveCiInfoByKey)       { $ciRoot = $payload.retrieveCiInfoByKey }
+            elseif ($payload.value.retrieveCiInfoByKey) { $ciRoot = $payload.value.retrieveCiInfoByKey }
+            elseif ($payload.Information)               { $ciRoot = $payload }
+            elseif ($payload.value.Information)         { $ciRoot = $payload.value }
 
-                        if ($ciRoot -and $ciRoot.Information) {
-                            foreach ($info in @($ciRoot.Information)) {
-                                if ($info.Status) { $ciStatuses += [string]$info.Status }
-                                if ($info.upstreamCIs) { $upstreamCIs += @($info.upstreamCIs) }
-                            }
-                        }
-                    }
+            if ($ciRoot -and $ciRoot.Information) {
+                foreach ($info in @($ciRoot.Information)) {
+                    if ($info.Status) { $ciStatuses += [string]$info.Status }
+                    if ($info.upstreamCIs) { $upstreamCIs += @($info.upstreamCIs) }
                 }
             }
 
