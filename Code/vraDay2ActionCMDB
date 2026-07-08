@@ -18,6 +18,11 @@ $UseSSL       = $true
 $showVmDetailsUri = "somethingsomething.something.wrappers/showVmDetails"
 $getVmAppsUri     = "somethingsomething.something.returns/getVmApplications"
 
+# --- NEW review actions (set these to your real action URIs) ---
+# [Unverified] Parameter names for these two actions are ASSUMED below - confirm them.
+$getCagAppsUri   = "somethingsomething.something.returns/getCagApplications"
+$returnAppVmsUri = "somethingsomething.something.returns/returnApplicationVms"
+
 # NSX Manager Configuration (fallback for VMs with empty AppApplication)
 $NSXManager       = "nsx-manager.company.com"
 $NSXAuthMode      = "vIDM"
@@ -323,13 +328,19 @@ foreach ($job in $jobs) {
                 }
 
                 $results.Add([PSCustomObject]@{
-                    DeploymentName = [string]$r.DeploymentName
-                    VMName         = [string]$r.VMName
-                    AppApplication = [string]$r.AppApplication
-                    InfraOS        = [string]$r.InfraOS
-                    AppLayer       = [string]$r.AppLayer
-                    CMDBCI         = [string]$r.CMDBCI
-                    CompareResult  = [string]$r.CompareResult
+                    DeploymentName        = [string]$r.DeploymentName
+                    VMName                = [string]$r.VMName
+                    AppApplication        = [string]$r.AppApplication
+                    InfraOS               = [string]$r.InfraOS
+                    AppLayer              = [string]$r.AppLayer
+                    CMDBCI                = [string]$r.CMDBCI
+                    CompareResult         = [string]$r.CompareResult
+                    # --- NEW review columns (populated in the review phase below) ---
+                    NSXMatchCMDB          = ""
+                    AppOrSubApp           = ""
+                    UpstreamToApp         = ""
+                    MultipleUpstream      = ""
+                    NoUpstreamRelationship = ""
                 })
             }
         }
@@ -558,6 +569,289 @@ if ($missingAppVMs.Count -gt 0) {
     }
 }
 
+# =====================================================================
+# CMDB RELATIONSHIP REVIEW PHASE
+# ---------------------------------------------------------------------
+# Populates: NSXMatchCMDB, AppOrSubApp, UpstreamToApp,
+#            MultipleUpstream, NoUpstreamRelationship
+#
+# [Unverified / Inference] The parsing below matches the data shapes
+# described to me. It is NOT verified against live action output.
+# Confirm the ASSUMPTIONS flagged with [Unverified] before trusting it.
+# =====================================================================
+Write-Log "`n=== CMDB RELATIONSHIP REVIEW ===" -Color Cyan
+
+# --- 1) NSXMatchCMDB : plain text mapping from the existing CompareResult ---
+# NSX Tag = CMDB naming  -> Good
+# NSX Tag <> CMDB naming  -> No match, review to modify relationship or segment
+foreach ($item in $results) {
+    switch ($item.CompareResult) {
+        "Match"                { $item.NSXMatchCMDB = "Good" }
+        "Match - Multiple Tags" { $item.NSXMatchCMDB = "Good" }
+        "Mismatch"             { $item.NSXMatchCMDB = "No match, review to modify relationship or segment" }
+        "Missing Data"         { $item.NSXMatchCMDB = "Missing Data" }
+        default                { $item.NSXMatchCMDB = $item.CompareResult }
+    }
+}
+
+# Only VMs that resolved a tag can be reviewed (skip failed / empty rows)
+$reviewVMs = @($results | Where-Object { $_.AppApplication })
+
+if ($reviewVMs.Count -gt 0) {
+    Write-Log "Reviewing $($reviewVMs.Count) VMs with a resolved app tag..." -Color Gray
+
+    $reviewScriptBlock = {
+        param($VraServer, $AuthToken, $GetCagUri, $ReturnAppVmsUri, $VMName, $ProjectId, $ProjectName, $AppTag, $RowIndex)
+
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+
+        $headers = @{
+            "Authorization" = "Bearer $AuthToken"
+            "Content-Type"  = "application/json"
+        }
+
+        # returnApplicationVms takes the application NAME = the NSX tag with underscores
+        # converted to spaces (verified against the debug output: the queried Key was
+        # "RANZG DATABASE SYSADMIN APPLICATION"). A VM may carry multiple "; "-joined
+        # tags; we use the FIRST/primary tag here.
+        # [Unverified] Multi-tag handling for the lookup is simplified to the first tag.
+        $primaryTag  = ($AppTag -split ';\s*')[0]
+        $tagSpaced   = ($primaryTag -replace '_', ' ')
+
+        # Batched external-values call (same pattern as the main script)
+        #   requestId 1 = getCagApplications  -> flat app/sub-app list (VERIFIED shape)
+        #   requestId 2 = returnApplicationVms -> retrieveCiInfoByKey.Information[]
+        #
+        # [Unverified] getCagApplications params assumed vmName+projectName.
+        # [Unverified] returnApplicationVms param name assumed "application"; the VALUE is
+        #   the tag with underscores->spaces (verified). See the note in the message about
+        #   this action needing to be form-exposed as an external-value, or called via the
+        #   vRO Action REST API instead.
+        $uri = "https://$VraServer/form-service/api/forms/renderer/external-values?projectId=$ProjectId"
+        $bodyArray = @(
+            @{
+                uri        = $GetCagUri
+                dataSource = "scriptAction"
+                parameters = @(
+                    @{ name = "vmName";      value = $VMName },
+                    @{ name = "projectName"; value = $ProjectName }
+                )
+                useResultsFromRequestId = -1
+                fieldType  = @{ dataType = "string" }
+                isMultiple = $true
+                requestId  = 1
+            },
+            @{
+                uri        = $ReturnAppVmsUri
+                dataSource = "scriptAction"
+                parameters = @(
+                    @{ name = "application"; value = $tagSpaced }
+                )
+                useResultsFromRequestId = -1
+                fieldType  = @{ dataType = "complex" }
+                isMultiple = $true
+                requestId  = 2
+            }
+        )
+        $body = "[" + (($bodyArray | ForEach-Object { $_ | ConvertTo-Json -Depth 6 -Compress }) -join ",") + "]"
+
+        $appOrSubApp      = ""
+        $upstreamToApp    = ""
+        $multipleUpstream = ""
+        $noUpstream       = ""
+
+        try {
+            $response = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body
+
+            $cagData     = $null
+            $upstreamCIs = @()      # aggregated across all Information[] entries
+            $ciStatuses  = @()      # Status of each matched CI
+
+            foreach ($result in $response) {
+                switch ($result.requestId) {
+                    1 { $cagData = $result.data }
+                    2 {
+                        # returnApplicationVms returns: retrieveCiInfoByKey.Information[]
+                        # Each Information entry carries CmsClass, Status, and a nested
+                        # upstreamCIs[] array. Unwrap defensively for the external-values
+                        # wrapper (.data / .value / single-element array).
+                        $payload = $result.data
+                        if ($payload -is [array] -and $payload.Count -eq 1) { $payload = $payload[0] }
+
+                        $ciRoot = $null
+                        if     ($payload.retrieveCiInfoByKey)       { $ciRoot = $payload.retrieveCiInfoByKey }
+                        elseif ($payload.value.retrieveCiInfoByKey) { $ciRoot = $payload.value.retrieveCiInfoByKey }
+                        elseif ($payload.Information)               { $ciRoot = $payload }
+                        elseif ($payload.value.Information)         { $ciRoot = $payload.value }
+
+                        if ($ciRoot -and $ciRoot.Information) {
+                            foreach ($info in @($ciRoot.Information)) {
+                                if ($info.Status) { $ciStatuses += [string]$info.Status }
+                                if ($info.upstreamCIs) { $upstreamCIs += @($info.upstreamCIs) }
+                            }
+                        }
+                    }
+                }
+            }
+
+            # --- App or Sub-App -------------------------------------------------
+            # sub-app -> Good ; app -> Convert to sub-app
+            # (split logic inlined - parent-scope functions are not visible in a runspace)
+            $apps    = [System.Collections.ArrayList]::new()
+            $subApps = [System.Collections.ArrayList]::new()
+            $mode    = $null
+            if ($cagData -is [array]) {
+                foreach ($entry in $cagData) {
+                    $text = [string]$entry
+                    if ($text -match '^\s*-{2,}') {
+                        if ($text -match '(?i)sub') { $mode = 'sub' } else { $mode = 'app' }
+                        continue
+                    }
+                    if ([string]::IsNullOrWhiteSpace($text)) { continue }
+                    if     ($mode -eq 'sub') { [void]$subApps.Add($text.Trim()) }
+                    elseif ($mode -eq 'app') { [void]$apps.Add($text.Trim()) }
+                }
+            }
+            $normTag  = ($primaryTag.ToLower().Trim() -replace '[_\s\-\.]+', '')
+            $inSub    = $false
+            $inApp    = $false
+            foreach ($s in $subApps) { if ((($s.ToLower().Trim() -replace '[_\s\-\.]+', '')) -eq $normTag) { $inSub = $true; break } }
+            foreach ($a in $apps)    { if ((($a.ToLower().Trim() -replace '[_\s\-\.]+', '')) -eq $normTag) { $inApp = $true; break } }
+
+            if     ($inSub) { $appOrSubApp = "Good" }
+            elseif ($inApp) { $appOrSubApp = "Convert to sub-app" }
+            else            { $appOrSubApp = "Tag not found in CAG list" }   # [Unverified] fallback
+
+            # --- Upstream analysis ---------------------------------------------
+            # [Unverified] Upstream presence/count is taken from the upstreamCIs[] arrays
+            # (nested in Information[]). You described getCagApplications as the "no upstream"
+            # source; upstreamCIs is the explicit array of upstream CIs and gives a reliable
+            # count, so it drives all three upstream columns here. If you'd rather derive
+            # presence/count from the getCagApplications Applications-section entries instead,
+            # that's a one-line swap - say the word.
+            $upCount = @($upstreamCIs).Count
+            $classes = @($upstreamCIs | ForEach-Object { [string]$_.UpstreamCICMSClass } | Where-Object { $_ })
+
+            # Upstream to App: upstream is an Application -> Good ; SubApplication -> review
+            if ($upCount -gt 0) {
+                if ($classes -contains "SubApplication") {
+                    $upstreamToApp = "Review Upstream Relationship"
+                } elseif ($classes -contains "Application") {
+                    $upstreamToApp = "Good"
+                } else {
+                    $upstreamToApp = "Unknown upstream class"   # [Unverified] fallback
+                }
+            }
+
+            # Multiple Upstream
+            if     ($upCount -gt 1) { $multipleUpstream = "Review Upstream Relationship, multiple Upstreams exist" }
+            elseif ($upCount -eq 1) { $multipleUpstream = "Good" }
+            else                    { $multipleUpstream = "No upstream" }
+
+            # No Upstream Relationship (your described sequence):
+            #   if no upstream -> look at the CI Status from returnApplicationVms
+            #       Disposed/Retired -> disposed sub-app note
+            #       otherwise        -> fix-upstream note
+            #   if it has an upstream -> leave blank
+            if ($upCount -eq 0) {
+                $isDisposed = @($ciStatuses | Where-Object { $_ -match '(?i)dispos|retir' }).Count -gt 0
+                if ($isDisposed) {
+                    $noUpstream = "Show no upstream, disposed subapp, review"
+                } else {
+                    $noUpstream = "Show no upstream, review fix upstream relationship"
+                }
+            }
+
+            return [PSCustomObject]@{
+                RowIndex               = $RowIndex
+                AppOrSubApp            = $appOrSubApp
+                UpstreamToApp          = $upstreamToApp
+                MultipleUpstream       = $multipleUpstream
+                NoUpstreamRelationship = $noUpstream
+                Error                  = ""
+            }
+        }
+        catch {
+            return [PSCustomObject]@{
+                RowIndex               = $RowIndex
+                AppOrSubApp            = ""
+                UpstreamToApp          = ""
+                MultipleUpstream       = ""
+                NoUpstreamRelationship = ""
+                Error                  = $_.Exception.Message
+            }
+        }
+    }
+
+    # Reset SSL callback for vRA (NSX fallback may have changed it)
+    [System.Net.ServicePointManager]::CertificatePolicy = $null
+    [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+
+    $reviewPool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $poolSize)
+    $reviewPool.Open()
+    $reviewJobs = [System.Collections.Generic.List[object]]::new()
+
+    # Build an index map so results come back to the right row
+    $indexOf = @{}
+    for ($i = 0; $i -lt $results.Count; $i++) { $indexOf[$results[$i]] = $i }
+
+    foreach ($item in $reviewVMs) {
+        $idx = $indexOf[$item]
+        $ps = [PowerShell]::Create().AddScript($reviewScriptBlock)
+        $ps.AddArgument($vraServer)        | Out-Null
+        $ps.AddArgument($authToken)        | Out-Null
+        $ps.AddArgument($getCagAppsUri)    | Out-Null
+        $ps.AddArgument($returnAppVmsUri)  | Out-Null
+        $ps.AddArgument($item.VMName)      | Out-Null
+        # ProjectId/ProjectName are not stored on the result row; resolve from the queue
+        $q = $vmQueue | Where-Object { $_.VMName -eq $item.VMName } | Select-Object -First 1
+        $ps.AddArgument($(if ($q) { $q.ProjectId }   else { "" })) | Out-Null
+        $ps.AddArgument($(if ($q) { $q.ProjectName } else { "" })) | Out-Null
+        $ps.AddArgument($item.AppApplication) | Out-Null
+        $ps.AddArgument($idx)              | Out-Null
+        $ps.RunspacePool = $reviewPool
+
+        $reviewJobs.Add(@{
+            PowerShell = $ps
+            Handle     = $ps.BeginInvoke()
+            VMName     = $item.VMName
+        })
+    }
+
+    $rDone = 0
+    foreach ($job in $reviewJobs) {
+        $rDone++
+        if ($job.Handle.AsyncWaitHandle.WaitOne($jobTimeoutSeconds * 1000)) {
+            $out = $job.PowerShell.EndInvoke($job.Handle)
+            if ($out) {
+                foreach ($o in $out) {
+                    $row = $results[$o.RowIndex]
+                    $row.AppOrSubApp            = $o.AppOrSubApp
+                    $row.UpstreamToApp          = $o.UpstreamToApp
+                    $row.MultipleUpstream       = $o.MultipleUpstream
+                    $row.NoUpstreamRelationship = $o.NoUpstreamRelationship
+                    if ($o.Error) {
+                        Write-Log "  [$rDone/$($reviewJobs.Count)] $($job.VMName) | review error: $($o.Error)" -Color Yellow
+                    } else {
+                        Write-Log "  [$rDone/$($reviewJobs.Count)] $($job.VMName) | $($o.AppOrSubApp) | $($o.MultipleUpstream)" -Color Gray
+                    }
+                }
+            }
+        }
+        else {
+            Write-Log "  [$rDone/$($reviewJobs.Count)] $($job.VMName) | review TIMEOUT" -Color Red
+            $job.PowerShell.Stop()
+        }
+        $job.PowerShell.Dispose()
+    }
+
+    if ($reviewPool) { $reviewPool.Close(); $reviewPool.Dispose() }
+}
+else {
+    Write-Log "No VMs with a resolved tag to review." -Color Yellow
+}
+
 # Summary
 Write-Log "`n=== SUMMARY ===" -Color Cyan
 Write-Log "VMs processed: $($vmQueue.Count)" -Color White
@@ -567,6 +861,11 @@ Write-Log "Matches:       $(($results | Where-Object { $_.CompareResult -eq 'Mat
 Write-Log "Match (Multi): $(($results | Where-Object { $_.CompareResult -eq 'Match - Multiple Tags' }).Count)" -Color Green
 Write-Log "Mismatches:    $(($results | Where-Object { $_.CompareResult -eq 'Mismatch' }).Count)" -Color Red
 Write-Log "Missing Data:  $(($results | Where-Object { $_.CompareResult -eq 'Missing Data' }).Count)" -Color Gray
+Write-Log "--- Review ---" -Color Cyan
+Write-Log "Convert to sub-app:     $(($results | Where-Object { $_.AppOrSubApp -eq 'Convert to sub-app' }).Count)" -Color Yellow
+Write-Log "Upstream needs review:  $(($results | Where-Object { $_.UpstreamToApp -eq 'Review Upstream Relationship' }).Count)" -Color Yellow
+Write-Log "Multiple upstreams:     $(($results | Where-Object { $_.MultipleUpstream -like 'Review*' }).Count)" -Color Yellow
+Write-Log "No upstream:            $(($results | Where-Object { $_.NoUpstreamRelationship -like 'Show no upstream*' }).Count)" -Color Yellow
 Write-Log "Time elapsed:  $($stopwatch.Elapsed.ToString('hh\:mm\:ss'))" -Color White
 
 # Export results
