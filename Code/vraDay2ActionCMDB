@@ -718,15 +718,16 @@ if ($reviewVMs.Count -gt 0) {
         $tagSpaced   = ($primaryTag -replace '_', ' ')
 
         # These two actions are NOT exposed as form external-values, so they are
-        # called directly against the embedded-vRO Action REST API, resolved by
-        # MODULE PATH + ACTION NAME (never the numeric action ID, which can change).
+        # called directly against the embedded-vRO Action REST API.
         #   $GetCagUri       = "module.path/getCagApplications"
         #   $ReturnAppVmsUri = "module.path/returnApplicationVms"
-        # Embedded vRO base = https://<vraServer>/vco/api ; the vRA bearer token is
-        # accepted. Each call POSTs to:
-        #   /vco/api/categories/<module>/actions/<name>/executions
-        # with a { parameters:[ {name,type,value:{<type>:{value}}} ] } body, then
-        # reads the execution result out of .value.
+        # This vRO exposes actions ONLY under /vco/api/actions/<ID> (NOT under the
+        # /categories/<module>/actions/<name> path). So we resolve the action by
+        # NAME via the search endpoint, pick the href whose module matches the one
+        # before the slash, then POST to <href>/executions. The ID is discovered at
+        # runtime from the name every run, so it is never hardcoded and self-heals
+        # if it changes. Embedded vRO base = https://<vraServer>/vco/api ; the vRA
+        # bearer token is accepted.
         function Invoke-VroAction {
             param($VraServer, $Bearer, $ModuleAndName, $Inputs)
             $module = $ModuleAndName.Substring(0, $ModuleAndName.LastIndexOf('/'))
@@ -744,25 +745,33 @@ if ($reviewVMs.Count -gt 0) {
             }
             $b = @{ parameters = $paramArr } | ConvertTo-Json -Depth 10
 
-            $encModule = [uri]::EscapeDataString($module)
-            $encName   = [uri]::EscapeDataString($name)
-            $execUri   = "https://$VraServer/vco/api/categories/$encModule/actions/$encName/executions"
+            $encName = [uri]::EscapeDataString($name)
 
-            try {
-                return Invoke-RestMethod -Uri $execUri -Method Post -Headers $h -Body $b -ErrorAction Stop
+            # 1) Resolve the action's /actions/<ID> href by NAME.
+            $searchUri = "https://$VraServer/vco/api/actions?conditions=name=$encName"
+            $search = Invoke-RestMethod -Uri $searchUri -Method Get -Headers $h -ErrorAction Stop
+
+            # Collect every href vRO returns for this name, plus its fully-qualified
+            # module (fqn = "module.name") so we can match the right one.
+            $candidates = @()
+            foreach ($item in $search.link) {
+                $href = ($item.attributes | Where-Object { $_.name -eq 'itemHref' }).value
+                $fqn  = ($item.attributes | Where-Object { $_.name -eq 'fully.qualified.name' }).value
+                if ($href) { $candidates += [PSCustomObject]@{ href = $href; fqn = $fqn } }
             }
-            catch {
-                # Fallback: resolve current href by name, then execute that.
-                $searchUri = "https://$VraServer/vco/api/actions?conditions=name=$encName"
-                $search = Invoke-RestMethod -Uri $searchUri -Method Get -Headers $h -ErrorAction Stop
-                $href = $null
-                foreach ($item in $search.link) {
-                    $hv = ($item.attributes | Where-Object { $_.name -eq 'itemHref' }).value
-                    if ($hv) { if ($hv -like "*$module*") { $href = $hv; break }; if (-not $href) { $href = $hv } }
-                }
-                if (-not $href) { throw "vRO action '$name' not resolvable in module '$module'." }
-                return Invoke-RestMethod -Uri (($href.TrimEnd('/')) + "/executions") -Method Post -Headers $h -Body $b -ErrorAction Stop
+            if ($candidates.Count -eq 0) { throw "vRO returned no action named '$name'." }
+
+            # Prefer the candidate whose fqn/href matches the expected module; else,
+            # if only one exists, use it; else fail loudly rather than guess wrong.
+            $chosen = $candidates | Where-Object { ($_.fqn -like "$module*") -or ($_.href -like "*$module*") } | Select-Object -First 1
+            if (-not $chosen) {
+                if ($candidates.Count -eq 1) { $chosen = $candidates[0] }
+                else { throw "Multiple '$name' actions found but none in module '$module'." }
             }
+
+            # 2) Execute that action's href.
+            $execUri = ($chosen.href.TrimEnd('/')) + "/executions"
+            return Invoke-RestMethod -Uri $execUri -Method Post -Headers $h -Body $b -ErrorAction Stop
         }
 
         # vRO execution result unwrap: string -> .value.string.value ;
