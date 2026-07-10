@@ -853,8 +853,18 @@ if ($reviewVMs.Count -gt 0) {
 
             # returnApplicationVms result: retrieveCiInfoByKey.Information[] with nested
             # upstreamCIs[] and Status. Unwrap defensively for whatever Get-VroResult returns.
+            # vRO serialises complex returns as a JSON string inside the array, so if
+            # the result is a string, parse it into an object first.
             $payload = Get-VroResult -Exec $vmsExec
-            if ($payload -is [array] -and $payload.Count -eq 1) { $payload = $payload[0] }
+            if ($payload -is [array]) {
+                if ($payload.Count -eq 1) { $payload = $payload[0] }
+                elseif ($payload.Count -gt 1 -and $payload[0] -is [string]) {
+                    $payload = ($payload -join '') 
+                }
+            }
+            if ($payload -is [string] -and $payload.Trim().StartsWith('{')) {
+                try { $payload = $payload | ConvertFrom-Json } catch { }
+            }
 
             $ciRoot = $null
             if     ($payload.retrieveCiInfoByKey)       { $ciRoot = $payload.retrieveCiInfoByKey }
@@ -870,8 +880,9 @@ if ($reviewVMs.Count -gt 0) {
             }
 
             # --- App or Sub-App -------------------------------------------------
+            # getCagApplications returns a flat string array with section delimiters:
+            #   ["--- Applications ---","app01","--- Sub-Applications ---","sub01",...]
             # sub-app -> Good ; app -> Convert to sub-app
-            # (split logic inlined - parent-scope functions are not visible in a runspace)
             $apps    = [System.Collections.ArrayList]::new()
             $subApps = [System.Collections.ArrayList]::new()
             $mode    = $null
@@ -887,6 +898,7 @@ if ($reviewVMs.Count -gt 0) {
                     elseif ($mode -eq 'app') { [void]$apps.Add($text.Trim()) }
                 }
             }
+
             $normTag  = ($primaryTag.ToLower().Trim() -replace '[_\s\-\.]+', '')
             $inSub    = $false
             $inApp    = $false
