@@ -175,6 +175,7 @@ try {
 
         # ----------------------------------------------------------------
         # iDRAC or iLO - direct Redfish
+        # Session auth first, falls back to basic auth if 405 (old iDRAC 8)
         # ----------------------------------------------------------------
         if ($serverType -match '^(?i)(idrac|dell|ilo|hpe)$') {
 
@@ -183,43 +184,63 @@ try {
             try {
                 Write-Host "Connecting to $vendor : $serverHost" -ForegroundColor Yellow
 
-                # Open Redfish session
-                $sessBody = @{
-                    UserName = $Credential.UserName
-                    Password = $Credential.GetNetworkCredential().Password
-                } | ConvertTo-Json -Compress
+                # Try session auth first
+                $useBasicAuth = $false
+                $rfHeaders    = @{ 'Accept' = 'application/json' }
+                $rfAuth       = @{}
+                $sessionUri   = $null
 
-                $sessResp = Invoke-WebRequest -Uri "https://$serverHost/redfish/v1/SessionService/Sessions" -Method Post `
-                                              -Body $sessBody -ContentType 'application/json' `
-                                              -Headers @{ 'Accept' = 'application/json' } -UseBasicParsing @script:SkipCert
+                try {
+                    $sessBody = @{
+                        UserName = $Credential.UserName
+                        Password = $Credential.GetNetworkCredential().Password
+                    } | ConvertTo-Json -Compress
 
-                $token    = $sessResp.Headers['X-Auth-Token']
-                $location = $sessResp.Headers['Location']
-                if ($token -is [array])    { $token    = $token[0] }
-                if ($location -is [array]) { $location = $location[0] }
-                if (-not $token) { throw "No X-Auth-Token returned" }
+                    $sessResp = Invoke-WebRequest -Uri "https://$serverHost/redfish/v1/SessionService/Sessions" -Method Post `
+                                                  -Body $sessBody -ContentType 'application/json' `
+                                                  -Headers @{ 'Accept' = 'application/json' } -UseBasicParsing @script:SkipCert
 
-                Write-Host "Connected to $serverHost" -ForegroundColor Green
+                    $token    = $sessResp.Headers['X-Auth-Token']
+                    $location = $sessResp.Headers['Location']
+                    if ($token -is [array])    { $token    = $token[0] }
+                    if ($location -is [array]) { $location = $location[0] }
+                    if (-not $token) { throw "No X-Auth-Token returned" }
 
-                $sessionUri = if ($location -match '^https?://') { $location }
-                              elseif ($location)                 { "https://$serverHost$location" }
-                              else                               { $null }
+                    $sessionUri = if ($location -match '^https?://') { $location }
+                                  elseif ($location)                 { "https://$serverHost$location" }
+                                  else                               { $null }
 
-                $rfHeaders = @{ 'X-Auth-Token' = $token; 'Accept' = 'application/json' }
+                    $rfHeaders = @{ 'X-Auth-Token' = $token; 'Accept' = 'application/json' }
+                    Write-Host "Connected to $serverHost (session auth)" -ForegroundColor Green
+
+                } catch {
+                    # 405 = session auth not supported (common on iDRAC 8), fall back to basic auth
+                    $status = $null
+                    if ($_.Exception.Response) {
+                        try { $status = [int]$_.Exception.Response.StatusCode } catch { }
+                    }
+                    if ($status -eq 405) {
+                        Write-Host "Session auth not supported on $serverHost, using basic auth" -ForegroundColor Yellow
+                        $useBasicAuth = $true
+                        $rfAuth = @{ Credential = $Credential }
+                    } else {
+                        throw
+                    }
+                }
 
                 # Discover the system URI (Dell = System.Embedded.1, HPE = 1)
-                $systems    = Invoke-RestMethod -Uri "https://$serverHost/redfish/v1/Systems" -Headers $rfHeaders @script:SkipCert
+                $systems    = Invoke-RestMethod -Uri "https://$serverHost/redfish/v1/Systems" -Headers $rfHeaders @rfAuth @script:SkipCert
                 $systemPath = $systems.Members[0].'@odata.id'
                 if (-not $systemPath) { throw "No systems returned" }
 
-                $system = Invoke-RestMethod -Uri "https://$serverHost$systemPath" -Headers $rfHeaders @script:SkipCert
+                $system = Invoke-RestMethod -Uri "https://$serverHost$systemPath" -Headers $rfHeaders @rfAuth @script:SkipCert
 
                 # BMC firmware version lives on the Manager resource
                 $bmcVersion = ""
                 try {
-                    $mgrs    = Invoke-RestMethod -Uri "https://$serverHost/redfish/v1/Managers" -Headers $rfHeaders @script:SkipCert
+                    $mgrs    = Invoke-RestMethod -Uri "https://$serverHost/redfish/v1/Managers" -Headers $rfHeaders @rfAuth @script:SkipCert
                     $mgrPath = $mgrs.Members[0].'@odata.id'
-                    $mgr     = Invoke-RestMethod -Uri "https://$serverHost$mgrPath" -Headers $rfHeaders @script:SkipCert
+                    $mgr     = Invoke-RestMethod -Uri "https://$serverHost$mgrPath" -Headers $rfHeaders @rfAuth @script:SkipCert
                     $bmcVersion = [string]$mgr.FirmwareVersion
                 } catch {
                     Write-Warning "Could not read BMC firmware on $serverHost"
@@ -241,7 +262,7 @@ try {
                 }
                 $Results += $ServerInfo
 
-                # Close the Redfish session
+                # Close the Redfish session (not needed for basic auth)
                 if ($sessionUri) {
                     try { Invoke-RestMethod -Uri $sessionUri -Method Delete -Headers $rfHeaders @script:SkipCert | Out-Null } catch { }
                 }
