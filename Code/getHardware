@@ -158,9 +158,7 @@ try {
                         SerialNumber = $s.serialNumber
                         BiosVersion  = $s.romVersion
                         BmcVersion   = $s.mpFirmwareVersion
-                        BmcAddress   = $iloAddress
                         PowerState   = $s.powerState
-                        Health       = $s.status
                         CpuModel     = $s.processorType
                         CpuCount     = $s.processorCount
                         MemoryGB     = if ($s.memoryMb) { [math]::Round($s.memoryMb / 1024, 0) } else { "N/A" }
@@ -241,9 +239,7 @@ try {
                     SerialNumber = if ($system.SKU) { [string]$system.SKU } else { [string]$system.SerialNumber }
                     BiosVersion  = [string]$system.BiosVersion
                     BmcVersion   = $bmcVersion
-                    BmcAddress   = $serverHost
                     PowerState   = [string]$system.PowerState
-                    Health       = [string]$system.Status.Health
                     CpuModel     = [string]$system.ProcessorSummary.Model
                     CpuCount     = [int]$system.ProcessorSummary.Count
                     MemoryGB     = [math]::Round([double]$system.MemorySummary.TotalSystemMemoryGiB, 0)
@@ -322,15 +318,6 @@ try {
     if ($BiosStats.Count -gt 0) {
         Write-Host "`n=== BY BIOS VERSION ===" -ForegroundColor Cyan
         foreach ($Stat in $BiosStats) {
-            Write-Host "$($Stat.Name): $($Stat.Count) server(s)" -ForegroundColor White
-        }
-    }
-
-    # Health breakdown
-    $HealthStats = $UniqueResults | Group-Object Health | Sort-Object Name
-    if ($HealthStats.Count -gt 0) {
-        Write-Host "`n=== BY HEALTH STATUS ===" -ForegroundColor Cyan
-        foreach ($Stat in $HealthStats) {
             Write-Host "$($Stat.Name): $($Stat.Count) server(s)" -ForegroundColor White
         }
     }
