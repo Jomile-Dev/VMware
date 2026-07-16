@@ -151,6 +151,361 @@ try {
 
                     $ServerInfo = [PSCustomObject]@{
                         Source       = "HPE-OneView"
+                        Name         = if ($s.serverName) { $s.serverName } else { $s.name }
+                        Enclosure    = $enclosureName
+                        Bay          = $s.position
+                        Model        = $s.shortModel
+                        SerialNumber = $s.serialNumber
+                        BiosVersion  = $s.romVersion
+                        BmcVersion   = $s.mpFirmwareVersion
+                        BmcAddress   = $iloAddress
+                        PowerState   = $s.powerState
+                        Health       = $s.status
+                        CpuModel     = $s.processorType
+                        CpuCount     = $s.processorCount
+                        MemoryGB     = if ($s.memoryMb) { [math]::Round($s.memoryMb / 1024, 0) } else { "N/A" }
+                    }
+                    $Results += $ServerInfo
+                }
+
+                # Log out of OneView
+                try { Invoke-RestMethod -Uri "https://$serverHost/rest/login-sessions" -Method Delete -Headers $ovHeaders @script:SkipCert | Out-Null } catch { }
+
+            } catch {
+                Write-Warning "Failed to process OneView $serverHost - $($_.Exception.Message)"
+                $Failures += [PSCustomObject]@{ Target = $serverHost; Type = "OneView"; Error = $_.Exception.Message }
+            }
+
+            $Counter++
+            continue
+        }
+
+        # ----------------------------------------------------------------
+        # iDRAC or iLO - direct Redfish
+        # ----------------------------------------------------------------
+        if ($serverType -match '^(?i)(idrac|dell|ilo|hpe)$') {
+
+            $vendor = if ($serverType -match '^(?i)(idrac|dell)$') { "Dell-iDRAC" } else { "HPE-iLO" }
+
+            try {
+                Write-Host "Connecting to $vendor : $serverHost" -ForegroundColor Yellow
+
+                # Open Redfish session
+                $sessBody = @{
+                    UserName = $Credential.UserName
+                    Password = $Credential.GetNetworkCredential().Password
+                } | ConvertTo-Json -Compress
+
+                $sessResp = Invoke-WebRequest -Uri "https://$serverHost/redfish/v1/SessionService/Sessions" -Method Post `
+                                              -Body $sessBody -ContentType 'application/json' `
+                                              -Headers @{ 'Accept' = 'application/json' } -UseBasicParsing @script:SkipCert
+
+                $token    = $sessResp.Headers['X-Auth-Token']
+                $location = $sessResp.Headers['Location']
+                if ($token -is [array])    { $token    = $token[0] }
+                if ($location -is [array]) { $location = $location[0] }
+                if (-not $token) { throw "No X-Auth-Token returned" }
+
+                Write-Host "Connected to $serverHost" -ForegroundColor Green
+
+                $sessionUri = if ($location -match '^https?://') { $location }
+                              elseif ($location)                 { "https://$serverHost$location" }
+                              else                               { $null }
+
+                $rfHeaders = @{ 'X-Auth-Token' = $token; 'Accept' = 'application/json' }
+
+                # Discover the system URI (Dell = System.Embedded.1, HPE = 1)
+                $systems    = Invoke-RestMethod -Uri "https://$serverHost/redfish/v1/Systems" -Headers $rfHeaders @script:SkipCert
+                $systemPath = $systems.Members[0].'@odata.id'
+                if (-not $systemPath) { throw "No systems returned" }
+
+                $system = Invoke-RestMethod -Uri "https://$serverHost$systemPath" -Headers $rfHeaders @script:SkipCert
+
+                # BMC firmware version lives on the Manager resource
+                $bmcVersion = ""
+                try {
+                    $mgrs    = Invoke-RestMethod -Uri "https://$serverHost/redfish/v1/Managers" -Headers $rfHeaders @script:SkipCert
+                    $mgrPath = $mgrs.Members[0].'@odata.id'
+                    $mgr     = Invoke-RestMethod -Uri "https://$serverHost$mgrPath" -Headers $rfHeaders @script:SkipCert
+                    $bmcVersion = [string]$mgr.FirmwareVersion
+                } catch {
+                    Write-Warning "Could not read BMC firmware on $serverHost"
+                }
+
+                $ServerInfo = [PSCustomObject]@{
+                    Source       = $vendor
+                    Name         = if ($system.HostName) { [string]$system.HostName } else { $serverHost }
+                    Enclosure    = ""
+                    Bay          = ""
+                    Model        = [string]$system.Model
+                    SerialNumber = if ($system.SKU) { [string]$system.SKU } else { [string]$system.SerialNumber }
+                    BiosVersion  = [string]$system.BiosVersion
+                    BmcVersion   = $bmcVersion
+                    BmcAddress   = $serverHost
+                    PowerState   = [string]$system.PowerState
+                    Health       = [string]$system.Status.Health
+                    CpuModel     = [string]$system.ProcessorSummary.Model
+                    CpuCount     = [int]$system.ProcessorSummary.Count
+                    MemoryGB     = [math]::Round([double]$system.MemorySummary.TotalSystemMemoryGiB, 0)
+                }
+                $Results += $ServerInfo
+
+                # Close the Redfish session
+                if ($sessionUri) {
+                    try { Invoke-RestMethod -Uri $sessionUri -Method Delete -Headers $rfHeaders @script:SkipCert | Out-Null } catch { }
+                }
+
+                Write-Host "Collected $serverHost" -ForegroundColor Green
+
+            } catch {
+                Write-Warning "Failed to process $vendor $serverHost - $($_.Exception.Message)"
+                $Failures += [PSCustomObject]@{ Target = $serverHost; Type = $vendor; Error = $_.Exception.Message }
+            }
+
+            $Counter++
+            continue
+        }
+
+        # Unknown type
+        Write-Warning "Unknown Type '$serverType' for $serverHost (expected OneView, iDRAC or iLO)"
+        $Failures += [PSCustomObject]@{ Target = $serverHost; Type = $serverType; Error = "Unknown Type" }
+        $Counter++
+    }
+
+    # Remove duplicates based on Name
+    Write-Host "`nRemoving duplicates..." -ForegroundColor Yellow
+    $UniqueResults = $Results | Sort-Object Name -Unique
+    $DuplicatesRemoved = $Results.Count - $UniqueResults.Count
+    if ($DuplicatesRemoved -gt 0) {
+        Write-Host "Removed $DuplicatesRemoved duplicate entries" -ForegroundColor Green
+    } else {
+        Write-Host "No duplicates found" -ForegroundColor Green
+    }
+
+    # Create output directory if it doesn't exist
+    $OutputDir = Split-Path $OutputPath -Parent
+    if (!(Test-Path $OutputDir)) {
+        New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+    }
+
+    # Export to CSV
+    Write-Host "Exporting results to CSV: $OutputPath" -ForegroundColor Yellow
+    $UniqueResults | Sort-Object Source, Name | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+
+    # Display summary
+    Write-Host "`n=== SUMMARY ===" -ForegroundColor Cyan
+    Write-Host "Total servers processed: $($Results.Count)" -ForegroundColor White
+    Write-Host "Unique servers in report: $($UniqueResults.Count)" -ForegroundColor White
+    Write-Host "Duplicates removed: $DuplicatesRemoved" -ForegroundColor White
+    Write-Host "Failures: $($Failures.Count)" -ForegroundColor White
+
+    # Source breakdown
+    $SourceStats = $UniqueResults | Group-Object Source | Sort-Object Name
+    if ($SourceStats.Count -gt 0) {
+        Write-Host "`n=== BY SOURCE ===" -ForegroundColor Cyan
+        foreach ($Stat in $SourceStats) {
+            Write-Host "$($Stat.Name): $($Stat.Count) server(s)" -ForegroundColor White
+        }
+    }
+
+    # Model breakdown
+    $ModelStats = $UniqueResults | Group-Object Model | Sort-Object Count -Descending
+    if ($ModelStats.Count -gt 0) {
+        Write-Host "`n=== BY MODEL ===" -ForegroundColor Cyan
+        foreach ($Stat in $ModelStats) {
+            Write-Host "$($Stat.Name): $($Stat.Count)" -ForegroundColor White
+        }
+    }
+
+    # BIOS version breakdown
+    $BiosStats = $UniqueResults | Group-Object BiosVersion | Sort-Object Name
+    if ($BiosStats.Count -gt 0) {
+        Write-Host "`n=== BY BIOS VERSION ===" -ForegroundColor Cyan
+        foreach ($Stat in $BiosStats) {
+            Write-Host "$($Stat.Name): $($Stat.Count) server(s)" -ForegroundColor White
+        }
+    }
+
+    # Health breakdown
+    $HealthStats = $UniqueResults | Group-Object Health | Sort-Object Name
+    if ($HealthStats.Count -gt 0) {
+        Write-Host "`n=== BY HEALTH STATUS ===" -ForegroundColor Cyan
+        foreach ($Stat in $HealthStats) {
+            Write-Host "$($Stat.Name): $($Stat.Count) server(s)" -ForegroundColor White
+        }
+    }
+
+    # List failures if any
+    if ($Failures.Count -gt 0) {
+        Write-Host "`n=== FAILURES ===" -ForegroundColor Red
+        foreach ($f in $Failures) {
+            Write-Host "$($f.Target) ($($f.Type)): $($f.Error)" -ForegroundColor Red
+        }
+    }
+
+    Write-Host "`nReport saved to: $OutputPath" -ForegroundColor Green
+
+    # Ask if user wants to open the CSV file
+    $OpenFile = Read-Host "`nWould you like to open the CSV file? (Y/N)"
+    if ($OpenFile -match "^[Yy]") {
+        Invoke-Item $OutputPath
+    }
+
+} catch {
+    Write-Error "An error occurred: $($_.Exception.Message)"
+}# Hardware and BIOS Inventory Script
+# Collects server hardware, firmware and BIOS data from HPE (OneView) and Dell (iDRAC Redfish)
+# Read-only - no settings are changed
+
+# Server list CSV - required columns: Host, Type (OneView / iDRAC / iLO)
+# Optional column: Exclude (TRUE to skip, e.g. VxRail nodes)
+$ServerListCsv = "C:\Scripts\Inventory\servers.csv"
+
+# Credential file - Export-Clixml format, DOMAIN\sAMAccountName
+# To create: Get-Credential | Export-Clixml -Path "C:\Scripts\Inventory\cred.xml"
+# Must be exported by the same user on the same machine that runs this script
+$CredentialPath = "C:\Scripts\Inventory\cred.xml"
+
+# Output file path
+$OutputPath = "C:\Temp\HardwareInventory.csv"
+
+# OneView login domain - the directory name configured in OneView (not necessarily the AD domain name)
+# Check OneView > Settings > Security > Directories for the exact name
+# Set to $null or "" to use the appliance's default directory
+$OneViewLoginDomain = "YOURDOMAIN"
+
+# OneView API version - $null = auto-detect from the appliance
+$OneViewApiVersion = $null
+
+# Suppress certificate warnings for self-signed BMC / appliance certs
+[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+if ($PSVersionTable.PSVersion.Major -ge 6) {
+    $script:SkipCert = @{ SkipCertificateCheck = $true }
+} else {
+    if (-not ("TrustAllCertsPolicy" -as [type])) {
+        Add-Type @"
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+public class TrustAllCertsPolicy : ICertificatePolicy {
+    public bool CheckValidationResult(ServicePoint sp, X509Certificate cert, WebRequest req, int problem) { return true; }
+}
+"@
+    }
+    [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+    $script:SkipCert = @{}
+}
+
+# Initialize arrays to store results
+$Results  = @()
+$Failures = @()
+
+try {
+
+    # Load credentials
+    if (-not (Test-Path $CredentialPath)) {
+        throw "Credential file not found: $CredentialPath. Create it with: Get-Credential | Export-Clixml -Path '$CredentialPath'"
+    }
+
+    Write-Host "Loading credentials from: $CredentialPath" -ForegroundColor Yellow
+    try {
+        $Credential = Import-Clixml -Path $CredentialPath
+    } catch {
+        throw "Failed to decrypt credential file. It must be exported by the same user on the same machine. Error: $($_.Exception.Message)"
+    }
+    Write-Host "Credentials loaded for: $($Credential.UserName)" -ForegroundColor Green
+
+    # Load the server list
+    if (-not (Test-Path $ServerListCsv)) {
+        throw "Server list not found: $ServerListCsv"
+    }
+
+    $serverRows = @(Import-Csv -Path $ServerListCsv | Where-Object {
+        $_.Host -and $_.Host -notmatch '^\s*#'
+    })
+
+    $targets = @($serverRows | Where-Object {
+        -not ($_.PSObject.Properties.Name -contains 'Exclude') -or
+        ($_.Exclude -notmatch '^(?i)(true|yes|y|1)$')
+    })
+
+    $excluded = $serverRows.Count - $targets.Count
+
+    if ($targets.Count -eq 0) {
+        throw "No servers to process in $ServerListCsv"
+    }
+
+    Write-Host "Loaded $($targets.Count) server(s) from CSV ($excluded excluded)" -ForegroundColor Green
+
+    # Progress counter
+    $Counter = 1
+
+    foreach ($row in $targets) {
+
+        $serverHost = $row.Host.Trim()
+        $serverType = $row.Type.Trim()
+
+        Write-Progress -Activity "Collecting Hardware Inventory" -Status "Processing: $serverHost ($serverType)" -PercentComplete (($Counter / $targets.Count) * 100)
+
+        # ----------------------------------------------------------------
+        # OneView - one appliance returns every blade in the enclosure(s)
+        # ----------------------------------------------------------------
+        if ($serverType -match '^(?i)oneview$') {
+
+            try {
+                Write-Host "Connecting to OneView: $serverHost" -ForegroundColor Yellow
+
+                # Auto-detect API version if not set
+                $apiVersion = $OneViewApiVersion
+                if (-not $apiVersion) {
+                    $verInfo = Invoke-RestMethod -Uri "https://$serverHost/rest/version" -Method Get @script:SkipCert
+                    $apiVersion = $verInfo.currentVersion
+                }
+
+                $loginHeaders = @{ 'X-API-Version' = "$apiVersion"; 'Accept' = 'application/json' }
+                $loginBody = @{
+                    userName        = $Credential.UserName
+                    password        = $Credential.GetNetworkCredential().Password
+                    authLoginDomain = if ($OneViewLoginDomain) { $OneViewLoginDomain } else { "" }
+                } | ConvertTo-Json -Compress
+
+                $login = Invoke-RestMethod -Uri "https://$serverHost/rest/login-sessions" -Method Post `
+                                           -Headers $loginHeaders -Body $loginBody -ContentType 'application/json' @script:SkipCert
+
+                if (-not $login.sessionID) { throw "OneView login returned no sessionID" }
+                Write-Host "Connected to $serverHost" -ForegroundColor Green
+
+                $ovHeaders = @{
+                    'X-API-Version' = "$apiVersion"
+                    'Auth'          = $login.sessionID
+                    'Accept'        = 'application/json'
+                }
+
+                # Build enclosure URI -> name lookup
+                $enclosureMap = @{}
+                try {
+                    $enclosures = Invoke-RestMethod -Uri "https://$serverHost/rest/enclosures?start=0&count=-1" -Headers $ovHeaders @script:SkipCert
+                    foreach ($e in $enclosures.members) { $enclosureMap[$e.uri] = $e.name }
+                } catch {
+                    Write-Warning "Could not enumerate enclosures: $($_.Exception.Message)"
+                }
+
+                # Get all server hardware from the appliance
+                $servers = Invoke-RestMethod -Uri "https://$serverHost/rest/server-hardware?start=0&count=-1" -Headers $ovHeaders @script:SkipCert
+                Write-Host "Found $($servers.members.Count) server(s) in OneView" -ForegroundColor Green
+
+                foreach ($s in $servers.members) {
+
+                    $enclosureName = if ($s.locationUri -and $enclosureMap.ContainsKey($s.locationUri)) {
+                        $enclosureMap[$s.locationUri]
+                    } else { $s.locationUri }
+
+                    $iloAddress = $null
+                    if ($s.mpHostInfo.mpIpAddresses) {
+                        $iloAddress = ($s.mpHostInfo.mpIpAddresses | Select-Object -First 1).address
+                    }
+
+                    $ServerInfo = [PSCustomObject]@{
+                        Source       = "HPE-OneView"
                         Name         = $s.name
                         Enclosure    = $enclosureName
                         Bay          = $s.position
