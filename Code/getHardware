@@ -64,14 +64,14 @@ try {
         throw "Server list not found: $ServerListCsv"
     }
 
-    $serverRows = Import-Csv -Path $ServerListCsv | Where-Object {
+    $serverRows = @(Import-Csv -Path $ServerListCsv | Where-Object {
         $_.Host -and $_.Host -notmatch '^\s*#'
-    }
+    })
 
-    $targets = $serverRows | Where-Object {
+    $targets = @($serverRows | Where-Object {
         -not ($_.PSObject.Properties.Name -contains 'Exclude') -or
         ($_.Exclude -notmatch '^(?i)(true|yes|y|1)$')
-    }
+    })
 
     $excluded = $serverRows.Count - $targets.Count
 
