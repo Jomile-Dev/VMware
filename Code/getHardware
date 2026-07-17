@@ -14,6 +14,15 @@ $CredentialPath = "C:\Scripts\Inventory\cred.xml"
 # Output file path
 $OutputPath = "C:\Temp\HardwareInventory.csv"
 
+# Email Configuration
+$SendEmail    = $true                                                                      # Set to $false to disable email
+$EmailTo      = "admin@company.com"                                                        # Recipient email
+$EmailFrom    = "hardware-reports@company.com"                                             # Sender email
+$EmailSubject = "Hardware / BIOS Inventory Report - $(Get-Date -Format 'yyyy-MM-dd')"      # Subject line
+$SMTPServer   = "mail.company.com"                                                         # Your SMTP server
+$SMTPPort     = 465                                                                        # SSL port (465 for SSL, 587 for TLS)
+$UseSSL       = $true                                                                      # Use SSL encryption
+
 # OneView login domain - the directory name configured in OneView (not necessarily the AD domain name)
 # Check OneView > Settings > Security > Directories for the exact name
 # Set to $null or "" to use the appliance's default directory
@@ -298,7 +307,114 @@ try {
 
     # Export to CSV
     Write-Host "Exporting results to CSV: $OutputPath" -ForegroundColor Yellow
-    $UniqueResults | Sort-Object Source, Name | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+    $sortedResults = $UniqueResults | Sort-Object Source, Name
+    $sortedResults | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+
+    # Send email report if configured
+    if ($SendEmail -and $sortedResults.Count -gt 0) {
+
+        Write-Host "`nGenerating email report..." -ForegroundColor Green
+
+        $htmlBody = @"
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+body { font-family: Arial, sans-serif; margin: 20px; }
+h1 { color: #2E8B57; }
+h2 { color: #4682B4; margin-top: 30px; }
+h3 { color: #333; margin-top: 20px; }
+table { border-collapse: collapse; width: 100%; margin: 15px 0; }
+th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+th { background-color: #f2f2f2; font-weight: bold; }
+.summary { background-color: #f5f5f5; padding: 10px; margin: 20px 0; }
+.center-text { text-align: center; }
+.fail { background-color: #ffe6e6; }
+</style>
+</head>
+<body>
+<h1>Hardware / BIOS Inventory Report</h1>
+<p><strong>Generated:</strong> $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</p>
+<p><strong>Total Servers:</strong> $($sortedResults.Count)</p>
+<p><strong>Failures:</strong> $($Failures.Count)</p>
+
+<h2>Server Inventory</h2>
+<table>
+<tr>
+<th>Source</th>
+<th>Name</th>
+<th>Enclosure</th>
+<th>Bay</th>
+<th>Model</th>
+<th>Serial Number</th>
+<th>BIOS Version</th>
+<th>BMC Version</th>
+<th>CAG</th>
+<th>Notes</th>
+</tr>
+"@
+
+        foreach ($result in $sortedResults) {
+            $htmlBody += "<tr>"
+            $htmlBody += "<td>$($result.Source)</td>"
+            $htmlBody += "<td>$($result.Name)</td>"
+            $htmlBody += "<td>$($result.Enclosure)</td>"
+            $htmlBody += "<td class='center-text'>$($result.Bay)</td>"
+            $htmlBody += "<td>$($result.Model)</td>"
+            $htmlBody += "<td>$($result.SerialNumber)</td>"
+            $htmlBody += "<td>$($result.BiosVersion)</td>"
+            $htmlBody += "<td>$($result.BmcVersion)</td>"
+            $htmlBody += "<td>$($result.CAG)</td>"
+            $htmlBody += "<td>$($result.Notes)</td>"
+            $htmlBody += "</tr>"
+        }
+
+        $htmlBody += "</table>"
+
+        if ($Failures.Count -gt 0) {
+            $htmlBody += @"
+
+<h2>Failures</h2>
+<table>
+<tr><th>Target</th><th>Type</th><th>Error</th></tr>
+"@
+            foreach ($f in $Failures) {
+                $htmlBody += "<tr class='fail'><td>$($f.Target)</td><td>$($f.Type)</td><td>$($f.Error)</td></tr>"
+            }
+            $htmlBody += "</table>"
+        }
+
+        $htmlBody += @"
+
+<div class="summary">
+<h3>Summary</h3>
+<ul>
+<li>Total servers in report: $($sortedResults.Count)</li>
+<li>Excluded from CSV: $excluded</li>
+<li>Failures: $($Failures.Count)</li>
+</ul>
+</div>
+</body>
+</html>
+"@
+
+        try {
+            $emailParams = @{
+                To         = $EmailTo
+                From       = $EmailFrom
+                Subject    = $EmailSubject
+                Body       = $htmlBody
+                BodyAsHtml = $true
+                SmtpServer = $SMTPServer
+                Port       = $SMTPPort
+                UseSsl     = $UseSSL
+            }
+            Send-MailMessage @emailParams
+            Write-Host "✓ Email report sent to $EmailTo" -ForegroundColor Green
+        } catch {
+            Write-Host "✗ Failed to send email: $($_.Exception.Message)" -ForegroundColor Red
+        }
+    }
 
     # Display summary
     Write-Host "`n=== SUMMARY ===" -ForegroundColor Cyan
