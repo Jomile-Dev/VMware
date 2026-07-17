@@ -11,8 +11,8 @@ $ServerListCsv = "C:\Scripts\Inventory\servers.csv"
 # Must be exported by the same user on the same machine that runs this script
 $CredentialPath = "C:\Scripts\Inventory\cred.xml"
 
-# Output file path
-$OutputPath = "C:\Temp\HardwareInventory.csv"
+# Output file path (timestamped so runs don't overwrite each other)
+$OutputPath = "C:\Temp\HardwareInventory_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
 
 # Email Configuration
 $SendEmail    = $true                                                                      # Set to $false to disable email
@@ -346,6 +346,12 @@ h1 { color: #2E8B57; }
             }
             Send-MailMessage @emailParams
             Write-Host "✓ Email report sent to $EmailTo" -ForegroundColor Green
+
+            # Clean up the CSV after successful send
+            if (Test-Path $OutputPath) {
+                Remove-Item -Path $OutputPath -Force
+                Write-Host "✓ Cleaned up $OutputPath" -ForegroundColor Green
+            }
         } catch {
             Write-Host "✗ Failed to send email: $($_.Exception.Message)" -ForegroundColor Red
         }
