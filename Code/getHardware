@@ -15,13 +15,13 @@ $CredentialPath = "C:\Scripts\Inventory\cred.xml"
 $OutputPath = "C:\Temp\HardwareInventory_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
 
 # Email Configuration
-$SendEmail    = $true                                                                      # Set to $false to disable email
-$EmailTo      = "admin@company.com"                                                        # Recipient email
-$EmailFrom    = "hardware-reports@company.com"                                             # Sender email
-$EmailSubject = "Hardware / BIOS Inventory Report - $(Get-Date -Format 'yyyy-MM-dd')"      # Subject line
-$SMTPServer   = "mail.company.com"                                                         # Your SMTP server
-$SMTPPort     = 465                                                                        # SSL port (465 for SSL, 587 for TLS)
-$UseSSL       = $true                                                                      # Use SSL encryption
+$SendEmail = $true # Set to $false to disable email
+$EmailTo = "admin@company.com" # Recipient email
+$EmailFrom = "hardware-reports@company.com" # Sender email
+$EmailSubject = "Hardware / BIOS Inventory Report - $(Get-Date -Format 'yyyy-MM-dd')" # Subject line
+$SMTPServer = "mail.company.com" # Your SMTP server
+$SMTPPort = 465 # SSL port (465 for SSL, 587 for TLS)
+$UseSSL = $true # Use SSL encryption
 
 # OneView login domain - the directory name configured in OneView (not necessarily the AD domain name)
 # Check OneView > Settings > Security > Directories for the exact name
@@ -33,6 +33,7 @@ $OneViewApiVersion = $null
 
 # Suppress certificate warnings for self-signed BMC / appliance certs
 [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+
 if ($PSVersionTable.PSVersion.Major -ge 6) {
     $script:SkipCert = @{ SkipCertificateCheck = $true }
 } else {
@@ -50,11 +51,10 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
 }
 
 # Initialize arrays to store results
-$Results  = @()
+$Results = @()
 $Failures = @()
 
 try {
-
     # Load credentials
     if (-not (Test-Path $CredentialPath)) {
         throw "Credential file not found: $CredentialPath. Create it with: Get-Credential | Export-Clixml -Path '$CredentialPath'"
@@ -94,7 +94,6 @@ try {
     $Counter = 1
 
     foreach ($row in $targets) {
-
         $serverHost = $row.Host.Trim()
         $serverType = $row.Type.Trim()
 
@@ -104,7 +103,6 @@ try {
         # OneView - one appliance returns every blade in the enclosure(s)
         # ----------------------------------------------------------------
         if ($serverType -match '^(?i)oneview$') {
-
             try {
                 Write-Host "Connecting to OneView: $serverHost" -ForegroundColor Yellow
 
@@ -117,21 +115,21 @@ try {
 
                 $loginHeaders = @{ 'X-API-Version' = "$apiVersion"; 'Accept' = 'application/json' }
                 $loginBody = @{
-                    userName        = $Credential.UserName
-                    password        = $Credential.GetNetworkCredential().Password
+                    userName = $Credential.UserName
+                    password = $Credential.GetNetworkCredential().Password
                     authLoginDomain = if ($OneViewLoginDomain) { $OneViewLoginDomain } else { "" }
                 } | ConvertTo-Json -Compress
 
                 $login = Invoke-RestMethod -Uri "https://$serverHost/rest/login-sessions" -Method Post `
-                                           -Headers $loginHeaders -Body $loginBody -ContentType 'application/json' @script:SkipCert
+                    -Headers $loginHeaders -Body $loginBody -ContentType 'application/json' @script:SkipCert
 
                 if (-not $login.sessionID) { throw "OneView login returned no sessionID" }
                 Write-Host "Connected to $serverHost" -ForegroundColor Green
 
                 $ovHeaders = @{
                     'X-API-Version' = "$apiVersion"
-                    'Auth'          = $login.sessionID
-                    'Accept'        = 'application/json'
+                    'Auth' = $login.sessionID
+                    'Accept' = 'application/json'
                 }
 
                 # Build enclosure URI -> name lookup
@@ -148,7 +146,6 @@ try {
                 Write-Host "Found $($servers.members.Count) server(s) in OneView" -ForegroundColor Green
 
                 foreach ($s in $servers.members) {
-
                     $enclosureName = if ($s.locationUri -and $enclosureMap.ContainsKey($s.locationUri)) {
                         $enclosureMap[$s.locationUri]
                     } else { $s.locationUri }
@@ -185,7 +182,6 @@ try {
         # Session auth first, falls back to basic auth if 405 (old iDRAC 8)
         # ----------------------------------------------------------------
         if ($serverType -match '^(?i)(idrac|dell|ilo|hpe)$') {
-
             $vendor = if ($serverType -match '^(?i)(idrac|dell)$') { "Dell-iDRAC" } else { "HPE-iLO" }
 
             try {
@@ -193,9 +189,9 @@ try {
 
                 # Try session auth first
                 $useBasicAuth = $false
-                $rfHeaders    = @{ 'Accept' = 'application/json' }
-                $rfAuth       = @{}
-                $sessionUri   = $null
+                $rfHeaders = @{ 'Accept' = 'application/json' }
+                $rfAuth = @{}
+                $sessionUri = $null
 
                 try {
                     $sessBody = @{
@@ -204,18 +200,18 @@ try {
                     } | ConvertTo-Json -Compress
 
                     $sessResp = Invoke-WebRequest -Uri "https://$serverHost/redfish/v1/SessionService/Sessions" -Method Post `
-                                                  -Body $sessBody -ContentType 'application/json' `
-                                                  -Headers @{ 'Accept' = 'application/json' } -UseBasicParsing @script:SkipCert
+                        -Body $sessBody -ContentType 'application/json' `
+                        -Headers @{ 'Accept' = 'application/json' } -UseBasicParsing @script:SkipCert
 
-                    $token    = $sessResp.Headers['X-Auth-Token']
+                    $token = $sessResp.Headers['X-Auth-Token']
                     $location = $sessResp.Headers['Location']
-                    if ($token -is [array])    { $token    = $token[0] }
+                    if ($token -is [array]) { $token = $token[0] }
                     if ($location -is [array]) { $location = $location[0] }
                     if (-not $token) { throw "No X-Auth-Token returned" }
 
                     $sessionUri = if ($location -match '^https?://') { $location }
-                                  elseif ($location)                 { "https://$serverHost$location" }
-                                  else                               { $null }
+                                  elseif ($location) { "https://$serverHost$location" }
+                                  else { $null }
 
                     $rfHeaders = @{ 'X-Auth-Token' = $token; 'Accept' = 'application/json' }
                     Write-Host "Connected to $serverHost (session auth)" -ForegroundColor Green
@@ -236,7 +232,7 @@ try {
                 }
 
                 # Discover the system URI (Dell = System.Embedded.1, HPE = 1)
-                $systems    = Invoke-RestMethod -Uri "https://$serverHost/redfish/v1/Systems" -Headers $rfHeaders @rfAuth @script:SkipCert
+                $systems = Invoke-RestMethod -Uri "https://$serverHost/redfish/v1/Systems" -Headers $rfHeaders @rfAuth @script:SkipCert
                 $systemPath = $systems.Members[0].'@odata.id'
                 if (-not $systemPath) { throw "No systems returned" }
 
@@ -245,9 +241,9 @@ try {
                 # BMC firmware version lives on the Manager resource
                 $bmcVersion = ""
                 try {
-                    $mgrs    = Invoke-RestMethod -Uri "https://$serverHost/redfish/v1/Managers" -Headers $rfHeaders @rfAuth @script:SkipCert
+                    $mgrs = Invoke-RestMethod -Uri "https://$serverHost/redfish/v1/Managers" -Headers $rfHeaders @rfAuth @script:SkipCert
                     $mgrPath = $mgrs.Members[0].'@odata.id'
-                    $mgr     = Invoke-RestMethod -Uri "https://$serverHost$mgrPath" -Headers $rfHeaders @rfAuth @script:SkipCert
+                    $mgr = Invoke-RestMethod -Uri "https://$serverHost$mgrPath" -Headers $rfHeaders @rfAuth @script:SkipCert
                     $bmcVersion = [string]$mgr.FirmwareVersion
                 } catch {
                     Write-Warning "Could not read BMC firmware on $serverHost"
@@ -312,7 +308,6 @@ try {
 
     # Send email report if configured
     if ($SendEmail -and $sortedResults.Count -gt 0) {
-
         Write-Host "`nGenerating email report..." -ForegroundColor Green
 
         $htmlBody = @"
@@ -345,15 +340,15 @@ h1 { color: #2E8B57; }
                 Attachments = $OutputPath
             }
             Send-MailMessage @emailParams
-            Write-Host "✓ Email report sent to $EmailTo" -ForegroundColor Green
+            Write-Host "Email report sent to $EmailTo" -ForegroundColor Green
 
             # Clean up the CSV after successful send
             if (Test-Path $OutputPath) {
                 Remove-Item -Path $OutputPath -Force
-                Write-Host "✓ Cleaned up $OutputPath" -ForegroundColor Green
+                Write-Host "Cleaned up $OutputPath" -ForegroundColor Green
             }
         } catch {
-            Write-Host "✗ Failed to send email: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "Failed to send email: $($_.Exception.Message)" -ForegroundColor Red
         }
     }
 
@@ -400,12 +395,6 @@ h1 { color: #2E8B57; }
     }
 
     Write-Host "`nReport saved to: $OutputPath" -ForegroundColor Green
-
-    # Ask if user wants to open the CSV file
-    $OpenFile = Read-Host "`nWould you like to open the CSV file? (Y/N)"
-    if ($OpenFile -match "^[Yy]") {
-        Invoke-Item $OutputPath
-    }
 
 } catch {
     Write-Error "An error occurred: $($_.Exception.Message)"
