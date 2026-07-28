@@ -31,6 +31,13 @@ $UseWorkflowLogs       = $false
 $UpstreamWorkflowId    = ""                 # GUID of the wrapper workflow that calls returnApplicationVms
 $UpstreamWorkflowInput = "applicationName"  # the workflow input parameter name
 
+# SIMPLEST OPTION - no vRO changes at all: run returnApplicationVms in the vRO
+# GUI for each distinct application tag, copy the whole Logs tab text, and save
+# it as <TAG>.txt in this folder (e.g. C:\Logs\upstream\SDI21_VRA_DTA.txt).
+# The review scrapes the upstreamCIs JSON out of those files. The script prints
+# the distinct tags it needs at the start of the review so you know what to run.
+$UpstreamLogDir        = "C:\Logs\upstream"
+
 # Field(s) on the upstream object that hold "Application" / "SubApplication".
 # UpstreamCIType is the current candidate; UpstreamCICMSClass is kept as a fallback.
 $UpstreamClassFields = @('UpstreamCICMSClass', 'UpstreamCIType')
@@ -334,7 +341,7 @@ function Get-UpstreamCIsFromLog {
 
 # Build the six review fields for one VM result object
 function Invoke-CmdbReview {
-    param($Vm, $Catalog, $VraServer, $AuthToken, $GetVmAppsUri, $ReturnAppVmsUri, $PhasedOut, $ClassFields, $DebugPath, $UseWorkflowLogs, $WorkflowId, $WorkflowInput)
+    param($Vm, $Catalog, $VraServer, $AuthToken, $GetVmAppsUri, $ReturnAppVmsUri, $PhasedOut, $ClassFields, $DebugPath, $UseWorkflowLogs, $WorkflowId, $WorkflowInput, $LogDir)
 
     $nsxMatch = switch ($Vm.CompareResult) {
         "Match"                 { "NSX tag matches CMDB" }
@@ -365,11 +372,25 @@ function Invoke-CmdbReview {
     foreach ($tag in $tags) {
         $appKey = $tag -replace '_', ' '
         try {
-            if ($UseWorkflowLogs -and $WorkflowId) {
-                $logText = Invoke-VroWorkflowLog -VraServer $VraServer -AuthToken $AuthToken -WorkflowId $WorkflowId -InputName $WorkflowInput -InputValue $appKey
-                $returnRaws += [ordered]@{ tag = $tag; logChars = @($logText).Length; log = $logText }
+            # 1) Local log file saved from the vRO GUI Logs tab (per tag) - preferred
+            $logFile = $null
+            if ($LogDir) {
+                foreach ($cand in @("$LogDir\$tag.txt", "$LogDir\$appKey.txt")) {
+                    if (Test-Path -LiteralPath $cand) { $logFile = $cand; break }
+                }
+            }
+            if ($logFile) {
+                $logText = Get-Content -LiteralPath $logFile -Raw
+                $returnRaws += [ordered]@{ tag = $tag; source = "file:$logFile"; logChars = @($logText).Length }
                 $upstreamCIs += @(Get-UpstreamCIsFromLog -LogText $logText)
             }
+            # 2) Wrapper workflow run + workflow log over REST (if one exists)
+            elseif ($UseWorkflowLogs -and $WorkflowId) {
+                $logText = Invoke-VroWorkflowLog -VraServer $VraServer -AuthToken $AuthToken -WorkflowId $WorkflowId -InputName $WorkflowInput -InputValue $appKey
+                $returnRaws += [ordered]@{ tag = $tag; source = "workflow"; logChars = @($logText).Length; log = $logText }
+                $upstreamCIs += @(Get-UpstreamCIsFromLog -LogText $logText)
+            }
+            # 3) Action REST return (known to lack upstreamCIs - kept as last resort)
             else {
                 $rraw = Invoke-VroActionRest -VraServer $VraServer -AuthToken $AuthToken -ActionUri $ReturnAppVmsUri -Raw -Parameters @{
                     applicationName  = $appKey
@@ -377,7 +398,7 @@ function Invoke-CmdbReview {
                     vmName           = $Vm.VMName
                     phasedOutEnabled = $PhasedOut
                 }
-                $returnRaws += [ordered]@{ tag = $tag; raw = $rraw }
+                $returnRaws += [ordered]@{ tag = $tag; source = "action-rest"; raw = $rraw }
                 $obj = Get-VroJson -Response $rraw
                 $upstreamCIs += @(Get-UpstreamCIs -Obj $obj)
             }
@@ -1094,6 +1115,19 @@ if ($RunReview) {
 
     if ($ReviewDebug -and (Test-Path $ReviewDebugPath)) { Remove-Item $ReviewDebugPath -Force }
 
+    # List the distinct application tags the review needs, and whether a saved
+    # log file exists for each in $UpstreamLogDir (run the action in the vRO GUI
+    # for the missing ones and save the Logs text as <TAG>.txt).
+    $distinctTags = @($results | ForEach-Object { $_.AppApplication -split ";\s*" } | Where-Object { $_ } | Sort-Object -Unique)
+    if ($distinctTags.Count -gt 0) {
+        Write-Log " Distinct application tags needed: $($distinctTags.Count)" -Color Cyan
+        foreach ($t in $distinctTags) {
+            $have = (Test-Path -LiteralPath "$UpstreamLogDir\$t.txt") -or (Test-Path -LiteralPath "$UpstreamLogDir\$($t -replace '_', ' ').txt")
+            if ($have) { Write-Log "  [have] $t" -Color Green }
+            else       { Write-Log "  [need] $t  -> save Logs as $UpstreamLogDir\$t.txt" -Color Yellow }
+        }
+    }
+
     $reviewSet = if ($ReviewLimit -gt 0) { @($results | Select-Object -First $ReviewLimit) } else { $results }
     $reviewTotal = @($reviewSet).Count
     if ($ReviewLimit -gt 0) { Write-Log " (limited to first $reviewTotal VMs)" -Color Yellow }
@@ -1102,7 +1136,7 @@ if ($RunReview) {
     foreach ($vm in $reviewSet) {
         Write-Log " [$($reviewed + 1)/$reviewTotal] $($vm.VMName)..." -Color DarkGray
         $cat = Get-CagForProject -ProjectName $vm.ProjectName -VraServer $vraServer -AuthToken $authToken -CagUri $getCagAppsUri -PhasedOut $phasedOutEnabled
-        $rev = Invoke-CmdbReview -Vm $vm -Catalog $cat -VraServer $vraServer -AuthToken $authToken -GetVmAppsUri $getVmAppsUri -ReturnAppVmsUri $returnAppVmsUri -PhasedOut $phasedOutEnabled -ClassFields $UpstreamClassFields -DebugPath $(if ($ReviewDebug) { $ReviewDebugPath } else { $null }) -UseWorkflowLogs $UseWorkflowLogs -WorkflowId $UpstreamWorkflowId -WorkflowInput $UpstreamWorkflowInput
+        $rev = Invoke-CmdbReview -Vm $vm -Catalog $cat -VraServer $vraServer -AuthToken $authToken -GetVmAppsUri $getVmAppsUri -ReturnAppVmsUri $returnAppVmsUri -PhasedOut $phasedOutEnabled -ClassFields $UpstreamClassFields -DebugPath $(if ($ReviewDebug) { $ReviewDebugPath } else { $null }) -UseWorkflowLogs $UseWorkflowLogs -WorkflowId $UpstreamWorkflowId -WorkflowInput $UpstreamWorkflowInput -LogDir $UpstreamLogDir
 
         Add-Member -InputObject $vm -NotePropertyName NSXMatchCMDB           -NotePropertyValue $rev.NSXMatchCMDB           -Force
         Add-Member -InputObject $vm -NotePropertyName AppOrSubApp            -NotePropertyValue $rev.AppOrSubApp            -Force
