@@ -644,6 +644,18 @@ function Test-VsanVmkConnectivity {
         $arguments.count = $PingCount
         $arguments.size = 1472
 
+        $netstackKey = $sourceVmk.ExtensionData.Spec.NetStackInstanceKey
+        if ($netstackKey) {
+            try {
+                if ($arguments.ContainsKey('netstack')) {
+                    $arguments.netstack = $netstackKey
+                }
+            }
+            catch {
+                # esxcli argument set does not expose netstack on this build; ignore.
+            }
+        }
+
         try {
             $result = $esxcli.network.diag.ping.Invoke($arguments)
 
@@ -843,6 +855,107 @@ th, td { border: 1px solid #cccccc; padding: 8px; text-align: left; }
 <table>
 <thead>
 <tr><th>Result</th><th>Check</th><th>Detail</th></tr>
+</thead>
+<tbody>
+$($rows -join "`n")
+</tbody>
+</table>
+</body>
+</html>
+"@
+
+    Set-Content -Path $Path -Value $html -Encoding UTF8
+}
+
+function Write-RunSummaryHtml {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$VCenter,
+        [Parameter(Mandatory)][string]$Cluster,
+        [Parameter(Mandatory)][string]$Mode,
+        $VsanHealth,
+        $VsanResync,
+        [int]$PortgroupCount,
+        [int]$EventCount,
+        [Parameter(Mandatory)]$HostRollups
+    )
+
+    $healthStatus = if ($VsanHealth) { [string]$VsanHealth.Status } else { 'n/a' }
+    $resyncStatus = if ($VsanResync) { [string]$VsanResync.Status } else { 'n/a' }
+
+    $rows = foreach ($item in $HostRollups) {
+        $class = switch ($item.Overall) {
+            'NOT READY'           { 'fail' }
+            'READY WITH WARNINGS' { 'warn' }
+            default               { 'pass' }
+        }
+
+        $hostCell = [System.Net.WebUtility]::HtmlEncode([string]$item.Host)
+        $href = [System.Net.WebUtility]::HtmlEncode([string]$item.ReportRelative)
+        $overallCell = [System.Net.WebUtility]::HtmlEncode([string]$item.Overall)
+
+        "<tr class='$class'>" +
+        "<td><a href='$href'>$hostCell</a></td>" +
+        "<td>$overallCell</td>" +
+        "<td>$($item.Pass)</td>" +
+        "<td>$($item.Warn)</td>" +
+        "<td>$($item.Fail)</td>" +
+        "</tr>"
+    }
+
+    $overall = if (@($HostRollups | Where-Object { $_.Overall -eq 'NOT READY' }).Count -gt 0) {
+        'NOT READY'
+    }
+    elseif (@($HostRollups | Where-Object { $_.Overall -eq 'READY WITH WARNINGS' }).Count -gt 0) {
+        'READY WITH WARNINGS'
+    }
+    else {
+        'READY'
+    }
+
+    $clusterEnc = [System.Net.WebUtility]::HtmlEncode($Cluster)
+    $vcEnc      = [System.Net.WebUtility]::HtmlEncode($VCenter)
+    $modeEnc    = [System.Net.WebUtility]::HtmlEncode($Mode)
+    $healthEnc  = [System.Net.WebUtility]::HtmlEncode($healthStatus)
+    $resyncEnc  = [System.Net.WebUtility]::HtmlEncode($resyncStatus)
+
+    $html = @"
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>$clusterEnc - $modeEnc - validation summary</title>
+<style>
+body { font-family: Arial, sans-serif; margin: 30px; }
+h1 { margin-bottom: 5px; }
+.meta { color: #555; margin-bottom: 4px; }
+.overall { font-size: 1.3em; font-weight: bold; margin: 16px 0; }
+table { border-collapse: collapse; width: 100%; margin-top: 16px; }
+th, td { border: 1px solid #cccccc; padding: 8px; text-align: left; }
+.pass { background: #e8f5e9; }
+.warn { background: #fff8e1; }
+.fail { background: #ffebee; }
+a { text-decoration: none; color: #1565c0; }
+</style>
+</head>
+<body>
+<h1>$clusterEnc</h1>
+<div class="meta">vCenter: $vcEnc</div>
+<div class="meta">Mode: $modeEnc</div>
+<div class="meta">Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</div>
+<div class="overall">Overall: $overall</div>
+
+<table>
+<tr><th>Cluster item</th><th>Value</th></tr>
+<tr><td>vSAN health</td><td>$healthEnc</td></tr>
+<tr><td>vSAN resync</td><td>$resyncEnc</td></tr>
+<tr><td>Distributed port groups</td><td>$PortgroupCount</td></tr>
+<tr><td>Recent warnings/errors (24h)</td><td>$EventCount</td></tr>
+</table>
+
+<table>
+<thead>
+<tr><th>Host</th><th>Status</th><th>Pass</th><th>Warn</th><th>Fail</th></tr>
 </thead>
 <tbody>
 $($rows -join "`n")
@@ -1059,17 +1172,19 @@ function Invoke-EnvironmentValidation {
             -ClusterName $clusterName `
             -HostName $(if ($selectedHost) { $selectedHost.Name } else { $null })
 
-        Get-DistributedPortgroupDetail -VCenterName $vCenterName |
-            Export-CsvSafe -Path (Join-Path $run.ClusterFolder 'VDS-Portgroups.csv')
+        $portgroups = @(Get-DistributedPortgroupDetail -VCenterName $vCenterName)
+        $portgroups | Export-CsvSafe -Path (Join-Path $run.ClusterFolder 'VDS-Portgroups.csv')
 
-        Get-RecentCriticalEvents -Entity $cluster -Hours 24 |
-            Export-CsvSafe -Path (Join-Path $run.ClusterFolder 'Recent-Warnings-Errors.csv')
+        $recentEvents = @(Get-RecentCriticalEvents -Entity $cluster -Hours 24)
+        $recentEvents | Export-CsvSafe -Path (Join-Path $run.ClusterFolder 'Recent-Warnings-Errors.csv')
 
-        Get-VsanHealthSafe -Cluster $cluster |
-            Export-Clixml -Path (Join-Path $run.ClusterFolder 'vSAN-Health.xml')
+        $vsanHealth = Get-VsanHealthSafe -Cluster $cluster
+        $vsanHealth | Export-Clixml -Path (Join-Path $run.ClusterFolder 'vSAN-Health.xml')
 
-        Get-VsanResyncSafe -Cluster $cluster |
-            Export-Clixml -Path (Join-Path $run.ClusterFolder 'vSAN-Resync.xml')
+        $vsanResync = Get-VsanResyncSafe -Cluster $cluster
+        $vsanResync | Export-Clixml -Path (Join-Path $run.ClusterFolder 'vSAN-Resync.xml')
+
+        $hostRollups = [System.Collections.Generic.List[object]]::new()
 
         foreach ($hostObject in $targetHosts) {
             Write-Host "Validating host: $($hostObject.Name)" -ForegroundColor Cyan
@@ -1145,15 +1260,47 @@ function Invoke-EnvironmentValidation {
                     -NoTypeInformation `
                     -Encoding UTF8
 
+            $hostSafe = ConvertTo-SafeFileName $hostObject.Name
+
             Write-HtmlReport `
                 -Title "$($hostObject.Name) - $Mode - $clusterName" `
                 -Checks $checks `
-                -Path (
-                    Join-Path `
-                        $hostFolder `
-                        "$((ConvertTo-SafeFileName $hostObject.Name))-Report.html"
-                )
+                -Path (Join-Path $hostFolder "$hostSafe-Report.html")
+
+            $failCount = @($checks | Where-Object { $_.Result -eq 'FAIL' -or $_.Result -eq 'ERROR' }).Count
+            $warnCount = @($checks | Where-Object { $_.Result -eq 'WARN' -or $_.Result -eq 'REVIEW' }).Count
+            $passCount = @($checks | Where-Object { $_.Result -eq 'PASS' }).Count
+
+            $hostOverall = if ($failCount -gt 0) {
+                'NOT READY'
+            }
+            elseif ($warnCount -gt 0) {
+                'READY WITH WARNINGS'
+            }
+            else {
+                'READY'
+            }
+
+            $hostRollups.Add([pscustomobject]@{
+                Host           = $hostObject.Name
+                Overall        = $hostOverall
+                Pass           = $passCount
+                Warn           = $warnCount
+                Fail           = $failCount
+                ReportRelative = "Hosts/$hostSafe/$hostSafe-Report.html"
+            })
         }
+
+        Write-RunSummaryHtml `
+            -Path (Join-Path $run.RunRoot 'Index.html') `
+            -VCenter $vCenterName `
+            -Cluster $clusterName `
+            -Mode $Mode `
+            -VsanHealth $vsanHealth `
+            -VsanResync $vsanResync `
+            -PortgroupCount $portgroups.Count `
+            -EventCount $recentEvents.Count `
+            -HostRollups $hostRollups
 
         $manifest = [pscustomobject]@{
             EnvironmentKey = $EnvironmentKey
@@ -1177,6 +1324,7 @@ function Invoke-EnvironmentValidation {
         Write-Host ''
         Write-Host "Completed: $clusterName" -ForegroundColor Green
         Write-Host "Output   : $($run.RunRoot)"
+        Write-Host "Summary  : $(Join-Path $run.RunRoot 'Index.html')" -ForegroundColor Green
 
         return [pscustomobject]@{
             Environment = $EnvironmentKey
