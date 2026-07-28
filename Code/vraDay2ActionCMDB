@@ -331,6 +331,19 @@ $headers = @{
     "Content-Type" = "application/json"
 }
 
+# Build projectId -> projectName map. The deployment API frequently returns
+# projectId but a blank projectName, and the vRO actions need projectName.
+# Endpoint may differ in your environment - wrapped so a miss can't break the run.
+$projectMap = @{}
+try {
+    $projResp = Invoke-RestMethod -Uri "https://$vraServer/iaas/api/projects?`$top=1000" -Method Get -Headers $headers -TimeoutSec 60
+    foreach ($p in @($projResp.content)) { $projectMap[$p.id] = $p.name }
+    Write-Log "Loaded $($projectMap.Count) projects for id->name resolution" -Color Green
+}
+catch {
+    Write-Log "Could not load project map: $($_.Exception.Message)" -Color Yellow
+}
+
 $vmQueue = [System.Collections.Generic.List[hashtable]]::new()
 $seenVMs = [System.Collections.Generic.HashSet[string]]::new()
 $page = 0
@@ -380,11 +393,15 @@ do {
             # Dedupe: a retried or re-run page can't add the same VM twice
             if (-not $seenVMs.Add("$($dep.name)|$vmName")) { continue }
 
+            $projName = if ($dep.projectName) { $dep.projectName }
+                        elseif ($dep.projectId -and $projectMap.ContainsKey($dep.projectId)) { $projectMap[$dep.projectId] }
+                        else { "" }
+
             $vmQueue.Add(@{
                 DeploymentName = $dep.name
                 VMName = $vmName
                 ProjectId = $dep.projectId
-                ProjectName = $dep.projectName
+                ProjectName = $projName
             })
         }
     }
@@ -943,12 +960,12 @@ Write-Log "Time elapsed: $($stopwatch.Elapsed.ToString('hh\:mm\:ss'))" -Color Wh
 
 # Export results (CompareResult kept internal for console/summary; CSV uses NSXMatchCMDB)
 $exportColumns = @(
-    'DeploymentName', 'VMName', 'AppApplication', 'InfraOS', 'AppLayer', 'CMDBCI',
+    'DeploymentName', 'VMName', 'ProjectName', 'ProjectId', 'AppApplication', 'InfraOS', 'AppLayer', 'CMDBCI',
     'NSXMatchCMDB', 'AppOrSubApp', 'UpstreamToApp', 'MultipleUpstream',
     'NoUpstreamRelationship', 'Decommissioned'
 )
 $resultsPath = "$resultsDir\CMDBRelations_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
-$results | Select-Object $exportColumns | Export-Csv -Path $resultsPath -NoTypeInformation
+$results | Select-Object $exportColumns | Export-Csv -Path $resultsPath -NoTypeInformation -Encoding UTF8
 Write-Log "`nResults saved: $resultsPath" -Color White
 
 # Email report
