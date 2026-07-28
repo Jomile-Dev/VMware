@@ -228,6 +228,16 @@ function Get-VroJson {
     if ($Response.value -and $Response.value.string) { $s = $Response.value.string.value }
     elseif ($Response -is [string]) { $s = $Response }
     if ($s) { try { return ($s | ConvertFrom-Json -ErrorAction Stop) } catch { return $null } }
+    # Array return: scan each string element for one that parses as JSON
+    if ($Response.value -and $Response.value.array -and $Response.value.array.elements) {
+        foreach ($el in $Response.value.array.elements) {
+            $ev = $el.string.value
+            if ($ev -and ($ev.TrimStart().StartsWith('{'))) {
+                try { return ($ev | ConvertFrom-Json -ErrorAction Stop) } catch { }
+            }
+        }
+        return $null
+    }
     return $Response
 }
 
@@ -252,26 +262,52 @@ function Get-UpstreamCIs {
     return @($ups | Where-Object { $_ })
 }
 
-# Scrape the CI-relationship JSON object out of action run-log text and return upstreamCIs.
-# Brace-matching extraction - fragile if CI values contain literal braces.
-function Get-UpstreamCIsFromLog {
-    param($LogText)
-    if (-not $LogText) { return @() }
-    $idx = $LogText.IndexOf('"retrieveCIRelationshipInfoByKey"')
-    if ($idx -lt 0) { $idx = $LogText.IndexOf('"upstreamCIs"') }
-    if ($idx -lt 0) { return @() }
-    $start = $LogText.LastIndexOf('{', $idx)
-    if ($start -lt 0) { return @() }
+# CI-level Status values from retrieveCiInfoByKey.Information[] - this is where
+# a disposed/retired sub-app shows even when there is no upstream relationship.
+function Get-CiStatuses {
+    param($Obj)
+    if ($null -eq $Obj) { return @() }
+    $infos = @()
+    if     ($Obj.retrieveCiInfoByKey.Information) { $infos = @($Obj.retrieveCiInfoByKey.Information) }
+    elseif ($Obj.Information)                     { $infos = @($Obj.Information) }
+    return @($infos | ForEach-Object { $_.Status } | Where-Object { $_ })
+}
+
+# Extract the JSON object surrounding a marker string from log text.
+# Brace-matching - fragile if values contain literal braces.
+function Get-JsonBlockFromText {
+    param($Text, $Marker)
+    if (-not $Text) { return $null }
+    $idx = $Text.IndexOf($Marker)
+    if ($idx -lt 0) { return $null }
+    $start = $Text.LastIndexOf('{', $idx)
+    if ($start -lt 0) { return $null }
     $depth = 0; $end = -1
-    for ($i = $start; $i -lt $LogText.Length; $i++) {
-        $c = $LogText[$i]
+    for ($i = $start; $i -lt $Text.Length; $i++) {
+        $c = $Text[$i]
         if     ($c -eq '{') { $depth++ }
         elseif ($c -eq '}') { $depth--; if ($depth -eq 0) { $end = $i; break } }
     }
-    if ($end -lt 0) { return @() }
-    $json = $LogText.Substring($start, $end - $start + 1)
-    try { $obj = $json | ConvertFrom-Json -ErrorAction Stop } catch { return @() }
+    if ($end -lt 0) { return $null }
+    $json = $Text.Substring($start, $end - $start + 1)
+    try { return ($json | ConvertFrom-Json -ErrorAction Stop) } catch { return $null }
+}
+
+# From log text: upstreamCIs out of the retrieveCIRelationshipInfoByKey block.
+function Get-UpstreamCIsFromLog {
+    param($LogText)
+    $obj = Get-JsonBlockFromText -Text $LogText -Marker '"retrieveCIRelationshipInfoByKey"'
+    if (-not $obj) { $obj = Get-JsonBlockFromText -Text $LogText -Marker '"upstreamCIs"' }
+    if (-not $obj) { return @() }
     return @(Get-UpstreamCIs -Obj $obj)
+}
+
+# From log text: CI Status values out of the retrieveCiInfoByKey block.
+function Get-CiStatusesFromLog {
+    param($LogText)
+    $obj = Get-JsonBlockFromText -Text $LogText -Marker '"retrieveCiInfoByKey"'
+    if (-not $obj) { return @() }
+    return @(Get-CiStatuses -Obj $obj)
 }
 
 # Run an action (same module/name URI as everywhere else) and fetch that run's
@@ -367,6 +403,7 @@ function Invoke-CmdbReview {
     # --- Upstream relationship from returnApplicationVms (returns JSON with upstreamCIs) ---
     # Keyed on the NSX tag (applicationName, underscores -> spaces). Aggregate across tags.
     $upstreamCIs = @()
+    $ciStatuses  = @()
     $returnRaws  = @()
     foreach ($tag in $tags) {
         $appKey = $tag -replace '_', ' '
@@ -376,14 +413,20 @@ function Invoke-CmdbReview {
                 applicationName = $appKey
             }
             $returnRaws += [ordered]@{ tag = $tag; execId = $runRes.ExecId; logEndpoint = $runRes.LogEndpoint; logChars = @($runRes.LogText).Length; log = $runRes.LogText; value = $runRes.Value }
-            # Upstream data: from the run's logs, plus the return value if it ever carries it
+            # Upstream CIs: from the log's retrieveCIRelationshipInfoByKey block
+            # (falls back to the return value if it ever carries the JSON)
             $upstreamCIs += @(Get-UpstreamCIsFromLog -LogText $runRes.LogText)
             $obj = Get-VroJson -Response $runRes.Value
             $upstreamCIs += @(Get-UpstreamCIs -Obj $obj)
+            # CI Status (disposed/retired) : from retrieveCiInfoByKey.Information[]
+            # in the return AND the log - covers decomm even with no upstream
+            $ciStatuses += @(Get-CiStatuses -Obj $obj)
+            $ciStatuses += @(Get-CiStatusesFromLog -LogText $runRes.LogText)
         }
         catch { }
     }
     $upstreamCIs = @($upstreamCIs | Where-Object { $_ })
+    $ciStatuses  = @($ciStatuses  | Where-Object { $_ })
 
     $upstreamToApp = "N/A"; $multiUpstream = "No multiple upstream"; $noUpstream = "N/A"; $decomm = "N/A"
 
@@ -402,12 +445,6 @@ function Invoke-CmdbReview {
         if ($upstreamCIs.Count -gt 1) {
             $multiUpstream = "Multiple upstreams ($($upstreamCIs.Count)) - review"
         }
-
-        $statuses = @($upstreamCIs | ForEach-Object { $_.UpstreamCIStatus })
-        $decommed = @($statuses | Where-Object { $_ -match 'dispos|retire|decommission' })
-        if ($decommed.Count -gt 0) {
-            $decomm = "App/Sub-App decommissioned ($($decommed -join '; ')) - review"
-        }
     }
     elseif ($tags.Count -eq 0) {
         $noUpstream = "No CMDB relationship - add"
@@ -416,30 +453,30 @@ function Invoke-CmdbReview {
         $noUpstream = "No upstream - review/fix upstream relationship"
     }
 
+    # Decommissioned: upstream CI statuses AND the CI's own Status - so a
+    # disposed sub-app with no upstream relationship still gets flagged
+    $allStatuses = @($upstreamCIs | ForEach-Object { $_.UpstreamCIStatus }) + $ciStatuses
+    $decommed = @($allStatuses | Where-Object { $_ -match 'dispos|retire|decommission' } | Select-Object -Unique)
+    if ($decommed.Count -gt 0) {
+        $decomm = "App/Sub-App decommissioned ($($decommed -join '; ')) - review"
+    }
+
     # --- Debug dump: raw + parsed data per VM for troubleshooting ---
     if ($DebugPath) {
-        $rawGetVmApps = $null
-        try {
-            $rawGetVmApps = Invoke-VroActionRest -VraServer $VraServer -AuthToken $AuthToken -ActionUri $GetVmAppsUri -Raw -Parameters @{
-                projectName = $Vm.ProjectName
-                vmName      = $Vm.VMName
-            }
-        }
-        catch { }
         $dbg = [ordered]@{
-            VMName          = $Vm.VMName
-            ProjectName     = $Vm.ProjectName
-            Tags            = $tags
-            CagApps         = @($Catalog.Apps).Count
-            CagSubApps      = @($Catalog.SubApps).Count
-            UpstreamCount   = $upstreamCIs.Count
-            UpstreamCIs     = @($upstreamCIs | ForEach-Object {
+            VMName           = $Vm.VMName
+            ProjectName      = $Vm.ProjectName
+            Tags             = $tags
+            CagApps          = @($Catalog.Apps).Count
+            CagSubApps       = @($Catalog.SubApps).Count
+            UpstreamCount    = $upstreamCIs.Count
+            UpstreamCIs      = @($upstreamCIs | ForEach-Object {
                 @($_.PSObject.Properties | ForEach-Object { "$($_.Name) = $($_.Value)" })
             })
-            ClassFieldsRead = @($upstreamCIs | ForEach-Object { Get-FirstFieldValue -Object $_ -Fields $ClassFields })
-            Statuses        = @($upstreamCIs | ForEach-Object { $_.UpstreamCIStatus })
-            RawReturnAppVms = $returnRaws
-            RawGetVmApps    = $rawGetVmApps
+            ClassFieldsRead  = @($upstreamCIs | ForEach-Object { Get-FirstFieldValue -Object $_ -Fields $ClassFields })
+            UpstreamStatuses = @($upstreamCIs | ForEach-Object { $_.UpstreamCIStatus })
+            CiStatuses       = $ciStatuses
+            RawReturnAppVms  = $returnRaws
         }
         "==================== $($Vm.VMName) ====================" | Add-Content -Path $DebugPath -Encoding UTF8
         ($dbg | ConvertTo-Json -Depth 12) | Add-Content -Path $DebugPath -Encoding UTF8
@@ -1127,7 +1164,25 @@ Write-Log "Mismatches: $(($results | Where-Object { $_.CompareResult -eq 'Mismat
 Write-Log "Missing Data: $(($results | Where-Object { $_.CompareResult -eq 'Missing Data' }).Count)" -Color Gray
 Write-Log "Time elapsed: $($stopwatch.Elapsed.ToString('hh\:mm\:ss'))" -Color White
 
+# Normalise typographic characters that mangle in CSV (en/em dashes -> '-',
+# NBSP -> space, curly quotes -> straight) so CI names export cleanly.
+function ConvertTo-CleanText {
+    param($s)
+    if ($null -eq $s) { return $s }
+    $s = [string]$s
+    $s = $s -replace [char]0x2013, '-' -replace [char]0x2014, '-'
+    $s = $s -replace [char]0x00A0, ' '
+    $s = $s -replace [char]0x2018, "'" -replace [char]0x2019, "'"
+    $s = $s -replace [char]0x201C, '"' -replace [char]0x201D, '"'
+    return $s
+}
+
 # Export results (CompareResult kept internal for console/summary; CSV uses NSXMatchCMDB)
+foreach ($r in $results) {
+    foreach ($p in $r.PSObject.Properties) {
+        if ($p.Value -is [string]) { $p.Value = ConvertTo-CleanText $p.Value }
+    }
+}
 $exportColumns = @(
     'DeploymentName', 'VMName', 'ProjectName', 'AppApplication', 'InfraOS', 'AppLayer', 'CMDBCI',
     'NSXMatchCMDB', 'AppOrSubApp', 'UpstreamToApp', 'MultipleUpstream',
