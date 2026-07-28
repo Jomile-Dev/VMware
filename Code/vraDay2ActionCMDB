@@ -43,6 +43,9 @@ $ProbeVMName      = ""            # blank = first VM in $results
 # Review only the first N VMs (0 = all). Handy for troubleshooting.
 $ReviewLimit      = 0
 
+# Fetch only the first N deployments (0 = all). Handy for troubleshooting the fetch.
+$MaxDeployments   = 0
+
 # Per-action REST timeout (seconds) so a bad/blocked endpoint fails fast
 # instead of hanging the whole review.
 $VroTimeoutSec    = 30
@@ -348,6 +351,7 @@ $vmQueue = [System.Collections.Generic.List[hashtable]]::new()
 $seenVMs = [System.Collections.Generic.HashSet[string]]::new()
 $page = 0
 $size = 200          # smaller pages: expand=resources at size=1000 can drop the connection
+if ($MaxDeployments -gt 0 -and $MaxDeployments -lt $size) { $size = $MaxDeployments }
 $totalProcessed = 0
 $skippedCount = 0
 $maxRetries = 3
@@ -414,6 +418,10 @@ do {
         $totalProcessed -lt $response.totalElements
     } else {
         $deployments.Count -eq $size
+    }
+    if ($MaxDeployments -gt 0 -and $totalProcessed -ge $MaxDeployments) {
+        Write-Log " Reached MaxDeployments ($MaxDeployments) - stopping fetch" -Color Yellow
+        break
     }
 } while ($hasMore)
 
