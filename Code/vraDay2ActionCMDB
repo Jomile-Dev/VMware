@@ -14,15 +14,14 @@ $SMTPServer = "mail.company.com"
 $SMTPPort = 465
 $UseSSL = $true
 
-# vRO action URIs - update these to match your environment
-$showVmDetailsUri = "somethingsomething.something.wrappers/showVmDetails"
-$getVmAppsUri     = "somethingsomething.something.returns/getVmApplications"
-
-# Review-phase action URIs (module/action). These are called via the vRO
-# Action REST API (/vco/api/actions), NOT the form external-values endpoint,
-# because they are not registered form data sources.
-$getCagAppsUri    = "somethingsomething.something.returns/getCagApplications"
-$returnAppVmsUri  = "somethingsomething.something.returns/returnApplicationsVms"
+# vRO action URIs - update the base once; actions build off it.
+# The review-phase actions (getCag, returnAppVms) are called via the vRO Action
+# REST API (/vco/api/actions), not the form external-values endpoint.
+$vroBase          = "somethingsomething.something"
+$showVmDetailsUri = "$vroBase.wrappers/showVmDetails"
+$getVmAppsUri     = "$vroBase.returns/getVmApplications"
+$getCagAppsUri    = "$vroBase.returns/getCagApplications"
+$returnAppVmsUri  = "$vroBase.returns/returnApplicationsVms"
 
 # Field(s) on the upstream object that hold "Application" / "SubApplication".
 # UpstreamCIType is the current candidate; UpstreamCICMSClass is kept as a fallback.
@@ -30,6 +29,23 @@ $UpstreamClassFields = @('UpstreamCIType', 'UpstreamCICMSClass')
 
 $phasedOutEnabled = $true
 $RunReview        = $true
+
+# Replay: skip the slow deployment fetch + main runspace phase and load a prior
+# snapshot CSV straight into $results, then run the review against it.
+$ReplayFromCsv    = $false
+$ReplayCsvPath    = "C:\Logs\results_snapshot.csv"
+
+# Probe: before the full review, run ONE getVmApplications call and dump the raw
+# response, so you can confirm the /vco/api/actions endpoint works and see the shape.
+$ProbeVroActions  = $false
+$ProbeVMName      = ""            # blank = first VM in $results
+
+# Review only the first N VMs (0 = all). Handy for troubleshooting.
+$ReviewLimit      = 0
+
+# Per-action REST timeout (seconds) so a bad/blocked endpoint fails fast
+# instead of hanging the whole review.
+$VroTimeoutSec    = 30
 
 # NSX Manager Configuration (fallback for VMs with empty AppApplication)
 $NSXManager    = "nsx-manager.company.com"
@@ -81,7 +97,8 @@ function Invoke-VroActionRest {
         [string]$AuthToken,
         [string]$ActionUri,      # "module/actionName"
         [hashtable]$Parameters,
-        [switch]$Raw
+        [switch]$Raw,
+        [int]$TimeoutSec = $(if ($VroTimeoutSec) { $VroTimeoutSec } else { 30 })
     )
 
     $lastSlash  = $ActionUri.LastIndexOf('/')
@@ -106,7 +123,7 @@ function Invoke-VroActionRest {
         "Accept"        = "application/json"
     }
 
-    $resp = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body
+    $resp = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body -TimeoutSec $TimeoutSec
     if ($Raw) { return $resp }
     $v = $resp.value
     if ($null -ne $v.string) { return $v.string.value }
@@ -290,6 +307,22 @@ function Invoke-CmdbReview {
         Decommissioned         = $decomm
     }
 }
+
+if ($ReplayFromCsv) {
+    Write-Log "`n=== REPLAY MODE: loading $ReplayCsvPath ===" -Color Cyan
+    if (-not (Test-Path -LiteralPath $ReplayCsvPath)) {
+        Write-Log "Replay CSV not found: $ReplayCsvPath" -Color Red
+        return
+    }
+    $results = [System.Collections.Generic.List[object]]::new()
+    Import-Csv -LiteralPath $ReplayCsvPath | ForEach-Object { $results.Add($_) }
+    $vmQueue      = @($results)
+    $successCount = @($results).Count
+    $failCount    = 0
+    $stopwatch    = [System.Diagnostics.Stopwatch]::StartNew()
+    Write-Log "Loaded $($results.Count) rows from replay CSV" -Color Green
+}
+else {
 
 # Fetch all deployments with resources in one pass (size=1000, same as working export script)
 Write-Log "`n=== FETCHING DEPLOYMENTS ===" -Color Cyan
@@ -576,10 +609,11 @@ foreach ($job in $jobs) {
 
 if ($runspacePool) { $runspacePool.Close(); $runspacePool.Dispose() }
 $stopwatch.Stop()
+}
 
 # NSX Fallback - fill in missing AppApplication from NSX VM tags
 $missingAppVMs = @($results | Where-Object { -not $_.AppApplication })
-if ($missingAppVMs.Count -gt 0) {
+if (-not $ReplayFromCsv -and $missingAppVMs.Count -gt 0) {
     Write-Log "`n=== NSX FALLBACK: $($missingAppVMs.Count) VMs with empty AppApplication ===" -Color Cyan
 
     # NSX Auth functions (from working NSX firewall script)
@@ -795,8 +829,34 @@ if ($RunReview) {
     [System.Net.ServicePointManager]::CertificatePolicy = $null
     [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
 
+    # Probe: confirm the /vco/api/actions endpoint responds and see the raw shape
+    if ($ProbeVroActions) {
+        $probeVm = if ($ProbeVMName) { $results | Where-Object { $_.VMName -eq $ProbeVMName } | Select-Object -First 1 }
+                   else { $results | Select-Object -First 1 }
+        if ($probeVm) {
+            Write-Log " PROBE getVmApplications for $($probeVm.VMName) (project $($probeVm.ProjectName))..." -Color Yellow
+            try {
+                $probeRaw = Invoke-VroActionRest -VraServer $vraServer -AuthToken $authToken -ActionUri $getVmAppsUri -Raw -Parameters @{
+                    projectName = $probeVm.ProjectName
+                    vmName      = $probeVm.VMName
+                }
+                Write-Log ($probeRaw | ConvertTo-Json -Depth 8) -Color Gray
+            }
+            catch {
+                Write-Log " PROBE failed: $($_.Exception.Message)" -Color Red
+            }
+        }
+        Write-Log " Probe done - set `$ProbeVroActions = `$false to run the full review." -Color Yellow
+        return
+    }
+
+    $reviewSet = if ($ReviewLimit -gt 0) { @($results | Select-Object -First $ReviewLimit) } else { $results }
+    $reviewTotal = @($reviewSet).Count
+    if ($ReviewLimit -gt 0) { Write-Log " (limited to first $reviewTotal VMs)" -Color Yellow }
+
     $reviewed = 0
-    foreach ($vm in $results) {
+    foreach ($vm in $reviewSet) {
+        Write-Log " [$($reviewed + 1)/$reviewTotal] $($vm.VMName)..." -Color DarkGray
         $cat = Get-CagForProject -ProjectName $vm.ProjectName -VraServer $vraServer -AuthToken $authToken -CagUri $getCagAppsUri -PhasedOut $phasedOutEnabled
         $rev = Invoke-CmdbReview -Vm $vm -Catalog $cat -VraServer $vraServer -AuthToken $authToken -GetVmAppsUri $getVmAppsUri -ReturnAppVmsUri $returnAppVmsUri -PhasedOut $phasedOutEnabled -ClassFields $UpstreamClassFields
 
@@ -808,7 +868,7 @@ if ($RunReview) {
         Add-Member -InputObject $vm -NotePropertyName Decommissioned         -NotePropertyValue $rev.Decommissioned         -Force
 
         $reviewed++
-        if ($reviewed % 50 -eq 0) { Write-Log " Reviewed $reviewed / $($results.Count)" -Color Gray }
+        if ($reviewed % 25 -eq 0) { Write-Log " Reviewed $reviewed / $reviewTotal" -Color Gray }
     }
     Write-Log " Review complete: $reviewed VMs" -Color Green
 }
