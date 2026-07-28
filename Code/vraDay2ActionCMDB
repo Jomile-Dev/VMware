@@ -332,15 +332,31 @@ $headers = @{
 }
 
 $vmQueue = [System.Collections.Generic.List[hashtable]]::new()
+$seenVMs = [System.Collections.Generic.HashSet[string]]::new()
 $page = 0
-$size = 1000
+$size = 200          # smaller pages: expand=resources at size=1000 can drop the connection
 $totalProcessed = 0
 $skippedCount = 0
+$maxRetries = 3
 
 do {
     $uri = "https://$vraServer/deployment/api/deployments?page=$page&size=$size&expand=resources"
     Write-Log " Page $($page + 1)..." -Color Gray
-    $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers
+
+    $response = $null
+    for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
+        try {
+            $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers -TimeoutSec 120
+            break
+        }
+        catch {
+            Write-Log "  Page $($page + 1) attempt $attempt failed: $($_.Exception.Message)" -Color Yellow
+            if ($attempt -lt $maxRetries) { Start-Sleep -Seconds ($attempt * 3) }
+            else { Write-Log "  Giving up on page $($page + 1) after $maxRetries attempts - stopping fetch" -Color Red }
+        }
+    }
+    if (-not $response) { break }   # don't reprocess a stale $response from a prior page
+
     $deployments = if ($response.content) { $response.content } else { $response }
 
     foreach ($dep in $deployments) {
@@ -360,6 +376,9 @@ do {
             $vmName = if ($machine.properties.resourceName) { $machine.properties.resourceName }
                       elseif ($machine.properties.hostname) { $machine.properties.hostname }
                       else { $machine.name }
+
+            # Dedupe: a retried or re-run page can't add the same VM twice
+            if (-not $seenVMs.Add("$($dep.name)|$vmName")) { continue }
 
             $vmQueue.Add(@{
                 DeploymentName = $dep.name
