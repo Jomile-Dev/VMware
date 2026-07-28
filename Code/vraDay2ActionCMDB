@@ -329,6 +329,14 @@ function Invoke-CmdbReview {
 
     # --- Debug dump: raw + parsed data per VM for troubleshooting ---
     if ($DebugPath) {
+        $rawGetVmApps = $null
+        try {
+            $rawGetVmApps = Invoke-VroActionRest -VraServer $VraServer -AuthToken $AuthToken -ActionUri $GetVmAppsUri -Raw -Parameters @{
+                projectName = $Vm.ProjectName
+                vmName      = $Vm.VMName
+            }
+        }
+        catch { }
         $dbg = [ordered]@{
             VMName          = $Vm.VMName
             ProjectName     = $Vm.ProjectName
@@ -342,6 +350,7 @@ function Invoke-CmdbReview {
             ClassFieldsRead = @($upstreamCIs | ForEach-Object { Get-FirstFieldValue -Object $_ -Fields $ClassFields })
             Statuses        = @($upstreamCIs | ForEach-Object { $_.UpstreamCIStatus })
             RawReturnAppVms = $returnRaws
+            RawGetVmApps    = $rawGetVmApps
         }
         "==================== $($Vm.VMName) ====================" | Add-Content -Path $DebugPath -Encoding UTF8
         ($dbg | ConvertTo-Json -Depth 12) | Add-Content -Path $DebugPath -Encoding UTF8
