@@ -43,8 +43,13 @@ $ProbeVMName      = ""            # blank = first VM in $results
 # Review only the first N VMs (0 = all). Handy for troubleshooting.
 $ReviewLimit      = 0
 
-# Fetch only the first N deployments (0 = all). Handy for troubleshooting the fetch.
+# Fetch only the first N deployments that contain eligible VMs (0 = all).
+# Handy for troubleshooting - empty/deleted deployments don't count toward N.
 $MaxDeployments   = 0
+
+# Write raw + parsed vRO responses per reviewed VM to a file for troubleshooting.
+$ReviewDebug      = $false
+$ReviewDebugPath  = "C:\Logs\review_debug.txt"
 
 # Per-action REST timeout (seconds) so a bad/blocked endpoint fails fast
 # instead of hanging the whole review.
@@ -216,7 +221,7 @@ function Get-FirstFieldValue {
 
 # Build the six review fields for one VM result object
 function Invoke-CmdbReview {
-    param($Vm, $Catalog, $VraServer, $AuthToken, $GetVmAppsUri, $ReturnAppVmsUri, $PhasedOut, $ClassFields)
+    param($Vm, $Catalog, $VraServer, $AuthToken, $GetVmAppsUri, $ReturnAppVmsUri, $PhasedOut, $ClassFields, $DebugPath)
 
     $nsxMatch = switch ($Vm.CompareResult) {
         "Match"                 { "NSX tag matches CMDB" }
@@ -241,6 +246,7 @@ function Invoke-CmdbReview {
     if ($appOrSub.Count -eq 0) { $appOrSub = @("No tag") }
 
     # --- Upstream relationship from getVmApplications (array of objects, one per relationship) ---
+    $raw = $null
     $upstreams = @()
     try {
         $raw = Invoke-VroActionRest -VraServer $VraServer -AuthToken $AuthToken -ActionUri $GetVmAppsUri -Raw -Parameters @{
@@ -253,7 +259,8 @@ function Invoke-CmdbReview {
         $upstreams = @()
     }
 
-    $upstreamToApp = ""; $multiUpstream = ""; $noUpstream = ""; $decomm = ""
+    $upstreamToApp = "N/A"; $multiUpstream = "No multiple upstream"; $noUpstream = "N/A"; $decomm = "N/A"
+    $returnRaws = @()
 
     if ($upstreams.Count -gt 0) {
         $classes = @($upstreams | ForEach-Object { Get-FirstFieldValue -Object $_ -Fields $ClassFields })
@@ -273,7 +280,7 @@ function Invoke-CmdbReview {
 
         $upStatuses = @($upstreams | ForEach-Object { $_.UpstreamCIStatus })
         if ($upStatuses | Where-Object { $_ -match 'dispos|retire' }) {
-            $decomm = "Disposed/retired upstream - review"
+            $decomm = "App/Sub-App decommissioned - review"
         }
     }
     elseif ($tags.Count -eq 0) {
@@ -282,6 +289,7 @@ function Invoke-CmdbReview {
     else {
         # No relationship: fall back to returnApplicationVms by NSX tag to read disposed Status
         $noUpstream = "No upstream - review/fix upstream relationship"
+        $decommList = @()
         foreach ($tag in $tags) {
             $appKey = $tag -replace '_', ' '
             try {
@@ -291,14 +299,37 @@ function Invoke-CmdbReview {
                     vmName           = $Vm.VMName
                     phasedOutEnabled = $PhasedOut
                 }
+                $returnRaws += [ordered]@{ tag = $tag; raw = $rraw }
                 $items  = @(Get-VroObjectArray -Response $rraw)
                 $status = Get-FirstFieldValue -Object ($items | Select-Object -First 1) -Fields @('Status', 'UpstreamCIStatus')
                 if ($status -match 'dispos|retire') {
-                    $decomm = (@($decomm, "${tag}: $status - review") | Where-Object { $_ }) -join "; "
+                    $decommList += "${tag}: App/Sub-App decommissioned ($status) - review"
                 }
             }
             catch { }
         }
+        if ($decommList.Count -gt 0) { $decomm = ($decommList -join "; ") }
+    }
+
+    # --- Debug dump: raw + parsed data per VM for troubleshooting ---
+    if ($DebugPath) {
+        $dbg = [ordered]@{
+            VMName          = $Vm.VMName
+            ProjectName     = $Vm.ProjectName
+            ProjectId       = $Vm.ProjectId
+            Tags            = $tags
+            CagApps         = @($Catalog.Apps).Count
+            CagSubApps      = @($Catalog.SubApps).Count
+            UpstreamCount   = $upstreams.Count
+            UpstreamObjects = @($upstreams | ForEach-Object {
+                @($_.PSObject.Properties | ForEach-Object { "$($_.Name) = $($_.Value)" })
+            })
+            ClassFieldsRead = @($upstreams | ForEach-Object { Get-FirstFieldValue -Object $_ -Fields $ClassFields })
+            RawGetVmApps    = $raw
+            RawReturnAppVms = $returnRaws
+        }
+        "==================== $($Vm.VMName) ====================" | Add-Content -Path $DebugPath -Encoding UTF8
+        ($dbg | ConvertTo-Json -Depth 12) | Add-Content -Path $DebugPath -Encoding UTF8
     }
 
     return [PSCustomObject]@{
@@ -351,8 +382,8 @@ $vmQueue = [System.Collections.Generic.List[hashtable]]::new()
 $seenVMs = [System.Collections.Generic.HashSet[string]]::new()
 $page = 0
 $size = 200          # smaller pages: expand=resources at size=1000 can drop the connection
-if ($MaxDeployments -gt 0 -and $MaxDeployments -lt $size) { $size = $MaxDeployments }
 $totalProcessed = 0
+$deploymentsWithVMs = 0
 $skippedCount = 0
 $maxRetries = 3
 
@@ -376,6 +407,7 @@ do {
 
     $deployments = if ($response.content) { $response.content } else { $response }
 
+    $capReached = $false
     foreach ($dep in $deployments) {
         # Skip deleted/failed deployments
         if ($dep.status -and $dep.status -in @("DELETE_SUCCESSFUL", "FAILED", "DELETE_INPROGRESS")) {
@@ -386,6 +418,7 @@ do {
         $machines = @($dep.resources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" })
         if ($machines.Count -eq 0) { continue }
 
+        $addedForThisDep = 0
         foreach ($machine in $machines) {
             # Skip failed or missing VMs
             if ($machine.state -and $machine.state -notin @("OK", "STARTED", "")) { continue }
@@ -407,11 +440,25 @@ do {
                 ProjectId = $dep.projectId
                 ProjectName = $projName
             })
+            $addedForThisDep++
+        }
+
+        # Cap counts only deployments that actually contributed VMs
+        if ($addedForThisDep -gt 0) {
+            $deploymentsWithVMs++
+            if ($MaxDeployments -gt 0 -and $deploymentsWithVMs -ge $MaxDeployments) {
+                $capReached = $true
+                break
+            }
         }
     }
 
     $totalProcessed += $deployments.Count
     $page++
+    if ($capReached) {
+        Write-Log " Reached $MaxDeployments deployments with VMs - stopping fetch" -Color Yellow
+        break
+    }
     $hasMore = if ($response.totalPages) {
         $page -lt $response.totalPages
     } elseif ($response.totalElements) {
@@ -419,13 +466,9 @@ do {
     } else {
         $deployments.Count -eq $size
     }
-    if ($MaxDeployments -gt 0 -and $totalProcessed -ge $MaxDeployments) {
-        Write-Log " Reached MaxDeployments ($MaxDeployments) - stopping fetch" -Color Yellow
-        break
-    }
 } while ($hasMore)
 
-Write-Log "Scanned: $totalProcessed deployments (skipped $skippedCount deleted/failed)" -Color Cyan
+Write-Log "Scanned: $totalProcessed deployments ($deploymentsWithVMs with VMs, skipped $skippedCount deleted/failed)" -Color Cyan
 Write-Log "VMs to process: $($vmQueue.Count)" -Color Cyan
 
 # Scriptblock that runs in each runspace
@@ -543,6 +586,7 @@ $scriptBlock = {
             DeploymentName = $DeploymentName
             VMName = $VMName
             ProjectName = $ProjectName
+            ProjectId = $ProjectId
             AppApplication = $appApplication
             InfraOS = $infraOs
             AppLayer = $appLayer
@@ -556,6 +600,7 @@ $scriptBlock = {
             DeploymentName = $DeploymentName
             VMName = $VMName
             ProjectName = $ProjectName
+            ProjectId = $ProjectId
             AppApplication = ""
             InfraOS = ""
             AppLayer = ""
@@ -634,6 +679,7 @@ foreach ($job in $jobs) {
                     DeploymentName = [string]$r.DeploymentName
                     VMName = [string]$r.VMName
                     ProjectName = [string]$r.ProjectName
+                    ProjectId = [string]$r.ProjectId
                     AppApplication = [string]$r.AppApplication
                     InfraOS = [string]$r.InfraOS
                     AppLayer = [string]$r.AppLayer
@@ -932,6 +978,8 @@ if ($RunReview) {
         return
     }
 
+    if ($ReviewDebug -and (Test-Path $ReviewDebugPath)) { Remove-Item $ReviewDebugPath -Force }
+
     $reviewSet = if ($ReviewLimit -gt 0) { @($results | Select-Object -First $ReviewLimit) } else { $results }
     $reviewTotal = @($reviewSet).Count
     if ($ReviewLimit -gt 0) { Write-Log " (limited to first $reviewTotal VMs)" -Color Yellow }
@@ -940,7 +988,7 @@ if ($RunReview) {
     foreach ($vm in $reviewSet) {
         Write-Log " [$($reviewed + 1)/$reviewTotal] $($vm.VMName)..." -Color DarkGray
         $cat = Get-CagForProject -ProjectName $vm.ProjectName -VraServer $vraServer -AuthToken $authToken -CagUri $getCagAppsUri -PhasedOut $phasedOutEnabled
-        $rev = Invoke-CmdbReview -Vm $vm -Catalog $cat -VraServer $vraServer -AuthToken $authToken -GetVmAppsUri $getVmAppsUri -ReturnAppVmsUri $returnAppVmsUri -PhasedOut $phasedOutEnabled -ClassFields $UpstreamClassFields
+        $rev = Invoke-CmdbReview -Vm $vm -Catalog $cat -VraServer $vraServer -AuthToken $authToken -GetVmAppsUri $getVmAppsUri -ReturnAppVmsUri $returnAppVmsUri -PhasedOut $phasedOutEnabled -ClassFields $UpstreamClassFields -DebugPath $(if ($ReviewDebug) { $ReviewDebugPath } else { $null })
 
         Add-Member -InputObject $vm -NotePropertyName NSXMatchCMDB           -NotePropertyValue $rev.NSXMatchCMDB           -Force
         Add-Member -InputObject $vm -NotePropertyName AppOrSubApp            -NotePropertyValue $rev.AppOrSubApp            -Force
@@ -970,7 +1018,8 @@ Write-Log "Time elapsed: $($stopwatch.Elapsed.ToString('hh\:mm\:ss'))" -Color Wh
 $exportColumns = @(
     'DeploymentName', 'VMName', 'ProjectName', 'ProjectId', 'AppApplication', 'InfraOS', 'AppLayer', 'CMDBCI',
     'NSXMatchCMDB', 'AppOrSubApp', 'UpstreamToApp', 'MultipleUpstream',
-    'NoUpstreamRelationship', 'Decommissioned'
+    'NoUpstreamRelationship',
+    @{ Name = 'App/Sub-App Decommissioned'; Expression = { $_.Decommissioned } }
 )
 $resultsPath = "$resultsDir\CMDBRelations_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
 $results | Select-Object $exportColumns | Export-Csv -Path $resultsPath -NoTypeInformation -Encoding UTF8
