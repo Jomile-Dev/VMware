@@ -942,7 +942,8 @@ function Get-HostChecks {
                 $ping.Detail
             }
             else {
-                "Target=$($ping.TargetIP); Loss=$($ping.LossPercent)%"
+                "Src=$($ping.SourceVmk)($($ping.SourceIP)) -> $($ping.TargetHost)($($ping.TargetIP)); " +
+                "Sent=$($ping.Transmitted); Recv=$($ping.Received); Loss=$($ping.LossPercent)%"
             }
         })
     }
