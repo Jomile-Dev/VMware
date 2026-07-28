@@ -28,6 +28,8 @@
     PowerCLI, vCenter, ESXi, VCF, VxRail and vSAN versions in use.
 #>
 
+#requires -Version 5.1
+
 [CmdletBinding()]
 param(
     [string]$OutputRoot = 'C:\VCF-Validation',
@@ -300,6 +302,7 @@ function Get-HostSummary {
 
     foreach ($hostObject in $Hosts) {
         $view = Get-View -Id $hostObject.Id
+        $hardware = $view.Summary.Hardware
 
         [pscustomobject]@{
             Host              = $hostObject.Name
@@ -310,8 +313,10 @@ function Get-HostSummary {
             Build             = $hostObject.Build
             Manufacturer      = $hostObject.Manufacturer
             Model             = $hostObject.Model
-            CpuSockets        = $hostObject.NumCpu
-            CpuCores          = $hostObject.NumCpu * $hostObject.NumCpuCores
+            CpuModel          = $hardware.CpuModel
+            CpuSockets        = $hardware.NumCpuPkgs
+            CpuCores          = $hardware.NumCpuCores
+            CpuThreads        = $hardware.NumCpuThreads
             MemoryGB          = [math]::Round($hostObject.MemoryTotalGB, 2)
             OverallStatus     = $view.OverallStatus
             BootTime          = $view.Runtime.BootTime
@@ -465,24 +470,19 @@ function Get-DistributedPortgroupDetail {
 
     foreach ($switch in (Get-VDSwitch -Server $VCenterName | Sort-Object Name)) {
         foreach ($portgroup in (Get-VDPortgroup -VDSwitch $switch | Sort-Object Name)) {
+            $defaultPortConfig = $portgroup.ExtensionData.Config.DefaultPortConfig
+            $teaming = if ($defaultPortConfig) { $defaultPortConfig.UplinkTeamingPolicy } else { $null }
+            $portOrder = if ($teaming) { $teaming.UplinkPortOrder } else { $null }
+
             [pscustomobject]@{
                 VDSwitch      = $switch.Name
                 Portgroup     = $portgroup.Name
                 Vlan          = ($portgroup.VlanConfiguration | Out-String).Trim()
                 NumPorts      = $portgroup.NumPorts
                 PortBinding   = $portgroup.PortBinding
-                ActiveUplink  = (
-                    $portgroup.ExtensionData.Config.DefaultPortConfig.
-                        UplinkTeamingPolicy.UplinkPortOrder.ActiveUplinkPort -join ','
-                )
-                StandbyUplink = (
-                    $portgroup.ExtensionData.Config.DefaultPortConfig.
-                        UplinkTeamingPolicy.UplinkPortOrder.StandbyUplinkPort -join ','
-                )
-                LoadBalance   = (
-                    $portgroup.ExtensionData.Config.DefaultPortConfig.
-                        UplinkTeamingPolicy.Policy.Value
-                )
+                ActiveUplink  = if ($portOrder) { $portOrder.ActiveUplinkPort -join ',' } else { $null }
+                StandbyUplink = if ($portOrder) { $portOrder.StandbyUplinkPort -join ',' } else { $null }
+                LoadBalance   = if ($teaming -and $teaming.Policy) { $teaming.Policy.Value } else { $null }
             }
         }
     }
@@ -526,19 +526,36 @@ function Get-RecentCriticalEvents {
 function Get-VsanHealthSafe {
     param([Parameter(Mandatory)]$Cluster)
 
-    if (-not (Get-Command Get-VsanClusterHealth -ErrorAction SilentlyContinue)) {
+    if (-not (Get-Command Get-VsanView -ErrorAction SilentlyContinue)) {
         return [pscustomobject]@{
             Status = 'UNKNOWN'
-            Note   = 'Get-VsanClusterHealth is unavailable in the installed PowerCLI version.'
+            Note   = 'Get-VsanView is unavailable; cannot query vSAN health.'
         }
     }
 
     try {
-        return Get-VsanClusterHealth -Cluster $Cluster
+        $healthSystem = Get-VsanView -Id 'VsanVcClusterHealthSystem-vsan-cluster-health-system' -ErrorAction Stop
+        $summary = $healthSystem.VsanQueryVcClusterHealthSummary(
+            $Cluster.ExtensionData.MoRef,   # cluster MoRef
+            $null,                           # vmCreateTimeout
+            $null,                           # objUuids
+            $true,                           # includeObjUuids
+            $null,                           # fields
+            $null,                           # fetchFromCache
+            'defaultView'                    # perspective
+        )
+
+        return [pscustomobject]@{
+            Status       = $summary.OverallHealth
+            HealthGroups = (
+                @($summary.Groups) |
+                    ForEach-Object { "$($_.GroupName)=$($_.GroupHealth)" }
+            ) -join '; '
+        }
     }
     catch {
         return [pscustomobject]@{
-            Status = 'ERROR'
+            Status = 'UNKNOWN'
             Note   = $_.Exception.Message
         }
     }
@@ -547,15 +564,31 @@ function Get-VsanHealthSafe {
 function Get-VsanResyncSafe {
     param([Parameter(Mandatory)]$Cluster)
 
-    if (-not (Get-Command Get-VsanResyncingOverview -ErrorAction SilentlyContinue)) {
+    if (-not (Get-Command Get-VsanResyncingComponent -ErrorAction SilentlyContinue)) {
         return [pscustomobject]@{
             Status = 'UNKNOWN'
-            Note   = 'Get-VsanResyncingOverview is unavailable in the installed PowerCLI version.'
+            Note   = 'Get-VsanResyncingComponent is unavailable in the installed PowerCLI version.'
         }
     }
 
     try {
-        return Get-VsanResyncingOverview -Cluster $Cluster
+        $components = @(Get-VsanResyncingComponent -Cluster $Cluster -ErrorAction Stop)
+
+        if ($components.Count -eq 0) {
+            return [pscustomobject]@{
+                Status         = 'NONE'
+                ComponentCount = 0
+                Note           = 'No components are resyncing.'
+            }
+        }
+
+        $bytesLeft = ($components | Measure-Object -Property BytesLeftToSync -Sum).Sum
+
+        return [pscustomobject]@{
+            Status         = 'RESYNCING'
+            ComponentCount = $components.Count
+            GBLeftToSync   = [math]::Round((([double]$bytesLeft) / 1GB), 2)
+        }
     }
     catch {
         return [pscustomobject]@{
@@ -665,6 +698,15 @@ function Compare-CsvFile {
         }
     }
 
+    if (-not (Test-Path $CurrentFile)) {
+        return [pscustomobject]@{
+            Result     = 'WARN'
+            Object     = 'File'
+            Key        = $CurrentFile
+            Difference = 'Current file was not found.'
+        }
+    }
+
     $baseline = Import-Csv $BaselineFile
     $current = Import-Csv $CurrentFile
     $results = [System.Collections.Generic.List[object]]::new()
@@ -733,8 +775,14 @@ function Write-HtmlReport {
             default { 'warn' }
         }
 
-        "<tr class='$class'><td>$($check.Result)</td><td>$($check.Check)</td><td>$($check.Detail)</td></tr>"
+        $resultCell = [System.Net.WebUtility]::HtmlEncode([string]$check.Result)
+        $checkCell  = [System.Net.WebUtility]::HtmlEncode([string]$check.Check)
+        $detailCell = [System.Net.WebUtility]::HtmlEncode([string]$check.Detail)
+
+        "<tr class='$class'><td>$resultCell</td><td>$checkCell</td><td>$detailCell</td></tr>"
     }
+
+    $titleEncoded = [System.Net.WebUtility]::HtmlEncode([string]$Title)
 
     $overall = if ($Checks.Result -contains 'FAIL' -or $Checks.Result -contains 'ERROR') {
         'NOT READY'
@@ -751,7 +799,7 @@ function Write-HtmlReport {
 <html>
 <head>
 <meta charset="utf-8">
-<title>$Title</title>
+<title>$titleEncoded</title>
 <style>
 body { font-family: Arial, sans-serif; margin: 30px; }
 h1 { margin-bottom: 5px; }
@@ -765,7 +813,7 @@ th, td { border: 1px solid #cccccc; padding: 8px; text-align: left; }
 </style>
 </head>
 <body>
-<h1>$Title</h1>
+<h1>$titleEncoded</h1>
 <div class="summary">Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</div>
 <div class="overall">Overall result: $overall</div>
 <table>
@@ -876,20 +924,17 @@ function Get-HostChecks {
     }
 
     $resync = Get-VsanResyncSafe -Cluster $Cluster
-    $resyncText = ($resync | Out-String).Trim()
 
     $checks.Add([pscustomobject]@{
         Check  = 'vSAN resynchronisation'
-        Result = if ($resyncText -match 'ERROR') {
-            'FAIL'
+        Result = switch ($resync.Status) {
+            'NONE'      { 'PASS' }
+            'RESYNCING' { 'WARN' }
+            'ERROR'     { 'FAIL' }
+            'UNKNOWN'   { 'WARN' }
+            default     { 'REVIEW' }
         }
-        elseif ($resyncText -match 'UNKNOWN') {
-            'WARN'
-        }
-        else {
-            'REVIEW'
-        }
-        Detail = $resyncText
+        Detail = ($resync | Out-String).Trim()
     })
 
     return $checks
@@ -1149,6 +1194,10 @@ function Invoke-EnvironmentValidation {
 ###############################################################################
 # MAIN
 ###############################################################################
+
+if (-not (Get-Module -ListAvailable -Name VMware.PowerCLI)) {
+    throw 'VMware.PowerCLI was not found. Install it with: Install-Module VMware.PowerCLI -Scope CurrentUser'
+}
 
 if ($SkipCertificateCheck) {
     Set-PowerCLIConfiguration `
