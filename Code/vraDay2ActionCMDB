@@ -23,26 +23,6 @@ $getVmAppsUri     = "$vroBase.returns/getVmApplications"
 $getCagAppsUri    = "$vroBase.returns/getCagApplications"
 $returnAppVmsUri  = "$vroBase.returns/returnApplicationsVms"
 
-# returnApplicationVms action ID (the GUID in the orchestration-ui URL:
-# .../orchestration-ui/#/action/<THIS>). Used to run the action and then fetch
-# THAT run's logs over REST - same data as the GUI Logs tab.
-$ReturnAppVmsActionId = "832df2c6-81b3-45e4-91cd-405872e12248"
-
-# Upstream data lives only in returnApplicationVms's LOG output, not its return
-# value. To reach it, run a wrapper workflow that calls the action, then read the
-# workflow run log over REST and scrape the relationship JSON out of it.
-# Set $UseWorkflowLogs = $true and fill in the wrapper workflow's ID + input name.
-$UseWorkflowLogs       = $false
-$UpstreamWorkflowId    = ""                 # GUID of the wrapper workflow that calls returnApplicationVms
-$UpstreamWorkflowInput = "applicationName"  # the workflow input parameter name
-
-# SIMPLEST OPTION - no vRO changes at all: run returnApplicationVms in the vRO
-# GUI for each distinct application tag, copy the whole Logs tab text, and save
-# it as <TAG>.txt in this folder (e.g. C:\Logs\upstream\SDI21_VRA_DTA.txt).
-# The review scrapes the upstreamCIs JSON out of those files. The script prints
-# the distinct tags it needs at the start of the review so you know what to run.
-$UpstreamLogDir        = "C:\Logs\upstream"
-
 # Field(s) on the upstream object that hold "Application" / "SubApplication".
 # UpstreamCIType is the current candidate; UpstreamCICMSClass is kept as a fallback.
 $UpstreamClassFields = @('UpstreamCICMSClass', 'UpstreamCIType')
@@ -272,57 +252,7 @@ function Get-UpstreamCIs {
     return @($ups | Where-Object { $_ })
 }
 
-# Run a wrapper workflow that calls returnApplicationVms, wait for it, and return
-# its run-log text. The action's System.log output lands in the workflow log,
-# which IS retrievable over REST (unlike an action's own log).
-# NOTE: verify the syslogs response shape and the state values against your vRO.
-function Invoke-VroWorkflowLog {
-    param($VraServer, $AuthToken, $WorkflowId, $InputName, $InputValue, [int]$TimeoutSec = 120)
-
-    $headers = @{
-        "Authorization" = "Bearer $AuthToken"
-        "Content-Type"  = "application/json"
-        "Accept"        = "application/json"
-    }
-    $body = @{
-        parameters = @(
-            @{ name = $InputName; type = "string"; value = @{ string = @{ value = [string]$InputValue } } }
-        )
-    } | ConvertTo-Json -Depth 6
-
-    $startUri = "https://$VraServer/vco/api/workflows/$WorkflowId/executions"
-    $execId = $null
-    try {
-        $resp = Invoke-WebRequest -Uri $startUri -Method Post -Headers $headers -Body $body -TimeoutSec $TimeoutSec -UseBasicParsing
-        if ($resp.Headers.Location) { $execId = (($resp.Headers.Location) -split '/')[-1] }
-    }
-    catch { return $null }
-    if (-not $execId) { return $null }
-
-    $stateUri = "https://$VraServer/vco/api/workflows/$WorkflowId/executions/$execId/state"
-    $deadline = (Get-Date).AddSeconds($TimeoutSec)
-    do {
-        Start-Sleep -Milliseconds 800
-        try { $state = (Invoke-RestMethod -Uri $stateUri -Method Get -Headers $headers -TimeoutSec 30).value }
-        catch { $state = $null }
-    } while (($state -in @("running", "waiting", $null)) -and ((Get-Date) -lt $deadline))
-
-    $logUri = "https://$VraServer/vco/api/workflows/$WorkflowId/executions/$execId/syslogs?maxResult=10000"
-    try { $logResp = Invoke-RestMethod -Uri $logUri -Method Get -Headers $headers -TimeoutSec 60 }
-    catch { return $null }
-
-    $lines = @()
-    foreach ($e in @($logResp.logs)) {
-        $m = $null
-        if     ($e.entry.'long-message')  { $m = $e.entry.'long-message' }
-        elseif ($e.entry.'short-message') { $m = $e.entry.'short-message' }
-        elseif ($e.message)               { $m = $e.message }
-        if ($m) { $lines += $m }
-    }
-    return ($lines -join "`n")
-}
-
-# Scrape the CI-relationship JSON object out of workflow log text and return upstreamCIs.
+# Scrape the CI-relationship JSON object out of action run-log text and return upstreamCIs.
 # Brace-matching extraction - fragile if CI values contain literal braces.
 function Get-UpstreamCIsFromLog {
     param($LogText)
@@ -344,11 +274,14 @@ function Get-UpstreamCIsFromLog {
     return @(Get-UpstreamCIs -Obj $obj)
 }
 
-# Run an action BY ID and fetch that execution's logs - the same data the GUI
-# Logs tab shows. Tries the known log endpoint patterns and records which one
-# answered (see .LogEndpoint in the debug output).
+# Run an action (same module/name URI as everywhere else) and fetch that run's
+# logs - the same data the GUI Logs tab shows. Also returns the action's value.
 function Invoke-VroActionWithLogs {
-    param($VraServer, $AuthToken, $ActionId, [hashtable]$Parameters, [int]$TimeoutSec = 60)
+    param($VraServer, $AuthToken, $ActionUri, [hashtable]$Parameters, [int]$TimeoutSec = 60)
+
+    $lastSlash  = $ActionUri.LastIndexOf('/')
+    $module     = $ActionUri.Substring(0, $lastSlash)
+    $actionName = $ActionUri.Substring($lastSlash + 1)
 
     $headers = @{
         "Authorization" = "Bearer $AuthToken"
@@ -362,10 +295,10 @@ function Invoke-VroActionWithLogs {
     }
     $body = @{ parameters = @($paramList) } | ConvertTo-Json -Depth 6
 
-    $runUri = "https://$VraServer/vco/api/actions/$ActionId/executions"
+    $base   = "https://$VraServer/vco/api/actions/$module/$actionName"
     $execId = $null; $value = $null
     try {
-        $resp = Invoke-WebRequest -Uri $runUri -Method Post -Headers $headers -Body $body -TimeoutSec $TimeoutSec -UseBasicParsing
+        $resp = Invoke-WebRequest -Uri "$base/executions" -Method Post -Headers $headers -Body $body -TimeoutSec $TimeoutSec -UseBasicParsing
         if ($resp.Headers.Location) { $execId = ([string]$resp.Headers.Location).TrimEnd('/').Split('/')[-1] }
         if ($resp.Content) {
             try {
@@ -381,9 +314,8 @@ function Invoke-VroActionWithLogs {
     $logText = ""; $usedEndpoint = "none"
     if ($execId) {
         $candidates = @(
-            "https://$VraServer/vco/api/actions/$ActionId/executions/$execId/syslogs?maxResult=10000",
-            "https://$VraServer/vco/api/actions/$ActionId/executions/$execId/logs?maxResult=10000",
-            "https://$VraServer/vco/api/actions/$ActionId/executions/$execId/syslogs/last?maxResult=10000"
+            "$base/executions/$execId/syslogs?maxResult=10000",
+            "$base/executions/$execId/logs?maxResult=10000"
         )
         foreach ($cand in $candidates) {
             try {
@@ -408,7 +340,7 @@ function Invoke-VroActionWithLogs {
 
 # Build the six review fields for one VM result object
 function Invoke-CmdbReview {
-    param($Vm, $Catalog, $VraServer, $AuthToken, $GetVmAppsUri, $ReturnAppVmsUri, $PhasedOut, $ClassFields, $DebugPath, $UseWorkflowLogs, $WorkflowId, $WorkflowInput, $LogDir, $ActionId)
+    param($Vm, $Catalog, $VraServer, $AuthToken, $ReturnAppVmsUri, $PhasedOut, $ClassFields, $DebugPath)
 
     $nsxMatch = switch ($Vm.CompareResult) {
         "Match"                 { "NSX tag matches CMDB" }
@@ -439,39 +371,15 @@ function Invoke-CmdbReview {
     foreach ($tag in $tags) {
         $appKey = $tag -replace '_', ' '
         try {
-            # 1) PRIMARY: run the action by ID and read THAT run's logs (GUI Logs tab data)
-            if ($ActionId) {
-                $runRes = Invoke-VroActionWithLogs -VraServer $VraServer -AuthToken $AuthToken -ActionId $ActionId -Parameters @{
-                    applicationName = $appKey
-                }
-                $returnRaws += [ordered]@{ tag = $tag; source = "action-logs"; execId = $runRes.ExecId; logEndpoint = $runRes.LogEndpoint; logChars = @($runRes.LogText).Length; log = $runRes.LogText }
-                $upstreamCIs += @(Get-UpstreamCIsFromLog -LogText $runRes.LogText)
+            # One call: runs returnApplicationVms and grabs that run's logs too
+            $runRes = Invoke-VroActionWithLogs -VraServer $VraServer -AuthToken $AuthToken -ActionUri $ReturnAppVmsUri -Parameters @{
+                applicationName = $appKey
             }
-            # 2) Local log file saved from the vRO GUI Logs tab (per tag)
-            elseif ($LogDir -and ((Test-Path -LiteralPath "$LogDir\$tag.txt") -or (Test-Path -LiteralPath "$LogDir\$appKey.txt"))) {
-                $logFile = if (Test-Path -LiteralPath "$LogDir\$tag.txt") { "$LogDir\$tag.txt" } else { "$LogDir\$appKey.txt" }
-                $logText = Get-Content -LiteralPath $logFile -Raw
-                $returnRaws += [ordered]@{ tag = $tag; source = "file:$logFile"; logChars = @($logText).Length }
-                $upstreamCIs += @(Get-UpstreamCIsFromLog -LogText $logText)
-            }
-            # 3) Wrapper workflow run + workflow log over REST (if one exists)
-            elseif ($UseWorkflowLogs -and $WorkflowId) {
-                $logText = Invoke-VroWorkflowLog -VraServer $VraServer -AuthToken $AuthToken -WorkflowId $WorkflowId -InputName $WorkflowInput -InputValue $appKey
-                $returnRaws += [ordered]@{ tag = $tag; source = "workflow"; logChars = @($logText).Length; log = $logText }
-                $upstreamCIs += @(Get-UpstreamCIsFromLog -LogText $logText)
-            }
-            # 4) Action REST return (known to lack upstreamCIs - kept as last resort)
-            else {
-                $rraw = Invoke-VroActionRest -VraServer $VraServer -AuthToken $AuthToken -ActionUri $ReturnAppVmsUri -Raw -Parameters @{
-                    applicationName  = $appKey
-                    projectName      = $Vm.ProjectName
-                    vmName           = $Vm.VMName
-                    phasedOutEnabled = $PhasedOut
-                }
-                $returnRaws += [ordered]@{ tag = $tag; source = "action-rest"; raw = $rraw }
-                $obj = Get-VroJson -Response $rraw
-                $upstreamCIs += @(Get-UpstreamCIs -Obj $obj)
-            }
+            $returnRaws += [ordered]@{ tag = $tag; execId = $runRes.ExecId; logEndpoint = $runRes.LogEndpoint; logChars = @($runRes.LogText).Length; log = $runRes.LogText; value = $runRes.Value }
+            # Upstream data: from the run's logs, plus the return value if it ever carries it
+            $upstreamCIs += @(Get-UpstreamCIsFromLog -LogText $runRes.LogText)
+            $obj = Get-VroJson -Response $runRes.Value
+            $upstreamCIs += @(Get-UpstreamCIs -Obj $obj)
         }
         catch { }
     }
@@ -1185,19 +1093,6 @@ if ($RunReview) {
 
     if ($ReviewDebug -and (Test-Path $ReviewDebugPath)) { Remove-Item $ReviewDebugPath -Force }
 
-    # List the distinct application tags the review needs, and whether a saved
-    # log file exists for each in $UpstreamLogDir (run the action in the vRO GUI
-    # for the missing ones and save the Logs text as <TAG>.txt).
-    $distinctTags = @($results | ForEach-Object { $_.AppApplication -split ";\s*" } | Where-Object { $_ } | Sort-Object -Unique)
-    if ($distinctTags.Count -gt 0) {
-        Write-Log " Distinct application tags needed: $($distinctTags.Count)" -Color Cyan
-        foreach ($t in $distinctTags) {
-            $have = (Test-Path -LiteralPath "$UpstreamLogDir\$t.txt") -or (Test-Path -LiteralPath "$UpstreamLogDir\$($t -replace '_', ' ').txt")
-            if ($have) { Write-Log "  [have] $t" -Color Green }
-            else       { Write-Log "  [need] $t  -> save Logs as $UpstreamLogDir\$t.txt" -Color Yellow }
-        }
-    }
-
     $reviewSet = if ($ReviewLimit -gt 0) { @($results | Select-Object -First $ReviewLimit) } else { $results }
     $reviewTotal = @($reviewSet).Count
     if ($ReviewLimit -gt 0) { Write-Log " (limited to first $reviewTotal VMs)" -Color Yellow }
@@ -1206,7 +1101,7 @@ if ($RunReview) {
     foreach ($vm in $reviewSet) {
         Write-Log " [$($reviewed + 1)/$reviewTotal] $($vm.VMName)..." -Color DarkGray
         $cat = Get-CagForProject -ProjectName $vm.ProjectName -VraServer $vraServer -AuthToken $authToken -CagUri $getCagAppsUri -PhasedOut $phasedOutEnabled
-        $rev = Invoke-CmdbReview -Vm $vm -Catalog $cat -VraServer $vraServer -AuthToken $authToken -GetVmAppsUri $getVmAppsUri -ReturnAppVmsUri $returnAppVmsUri -PhasedOut $phasedOutEnabled -ClassFields $UpstreamClassFields -DebugPath $(if ($ReviewDebug) { $ReviewDebugPath } else { $null }) -UseWorkflowLogs $UseWorkflowLogs -WorkflowId $UpstreamWorkflowId -WorkflowInput $UpstreamWorkflowInput -LogDir $UpstreamLogDir -ActionId $ReturnAppVmsActionId
+        $rev = Invoke-CmdbReview -Vm $vm -Catalog $cat -VraServer $vraServer -AuthToken $authToken -ReturnAppVmsUri $returnAppVmsUri -PhasedOut $phasedOutEnabled -ClassFields $UpstreamClassFields -DebugPath $(if ($ReviewDebug) { $ReviewDebugPath } else { $null })
 
         Add-Member -InputObject $vm -NotePropertyName NSXMatchCMDB           -NotePropertyValue $rev.NSXMatchCMDB           -Force
         Add-Member -InputObject $vm -NotePropertyName AppOrSubApp            -NotePropertyValue $rev.AppOrSubApp            -Force
