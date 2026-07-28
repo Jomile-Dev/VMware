@@ -25,7 +25,7 @@ $returnAppVmsUri  = "$vroBase.returns/returnApplicationsVms"
 
 # Field(s) on the upstream object that hold "Application" / "SubApplication".
 # UpstreamCIType is the current candidate; UpstreamCICMSClass is kept as a fallback.
-$UpstreamClassFields = @('UpstreamCIType', 'UpstreamCICMSClass')
+$UpstreamClassFields = @('UpstreamCICMSClass', 'UpstreamCIType')
 
 $phasedOutEnabled = $true
 $RunReview        = $true
@@ -219,6 +219,36 @@ function Get-FirstFieldValue {
     return ""
 }
 
+# Unwrap a returnApplicationVms REST response to a JSON object.
+# The action returns a JSON string (vRO envelope at value.string.value); ConvertFrom-Json it.
+function Get-VroJson {
+    param($Response)
+    if ($null -eq $Response) { return $null }
+    $s = $null
+    if ($Response.value -and $Response.value.string) { $s = $Response.value.string.value }
+    elseif ($Response -is [string]) { $s = $Response }
+    if ($s) { try { return ($s | ConvertFrom-Json -ErrorAction Stop) } catch { return $null } }
+    return $Response
+}
+
+# Pull the upstreamCIs array out of a parsed returnApplicationVms object,
+# handling retrieveCiInfoByKey.Information[] nesting or a flatter shape.
+function Get-UpstreamCIs {
+    param($Obj)
+    if ($null -eq $Obj) { return @() }
+    $ups = @()
+    if ($Obj.retrieveCiInfoByKey.Information) {
+        foreach ($info in @($Obj.retrieveCiInfoByKey.Information)) { $ups += @($info.upstreamCIs) }
+    }
+    elseif ($Obj.Information) {
+        foreach ($info in @($Obj.Information)) { $ups += @($info.upstreamCIs) }
+    }
+    elseif ($Obj.upstreamCIs) {
+        $ups += @($Obj.upstreamCIs)
+    }
+    return @($ups | Where-Object { $_ })
+}
+
 # Build the six review fields for one VM result object
 function Invoke-CmdbReview {
     param($Vm, $Catalog, $VraServer, $AuthToken, $GetVmAppsUri, $ReturnAppVmsUri, $PhasedOut, $ClassFields, $DebugPath)
@@ -245,70 +275,56 @@ function Invoke-CmdbReview {
     }
     if ($appOrSub.Count -eq 0) { $appOrSub = @("No tag") }
 
-    # --- Upstream relationship from getVmApplications (array of objects, one per relationship) ---
-    $raw = $null
-    $upstreams = @()
-    try {
-        $raw = Invoke-VroActionRest -VraServer $VraServer -AuthToken $AuthToken -ActionUri $GetVmAppsUri -Raw -Parameters @{
-            projectName = $Vm.ProjectName
-            vmName      = $Vm.VMName
+    # --- Upstream relationship from returnApplicationVms (returns JSON with upstreamCIs) ---
+    # Keyed on the NSX tag (applicationName, underscores -> spaces). Aggregate across tags.
+    $upstreamCIs = @()
+    $returnRaws  = @()
+    foreach ($tag in $tags) {
+        $appKey = $tag -replace '_', ' '
+        try {
+            $rraw = Invoke-VroActionRest -VraServer $VraServer -AuthToken $AuthToken -ActionUri $ReturnAppVmsUri -Raw -Parameters @{
+                applicationName  = $appKey
+                projectName      = $Vm.ProjectName
+                vmName           = $Vm.VMName
+                phasedOutEnabled = $PhasedOut
+            }
+            $returnRaws += [ordered]@{ tag = $tag; raw = $rraw }
+            $obj = Get-VroJson -Response $rraw
+            $upstreamCIs += @(Get-UpstreamCIs -Obj $obj)
         }
-        $upstreams = @(Get-VroObjectArray -Response $raw)
+        catch { }
     }
-    catch {
-        $upstreams = @()
-    }
+    $upstreamCIs = @($upstreamCIs | Where-Object { $_ })
 
     $upstreamToApp = "N/A"; $multiUpstream = "No multiple upstream"; $noUpstream = "N/A"; $decomm = "N/A"
-    $returnRaws = @()
 
-    if ($upstreams.Count -gt 0) {
-        $classes = @($upstreams | ForEach-Object { Get-FirstFieldValue -Object $_ -Fields $ClassFields })
+    if ($upstreamCIs.Count -gt 0) {
+        $classes = @($upstreamCIs | ForEach-Object { Get-FirstFieldValue -Object $_ -Fields $ClassFields })
         if ($classes -contains "Application") {
             $upstreamToApp = "Upstream to Application"
         }
-        elseif ($classes | Where-Object { $_ -match 'sub' }) {
+        elseif ($classes -contains "SubApplication") {
             $upstreamToApp = "Upstream is Sub-Application - review upstream relationship"
         }
         else {
-            $upstreamToApp = "Upstream class unknown - review"
+            $upstreamToApp = "Upstream class unknown ($($classes -join ',')) - review"
         }
 
-        if ($upstreams.Count -gt 1) {
-            $multiUpstream = "Multiple upstreams ($($upstreams.Count)) - review"
+        if ($upstreamCIs.Count -gt 1) {
+            $multiUpstream = "Multiple upstreams ($($upstreamCIs.Count)) - review"
         }
 
-        $upStatuses = @($upstreams | ForEach-Object { $_.UpstreamCIStatus })
-        if ($upStatuses | Where-Object { $_ -match 'dispos|retire' }) {
-            $decomm = "App/Sub-App decommissioned - review"
+        $statuses = @($upstreamCIs | ForEach-Object { $_.UpstreamCIStatus })
+        $decommed = @($statuses | Where-Object { $_ -match 'dispos|retire|decommission' })
+        if ($decommed.Count -gt 0) {
+            $decomm = "App/Sub-App decommissioned ($($decommed -join '; ')) - review"
         }
     }
     elseif ($tags.Count -eq 0) {
         $noUpstream = "No CMDB relationship - add"
     }
     else {
-        # No relationship: fall back to returnApplicationVms by NSX tag to read disposed Status
         $noUpstream = "No upstream - review/fix upstream relationship"
-        $decommList = @()
-        foreach ($tag in $tags) {
-            $appKey = $tag -replace '_', ' '
-            try {
-                $rraw = Invoke-VroActionRest -VraServer $VraServer -AuthToken $AuthToken -ActionUri $ReturnAppVmsUri -Raw -Parameters @{
-                    applicationName  = $appKey
-                    projectName      = $Vm.ProjectName
-                    vmName           = $Vm.VMName
-                    phasedOutEnabled = $PhasedOut
-                }
-                $returnRaws += [ordered]@{ tag = $tag; raw = $rraw }
-                $items  = @(Get-VroObjectArray -Response $rraw)
-                $status = Get-FirstFieldValue -Object ($items | Select-Object -First 1) -Fields @('Status', 'UpstreamCIStatus')
-                if ($status -match 'dispos|retire') {
-                    $decommList += "${tag}: App/Sub-App decommissioned ($status) - review"
-                }
-            }
-            catch { }
-        }
-        if ($decommList.Count -gt 0) { $decomm = ($decommList -join "; ") }
     }
 
     # --- Debug dump: raw + parsed data per VM for troubleshooting ---
@@ -316,16 +332,15 @@ function Invoke-CmdbReview {
         $dbg = [ordered]@{
             VMName          = $Vm.VMName
             ProjectName     = $Vm.ProjectName
-            ProjectId       = $Vm.ProjectId
             Tags            = $tags
             CagApps         = @($Catalog.Apps).Count
             CagSubApps      = @($Catalog.SubApps).Count
-            UpstreamCount   = $upstreams.Count
-            UpstreamObjects = @($upstreams | ForEach-Object {
+            UpstreamCount   = $upstreamCIs.Count
+            UpstreamCIs     = @($upstreamCIs | ForEach-Object {
                 @($_.PSObject.Properties | ForEach-Object { "$($_.Name) = $($_.Value)" })
             })
-            ClassFieldsRead = @($upstreams | ForEach-Object { Get-FirstFieldValue -Object $_ -Fields $ClassFields })
-            RawGetVmApps    = $raw
+            ClassFieldsRead = @($upstreamCIs | ForEach-Object { Get-FirstFieldValue -Object $_ -Fields $ClassFields })
+            Statuses        = @($upstreamCIs | ForEach-Object { $_.UpstreamCIStatus })
             RawReturnAppVms = $returnRaws
         }
         "==================== $($Vm.VMName) ====================" | Add-Content -Path $DebugPath -Encoding UTF8
