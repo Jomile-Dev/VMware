@@ -329,15 +329,17 @@ function Get-PhysicalNicDetail {
 
     foreach ($hostObject in $Hosts) {
         foreach ($nic in (Get-VMHostNetworkAdapter -VMHost $hostObject -Physical | Sort-Object Name)) {
+            $link = $nic.ExtensionData.LinkSpeed
+
             [pscustomobject]@{
                 Host       = $hostObject.Name
                 Device     = $nic.Name
                 Mac        = $nic.Mac
-                LinkUp     = $null -ne $nic.LinkSpeed
-                SpeedMb    = if ($nic.LinkSpeed) { $nic.LinkSpeed.SpeedMb } else { $null }
-                FullDuplex = if ($nic.LinkSpeed) { $nic.LinkSpeed.Duplex } else { $null }
+                LinkUp     = $null -ne $link
+                SpeedMb    = if ($link) { $link.SpeedMb } else { $null }
+                FullDuplex = if ($link) { $link.Duplex } else { $null }
                 Driver     = $nic.ExtensionData.Driver
-                Pci        = $nic.Pci
+                Pci        = $nic.ExtensionData.Pci
             }
         }
     }
@@ -354,6 +356,8 @@ function Get-PhysicalNicNeighbor {
             $hint = $hints |
                 Where-Object Device -eq $nic.Name |
                 Select-Object -First 1
+
+            $link = $nic.ExtensionData.LinkSpeed
 
             $protocol = 'NONE_DETECTED'
             $systemName = $null
@@ -409,8 +413,8 @@ function Get-PhysicalNicNeighbor {
                 Host              = $hostObject.Name
                 Pnic              = $nic.Name
                 Mac               = $nic.Mac
-                LinkUp            = $null -ne $nic.LinkSpeed
-                SpeedMb           = if ($nic.LinkSpeed) { $nic.LinkSpeed.SpeedMb } else { $null }
+                LinkUp            = $null -ne $link
+                SpeedMb           = if ($link) { $link.SpeedMb } else { $null }
                 DiscoveryProtocol = $protocol
                 SwitchSystemName  = $systemName
                 SwitchDeviceId    = $deviceId
@@ -436,7 +440,6 @@ function Get-VmkDetail {
                 IP             = $vmk.IP
                 SubnetMask     = $vmk.SubnetMask
                 Mtu            = $vmk.Mtu
-                Enabled        = $vmk.Enabled
                 VMotionEnabled = $vmk.VMotionEnabled
                 VsanEnabled    = $vmk.VsanTrafficEnabled
                 Management     = $vmk.ManagementTrafficEnabled
@@ -644,11 +647,32 @@ function Test-VsanVmkConnectivity {
         try {
             $result = $esxcli.network.diag.ping.Invoke($arguments)
 
-            $lossPercent = if ($result.Transmitted -gt 0) {
-                [math]::Round(
-                    (1 - ($result.Received / $result.Transmitted)) * 100,
-                    2
-                )
+            $summary = if ($result.PSObject.Properties['Summary'] -and $result.Summary) {
+                $result.Summary
+            }
+            else {
+                $result
+            }
+
+            $transmitted = if ($summary.PSObject.Properties['Transmitted']) {
+                [int]$summary.Transmitted
+            }
+            else {
+                0
+            }
+
+            $received = if ($summary.PSObject.Properties['Received']) {
+                [int]$summary.Received
+            }
+            elseif ($summary.PSObject.Properties['Recieved']) {
+                [int]$summary.Recieved
+            }
+            else {
+                0
+            }
+
+            $lossPercent = if ($transmitted -gt 0) {
+                [math]::Round((1 - ($received / $transmitted)) * 100, 2)
             }
             else {
                 100
@@ -660,8 +684,8 @@ function Test-VsanVmkConnectivity {
                 SourceIP    = $sourceVmk.IP
                 TargetHost  = $targetHost.Name
                 TargetIP    = $targetVmk.IP
-                Received    = $result.Received
-                Transmitted = $result.Transmitted
+                Received    = $received
+                Transmitted = $transmitted
                 LossPercent = $lossPercent
                 Result      = if ($lossPercent -eq 0) { 'PASS' } else { 'FAIL' }
                 Detail      = $null
