@@ -853,19 +853,57 @@ if ($RunReview) {
         $probeVm = if ($ProbeVMName) { $results | Where-Object { $_.VMName -eq $ProbeVMName } | Select-Object -First 1 }
                    else { $results | Select-Object -First 1 }
         if ($probeVm) {
-            Write-Log " PROBE getVmApplications for $($probeVm.VMName) (project $($probeVm.ProjectName))..." -Color Yellow
+            Write-Log " ===== PROBE: $($probeVm.VMName) | project $($probeVm.ProjectName) | tags '$($probeVm.AppApplication)' =====" -Color Yellow
+
+            # 1) getCagApplications - does the catalogue return anything, and how does it parse?
+            Write-Log "`n --- getCagApplications (raw) ---" -Color Yellow
             try {
-                $probeRaw = Invoke-VroActionRest -VraServer $vraServer -AuthToken $authToken -ActionUri $getVmAppsUri -Raw -Parameters @{
+                $cagRaw = Invoke-VroActionRest -VraServer $vraServer -AuthToken $authToken -ActionUri $getCagAppsUri -Parameters @{
+                    projectName      = $probeVm.ProjectName
+                    phasedOutEnabled = $phasedOutEnabled
+                }
+                Write-Log ($cagRaw | ConvertTo-Json -Depth 8) -Color Gray
+                $cagCat = Get-CagCatalog -RawArray $cagRaw
+                Write-Log " Parsed CAG -> Apps: $($cagCat.Apps.Count), SubApps: $($cagCat.SubApps.Count)" -Color Cyan
+                Write-Log ("  Apps sample:    " + (($cagCat.Apps    | Select-Object -First 5) -join ' | ')) -Color Gray
+                Write-Log ("  SubApps sample: " + (($cagCat.SubApps | Select-Object -First 5) -join ' | ')) -Color Gray
+            }
+            catch { Write-Log " getCagApplications failed: $($_.Exception.Message)" -Color Red }
+
+            # 2) getVmApplications - raw shape AND the real property names on each object
+            Write-Log "`n --- getVmApplications (raw) ---" -Color Yellow
+            try {
+                $vmRaw = Invoke-VroActionRest -VraServer $vraServer -AuthToken $authToken -ActionUri $getVmAppsUri -Raw -Parameters @{
                     projectName = $probeVm.ProjectName
                     vmName      = $probeVm.VMName
                 }
-                Write-Log ($probeRaw | ConvertTo-Json -Depth 8) -Color Gray
+                Write-Log ($vmRaw | ConvertTo-Json -Depth 10) -Color Gray
+                $objs = @(Get-VroObjectArray -Response $vmRaw)
+                Write-Log " Parsed objects: $($objs.Count)" -Color Cyan
+                if ($objs.Count -gt 0) {
+                    Write-Log ("  Property names on object[0]: " + (($objs[0].PSObject.Properties.Name) -join ', ')) -Color Green
+                    Write-Log ($objs[0] | ConvertTo-Json -Depth 6) -Color Gray
+                }
             }
-            catch {
-                Write-Log " PROBE failed: $($_.Exception.Message)" -Color Red
+            catch { Write-Log " getVmApplications failed: $($_.Exception.Message)" -Color Red }
+
+            # 3) returnApplicationVms - raw shape for the first tag
+            $firstTag = ($probeVm.AppApplication -split ";\s*" | Where-Object { $_ } | Select-Object -First 1)
+            if ($firstTag) {
+                Write-Log "`n --- returnApplicationVms (raw) for tag '$firstTag' ---" -Color Yellow
+                try {
+                    $rRaw = Invoke-VroActionRest -VraServer $vraServer -AuthToken $authToken -ActionUri $returnAppVmsUri -Raw -Parameters @{
+                        applicationName  = ($firstTag -replace '_', ' ')
+                        projectName      = $probeVm.ProjectName
+                        vmName           = $probeVm.VMName
+                        phasedOutEnabled = $phasedOutEnabled
+                    }
+                    Write-Log ($rRaw | ConvertTo-Json -Depth 10) -Color Gray
+                }
+                catch { Write-Log " returnApplicationVms failed: $($_.Exception.Message)" -Color Red }
             }
         }
-        Write-Log " Probe done - set `$ProbeVroActions = `$false to run the full review." -Color Yellow
+        Write-Log "`n Probe done - set `$ProbeVroActions = `$false to run the full review." -Color Yellow
         return
     }
 
