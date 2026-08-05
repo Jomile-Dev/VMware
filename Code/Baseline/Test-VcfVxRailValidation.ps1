@@ -601,6 +601,31 @@ function Get-VsanResyncSafe {
     }
 }
 
+function Get-IPv4Network {
+    param(
+        [string]$IPAddress,
+        [string]$SubnetMask
+    )
+
+    if ([string]::IsNullOrWhiteSpace($IPAddress) -or [string]::IsNullOrWhiteSpace($SubnetMask)) {
+        return $null
+    }
+
+    try {
+        $ipBytes   = ([System.Net.IPAddress]::Parse($IPAddress)).GetAddressBytes()
+        $maskBytes = ([System.Net.IPAddress]::Parse($SubnetMask)).GetAddressBytes()
+
+        $networkBytes = for ($index = 0; $index -lt 4; $index++) {
+            $ipBytes[$index] -band $maskBytes[$index]
+        }
+
+        return ($networkBytes -join '.')
+    }
+    catch {
+        return $null
+    }
+}
+
 function Test-VsanVmkConnectivity {
     param(
         [Parameter(Mandatory)]$SourceHost,
@@ -608,11 +633,13 @@ function Test-VsanVmkConnectivity {
         [int]$PingCount = 5
     )
 
-    $sourceVmk = Get-VMHostNetworkAdapter -VMHost $SourceHost -VMKernel |
-        Where-Object VsanTrafficEnabled |
-        Select-Object -First 1
+    $sourceVmks = @(
+        Get-VMHostNetworkAdapter -VMHost $SourceHost -VMKernel |
+            Where-Object VsanTrafficEnabled |
+            Sort-Object Name
+    )
 
-    if (-not $sourceVmk) {
+    if ($sourceVmks.Count -eq 0) {
         return [pscustomobject]@{
             SourceHost = $SourceHost.Name
             Result     = 'FAIL'
@@ -623,11 +650,13 @@ function Test-VsanVmkConnectivity {
     $esxcli = Get-EsxCli -VMHost $SourceHost -V2
 
     foreach ($targetHost in ($AllHosts | Where-Object Name -ne $SourceHost.Name)) {
-        $targetVmk = Get-VMHostNetworkAdapter -VMHost $targetHost -VMKernel |
-            Where-Object VsanTrafficEnabled |
-            Select-Object -First 1
+        $targetVmks = @(
+            Get-VMHostNetworkAdapter -VMHost $targetHost -VMKernel |
+                Where-Object VsanTrafficEnabled |
+                Sort-Object Name
+        )
 
-        if (-not $targetVmk) {
+        if ($targetVmks.Count -eq 0) {
             [pscustomobject]@{
                 SourceHost = $SourceHost.Name
                 TargetHost = $targetHost.Name
@@ -636,6 +665,40 @@ function Test-VsanVmkConnectivity {
             }
 
             continue
+        }
+
+        # Pair a source and target vSAN VMkernel that share an IP subnet.
+        # When more than one vSAN subnet is present (for example a stretched
+        # cluster), pinging across subnets tests a path that is not expected
+        # to succeed and would report a misleading failure.
+        $sourceVmk  = $null
+        $targetVmk  = $null
+        $sameSubnet = $false
+
+        foreach ($candidateSource in $sourceVmks) {
+            $sourceNetwork = Get-IPv4Network -IPAddress $candidateSource.IP -SubnetMask $candidateSource.SubnetMask
+
+            if ($null -eq $sourceNetwork) {
+                continue
+            }
+
+            $candidateTarget = $targetVmks |
+                Where-Object {
+                    (Get-IPv4Network -IPAddress $_.IP -SubnetMask $_.SubnetMask) -eq $sourceNetwork
+                } |
+                Select-Object -First 1
+
+            if ($candidateTarget) {
+                $sourceVmk  = $candidateSource
+                $targetVmk  = $candidateTarget
+                $sameSubnet = $true
+                break
+            }
+        }
+
+        if (-not $sourceVmk) {
+            $sourceVmk = $sourceVmks[0]
+            $targetVmk = $targetVmks[0]
         }
 
         $arguments = $esxcli.network.diag.ping.CreateArgs()
@@ -690,6 +753,28 @@ function Test-VsanVmkConnectivity {
                 100
             }
 
+            $pingResult = if ($transmitted -eq 0 -or $lossPercent -ne 0) {
+                'FAIL'
+            }
+            else {
+                'PASS'
+            }
+
+            $pingDetail = if ($transmitted -eq 0) {
+                "Src=$($sourceVmk.Name)($($sourceVmk.IP)) -> $($targetHost.Name)($($targetVmk.IP)); " +
+                "Sent=0; Recv=0; Loss=100%; " +
+                "NOTE=interface transmitted 0 packets - no egress on $($sourceVmk.Name) " +
+                "(check the uplink link state for this vSAN portgroup and the vSAN netstack)"
+            }
+            elseif (-not $sameSubnet) {
+                "Src=$($sourceVmk.Name)($($sourceVmk.IP)) -> $($targetHost.Name)($($targetVmk.IP)); " +
+                "Sent=$transmitted; Recv=$received; Loss=$lossPercent%; " +
+                "NOTE=source and target vSAN VMkernel are on different subnets"
+            }
+            else {
+                $null
+            }
+
             [pscustomobject]@{
                 SourceHost  = $SourceHost.Name
                 SourceVmk   = $sourceVmk.Name
@@ -699,8 +784,8 @@ function Test-VsanVmkConnectivity {
                 Received    = $received
                 Transmitted = $transmitted
                 LossPercent = $lossPercent
-                Result      = if ($lossPercent -eq 0) { 'PASS' } else { 'FAIL' }
-                Detail      = $null
+                Result      = $pingResult
+                Detail      = $pingDetail
             }
         }
         catch {
@@ -808,6 +893,7 @@ function Write-HtmlReport {
             'PASS' { 'pass' }
             'FAIL' { 'fail' }
             'ERROR' { 'fail' }
+            'INFO' { 'info' }
             default { 'warn' }
         }
 
@@ -846,6 +932,7 @@ th, td { border: 1px solid #cccccc; padding: 8px; text-align: left; }
 .pass { background: #e8f5e9; }
 .warn { background: #fff8e1; }
 .fail { background: #ffebee; }
+.info { background: #eceff1; }
 </style>
 </head>
 <body>
@@ -1009,6 +1096,13 @@ function Get-HostChecks {
     $checks = [System.Collections.Generic.List[object]]::new()
     $view = Get-View -Id $TargetHost.Id
 
+    # Physical NICs that are actually assigned as distributed switch uplinks.
+    # A NIC that is down but not an uplink is a spare and is not a fault.
+    $uplinkPnics = @(
+        Get-VdsHostMapping -Hosts @($TargetHost) |
+            Select-Object -ExpandProperty Pnic -Unique
+    )
+
     $checks.Add([pscustomobject]@{
         Check  = 'vCenter connection'
         Result = if ($TargetHost.ConnectionState -eq 'Connected') { 'PASS' } else { 'FAIL' }
@@ -1028,17 +1122,44 @@ function Get-HostChecks {
     })
 
     foreach ($nic in (Get-PhysicalNicDetail -Hosts @($TargetHost))) {
+        $nicInUse = $uplinkPnics -contains $nic.Device
+
+        $nicResult = if ($nic.LinkUp) {
+            'PASS'
+        }
+        elseif ($nicInUse) {
+            'FAIL'
+        }
+        else {
+            'INFO'
+        }
+
+        $nicUsage = if ($nicInUse) { 'uplink' } else { 'unused' }
+
         $checks.Add([pscustomobject]@{
             Check  = "Physical NIC $($nic.Device)"
-            Result = if ($nic.LinkUp) { 'PASS' } else { 'FAIL' }
-            Detail = "Link=$($nic.LinkUp); SpeedMb=$($nic.SpeedMb); MAC=$($nic.Mac)"
+            Result = $nicResult
+            Detail = "Link=$($nic.LinkUp); SpeedMb=$($nic.SpeedMb); MAC=$($nic.Mac); Usage=$nicUsage"
         })
     }
 
     foreach ($neighbor in (Get-PhysicalNicNeighbor -Hosts @($TargetHost))) {
+        $neighborInUse = $uplinkPnics -contains $neighbor.Pnic
+        $noNeighbor    = $neighbor.DiscoveryProtocol -eq 'NONE_DETECTED'
+
+        $neighborResult = if (-not $noNeighbor) {
+            'PASS'
+        }
+        elseif ($neighborInUse) {
+            'WARN'
+        }
+        else {
+            'INFO'
+        }
+
         $checks.Add([pscustomobject]@{
             Check  = "LLDP/CDP $($neighbor.Pnic)"
-            Result = if ($neighbor.DiscoveryProtocol -eq 'NONE_DETECTED') { 'WARN' } else { 'PASS' }
+            Result = $neighborResult
             Detail = (
                 "$($neighbor.DiscoveryProtocol); " +
                 "Switch=$($neighbor.SwitchSystemName); " +
