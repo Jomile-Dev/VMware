@@ -722,28 +722,63 @@ function Test-VsanVmkConnectivity {
         try {
             $result = $esxcli.network.diag.ping.Invoke($arguments)
 
-            $summary = if ($result.PSObject.Properties['Summary'] -and $result.Summary) {
-                $result.Summary
+            # The esxcli ping result places the packet counts under a Summary
+            # object on most builds, at the top level on others, and sometimes
+            # inside a single-element array. Gather every candidate object and
+            # read the counts from wherever this build actually put them.
+            # VMware spells the received field "Recieved" on many builds.
+            $candidates = [System.Collections.Generic.List[object]]::new()
+            if ($result) {
+                $candidates.Add($result)
             }
-            else {
-                $result
+            if ($result -and $result.PSObject.Properties['Summary'] -and $result.Summary) {
+                $candidates.Add($result.Summary)
+            }
+            foreach ($candidate in @($candidates)) {
+                if ($candidate -is [System.Array] -and $candidate.Count -ge 1) {
+                    $candidates.Add($candidate[0])
+                }
             }
 
-            $transmitted = if ($summary.PSObject.Properties['Transmitted']) {
-                [int]$summary.Transmitted
-            }
-            else {
-                0
+            $transmitted = $null
+            $received    = $null
+
+            foreach ($candidate in $candidates) {
+                if ($null -eq $candidate) {
+                    continue
+                }
+
+                if ($null -eq $transmitted) {
+                    foreach ($name in @('Transmitted', 'Trasmitted', 'Sent')) {
+                        $property = $candidate.PSObject.Properties[$name]
+                        if ($property -and "$($property.Value)" -match '^\d+$') {
+                            $transmitted = [int]$property.Value
+                            break
+                        }
+                    }
+                }
+
+                if ($null -eq $received) {
+                    foreach ($name in @('Recieved', 'Received')) {
+                        $property = $candidate.PSObject.Properties[$name]
+                        if ($property -and "$($property.Value)" -match '^\d+$') {
+                            $received = [int]$property.Value
+                            break
+                        }
+                    }
+                }
             }
 
-            $received = if ($summary.PSObject.Properties['Received']) {
-                [int]$summary.Received
+            # If the transmit count could not be read, the ping still ran, so
+            # fall back to the number of packets requested. Assuming 0 here is
+            # what previously reported a working path as a failure.
+            $countsParsed = $true
+            if ($null -eq $transmitted) {
+                $transmitted  = $PingCount
+                $countsParsed = $false
             }
-            elseif ($summary.PSObject.Properties['Recieved']) {
-                [int]$summary.Recieved
-            }
-            else {
-                0
+            if ($null -eq $received) {
+                $received = 0
             }
 
             $lossPercent = if ($transmitted -gt 0) {
@@ -753,18 +788,12 @@ function Test-VsanVmkConnectivity {
                 100
             }
 
-            $pingResult = if ($transmitted -eq 0 -or $lossPercent -ne 0) {
-                'FAIL'
-            }
-            else {
-                'PASS'
-            }
+            $pingResult = if ($lossPercent -eq 0) { 'PASS' } else { 'FAIL' }
 
-            $pingDetail = if ($transmitted -eq 0) {
+            $pingDetail = if (-not $countsParsed -and $received -eq 0) {
                 "Src=$($sourceVmk.Name)($($sourceVmk.IP)) -> $($targetHost.Name)($($targetVmk.IP)); " +
-                "Sent=0; Recv=0; Loss=100%; " +
-                "NOTE=interface transmitted 0 packets - no egress on $($sourceVmk.Name) " +
-                "(check the uplink link state for this vSAN portgroup and the vSAN netstack)"
+                "the ping ran but its result could not be parsed on this PowerCLI build; " +
+                "verify by hand: vmkping -I $($sourceVmk.Name) $($targetVmk.IP)"
             }
             elseif (-not $sameSubnet) {
                 "Src=$($sourceVmk.Name)($($sourceVmk.IP)) -> $($targetHost.Name)($($targetVmk.IP)); " +
