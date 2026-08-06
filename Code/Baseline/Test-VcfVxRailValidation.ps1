@@ -713,7 +713,29 @@ function Test-VsanVmkConnectivity {
         }
     }
 
-    $esxcli = Get-EsxCli -VMHost $SourceHost -V2
+    # Get-EsxCli -V2 is not safe to build in several runspaces at once and
+    # null-references under concurrency. Serialise just its creation with the
+    # shared mutex. In serial runs the mutex is uncontended, so this costs
+    # almost nothing.
+    $esxcliMutex = New-Object System.Threading.Mutex($false, 'VcfVxRailValidationViConnect')
+
+    try {
+        try {
+            [void]$esxcliMutex.WaitOne()
+        }
+        catch [System.Threading.AbandonedMutexException] {
+        }
+
+        try {
+            $esxcli = Get-EsxCli -VMHost $SourceHost -V2
+        }
+        finally {
+            $esxcliMutex.ReleaseMutex()
+        }
+    }
+    finally {
+        $esxcliMutex.Dispose()
+    }
 
     foreach ($targetHost in ($AllHosts | Where-Object Name -ne $SourceHost.Name)) {
         $targetVmks = @(
@@ -1748,10 +1770,12 @@ function Invoke-EnvironmentValidation {
         $hostRollups = [System.Collections.Generic.List[object]]::new()
 
         if ($ThrottleLimit -gt 1 -and @($targetHosts).Count -gt 1) {
-            Write-Host (
-                "Validating $(@($targetHosts).Count) hosts in parallel " +
-                "(throttle $ThrottleLimit)..."
-            ) -ForegroundColor Cyan
+            Write-Warning (
+                "PARALLEL mode is ON (throttle $ThrottleLimit): validating " +
+                "$(@($targetHosts).Count) hosts at once. This is faster but less " +
+                "reliable with PowerCLI. If you hit connection or Get-EsxCli " +
+                "errors, set `$ThrottleLimit = 1 in the console for serial mode."
+            )
 
             $parallelRollups = Invoke-HostValidationParallel `
                 -HostNames @($targetHosts | ForEach-Object { $_.Name }) `
