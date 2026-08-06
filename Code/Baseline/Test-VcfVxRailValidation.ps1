@@ -36,33 +36,25 @@ param(
 
     [PSCredential]$Credential,
 
-    [switch]$SkipCertificateCheck,
-
-    # Number of hosts to validate at once within a cluster. 1 (default) keeps
-    # the original serial behaviour. Values above 1 validate hosts in parallel
-    # using a runspace pool; each worker opens its own vCenter connection.
-    [ValidateRange(1, 16)]
-    [int]$ThrottleLimit = 1
+    [switch]$SkipCertificateCheck
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# Let the throttle be driven by a plain variable when the script is pasted into
-# the ISE editor and run with F5, rather than called with -ThrottleLimit. Set
-# $ThrottleLimit in the console (for example: $ThrottleLimit = 4) before running
-# the script, and that value is picked up here. A value passed as -ThrottleLimit
-# still takes precedence.
-if (-not $PSBoundParameters.ContainsKey('ThrottleLimit')) {
-    $existingThrottle = Get-Variable -Name ThrottleLimit -Scope Global -ErrorAction SilentlyContinue
+###############################################################################
+# PARALLELISM  --  EDIT THE NUMBER BELOW
+#
+#   1  = serial: validate hosts one at a time. Reliable for every mode
+#        (sanity check, baseline, relocated host, post-migration), single
+#        cluster or all. Use this for anything real.
+#
+#   2+ = validate that many hosts at once. Faster on large clusters, but less
+#        reliable with PowerCLI (may throw connection or Get-EsxCli errors).
+#        Test it against a non-production cluster before trusting it.
+###############################################################################
 
-    if ($existingThrottle) {
-        $parsedThrottle = 0
-        if ([int]::TryParse([string]$existingThrottle.Value, [ref]$parsedThrottle) -and $parsedThrottle -ge 1) {
-            $ThrottleLimit = $parsedThrottle
-        }
-    }
-}
+$ThrottleLimit = 1
 
 ###############################################################################
 # ENVIRONMENT CONFIGURATION
@@ -1774,7 +1766,7 @@ function Invoke-EnvironmentValidation {
                 "PARALLEL mode is ON (throttle $ThrottleLimit): validating " +
                 "$(@($targetHosts).Count) hosts at once. This is faster but less " +
                 "reliable with PowerCLI. If you hit connection or Get-EsxCli " +
-                "errors, set `$ThrottleLimit = 1 in the console for serial mode."
+                "errors, set `$ThrottleLimit = 1 near the top of the script."
             )
 
             $parallelRollups = Invoke-HostValidationParallel `
