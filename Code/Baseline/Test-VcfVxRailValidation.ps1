@@ -1120,7 +1120,8 @@ function Get-HostChecks {
     param(
         [Parameter(Mandatory)]$TargetHost,
         [Parameter(Mandatory)]$Cluster,
-        [Parameter(Mandatory)]$AllHosts
+        [Parameter(Mandatory)]$AllHosts,
+        $VsanResync
     )
 
     $checks = [System.Collections.Generic.List[object]]::new()
@@ -1255,7 +1256,12 @@ function Get-HostChecks {
         })
     }
 
-    $resync = Get-VsanResyncSafe -Cluster $Cluster
+    $resync = if ($null -ne $VsanResync) {
+        $VsanResync
+    }
+    else {
+        Get-VsanResyncSafe -Cluster $Cluster
+    }
 
     $checks.Add([pscustomobject]@{
         Check  = 'vSAN resynchronisation'
@@ -1393,7 +1399,8 @@ function Invoke-EnvironmentValidation {
                 Get-HostChecks `
                     -TargetHost $hostObject `
                     -Cluster $cluster `
-                    -AllHosts $allHosts
+                    -AllHosts $allHosts `
+                    -VsanResync $vsanResync
             )
 
             if ($baselinePath) {
