@@ -1353,12 +1353,14 @@ function Invoke-EnvironmentValidation {
                 -ClusterName $clusterName
         }
 
-        $targetHosts = if ($Mode -eq 'ValidateHostMove') {
-            @($selectedHost)
-        }
-        else {
-            $allHosts
-        }
+        $targetHosts = @(
+            if ($Mode -eq 'ValidateHostMove') {
+                $selectedHost
+            }
+            else {
+                $allHosts
+            }
+        )
 
         $run = New-RunContext `
             -Mode $Mode `
@@ -1504,7 +1506,7 @@ function Invoke-EnvironmentValidation {
             Mode           = $Mode
             HostName       = if ($selectedHost) { $selectedHost.Name } else { $null }
             BaselinePath   = $baselinePath
-            HostCount      = $targetHosts.Count
+            HostCount      = @($targetHosts).Count
             Generated      = Get-Date
             OutputPath     = $run.RunRoot
         }
@@ -1526,7 +1528,7 @@ function Invoke-EnvironmentValidation {
             Cluster     = $clusterName
             Mode        = $Mode
             Result      = 'COMPLETED'
-            HostCount   = $targetHosts.Count
+            HostCount   = @($targetHosts).Count
             Detail      = $null
             Output      = $run.RunRoot
         }
