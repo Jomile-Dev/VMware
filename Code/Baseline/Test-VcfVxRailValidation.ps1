@@ -1459,7 +1459,6 @@ function Invoke-HostValidationParallel {
     # works when the script is pasted into the ISE editor and run unsaved, and on
     # repeated runs in the same ISE session.
     $sessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
-    $sessionState.ImportPSModule(@('VMware.VimAutomation.Core', 'VMware.VimAutomation.Storage'))
 
     $functionNames = @(
         'ConvertTo-SafeFileName'
@@ -1515,10 +1514,12 @@ function Invoke-HostValidationParallel {
         $ErrorActionPreference = 'Stop'
         $connection = $null
 
-        # PowerCLI rewrites a single shared RecentServerList.xml on every connect
-        # and disconnect. Concurrent workers collide on that file, so connect and
-        # disconnect are serialised with a named mutex. The validation work in
-        # between still runs in parallel.
+        # Import PowerCLI fully inside the worker rather than only through the
+        # runspace session state. A partial load lets Connect-VIServer and
+        # Get-VMHost work but leaves Get-EsxCli -V2 throwing a null reference,
+        # because the ESXCLI interface needs the module's full initialisation.
+        Import-Module VMware.VimAutomation.Core -ErrorAction Stop
+
         $connectMutex = New-Object System.Threading.Mutex($false, 'VcfVxRailValidationViConnect')
 
         try {
