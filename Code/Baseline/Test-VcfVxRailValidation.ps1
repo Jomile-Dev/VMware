@@ -1145,10 +1145,53 @@ function Get-HostChecks {
         Detail = $TargetHost.PowerState
     })
 
+    $overallStatus = [string]$view.OverallStatus
+
+    $statusReasons = [System.Collections.Generic.List[string]]::new()
+
+    if ($view.TriggeredAlarmState) {
+        foreach ($alarmState in $view.TriggeredAlarmState) {
+            if ($null -eq $alarmState -or $alarmState.OverallStatus -eq 'green') {
+                continue
+            }
+
+            $alarmName = try {
+                (Get-View -Id $alarmState.Alarm).Info.Name
+            }
+            catch {
+                'unknown alarm'
+            }
+
+            $statusReasons.Add("alarm [$($alarmState.OverallStatus)]: $alarmName")
+        }
+    }
+
+    if ($view.ConfigIssue) {
+        foreach ($issue in $view.ConfigIssue) {
+            if ($issue -and $issue.FullFormattedMessage) {
+                $statusReasons.Add("config issue: $($issue.FullFormattedMessage)")
+            }
+        }
+    }
+
+    $overallDetail = if ($statusReasons.Count -gt 0) {
+        "$overallStatus - " + ($statusReasons -join '; ')
+    }
+    else {
+        $overallStatus
+    }
+
+    $overallResult = switch ($overallStatus) {
+        'green'  { 'PASS' }
+        'yellow' { 'WARN' }
+        'red'    { 'FAIL' }
+        default  { 'WARN' }
+    }
+
     $checks.Add([pscustomobject]@{
         Check  = 'Host overall status'
-        Result = if ($view.OverallStatus -eq 'green') { 'PASS' } else { 'FAIL' }
-        Detail = $view.OverallStatus
+        Result = $overallResult
+        Detail = $overallDetail
     })
 
     foreach ($nic in (Get-PhysicalNicDetail -Hosts @($TargetHost))) {
