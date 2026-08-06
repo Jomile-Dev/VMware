@@ -36,7 +36,13 @@ param(
 
     [PSCredential]$Credential,
 
-    [switch]$SkipCertificateCheck
+    [switch]$SkipCertificateCheck,
+
+    # Number of hosts to validate at once within a cluster. 1 (default) keeps
+    # the original serial behaviour. Values above 1 validate hosts in parallel
+    # using a runspace pool; each worker opens its own vCenter connection.
+    [ValidateRange(1, 16)]
+    [int]$ThrottleLimit = 1
 )
 
 Set-StrictMode -Version Latest
@@ -1303,6 +1309,274 @@ function Get-BaselinePathForEnvironment {
     }
 }
 
+function Invoke-HostValidation {
+    param(
+        [Parameter(Mandatory)]$HostObject,
+        [Parameter(Mandatory)]$Cluster,
+        [Parameter(Mandatory)]$AllHosts,
+        $VsanResync,
+        [Parameter(Mandatory)]$Run,
+        [string]$BaselinePath,
+        [Parameter(Mandatory)][string]$Mode,
+        [Parameter(Mandatory)][string]$ClusterName
+    )
+
+    $hostFolder = Export-HostEvidence -HostObject $HostObject -RunContext $Run
+
+    $checks = @(
+        Get-HostChecks `
+            -TargetHost $HostObject `
+            -Cluster $Cluster `
+            -AllHosts $AllHosts `
+            -VsanResync $VsanResync
+    )
+
+    if ($BaselinePath) {
+        $baselineHostFolder = Join-Path `
+            $BaselinePath `
+            "Hosts\$(ConvertTo-SafeFileName $HostObject.Name)"
+
+        $comparisons = @()
+
+        $comparisons += Compare-CsvFile `
+            -BaselineFile (Join-Path $baselineHostFolder 'Physical-NICs.csv') `
+            -CurrentFile (Join-Path $hostFolder 'Physical-NICs.csv') `
+            -KeyProperties @('Host', 'Device') `
+            -CompareProperties @('Mac', 'LinkUp', 'SpeedMb', 'Driver', 'Pci')
+
+        $comparisons += Compare-CsvFile `
+            -BaselineFile (Join-Path $baselineHostFolder 'LLDP-CDP.csv') `
+            -CurrentFile (Join-Path $hostFolder 'LLDP-CDP.csv') `
+            -KeyProperties @('Host', 'Pnic') `
+            -CompareProperties @(
+                'DiscoveryProtocol',
+                'SwitchSystemName',
+                'SwitchDeviceId',
+                'SwitchPortId',
+                'SpeedMb'
+            )
+
+        $comparisons += Compare-CsvFile `
+            -BaselineFile (Join-Path $baselineHostFolder 'VMkernel.csv') `
+            -CurrentFile (Join-Path $hostFolder 'VMkernel.csv') `
+            -KeyProperties @('Host', 'Device') `
+            -CompareProperties @(
+                'PortGroup',
+                'IP',
+                'SubnetMask',
+                'Mtu',
+                'VMotionEnabled',
+                'VsanEnabled',
+                'Management'
+            )
+
+        $comparisons |
+            Export-Csv `
+                -Path (Join-Path $hostFolder 'Baseline-Differences.csv') `
+                -NoTypeInformation `
+                -Encoding UTF8
+
+        foreach ($comparison in $comparisons) {
+            $checks += [pscustomobject]@{
+                Check  = "Baseline comparison: $($comparison.Object)"
+                Result = $comparison.Result
+                Detail = "$($comparison.Key): $($comparison.Difference)"
+            }
+        }
+    }
+
+    $checks |
+        Export-Csv `
+            -Path (Join-Path $hostFolder 'Readiness-Checks.csv') `
+            -NoTypeInformation `
+            -Encoding UTF8
+
+    $hostSafe = ConvertTo-SafeFileName $HostObject.Name
+
+    Write-HtmlReport `
+        -Title "$($HostObject.Name) - $Mode - $ClusterName" `
+        -Checks $checks `
+        -Path (Join-Path $hostFolder "$hostSafe-Report.html")
+
+    $failCount = @($checks | Where-Object { $_.Result -eq 'FAIL' -or $_.Result -eq 'ERROR' }).Count
+    $warnCount = @($checks | Where-Object { $_.Result -eq 'WARN' -or $_.Result -eq 'REVIEW' }).Count
+    $passCount = @($checks | Where-Object { $_.Result -eq 'PASS' }).Count
+
+    $hostOverall = if ($failCount -gt 0) {
+        'NOT READY'
+    }
+    elseif ($warnCount -gt 0) {
+        'READY WITH WARNINGS'
+    }
+    else {
+        'READY'
+    }
+
+    return [pscustomobject]@{
+        Host           = $HostObject.Name
+        Overall        = $hostOverall
+        Pass           = $passCount
+        Warn           = $warnCount
+        Fail           = $failCount
+        ReportRelative = "Hosts/$hostSafe/$hostSafe-Report.html"
+        Error          = $null
+    }
+}
+
+function Invoke-HostValidationParallel {
+    param(
+        [Parameter(Mandatory)][string[]]$HostNames,
+        [Parameter(Mandatory)][string]$VCenterName,
+        [Parameter(Mandatory)][string]$ClusterName,
+        [Parameter(Mandatory)]$Credential,
+        [Parameter(Mandatory)]$Run,
+        $VsanResync,
+        [string]$BaselinePath,
+        [Parameter(Mandatory)][string]$Mode,
+        [Parameter(Mandatory)][bool]$IgnoreCert,
+        [Parameter(Mandatory)][int]$ThrottleLimit
+    )
+
+    # Carry this script's own functions into each worker runspace. Runspaces do
+    # not inherit the functions defined in this session, so each one is added to
+    # the initial session state by name and definition.
+    $sessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+    $sessionState.ImportPSModule(@('VMware.VimAutomation.Core', 'VMware.VimAutomation.Storage'))
+
+    $scriptFile = $PSCommandPath
+
+    foreach ($functionInfo in Get-ChildItem -Path Function:) {
+        $definitionFile = $functionInfo.ScriptBlock.File
+
+        if ($scriptFile -and $definitionFile -eq $scriptFile) {
+            $entry = New-Object `
+                System.Management.Automation.Runspaces.SessionStateFunctionEntry `
+                -ArgumentList $functionInfo.Name, $functionInfo.Definition
+
+            $sessionState.Commands.Add($entry)
+        }
+    }
+
+    $pool = [runspacefactory]::CreateRunspacePool(1, $ThrottleLimit, $sessionState, $Host)
+    $pool.Open()
+
+    $worker = {
+        param(
+            $HostName,
+            $VCenterName,
+            $ClusterName,
+            $Credential,
+            $Run,
+            $VsanResync,
+            $BaselinePath,
+            $Mode,
+            $IgnoreCert
+        )
+
+        Set-StrictMode -Version Latest
+        $ErrorActionPreference = 'Stop'
+        $connection = $null
+
+        try {
+            if ($IgnoreCert) {
+                Set-PowerCLIConfiguration `
+                    -InvalidCertificateAction Ignore `
+                    -Scope Session `
+                    -Confirm:$false | Out-Null
+            }
+
+            $connection = Connect-VIServer -Server $VCenterName -Credential $Credential
+
+            $clusterObject = Get-Cluster -Name $ClusterName -Server $connection
+            $allHosts = @(Get-VMHost -Location $clusterObject -Server $connection | Sort-Object Name)
+            $hostObject = $allHosts | Where-Object { $_.Name -eq $HostName } | Select-Object -First 1
+
+            if (-not $hostObject) {
+                throw "Host $HostName was not found in cluster $ClusterName."
+            }
+
+            Invoke-HostValidation `
+                -HostObject $hostObject `
+                -Cluster $clusterObject `
+                -AllHosts $allHosts `
+                -VsanResync $VsanResync `
+                -Run $Run `
+                -BaselinePath $BaselinePath `
+                -Mode $Mode `
+                -ClusterName $ClusterName
+        }
+        catch {
+            [pscustomobject]@{
+                Host           = $HostName
+                Overall        = 'NOT READY'
+                Pass           = 0
+                Warn           = 0
+                Fail           = 1
+                ReportRelative = $null
+                Error          = $_.Exception.Message
+            }
+        }
+        finally {
+            if ($connection) {
+                Disconnect-VIServer -Server $connection -Confirm:$false -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    $running = foreach ($hostName in $HostNames) {
+        $shell = [powershell]::Create()
+        $shell.RunspacePool = $pool
+
+        [void]$shell.AddScript($worker).
+            AddArgument($hostName).
+            AddArgument($VCenterName).
+            AddArgument($ClusterName).
+            AddArgument($Credential).
+            AddArgument($Run).
+            AddArgument($VsanResync).
+            AddArgument($BaselinePath).
+            AddArgument($Mode).
+            AddArgument($IgnoreCert)
+
+        [pscustomobject]@{
+            Shell  = $shell
+            Handle = $shell.BeginInvoke()
+            Name   = $hostName
+        }
+    }
+
+    $rollups = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($item in $running) {
+        try {
+            $output = $item.Shell.EndInvoke($item.Handle)
+
+            foreach ($result in $output) {
+                $rollups.Add($result)
+            }
+        }
+        catch {
+            $rollups.Add([pscustomobject]@{
+                Host           = $item.Name
+                Overall        = 'NOT READY'
+                Pass           = 0
+                Warn           = 0
+                Fail           = 1
+                ReportRelative = $null
+                Error          = $_.Exception.Message
+            })
+        }
+        finally {
+            $item.Shell.Dispose()
+        }
+    }
+
+    $pool.Close()
+    $pool.Dispose()
+
+    return $rollups
+}
+
 function Invoke-EnvironmentValidation {
     param(
         [Parameter(Mandatory)][string]$Mode,
@@ -1388,110 +1662,48 @@ function Invoke-EnvironmentValidation {
 
         $hostRollups = [System.Collections.Generic.List[object]]::new()
 
-        foreach ($hostObject in $targetHosts) {
-            Write-Host "Validating host: $($hostObject.Name)" -ForegroundColor Cyan
+        if ($ThrottleLimit -gt 1 -and @($targetHosts).Count -gt 1) {
+            Write-Host (
+                "Validating $(@($targetHosts).Count) hosts in parallel " +
+                "(throttle $ThrottleLimit)..."
+            ) -ForegroundColor Cyan
 
-            $hostFolder = Export-HostEvidence `
-                -HostObject $hostObject `
-                -RunContext $run
+            $parallelRollups = Invoke-HostValidationParallel `
+                -HostNames @($targetHosts | ForEach-Object { $_.Name }) `
+                -VCenterName $vCenterName `
+                -ClusterName $clusterName `
+                -Credential $Credential `
+                -Run $run `
+                -VsanResync $vsanResync `
+                -BaselinePath $baselinePath `
+                -Mode $Mode `
+                -IgnoreCert ([bool]$SkipCertificateCheck) `
+                -ThrottleLimit $ThrottleLimit
 
-            $checks = @(
-                Get-HostChecks `
-                    -TargetHost $hostObject `
+            foreach ($rollup in $parallelRollups) {
+                if ($rollup.PSObject.Properties['Error'] -and $rollup.Error) {
+                    Write-Warning "Host $($rollup.Host) failed: $($rollup.Error)"
+                }
+
+                $hostRollups.Add($rollup)
+            }
+        }
+        else {
+            foreach ($hostObject in $targetHosts) {
+                Write-Host "Validating host: $($hostObject.Name)" -ForegroundColor Cyan
+
+                $rollup = Invoke-HostValidation `
+                    -HostObject $hostObject `
                     -Cluster $cluster `
                     -AllHosts $allHosts `
-                    -VsanResync $vsanResync
-            )
+                    -VsanResync $vsanResync `
+                    -Run $run `
+                    -BaselinePath $baselinePath `
+                    -Mode $Mode `
+                    -ClusterName $clusterName
 
-            if ($baselinePath) {
-                $baselineHostFolder = Join-Path `
-                    $baselinePath `
-                    "Hosts\$(ConvertTo-SafeFileName $hostObject.Name)"
-
-                $comparisons = @()
-
-                $comparisons += Compare-CsvFile `
-                    -BaselineFile (Join-Path $baselineHostFolder 'Physical-NICs.csv') `
-                    -CurrentFile (Join-Path $hostFolder 'Physical-NICs.csv') `
-                    -KeyProperties @('Host','Device') `
-                    -CompareProperties @('Mac','LinkUp','SpeedMb','Driver','Pci')
-
-                $comparisons += Compare-CsvFile `
-                    -BaselineFile (Join-Path $baselineHostFolder 'LLDP-CDP.csv') `
-                    -CurrentFile (Join-Path $hostFolder 'LLDP-CDP.csv') `
-                    -KeyProperties @('Host','Pnic') `
-                    -CompareProperties @(
-                        'DiscoveryProtocol',
-                        'SwitchSystemName',
-                        'SwitchDeviceId',
-                        'SwitchPortId',
-                        'SpeedMb'
-                    )
-
-                $comparisons += Compare-CsvFile `
-                    -BaselineFile (Join-Path $baselineHostFolder 'VMkernel.csv') `
-                    -CurrentFile (Join-Path $hostFolder 'VMkernel.csv') `
-                    -KeyProperties @('Host','Device') `
-                    -CompareProperties @(
-                        'PortGroup',
-                        'IP',
-                        'SubnetMask',
-                        'Mtu',
-                        'VMotionEnabled',
-                        'VsanEnabled',
-                        'Management'
-                    )
-
-                $comparisons |
-                    Export-Csv `
-                        -Path (Join-Path $hostFolder 'Baseline-Differences.csv') `
-                        -NoTypeInformation `
-                        -Encoding UTF8
-
-                foreach ($comparison in $comparisons) {
-                    $checks += [pscustomobject]@{
-                        Check  = "Baseline comparison: $($comparison.Object)"
-                        Result = $comparison.Result
-                        Detail = "$($comparison.Key): $($comparison.Difference)"
-                    }
-                }
+                $hostRollups.Add($rollup)
             }
-
-            $checks |
-                Export-Csv `
-                    -Path (Join-Path $hostFolder 'Readiness-Checks.csv') `
-                    -NoTypeInformation `
-                    -Encoding UTF8
-
-            $hostSafe = ConvertTo-SafeFileName $hostObject.Name
-
-            Write-HtmlReport `
-                -Title "$($hostObject.Name) - $Mode - $clusterName" `
-                -Checks $checks `
-                -Path (Join-Path $hostFolder "$hostSafe-Report.html")
-
-            $failCount = @($checks | Where-Object { $_.Result -eq 'FAIL' -or $_.Result -eq 'ERROR' }).Count
-            $warnCount = @($checks | Where-Object { $_.Result -eq 'WARN' -or $_.Result -eq 'REVIEW' }).Count
-            $passCount = @($checks | Where-Object { $_.Result -eq 'PASS' }).Count
-
-            $hostOverall = if ($failCount -gt 0) {
-                'NOT READY'
-            }
-            elseif ($warnCount -gt 0) {
-                'READY WITH WARNINGS'
-            }
-            else {
-                'READY'
-            }
-
-            $hostRollups.Add([pscustomobject]@{
-                Host           = $hostObject.Name
-                Overall        = $hostOverall
-                Pass           = $passCount
-                Warn           = $warnCount
-                Fail           = $failCount
-                ReportRelative = "Hosts/$hostSafe/$hostSafe-Report.html"
-            })
         }
 
         Write-RunSummaryHtml `
