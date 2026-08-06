@@ -48,13 +48,21 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# Record which functions exist before this script defines its own. The parallel
-# runspace pool uses this to copy exactly this script's functions into each
-# worker, without depending on $PSCommandPath (which is empty when the script is
-# run as a highlighted selection rather than by path).
-$script:PreExistingFunctionNames = @(
-    Get-ChildItem -Path Function: | ForEach-Object { $_.Name }
-)
+# Let the throttle be driven by a plain variable when the script is pasted into
+# the ISE editor and run with F5, rather than called with -ThrottleLimit. Set
+# $ThrottleLimit in the console (for example: $ThrottleLimit = 4) before running
+# the script, and that value is picked up here. A value passed as -ThrottleLimit
+# still takes precedence.
+if (-not $PSBoundParameters.ContainsKey('ThrottleLimit')) {
+    $existingThrottle = Get-Variable -Name ThrottleLimit -Scope Global -ErrorAction SilentlyContinue
+
+    if ($existingThrottle) {
+        $parsedThrottle = 0
+        if ([int]::TryParse([string]$existingThrottle.Value, [ref]$parsedThrottle) -and $parsedThrottle -ge 1) {
+            $ThrottleLimit = $parsedThrottle
+        }
+    }
+}
 
 ###############################################################################
 # ENVIRONMENT CONFIGURATION
@@ -1446,17 +1454,40 @@ function Invoke-HostValidationParallel {
     )
 
     # Carry this script's own functions into each worker runspace. Runspaces do
-    # not inherit the functions defined in this session, so each one is added to
-    # the initial session state. The set is worked out by diffing against the
-    # functions that existed before this script defined its own, which is
-    # reliable regardless of how the script was launched.
+    # not inherit session functions, so each is added to the initial session
+    # state. They are added by name (not by file path or a session diff) so this
+    # works when the script is pasted into the ISE editor and run unsaved, and on
+    # repeated runs in the same ISE session.
     $sessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
     $sessionState.ImportPSModule(@('VMware.VimAutomation.Core', 'VMware.VimAutomation.Storage'))
 
-    $scriptFunctions = Get-ChildItem -Path Function: |
-        Where-Object { $script:PreExistingFunctionNames -notcontains $_.Name }
+    $functionNames = @(
+        'ConvertTo-SafeFileName'
+        'Export-CsvSafe'
+        'Get-HostSummary'
+        'Get-PhysicalNicDetail'
+        'Get-PhysicalNicNeighbor'
+        'Get-VmkDetail'
+        'Get-VdsHostMapping'
+        'Get-VmNetworkInventory'
+        'Get-VsanResyncSafe'
+        'Get-IPv4Network'
+        'Find-PingCount'
+        'Test-VsanVmkConnectivity'
+        'Compare-CsvFile'
+        'Write-HtmlReport'
+        'Export-HostEvidence'
+        'Get-HostChecks'
+        'Invoke-HostValidation'
+    )
 
-    foreach ($functionInfo in $scriptFunctions) {
+    foreach ($functionName in $functionNames) {
+        $functionInfo = Get-Item -Path "Function:\$functionName" -ErrorAction SilentlyContinue
+
+        if (-not $functionInfo) {
+            throw "Required function '$functionName' was not found in the session; run the whole script so all functions are defined before validating."
+        }
+
         $entry = New-Object `
             System.Management.Automation.Runspaces.SessionStateFunctionEntry `
             -ArgumentList $functionInfo.Name, $functionInfo.Definition
@@ -1484,6 +1515,12 @@ function Invoke-HostValidationParallel {
         $ErrorActionPreference = 'Stop'
         $connection = $null
 
+        # PowerCLI rewrites a single shared RecentServerList.xml on every connect
+        # and disconnect. Concurrent workers collide on that file, so connect and
+        # disconnect are serialised with a named mutex. The validation work in
+        # between still runs in parallel.
+        $connectMutex = New-Object System.Threading.Mutex($false, 'VcfVxRailValidationViConnect')
+
         try {
             if ($IgnoreCert) {
                 Set-PowerCLIConfiguration `
@@ -1492,7 +1529,19 @@ function Invoke-HostValidationParallel {
                     -Confirm:$false | Out-Null
             }
 
-            $connection = Connect-VIServer -Server $VCenterName -Credential $Credential
+            try {
+                [void]$connectMutex.WaitOne()
+            }
+            catch [System.Threading.AbandonedMutexException] {
+                # A previous worker exited without releasing; ownership is now ours.
+            }
+
+            try {
+                $connection = Connect-VIServer -Server $VCenterName -Credential $Credential
+            }
+            finally {
+                $connectMutex.ReleaseMutex()
+            }
 
             $clusterObject = Get-Cluster -Name $ClusterName -Server $connection
             $allHosts = @(Get-VMHost -Location $clusterObject -Server $connection | Sort-Object Name)
@@ -1525,8 +1574,24 @@ function Invoke-HostValidationParallel {
         }
         finally {
             if ($connection) {
-                Disconnect-VIServer -Server $connection -Confirm:$false -ErrorAction SilentlyContinue
+                try {
+                    [void]$connectMutex.WaitOne()
+                }
+                catch [System.Threading.AbandonedMutexException] {
+                }
+
+                try {
+                    Disconnect-VIServer `
+                        -Server $connection `
+                        -Confirm:$false `
+                        -ErrorAction SilentlyContinue
+                }
+                finally {
+                    $connectMutex.ReleaseMutex()
+                }
             }
+
+            $connectMutex.Dispose()
         }
     }
 
