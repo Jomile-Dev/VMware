@@ -48,6 +48,14 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# Record which functions exist before this script defines its own. The parallel
+# runspace pool uses this to copy exactly this script's functions into each
+# worker, without depending on $PSCommandPath (which is empty when the script is
+# run as a highlighted selection rather than by path).
+$script:PreExistingFunctionNames = @(
+    Get-ChildItem -Path Function: | ForEach-Object { $_.Name }
+)
+
 ###############################################################################
 # ENVIRONMENT CONFIGURATION
 #
@@ -1439,22 +1447,21 @@ function Invoke-HostValidationParallel {
 
     # Carry this script's own functions into each worker runspace. Runspaces do
     # not inherit the functions defined in this session, so each one is added to
-    # the initial session state by name and definition.
+    # the initial session state. The set is worked out by diffing against the
+    # functions that existed before this script defined its own, which is
+    # reliable regardless of how the script was launched.
     $sessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
     $sessionState.ImportPSModule(@('VMware.VimAutomation.Core', 'VMware.VimAutomation.Storage'))
 
-    $scriptFile = $PSCommandPath
+    $scriptFunctions = Get-ChildItem -Path Function: |
+        Where-Object { $script:PreExistingFunctionNames -notcontains $_.Name }
 
-    foreach ($functionInfo in Get-ChildItem -Path Function:) {
-        $definitionFile = $functionInfo.ScriptBlock.File
+    foreach ($functionInfo in $scriptFunctions) {
+        $entry = New-Object `
+            System.Management.Automation.Runspaces.SessionStateFunctionEntry `
+            -ArgumentList $functionInfo.Name, $functionInfo.Definition
 
-        if ($scriptFile -and $definitionFile -eq $scriptFile) {
-            $entry = New-Object `
-                System.Management.Automation.Runspaces.SessionStateFunctionEntry `
-                -ArgumentList $functionInfo.Name, $functionInfo.Definition
-
-            $sessionState.Commands.Add($entry)
-        }
+        $sessionState.Commands.Add($entry)
     }
 
     $pool = [runspacefactory]::CreateRunspacePool(1, $ThrottleLimit, $sessionState, $Host)
