@@ -1532,8 +1532,18 @@ function Invoke-EnvironmentValidation {
         }
     }
     catch {
+        $position = if ($_.InvocationInfo) { $_.InvocationInfo.PositionMessage } else { '' }
+
         Write-Warning "Validation failed for $clusterName on $vCenterName."
         Write-Warning $_.Exception.Message
+
+        if ($position) {
+            Write-Warning $position
+        }
+
+        if ($_.ScriptStackTrace) {
+            Write-Warning "Stack trace:`n$($_.ScriptStackTrace)"
+        }
 
         return [pscustomobject]@{
             Environment = $EnvironmentKey
@@ -1542,7 +1552,7 @@ function Invoke-EnvironmentValidation {
             Mode        = $Mode
             Result      = 'FAILED'
             HostCount   = 0
-            Detail      = $_.Exception.Message
+            Detail      = ("$($_.Exception.Message) $position").Trim()
             Output      = $null
         }
     }
