@@ -626,6 +626,50 @@ function Get-IPv4Network {
     }
 }
 
+function Find-PingCount {
+    param(
+        $InputObject,
+        [Parameter(Mandatory)][string[]]$Names,
+        [int]$Depth = 0
+    )
+
+    if ($null -eq $InputObject -or $Depth -gt 5) {
+        return $null
+    }
+
+    foreach ($name in $Names) {
+        $property = $InputObject.PSObject.Properties[$name]
+        if ($property -and "$($property.Value)" -match '^\d+$') {
+            return [int]$property.Value
+        }
+    }
+
+    foreach ($property in $InputObject.PSObject.Properties) {
+        $value = $property.Value
+
+        if ($null -eq $value -or $value -is [string] -or $value -is [System.ValueType]) {
+            continue
+        }
+
+        if ($value -is [System.Collections.IEnumerable]) {
+            foreach ($item in $value) {
+                $found = Find-PingCount -InputObject $item -Names $Names -Depth ($Depth + 1)
+                if ($null -ne $found) {
+                    return $found
+                }
+            }
+        }
+        else {
+            $found = Find-PingCount -InputObject $value -Names $Names -Depth ($Depth + 1)
+            if ($null -ne $found) {
+                return $found
+            }
+        }
+    }
+
+    return $null
+}
+
 function Test-VsanVmkConnectivity {
     param(
         [Parameter(Mandatory)]$SourceHost,
@@ -707,8 +751,12 @@ function Test-VsanVmkConnectivity {
         $arguments.count = $PingCount
         $arguments.size = 1472
 
+        # Only override the netstack when the vSAN VMkernel is on a non-default
+        # stack. Forcing the default stack name here can make the esxcli ping
+        # behave differently from a manual "vmkping -I vmkX", which uses the
+        # interface's own stack.
         $netstackKey = $sourceVmk.ExtensionData.Spec.NetStackInstanceKey
-        if ($netstackKey) {
+        if ($netstackKey -and $netstackKey -ne 'defaultTcpipStack') {
             try {
                 if ($arguments.ContainsKey('netstack')) {
                     $arguments.netstack = $netstackKey
@@ -722,86 +770,39 @@ function Test-VsanVmkConnectivity {
         try {
             $result = $esxcli.network.diag.ping.Invoke($arguments)
 
-            # The esxcli ping result places the packet counts under a Summary
-            # object on most builds, at the top level on others, and sometimes
-            # inside a single-element array. Gather every candidate object and
-            # read the counts from wherever this build actually put them.
-            # VMware spells the received field "Recieved" on many builds.
-            $candidates = [System.Collections.Generic.List[object]]::new()
-            if ($result) {
-                $candidates.Add($result)
-            }
-            if ($result -and $result.PSObject.Properties['Summary'] -and $result.Summary) {
-                $candidates.Add($result.Summary)
-            }
-            foreach ($candidate in @($candidates)) {
-                if ($candidate -is [System.Array] -and $candidate.Count -ge 1) {
-                    $candidates.Add($candidate[0])
+            # Read the packet counts from wherever this build placed them.
+            # esxcli returns them under Summary on some builds, at the top
+            # level on others, and occasionally inside a nested array, so the
+            # whole result graph is searched. VMware spells the received field
+            # "Recieved" on many builds.
+            $transmitted = Find-PingCount -InputObject $result -Names @('Transmitted', 'Trasmitted', 'Sent')
+            $received    = Find-PingCount -InputObject $result -Names @('Recieved', 'Received')
+
+            if ($null -ne $transmitted -and $null -ne $received -and $transmitted -gt 0) {
+                $lossPercent = [math]::Round((1 - ($received / $transmitted)) * 100, 2)
+                $pingResult  = if ($lossPercent -eq 0) { 'PASS' } else { 'FAIL' }
+
+                $pingDetail = if (-not $sameSubnet) {
+                    "Src=$($sourceVmk.Name)($($sourceVmk.IP)) -> $($targetHost.Name)($($targetVmk.IP)); " +
+                    "Sent=$transmitted; Recv=$received; Loss=$lossPercent%; " +
+                    "NOTE=source and target vSAN VMkernel are on different subnets"
                 }
-            }
-
-            $transmitted = $null
-            $received    = $null
-
-            foreach ($candidate in $candidates) {
-                if ($null -eq $candidate) {
-                    continue
+                else {
+                    $null
                 }
-
-                if ($null -eq $transmitted) {
-                    foreach ($name in @('Transmitted', 'Trasmitted', 'Sent')) {
-                        $property = $candidate.PSObject.Properties[$name]
-                        if ($property -and "$($property.Value)" -match '^\d+$') {
-                            $transmitted = [int]$property.Value
-                            break
-                        }
-                    }
-                }
-
-                if ($null -eq $received) {
-                    foreach ($name in @('Recieved', 'Received')) {
-                        $property = $candidate.PSObject.Properties[$name]
-                        if ($property -and "$($property.Value)" -match '^\d+$') {
-                            $received = [int]$property.Value
-                            break
-                        }
-                    }
-                }
-            }
-
-            # If the transmit count could not be read, the ping still ran, so
-            # fall back to the number of packets requested. Assuming 0 here is
-            # what previously reported a working path as a failure.
-            $countsParsed = $true
-            if ($null -eq $transmitted) {
-                $transmitted  = $PingCount
-                $countsParsed = $false
-            }
-            if ($null -eq $received) {
-                $received = 0
-            }
-
-            $lossPercent = if ($transmitted -gt 0) {
-                [math]::Round((1 - ($received / $transmitted)) * 100, 2)
             }
             else {
-                100
-            }
-
-            $pingResult = if ($lossPercent -eq 0) { 'PASS' } else { 'FAIL' }
-
-            $pingDetail = if (-not $countsParsed -and $received -eq 0) {
-                "Src=$($sourceVmk.Name)($($sourceVmk.IP)) -> $($targetHost.Name)($($targetVmk.IP)); " +
-                "the ping ran but its result could not be parsed on this PowerCLI build; " +
-                "verify by hand: vmkping -I $($sourceVmk.Name) $($targetVmk.IP)"
-            }
-            elseif (-not $sameSubnet) {
-                "Src=$($sourceVmk.Name)($($sourceVmk.IP)) -> $($targetHost.Name)($($targetVmk.IP)); " +
-                "Sent=$transmitted; Recv=$received; Loss=$lossPercent%; " +
-                "NOTE=source and target vSAN VMkernel are on different subnets"
-            }
-            else {
-                $null
+                # The ping ran without throwing, but its counts could not be
+                # read on this build. This is not evidence of a failure - a
+                # working path would be flagged wrongly - so surface it for a
+                # manual check instead of reporting a loss.
+                $transmitted = if ($null -ne $transmitted) { $transmitted } else { 0 }
+                $received    = if ($null -ne $received) { $received } else { 0 }
+                $lossPercent = $null
+                $pingResult  = 'INFO'
+                $pingDetail  = "Src=$($sourceVmk.Name)($($sourceVmk.IP)) -> $($targetHost.Name)($($targetVmk.IP)); " +
+                    "ping ran but packet counts could not be read on this PowerCLI build; " +
+                    "verify by hand: vmkping -I $($sourceVmk.Name) $($targetVmk.IP)"
             }
 
             [pscustomobject]@{
