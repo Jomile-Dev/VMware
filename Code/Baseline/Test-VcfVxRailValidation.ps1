@@ -1514,20 +1514,32 @@ function Invoke-HostValidationParallel {
         $ErrorActionPreference = 'Stop'
         $connection = $null
 
-        # Import PowerCLI fully inside the worker rather than only through the
-        # runspace session state. A partial load lets Connect-VIServer and
-        # Get-VMHost work but leaves Get-EsxCli -V2 throwing a null reference,
-        # because the ESXCLI interface needs the module's full initialisation.
-        Import-Module VMware.VimAutomation.Core -ErrorAction Stop
-
         $connectMutex = New-Object System.Threading.Mutex($false, 'VcfVxRailValidationViConnect')
 
         try {
-            if ($IgnoreCert) {
-                Set-PowerCLIConfiguration `
-                    -InvalidCertificateAction Ignore `
-                    -Scope Session `
-                    -Confirm:$false | Out-Null
+            # Import PowerCLI fully inside the worker (a partial session-state
+            # load leaves Get-EsxCli -V2 null-referencing), but serialise it:
+            # importing this module in several runspaces at once modifies shared
+            # collections and fails with "Collection was modified". The import is
+            # a one-time cost per worker, so serialising it barely matters.
+            try {
+                [void]$connectMutex.WaitOne()
+            }
+            catch [System.Threading.AbandonedMutexException] {
+            }
+
+            try {
+                Import-Module VMware.VimAutomation.Core -ErrorAction Stop
+
+                if ($IgnoreCert) {
+                    Set-PowerCLIConfiguration `
+                        -InvalidCertificateAction Ignore `
+                        -Scope Session `
+                        -Confirm:$false | Out-Null
+                }
+            }
+            finally {
+                $connectMutex.ReleaseMutex()
             }
 
             try {
