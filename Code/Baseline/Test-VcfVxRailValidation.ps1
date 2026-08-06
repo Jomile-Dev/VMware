@@ -1522,15 +1522,28 @@ function Invoke-EnvironmentValidation {
         Write-Host "Output   : $($run.RunRoot)"
         Write-Host "Summary  : $(Join-Path $run.RunRoot 'Index.html')" -ForegroundColor Green
 
+        $clusterReadiness =
+            if (@($hostRollups | Where-Object { $_.Overall -eq 'NOT READY' }).Count -gt 0) {
+                'NOT READY'
+            }
+            elseif (@($hostRollups | Where-Object { $_.Overall -eq 'READY WITH WARNINGS' }).Count -gt 0) {
+                'READY WITH WARNINGS'
+            }
+            else {
+                'READY'
+            }
+
         return [pscustomobject]@{
             Environment = $EnvironmentKey
             VCenter     = $vCenterName
             Cluster     = $clusterName
             Mode        = $Mode
             Result      = 'COMPLETED'
+            Readiness   = $clusterReadiness
             HostCount   = @($targetHosts).Count
             Detail      = $null
             Output      = $run.RunRoot
+            IndexPath   = (Join-Path $run.RunRoot 'Index.html')
         }
     }
     catch {
@@ -1553,9 +1566,11 @@ function Invoke-EnvironmentValidation {
             Cluster     = $clusterName
             Mode        = $Mode
             Result      = 'FAILED'
+            Readiness   = 'FAILED'
             HostCount   = 0
             Detail      = ("$($_.Exception.Message) $position").Trim()
             Output      = $null
+            IndexPath   = $null
         }
     }
     finally {
@@ -1568,6 +1583,83 @@ function Invoke-EnvironmentValidation {
             Write-Host "Disconnected from $vCenterName." -ForegroundColor DarkGray
         }
     }
+}
+
+function Write-MasterIndexHtml {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Mode,
+        [Parameter(Mandatory)]$Results
+    )
+
+    $rows = foreach ($result in $Results) {
+        $readiness = if ($result.PSObject.Properties['Readiness'] -and $result.Readiness) {
+            [string]$result.Readiness
+        }
+        else {
+            [string]$result.Result
+        }
+
+        $class = switch ($readiness) {
+            'READY'               { 'pass' }
+            'READY WITH WARNINGS' { 'warn' }
+            'NOT READY'           { 'fail' }
+            'FAILED'              { 'fail' }
+            default               { 'warn' }
+        }
+
+        $clusterCell   = [System.Net.WebUtility]::HtmlEncode([string]$result.Cluster)
+        $vcenterCell   = [System.Net.WebUtility]::HtmlEncode([string]$result.VCenter)
+        $readinessCell = [System.Net.WebUtility]::HtmlEncode($readiness)
+        $hostsCell     = [System.Net.WebUtility]::HtmlEncode([string]$result.HostCount)
+
+        $reportCell = if ($result.PSObject.Properties['IndexPath'] -and $result.IndexPath) {
+            $url = 'file:///' + ($result.IndexPath -replace '\\', '/')
+            "<a href=`"$url`">Open report</a>"
+        }
+        else {
+            [System.Net.WebUtility]::HtmlEncode([string]$result.Detail)
+        }
+
+        "<tr class=`"$class`"><td>$clusterCell</td><td>$vcenterCell</td>" +
+        "<td>$readinessCell</td><td>$hostsCell</td><td>$reportCell</td></tr>"
+    }
+
+    $generated   = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $modeEncoded = [System.Net.WebUtility]::HtmlEncode($Mode)
+    $clusterTotal = @($Results).Count
+
+    $html = @"
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Validation run - $modeEncoded</title>
+<style>
+body { font-family: Segoe UI, Arial, sans-serif; margin: 24px; color: #1f2933; }
+h1 { font-size: 1.5em; margin-bottom: 4px; }
+.summary { color: #52606d; margin-bottom: 20px; }
+table { border-collapse: collapse; width: 100%; }
+th, td { border: 1px solid #cccccc; padding: 8px; text-align: left; }
+th { background: #f0f4f8; }
+.pass { background: #e8f5e9; }
+.warn { background: #fff8e1; }
+.fail { background: #ffebee; }
+a { color: #1565c0; }
+</style>
+</head>
+<body>
+<h1>Validation run - $modeEncoded</h1>
+<div class="summary">Generated: $generated &nbsp;|&nbsp; Clusters: $clusterTotal</div>
+<table>
+<tr><th>Cluster</th><th>vCenter</th><th>Result</th><th>Hosts</th><th>Report</th></tr>
+$($rows -join "`n")
+</table>
+</body>
+</html>
+"@
+
+    Set-Content -Path $Path -Value $html -Encoding UTF8
 }
 
 ###############################################################################
@@ -1626,14 +1718,13 @@ foreach ($key in $selectedEnvironmentKeys) {
 }
 
 Write-Section 'Overall results'
-$results | Format-Table -AutoSize
+$results | Format-Table -AutoSize -Property Cluster, VCenter, Readiness, HostCount
 
-$summaryFolder = Join-Path $OutputRoot 'Run-Summaries'
+$sessionStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$summaryFolder = Join-Path $OutputRoot (Join-Path 'Run-Summaries' "$mode-$sessionStamp")
 New-Item -ItemType Directory -Path $summaryFolder -Force | Out-Null
 
-$summaryFile = Join-Path `
-    $summaryFolder `
-    ("Validation-Summary-{0}.csv" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+$summaryFile = Join-Path $summaryFolder 'Validation-Summary.csv'
 
 $results |
     Export-Csv `
@@ -1641,5 +1732,10 @@ $results |
         -NoTypeInformation `
         -Encoding UTF8
 
+$masterIndex = Join-Path $summaryFolder 'index.html'
+Write-MasterIndexHtml -Path $masterIndex -Mode $mode -Results $results
+
 Write-Host ''
-Write-Host "Summary saved to: $summaryFile" -ForegroundColor Green
+Write-Host 'Open this one file for every cluster in this run:' -ForegroundColor Green
+Write-Host "  $masterIndex" -ForegroundColor Green
+Write-Host "Summary CSV: $summaryFile" -ForegroundColor DarkGray
