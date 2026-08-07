@@ -2468,6 +2468,7 @@ function Invoke-EnvironmentValidation {
     $connection = $null
     $baselinePath = $null
     $selectedHost = $null
+    $stage        = 'starting'
 
     Write-Section "$($environment.DisplayName): $clusterName"
     Write-Host "vCenter : $vCenterName"
@@ -2478,6 +2479,7 @@ function Invoke-EnvironmentValidation {
         Write-Host ''
         Write-Host "Connecting to $vCenterName..." -ForegroundColor Cyan
 
+        $stage = "connecting to vCenter $vCenterName"
         $connection = Connect-VIServer `
             -Server $vCenterName `
             -Credential $Credential `
@@ -2485,12 +2487,16 @@ function Invoke-EnvironmentValidation {
 
         Write-Host 'Connected.' -ForegroundColor Green
 
+        $stage = "finding cluster $clusterName"
         $cluster = Get-Cluster `
             -Server $connection `
             -Name $clusterName `
             -ErrorAction Stop
 
+        $stage = "listing hosts in $clusterName"
         $allHosts = @(Get-VMHost -Location $cluster -Server $connection | Sort-Object Name)
+
+        Write-Host ("Found {0} host(s) in {1}." -f $allHosts.Count, $clusterName) -ForegroundColor DarkGray
 
         if ($allHosts.Count -eq 0) {
             throw "No ESXi hosts were found in cluster $clusterName."
@@ -2520,24 +2526,32 @@ function Invoke-EnvironmentValidation {
             }
         )
 
+        $stage = 'creating run folders'
         $run = New-RunContext `
             -Mode $Mode `
             -VCenterName $vCenterName `
             -ClusterName $clusterName `
             -HostName $(if ($selectedHost) { $selectedHost.Name } else { $null })
 
+        $stage = 'reading distributed port groups'
         $portgroups = @(Get-DistributedPortgroupDetail -VCenterName $vCenterName)
         $portgroups | Export-CsvSafe -Path (Join-Path $run.ClusterFolder 'VDS-Portgroups.csv')
 
+        $stage = 'reading recent events'
         $recentEvents = @(Get-RecentCriticalEvents -Entity $cluster -Hours 24)
         $recentEvents | Export-CsvSafe -Path (Join-Path $run.ClusterFolder 'Recent-Warnings-Errors.csv')
 
+        $stage = 'reading vSAN health'
         $vsanHealth = Get-VsanHealthSafe -Cluster $cluster
         $vsanHealth | Export-Clixml -Path (Join-Path $run.ClusterFolder 'vSAN-Health.xml')
 
+        $stage = 'reading vSAN resync'
         $vsanResync = Get-VsanResyncSafe -Cluster $cluster
         $vsanResync | Export-Clixml -Path (Join-Path $run.ClusterFolder 'vSAN-Resync.xml')
 
+        Write-Host 'Cluster-level checks done; validating hosts...' -ForegroundColor DarkGray
+
+        $stage = 'validating hosts'
         $hostRollups = [System.Collections.Generic.List[object]]::new()
 
         if ($ThrottleLimit -gt 1 -and @($targetHosts).Count -gt 1) {
@@ -2646,18 +2660,46 @@ function Invoke-EnvironmentValidation {
         }
     }
     catch {
-        $position = if ($_.InvocationInfo) { $_.InvocationInfo.PositionMessage } else { '' }
+        $errorRecord   = $_
+        $exceptionType = $errorRecord.Exception.GetType().FullName
+        $message       = [string]$errorRecord.Exception.Message
 
-        Write-Warning "Validation failed for $clusterName on $vCenterName."
-        Write-Warning $_.Exception.Message
+        if ([string]::IsNullOrWhiteSpace($message)) {
+            $message = '(the exception carried no message text)'
+        }
+
+        $failingLine = if ($errorRecord.InvocationInfo) {
+            ([string]$errorRecord.InvocationInfo.Line).Trim()
+        }
+        else {
+            ''
+        }
+
+        $position  = if ($errorRecord.InvocationInfo) { $errorRecord.InvocationInfo.PositionMessage } else { '' }
+        $stageText = if ($stage) { $stage } else { 'unknown stage' }
+
+        Write-Host ''
+        Write-Host ('!' * 72) -ForegroundColor Red
+        Write-Host "VALIDATION FAILED: $clusterName on $vCenterName" -ForegroundColor Red
+        Write-Host "  Failed during : $stageText" -ForegroundColor Red
+        Write-Host "  Exception     : $exceptionType" -ForegroundColor Red
+        Write-Host "  Message       : $message" -ForegroundColor Red
+
+        if ($failingLine) {
+            Write-Host "  Command       : $failingLine" -ForegroundColor Red
+        }
 
         if ($position) {
-            Write-Warning $position
+            Write-Host "  Position      : $position" -ForegroundColor DarkYellow
         }
 
-        if ($_.ScriptStackTrace) {
-            Write-Warning "Stack trace:`n$($_.ScriptStackTrace)"
+        if ($errorRecord.ScriptStackTrace) {
+            Write-Host '  Stack trace   :' -ForegroundColor DarkYellow
+            Write-Host $errorRecord.ScriptStackTrace -ForegroundColor DarkGray
         }
+
+        Write-Host ('!' * 72) -ForegroundColor Red
+        Write-Host ''
 
         return [pscustomobject]@{
             Environment = $EnvironmentKey
@@ -2667,7 +2709,7 @@ function Invoke-EnvironmentValidation {
             Result      = 'FAILED'
             Readiness   = 'FAILED'
             HostCount   = 0
-            Detail      = ("$($_.Exception.Message) $position").Trim()
+            Detail      = ("[$stageText] $message $position").Trim()
             Output      = $null
             IndexPath   = $null
         }
