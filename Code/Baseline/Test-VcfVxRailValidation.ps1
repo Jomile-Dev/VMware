@@ -1607,6 +1607,117 @@ function Export-HostEvidence {
     return $folder
 }
 
+function Get-VsanStretchedFaultDomainSafe {
+    # Stretched-cluster preferred fault domain and witness, for the management
+    # cluster. Returns Result='SKIP' on a non-stretched cluster so the caller
+    # can omit the row on workload clusters.
+    param([Parameter(Mandatory)]$Cluster)
+
+    if (-not (Get-Command Get-VsanClusterConfiguration -ErrorAction SilentlyContinue)) {
+        return [pscustomobject]@{
+            Result = 'INFO'
+            Detail = 'Get-VsanClusterConfiguration is unavailable; confirm preferred fault domain and witness placement by hand.'
+        }
+    }
+
+    try {
+        $configuration = Get-VsanClusterConfiguration -Cluster $Cluster -ErrorAction Stop
+
+        $stretched = if ($configuration.PSObject.Properties['StretchedClusterEnabled']) {
+            [bool]$configuration.StretchedClusterEnabled
+        }
+        else {
+            $false
+        }
+
+        if (-not $stretched) {
+            return [pscustomobject]@{
+                Result = 'SKIP'
+                Detail = 'Not a stretched cluster.'
+            }
+        }
+
+        $preferred = if ($configuration.PSObject.Properties['PreferredFaultDomain'] -and $configuration.PreferredFaultDomain) {
+            [string]$configuration.PreferredFaultDomain
+        }
+        else {
+            'unknown'
+        }
+
+        $witness = if ($configuration.PSObject.Properties['WitnessHost'] -and $configuration.WitnessHost) {
+            $configuration.WitnessHost
+        }
+        else {
+            $null
+        }
+
+        $witnessName = if ($witness -and $witness.PSObject.Properties['Name'] -and $witness.Name) {
+            [string]$witness.Name
+        }
+        else {
+            'unknown'
+        }
+
+        $witnessState = if ($witness -and $witness.PSObject.Properties['ConnectionState'] -and $witness.ConnectionState) {
+            [string]$witness.ConnectionState
+        }
+        else {
+            'unknown'
+        }
+
+        $result = if ($witness -and $witnessState -ne 'Connected' -and $witnessState -ne 'unknown') {
+            'WARN'
+        }
+        else {
+            'INFO'
+        }
+
+        return [pscustomobject]@{
+            Result = $result
+            Detail = "Stretched cluster: preferred fault domain=$preferred; witness=$witnessName (state=$witnessState). Confirm the witness runs outside the migrating site and that the preferred site is where you intend for the move."
+        }
+    }
+    catch {
+        return [pscustomobject]@{
+            Result = 'INFO'
+            Detail = "Could not read stretched-cluster configuration: $($_.Exception.Message)"
+        }
+    }
+}
+
+function Get-VsanRepairTimerSafe {
+    # Current vSAN object repair timer (VSAN.ClomRepairDelay, in minutes). The
+    # migration runbook may extend this from the 60-minute default for the move
+    # and revert it after; this row lets you confirm the current value.
+    param([Parameter(Mandatory)]$HostObject)
+
+    try {
+        $setting = Get-AdvancedSetting `
+            -Entity $HostObject `
+            -Name 'VSAN.ClomRepairDelay' `
+            -ErrorAction Stop |
+            Select-Object -First 1
+
+        if (-not $setting) {
+            return [pscustomobject]@{
+                Result = 'INFO'
+                Detail = 'VSAN.ClomRepairDelay was not found on this host.'
+            }
+        }
+
+        return [pscustomobject]@{
+            Result = 'INFO'
+            Detail = "vSAN object repair timer (VSAN.ClomRepairDelay) = $([string]$setting.Value) minutes. Default is 60; if it was extended for the move, confirm it is reverted afterwards."
+        }
+    }
+    catch {
+        return [pscustomobject]@{
+            Result = 'INFO'
+            Detail = "Could not read VSAN.ClomRepairDelay: $($_.Exception.Message)"
+        }
+    }
+}
+
 function Get-VMHostActiveTasks {
     # Running and recently failed vCenter tasks for a host, so a "connected /
     # yellow" host also shows what it is actually doing - entering maintenance,
@@ -1918,6 +2029,24 @@ function Get-HostChecks {
         Detail = $vsanCapacity.Detail
     })
 
+    $faultDomain = Get-VsanStretchedFaultDomainSafe -Cluster $Cluster
+
+    if ($faultDomain.Result -ne 'SKIP') {
+        $checks.Add([pscustomobject]@{
+            Check  = 'vSAN stretched fault domain / witness'
+            Result = $faultDomain.Result
+            Detail = $faultDomain.Detail
+        })
+    }
+
+    $repairTimer = Get-VsanRepairTimerSafe -HostObject $TargetHost
+
+    $checks.Add([pscustomobject]@{
+        Check  = 'vSAN object repair timer'
+        Result = $repairTimer.Result
+        Detail = $repairTimer.Detail
+    })
+
     return $checks
 }
 
@@ -2049,6 +2178,42 @@ function Invoke-HostValidation {
         'READY'
     }
 
+    # Echo the outcome to the console as the run proceeds, so the operator sees
+    # what and why on screen instead of only the final summary. Every WARN /
+    # FAIL / ERROR check is listed with its detail; the full record is still in
+    # the host's HTML report and Readiness-Checks.csv.
+    $consoleNotables = @(
+        $checks |
+            Where-Object {
+                $_.Result -eq 'FAIL' -or
+                $_.Result -eq 'ERROR' -or
+                $_.Result -eq 'WARN' -or
+                $_.Result -eq 'REVIEW'
+            }
+    )
+
+    $overallColor = switch ($hostOverall) {
+        'NOT READY'           { 'Red' }
+        'READY WITH WARNINGS' { 'Yellow' }
+        default               { 'Green' }
+    }
+
+    Write-Host (
+        "  {0}: {1} (Pass={2} Warn={3} Fail={4})" -f
+            $HostObject.Name, $hostOverall, $passCount, $warnCount, $failCount
+    ) -ForegroundColor $overallColor
+
+    foreach ($notable in $consoleNotables) {
+        $notableColor = if ($notable.Result -eq 'FAIL' -or $notable.Result -eq 'ERROR') {
+            'Red'
+        }
+        else {
+            'Yellow'
+        }
+
+        Write-Host ("      [{0}] {1} - {2}" -f $notable.Result, $notable.Check, $notable.Detail) -ForegroundColor $notableColor
+    }
+
     return [pscustomobject]@{
         Host           = $HostObject.Name
         Overall        = $hostOverall
@@ -2099,6 +2264,8 @@ function Invoke-HostValidationParallel {
         'Get-VsanClusterPostureSafe'
         'Get-VsanCapacitySafe'
         'Get-VMHostActiveTasks'
+        'Get-VsanStretchedFaultDomainSafe'
+        'Get-VsanRepairTimerSafe'
         'Compare-CsvFile'
         'Write-HtmlReport'
         'Export-HostEvidence'
