@@ -1607,6 +1607,65 @@ function Export-HostEvidence {
     return $folder
 }
 
+function Get-VMHostActiveTasks {
+    # Running and recently failed vCenter tasks for a host, so a "connected /
+    # yellow" host also shows what it is actually doing - entering maintenance,
+    # a vSAN reconfigure, a health remediation, a vMotion, and so on.
+    param(
+        [Parameter(Mandatory)]$View
+    )
+
+    $tasks = [System.Collections.Generic.List[object]]::new()
+
+    if (-not $View.RecentTask) {
+        return $tasks
+    }
+
+    foreach ($taskRef in @($View.RecentTask)) {
+        try {
+            $taskView = Get-View -Id $taskRef -ErrorAction Stop
+            $info = $taskView.Info
+
+            $name = if ($info.PSObject.Properties['DescriptionId'] -and $info.DescriptionId) {
+                [string]$info.DescriptionId
+            }
+            elseif ($info.PSObject.Properties['EntityName'] -and $info.EntityName) {
+                [string]$info.EntityName
+            }
+            else {
+                'task'
+            }
+
+            $progress = if ($info.PSObject.Properties['Progress'] -and $null -ne $info.Progress) {
+                [string]$info.Progress
+            }
+            else {
+                $null
+            }
+
+            $errorMessage = if ($info.Error -and $info.Error.LocalizedMessage) {
+                [string]$info.Error.LocalizedMessage
+            }
+            else {
+                $null
+            }
+
+            $tasks.Add([pscustomobject]@{
+                Name     = $name
+                State    = [string]$info.State
+                Progress = $progress
+                Error    = $errorMessage
+            })
+        }
+        catch {
+            # Task view could not be resolved (already cleared, or a permissions
+            # edge); skip it rather than fail the host.
+        }
+    }
+
+    return $tasks
+}
+
 function Get-HostChecks {
     param(
         [Parameter(Mandatory)]$TargetHost,
@@ -1676,6 +1735,26 @@ function Get-HostChecks {
         }
     }
 
+    # Hardware health sensors are a common reason a host is yellow/red with no
+    # alarm text (failed PSU, fan, memory, temperature, and so on). Surface any
+    # non-green numeric sensor so the status carries its own explanation.
+    if ($view.Runtime -and
+        $view.Runtime.HealthSystemRuntime -and
+        $view.Runtime.HealthSystemRuntime.SystemHealthInfo) {
+
+        foreach ($sensor in @($view.Runtime.HealthSystemRuntime.SystemHealthInfo.NumericSensorInfo)) {
+            if ($null -eq $sensor -or -not $sensor.HealthState) {
+                continue
+            }
+
+            $sensorState = [string]$sensor.HealthState.Key
+
+            if ($sensorState -and $sensorState -ne 'green' -and $sensorState -ne 'unknown') {
+                $statusReasons.Add("hardware [$sensorState]: $($sensor.Name)")
+            }
+        }
+    }
+
     $overallDetail = if ($statusReasons.Count -gt 0) {
         "$overallStatus - " + ($statusReasons -join '; ')
     }
@@ -1695,6 +1774,37 @@ function Get-HostChecks {
         Result = $overallResult
         Detail = $overallDetail
     })
+
+    $hostTasks    = Get-VMHostActiveTasks -View $view
+    $runningTasks = @($hostTasks | Where-Object { $_.State -eq 'running' })
+    $failedTasks  = @($hostTasks | Where-Object { $_.State -eq 'error' })
+
+    if ($runningTasks.Count -gt 0) {
+        foreach ($task in $runningTasks) {
+            $progressText = if ($null -ne $task.Progress) { " ($($task.Progress)%)" } else { '' }
+
+            $checks.Add([pscustomobject]@{
+                Check  = 'Host running task'
+                Result = 'INFO'
+                Detail = "$($task.Name)$progressText is in progress on this host."
+            })
+        }
+    }
+    else {
+        $checks.Add([pscustomobject]@{
+            Check  = 'Host running task'
+            Result = 'INFO'
+            Detail = 'No vCenter task is currently running on this host.'
+        })
+    }
+
+    foreach ($task in $failedTasks) {
+        $checks.Add([pscustomobject]@{
+            Check  = 'Host recent task failure'
+            Result = 'WARN'
+            Detail = "$($task.Name) recently failed" + $(if ($task.Error) { ": $($task.Error)" } else { '.' })
+        })
+    }
 
     foreach ($nic in (Get-PhysicalNicDetail -Hosts @($TargetHost))) {
         $nicInUse = $uplinkPnics -contains $nic.Device
@@ -1988,6 +2098,7 @@ function Invoke-HostValidationParallel {
         'Get-VMHostCertExpirySafe'
         'Get-VsanClusterPostureSafe'
         'Get-VsanCapacitySafe'
+        'Get-VMHostActiveTasks'
         'Compare-CsvFile'
         'Write-HtmlReport'
         'Export-HostEvidence'
