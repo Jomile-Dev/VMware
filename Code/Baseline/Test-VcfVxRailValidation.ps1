@@ -57,6 +57,25 @@ $ErrorActionPreference = 'Stop'
 $ThrottleLimit = 1
 
 ###############################################################################
+# OPTIONAL CHECK TUNABLES  --  SAFE TO EDIT
+#
+#   $JumboFrameSize      Payload bytes for the don't-fragment jumbo vmkping.
+#                        8972 = 9000 MTU (9000 - 28 overhead). Set to the
+#                        payload your vSAN / vMotion / overlay MTU expects.
+#   $CertExpiryWarnDays  Warn when an ESXi host SSL certificate expires within
+#                        this many days (the "no certs expiring during the
+#                        migration window" item; ESXi host machine cert only).
+#   $VsanN1SafetyFactor  Free space must exceed one host's share times this
+#                        factor for the N-1 evacuation-headroom estimate to
+#                        pass. Advisory only; dedupe/compression make raw
+#                        free-space math approximate.
+###############################################################################
+
+$JumboFrameSize     = 8972
+$CertExpiryWarnDays = 60
+$VsanN1SafetyFactor = 1.25
+
+###############################################################################
 # ENVIRONMENT CONFIGURATION
 #
 # Update only this section with the real vCenter and cluster names.
@@ -868,6 +887,442 @@ function Test-VsanVmkConnectivity {
     }
 }
 
+function Test-VmkJumboConnectivity {
+    # Don't-fragment, jumbo-sized vmkping between same-subnet VMkernel peers,
+    # per traffic type. This is the check the DC-migration runbook asks for
+    # ("vmkping -I vmkX -d -s 8972 host to host, per VMkernel network"): a
+    # standard-MTU ping proves reachability but not that the path carries the
+    # full jumbo frame unfragmented. vSAN and vMotion are matched by their
+    # adapter flags; host TEP (overlay) is matched by netstack name as a
+    # best-effort - confirm any TEP result by hand. Edge TEP lives on edge
+    # transport nodes, not ESXi hosts, so it is out of scope here.
+    param(
+        [Parameter(Mandatory)]$SourceHost,
+        [Parameter(Mandatory)]$AllHosts,
+        [int]$Size = 8972,
+        [bool]$DontFragment = $true,
+        [int]$PingCount = 3
+    )
+
+    $trafficTypes = @(
+        [pscustomobject]@{
+            Name  = 'vSAN'
+            Match = { param($vmk) [bool]$vmk.VsanTrafficEnabled }
+        }
+        [pscustomobject]@{
+            Name  = 'vMotion'
+            Match = { param($vmk) [bool]$vmk.VMotionEnabled }
+        }
+        [pscustomobject]@{
+            Name  = 'hostTEP'
+            Match = {
+                param($vmk)
+                $stack = $vmk.ExtensionData.Spec.NetStackInstanceKey
+                [bool]($stack -and ($stack -match 'vxlan|overlay'))
+            }
+        }
+    )
+
+    # Get-EsxCli -V2 is not safe to build in several runspaces at once, so
+    # serialise its creation with the shared mutex (uncontended in serial runs).
+    $esxcliMutex = New-Object System.Threading.Mutex($false, 'VcfVxRailValidationViConnect')
+
+    try {
+        try {
+            [void]$esxcliMutex.WaitOne()
+        }
+        catch [System.Threading.AbandonedMutexException] {
+        }
+
+        try {
+            $esxcli = Get-EsxCli -VMHost $SourceHost -V2
+        }
+        finally {
+            $esxcliMutex.ReleaseMutex()
+        }
+    }
+    finally {
+        $esxcliMutex.Dispose()
+    }
+
+    foreach ($trafficType in $trafficTypes) {
+        $sourceVmks = @(
+            Get-VMHostNetworkAdapter -VMHost $SourceHost -VMKernel |
+                Where-Object { & $trafficType.Match $_ } |
+                Sort-Object Name
+        )
+
+        if ($sourceVmks.Count -eq 0) {
+            # This traffic type is not present on the source host; skip quietly.
+            continue
+        }
+
+        foreach ($targetHost in ($AllHosts | Where-Object Name -ne $SourceHost.Name)) {
+            $targetVmks = @(
+                Get-VMHostNetworkAdapter -VMHost $targetHost -VMKernel |
+                    Where-Object { & $trafficType.Match $_ } |
+                    Sort-Object Name
+            )
+
+            if ($targetVmks.Count -eq 0) {
+                [pscustomobject]@{
+                    TrafficType = $trafficType.Name
+                    SourceHost  = $SourceHost.Name
+                    SourceVmk   = $null
+                    SourceIP    = $null
+                    TargetHost  = $targetHost.Name
+                    TargetIP    = $null
+                    Size        = $Size
+                    DF          = $false
+                    Received    = 0
+                    Transmitted = 0
+                    LossPercent = $null
+                    Result      = 'INFO'
+                    Detail      = "Target host has no $($trafficType.Name) VMkernel adapter; nothing to test."
+                }
+
+                continue
+            }
+
+            # Pair a source and target VMkernel that share an IP subnet, so a
+            # stretched cluster's second subnet is not pinged across a path that
+            # is not expected to work.
+            $sourceVmk  = $null
+            $targetVmk  = $null
+            $sameSubnet = $false
+
+            foreach ($candidateSource in $sourceVmks) {
+                $sourceNetwork = Get-IPv4Network -IPAddress $candidateSource.IP -SubnetMask $candidateSource.SubnetMask
+
+                if ($null -eq $sourceNetwork) {
+                    continue
+                }
+
+                $candidateTarget = $targetVmks |
+                    Where-Object {
+                        (Get-IPv4Network -IPAddress $_.IP -SubnetMask $_.SubnetMask) -eq $sourceNetwork
+                    } |
+                    Select-Object -First 1
+
+                if ($candidateTarget) {
+                    $sourceVmk  = $candidateSource
+                    $targetVmk  = $candidateTarget
+                    $sameSubnet = $true
+                    break
+                }
+            }
+
+            if (-not $sourceVmk) {
+                $sourceVmk = $sourceVmks[0]
+                $targetVmk = $targetVmks[0]
+            }
+
+            $arguments = $esxcli.network.diag.ping.CreateArgs()
+            $arguments.host      = $targetVmk.IP
+            $arguments.interface = $sourceVmk.Name
+            $arguments.count     = $PingCount
+            $arguments.size      = $Size
+
+            $dfApplied = $false
+            if ($arguments.ContainsKey('df')) {
+                try {
+                    $arguments.df = $DontFragment
+                    $dfApplied = [bool]$DontFragment
+                }
+                catch {
+                    # This esxcli build does not accept the df argument; leave it.
+                }
+            }
+
+            $netstackKey = $sourceVmk.ExtensionData.Spec.NetStackInstanceKey
+            if ($netstackKey -and $netstackKey -ne 'defaultTcpipStack' -and $arguments.ContainsKey('netstack')) {
+                try {
+                    $arguments.netstack = $netstackKey
+                }
+                catch {
+                    # esxcli argument set does not expose netstack on this build; ignore.
+                }
+            }
+
+            try {
+                $result = $esxcli.network.diag.ping.Invoke($arguments)
+
+                $transmitted = Find-PingCount -InputObject $result -Names @('Transmitted', 'Trasmitted', 'Sent')
+                $received    = Find-PingCount -InputObject $result -Names @('Recieved', 'Received')
+
+                $subnetNote = if (-not $sameSubnet) {
+                    ' NOTE=source and target are on different subnets'
+                }
+                else {
+                    ''
+                }
+
+                if ($null -ne $transmitted -and $null -ne $received -and $transmitted -gt 0) {
+                    $lossPercent = [math]::Round((1 - ($received / $transmitted)) * 100, 2)
+
+                    if ($lossPercent -eq 0 -and $dfApplied) {
+                        $pingResult = 'PASS'
+                        $pingNote   = "jumbo frame ($Size B, DF set) passed"
+                    }
+                    elseif ($lossPercent -eq 0 -and -not $dfApplied) {
+                        $pingResult = 'INFO'
+                        $pingNote   = "sent $Size B but this build would not set don't-fragment, so an unfragmented jumbo path is not proven; verify by hand"
+                    }
+                    else {
+                        $pingResult = 'FAIL'
+                        $pingNote   = "loss with DF set means the path does not carry $Size B unfragmented (MTU or VLAN issue)"
+                    }
+
+                    $pingDetail = "Src=$($sourceVmk.Name)($($sourceVmk.IP)) -> $($targetHost.Name)($($targetVmk.IP)); " +
+                        "Sent=$transmitted; Recv=$received; Loss=$lossPercent%; DF=$dfApplied; Size=$Size; $pingNote.$subnetNote"
+                }
+                else {
+                    $transmitted = if ($null -ne $transmitted) { $transmitted } else { 0 }
+                    $received    = if ($null -ne $received) { $received } else { 0 }
+                    $lossPercent = $null
+                    $pingResult  = 'INFO'
+                    $pingDetail  = "Src=$($sourceVmk.Name)($($sourceVmk.IP)) -> $($targetHost.Name)($($targetVmk.IP)); " +
+                        "ping ran but packet counts could not be read on this PowerCLI build; " +
+                        "verify by hand: vmkping -I $($sourceVmk.Name) -d -s $Size $($targetVmk.IP).$subnetNote"
+                }
+
+                [pscustomobject]@{
+                    TrafficType = $trafficType.Name
+                    SourceHost  = $SourceHost.Name
+                    SourceVmk   = $sourceVmk.Name
+                    SourceIP    = $sourceVmk.IP
+                    TargetHost  = $targetHost.Name
+                    TargetIP    = $targetVmk.IP
+                    Size        = $Size
+                    DF          = $dfApplied
+                    Received    = $received
+                    Transmitted = $transmitted
+                    LossPercent = $lossPercent
+                    Result      = $pingResult
+                    Detail      = $pingDetail
+                }
+            }
+            catch {
+                [pscustomobject]@{
+                    TrafficType = $trafficType.Name
+                    SourceHost  = $SourceHost.Name
+                    SourceVmk   = $sourceVmk.Name
+                    SourceIP    = $sourceVmk.IP
+                    TargetHost  = $targetHost.Name
+                    TargetIP    = $targetVmk.IP
+                    Size        = $Size
+                    DF          = $dfApplied
+                    Received    = 0
+                    Transmitted = 0
+                    LossPercent = $null
+                    Result      = 'ERROR'
+                    Detail      = $_.Exception.Message
+                }
+            }
+        }
+    }
+}
+
+function Get-VMHostCertExpirySafe {
+    param(
+        [Parameter(Mandatory)]$HostObject,
+        [int]$WarnDays = 60
+    )
+
+    if (-not (Get-Command Get-VIMachineCertificate -ErrorAction SilentlyContinue)) {
+        return [pscustomobject]@{
+            Result = 'INFO'
+            Detail = 'Get-VIMachineCertificate is unavailable in this PowerCLI build; check the host SSL certificate expiry by hand.'
+        }
+    }
+
+    try {
+        $certs = @(Get-VIMachineCertificate -VMHost $HostObject -ErrorAction Stop)
+
+        if ($certs.Count -eq 0) {
+            return [pscustomobject]@{
+                Result = 'INFO'
+                Detail = 'No host certificate was returned.'
+            }
+        }
+
+        $soonest = $null
+
+        foreach ($cert in $certs) {
+            $notAfter = $null
+
+            foreach ($propertyName in @('NotValidAfter', 'NotAfter')) {
+                if ($cert.PSObject.Properties[$propertyName] -and $cert.$propertyName) {
+                    try {
+                        $notAfter = [datetime]$cert.$propertyName
+                    }
+                    catch {
+                        $notAfter = $null
+                    }
+
+                    if ($notAfter) {
+                        break
+                    }
+                }
+            }
+
+            if (-not $notAfter -and $cert.PSObject.Properties['Certificate'] -and $cert.Certificate) {
+                try {
+                    $notAfter = [datetime]$cert.Certificate.NotAfter
+                }
+                catch {
+                    $notAfter = $null
+                }
+            }
+
+            if ($notAfter -and (($null -eq $soonest) -or ($notAfter -lt $soonest))) {
+                $soonest = $notAfter
+            }
+        }
+
+        if ($null -eq $soonest) {
+            return [pscustomobject]@{
+                Result = 'INFO'
+                Detail = 'A host certificate was returned but no expiry date could be read from it.'
+            }
+        }
+
+        $daysLeft = [math]::Round(($soonest - (Get-Date)).TotalDays, 1)
+
+        $result = if ($daysLeft -lt 0) {
+            'FAIL'
+        }
+        elseif ($daysLeft -le $WarnDays) {
+            'WARN'
+        }
+        else {
+            'PASS'
+        }
+
+        return [pscustomobject]@{
+            Result = $result
+            Detail = "Host SSL certificate expires $($soonest.ToString('yyyy-MM-dd')) (in $daysLeft days); warn threshold is $WarnDays days. Covers the ESXi host machine certificate only, not vCenter, NSX, SDDC Manager, or service-account passwords."
+        }
+    }
+    catch {
+        return [pscustomobject]@{
+            Result = 'INFO'
+            Detail = "Could not read the host certificate: $($_.Exception.Message)"
+        }
+    }
+}
+
+function Get-VsanClusterPostureSafe {
+    param([Parameter(Mandatory)]$Cluster)
+
+    if (-not (Get-Command Get-VsanClusterConfiguration -ErrorAction SilentlyContinue)) {
+        return [pscustomobject]@{
+            Result = 'INFO'
+            Detail = 'Get-VsanClusterConfiguration is unavailable; confirm dedupe/compression and encryption status by hand.'
+        }
+    }
+
+    try {
+        $configuration = Get-VsanClusterConfiguration -Cluster $Cluster -ErrorAction Stop
+
+        $spaceEfficiency = if ($configuration.PSObject.Properties['SpaceEfficiencyEnabled']) {
+            $configuration.SpaceEfficiencyEnabled
+        }
+        else {
+            'unknown'
+        }
+
+        $encryption = if ($configuration.PSObject.Properties['EncryptionEnabled']) {
+            $configuration.EncryptionEnabled
+        }
+        else {
+            'unknown'
+        }
+
+        $kms = if ($configuration.PSObject.Properties['KmsCluster'] -and $configuration.KmsCluster) {
+            [string]$configuration.KmsCluster
+        }
+        else {
+            $null
+        }
+
+        $detail = "Dedupe/compression=$spaceEfficiency; encryption=$encryption"
+
+        if ($kms) {
+            $detail += "; KMS=$kms"
+        }
+
+        $detail += '. Dedupe/compression lengthens data evacuation; if encryption is on, confirm the KMS is reachable from the new site.'
+
+        return [pscustomobject]@{
+            Result = 'INFO'
+            Detail = $detail
+        }
+    }
+    catch {
+        return [pscustomobject]@{
+            Result = 'INFO'
+            Detail = "Could not read the vSAN cluster configuration: $($_.Exception.Message)"
+        }
+    }
+}
+
+function Get-VsanCapacitySafe {
+    param(
+        [Parameter(Mandatory)]$Cluster,
+        [Parameter(Mandatory)][int]$HostCount,
+        [double]$SafetyFactor = 1.25
+    )
+
+    try {
+        $datastores = @(
+            Get-Datastore -RelatedObject $Cluster -ErrorAction Stop |
+                Where-Object { $_.Type -eq 'vsan' }
+        )
+
+        if ($datastores.Count -eq 0) {
+            return [pscustomobject]@{
+                Result = 'INFO'
+                Detail = 'No vSAN datastore was found for this cluster.'
+            }
+        }
+
+        $vsanDatastore = $datastores | Select-Object -First 1
+        $capacityGB    = [double]$vsanDatastore.CapacityGB
+        $freeGB        = [double]$vsanDatastore.FreeSpaceGB
+
+        if ($capacityGB -le 0 -or $HostCount -le 1) {
+            return [pscustomobject]@{
+                Result = 'INFO'
+                Detail = "vSAN capacity=$([math]::Round($capacityGB, 1))GB, free=$([math]::Round($freeGB, 1))GB, hosts=$HostCount; not enough to estimate N-1 headroom."
+            }
+        }
+
+        $usedGB       = $capacityGB - $freeGB
+        $usedPercent  = [math]::Round(($usedGB / $capacityGB) * 100, 1)
+        $perHostShare = [math]::Round($capacityGB / $HostCount, 1)
+        $requiredFree = [math]::Round($perHostShare * $SafetyFactor, 1)
+
+        $result  = if ($freeGB -ge $requiredFree) { 'INFO' } else { 'WARN' }
+        $verdict = if ($freeGB -ge $requiredFree) { 'above' } else { 'BELOW' }
+
+        $detail = "vSAN used $usedPercent% (used $([math]::Round($usedGB, 1))GB of $([math]::Round($capacityGB, 1))GB, free $([math]::Round($freeGB, 1))GB). " +
+            "Rough N-1 estimate: one host's share ~$perHostShare GB x $SafetyFactor = $requiredFree GB free needed to evacuate a host; free space is $verdict that. " +
+            "Estimate only - dedupe/compression and uneven component layout change the real figure; confirm with a vSAN full-data-migration simulation."
+
+        return [pscustomobject]@{
+            Result = $result
+            Detail = $detail
+        }
+    }
+    catch {
+        return [pscustomobject]@{
+            Result = 'INFO'
+            Detail = "Could not read vSAN capacity: $($_.Exception.Message)"
+        }
+    }
+}
+
 function Compare-CsvFile {
     param(
         [Parameter(Mandatory)][string]$BaselineFile,
@@ -1163,6 +1618,16 @@ function Get-HostChecks {
     $checks = [System.Collections.Generic.List[object]]::new()
     $view = Get-View -Id $TargetHost.Id
 
+    # Optional-check tunables. Read the script-level values when present (serial
+    # runs) and fall back to defaults otherwise: parallel worker runspaces do
+    # not inherit them. -ErrorAction keeps this StrictMode-safe.
+    $jumboSize = Get-Variable -Name JumboFrameSize     -ValueOnly -ErrorAction SilentlyContinue
+    $certWarn  = Get-Variable -Name CertExpiryWarnDays -ValueOnly -ErrorAction SilentlyContinue
+    $n1Factor  = Get-Variable -Name VsanN1SafetyFactor -ValueOnly -ErrorAction SilentlyContinue
+    if ($null -eq $jumboSize) { $jumboSize = 8972 }
+    if ($null -eq $certWarn)  { $certWarn  = 60 }
+    if ($null -eq $n1Factor)  { $n1Factor  = 1.25 }
+
     # Physical NICs that are actually assigned as distributed switch uplinks.
     # A NIC that is down but not an uplink is a spare and is not a fault.
     $uplinkPnics = @(
@@ -1292,6 +1757,14 @@ function Get-HostChecks {
         })
     }
 
+    foreach ($ping in (Test-VmkJumboConnectivity -SourceHost $TargetHost -AllHosts $AllHosts -Size $jumboSize)) {
+        $checks.Add([pscustomobject]@{
+            Check  = "Jumbo $($ping.TrafficType) vmkping to $($ping.TargetHost) ($($ping.Size)B, DF)"
+            Result = $ping.Result
+            Detail = $ping.Detail
+        })
+    }
+
     $resync = if ($null -ne $VsanResync) {
         $VsanResync
     }
@@ -1309,6 +1782,30 @@ function Get-HostChecks {
             default     { 'REVIEW' }
         }
         Detail = ($resync | Out-String).Trim()
+    })
+
+    $certExpiry = Get-VMHostCertExpirySafe -HostObject $TargetHost -WarnDays $certWarn
+
+    $checks.Add([pscustomobject]@{
+        Check  = 'ESXi host certificate expiry'
+        Result = $certExpiry.Result
+        Detail = $certExpiry.Detail
+    })
+
+    $vsanPosture = Get-VsanClusterPostureSafe -Cluster $Cluster
+
+    $checks.Add([pscustomobject]@{
+        Check  = 'vSAN dedupe/compression and encryption'
+        Result = $vsanPosture.Result
+        Detail = $vsanPosture.Detail
+    })
+
+    $vsanCapacity = Get-VsanCapacitySafe -Cluster $Cluster -HostCount (@($AllHosts).Count) -SafetyFactor $n1Factor
+
+    $checks.Add([pscustomobject]@{
+        Check  = 'vSAN N-1 evacuation headroom (estimate)'
+        Result = $vsanCapacity.Result
+        Detail = $vsanCapacity.Detail
     })
 
     return $checks
@@ -1487,6 +1984,10 @@ function Invoke-HostValidationParallel {
         'Get-IPv4Network'
         'Find-PingCount'
         'Test-VsanVmkConnectivity'
+        'Test-VmkJumboConnectivity'
+        'Get-VMHostCertExpirySafe'
+        'Get-VsanClusterPostureSafe'
+        'Get-VsanCapacitySafe'
         'Compare-CsvFile'
         'Write-HtmlReport'
         'Export-HostEvidence'
