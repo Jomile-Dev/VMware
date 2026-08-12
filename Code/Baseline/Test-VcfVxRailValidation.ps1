@@ -638,6 +638,7 @@ function Get-VsanResyncSafe {
                 Status         = 'NONE'
                 ComponentCount = 0
                 Note           = 'No components are resyncing.'
+                Components     = @()
             }
         }
 
@@ -647,6 +648,7 @@ function Get-VsanResyncSafe {
             Status         = 'RESYNCING'
             ComponentCount = $components.Count
             GBLeftToSync   = [math]::Round((([double]$bytesLeft) / 1GB), 2)
+            Components     = $components
         }
     }
     catch {
@@ -2617,6 +2619,26 @@ function Invoke-EnvironmentValidation {
         $stage = 'reading vSAN resync'
         $vsanResync = Get-VsanResyncSafe -Cluster $cluster
         $vsanResync | Export-Clixml -Path (Join-Path $run.ClusterFolder 'vSAN-Resync.xml')
+
+        $resyncObjects = @(
+            if ($vsanResync -and $vsanResync.PSObject.Properties['Components']) {
+                $vsanResync.Components
+            }
+        )
+
+        if ($resyncObjects.Count -gt 0) {
+            $resyncObjects |
+                Select-Object *, @{
+                    Name       = 'GBLeftToSync'
+                    Expression = { [math]::Round((([double]$_.BytesLeftToSync) / 1GB), 2) }
+                } |
+                Export-Csv `
+                    -Path (Join-Path $run.ClusterFolder 'vSAN-Resyncing-Objects.csv') `
+                    -NoTypeInformation `
+                    -Encoding UTF8
+
+            Write-Host ("  vSAN resyncing objects: {0} component(s) -> vSAN-Resyncing-Objects.csv" -f $resyncObjects.Count) -ForegroundColor DarkGray
+        }
 
         Write-Host 'Cluster-level checks done; validating hosts...' -ForegroundColor DarkGray
 
