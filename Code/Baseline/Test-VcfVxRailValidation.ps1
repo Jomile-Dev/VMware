@@ -122,6 +122,14 @@ function ConvertTo-SafeFileName {
     return ($Name -replace '[\\/:*?"<>|]', '_')
 }
 
+function Test-HostQueryable {
+    param([Parameter(Mandatory)]$HostObject)
+    # Live host queries (Get-VMHostNetworkAdapter, QueryNetworkHint, Get-EsxCli)
+    # are only permitted when the host is Connected or in Maintenance. Any other
+    # state (Disconnected, NotResponding, powered off) makes them throw.
+    return ([string]$HostObject.ConnectionState -in @('Connected', 'Maintenance'))
+}
+
 function Write-Section {
     param([string]$Text)
 
@@ -361,6 +369,11 @@ function Get-PhysicalNicDetail {
     param([Parameter(Mandatory)]$Hosts)
 
     foreach ($hostObject in $Hosts) {
+        if (-not (Test-HostQueryable -HostObject $hostObject)) {
+            Write-Warning ("Skipping physical NIC query for {0}: connection state is {1}." -f $hostObject.Name, $hostObject.ConnectionState)
+            continue
+        }
+
         foreach ($nic in (Get-VMHostNetworkAdapter -VMHost $hostObject -Physical | Sort-Object Name)) {
             $link = $nic.ExtensionData.LinkSpeed
 
@@ -382,6 +395,11 @@ function Get-PhysicalNicNeighbor {
     param([Parameter(Mandatory)]$Hosts)
 
     foreach ($hostObject in $Hosts) {
+        if (-not (Test-HostQueryable -HostObject $hostObject)) {
+            Write-Warning ("Skipping LLDP/CDP query for {0}: connection state is {1}." -f $hostObject.Name, $hostObject.ConnectionState)
+            continue
+        }
+
         $networkSystem = Get-View -Id $hostObject.ExtensionData.ConfigManager.NetworkSystem
         $hints = @($networkSystem.QueryNetworkHint($null))
 
@@ -465,6 +483,11 @@ function Get-VmkDetail {
     param([Parameter(Mandatory)]$Hosts)
 
     foreach ($hostObject in $Hosts) {
+        if (-not (Test-HostQueryable -HostObject $hostObject)) {
+            Write-Warning ("Skipping VMkernel query for {0}: connection state is {1}." -f $hostObject.Name, $hostObject.ConnectionState)
+            continue
+        }
+
         foreach ($vmk in (Get-VMHostNetworkAdapter -VMHost $hostObject -VMKernel | Sort-Object Name)) {
             [pscustomobject]@{
                 Host           = $hostObject.Name
@@ -710,6 +733,14 @@ function Test-VsanVmkConnectivity {
         [int]$PingCount = 5
     )
 
+    if (-not (Test-HostQueryable -HostObject $SourceHost)) {
+        return [pscustomobject]@{
+            SourceHost = $SourceHost.Name
+            Result     = 'SKIP'
+            Detail     = "Source host connection state is $($SourceHost.ConnectionState); vSAN ping test skipped."
+        }
+    }
+
     $sourceVmks = @(
         Get-VMHostNetworkAdapter -VMHost $SourceHost -VMKernel |
             Where-Object VsanTrafficEnabled |
@@ -749,6 +780,17 @@ function Test-VsanVmkConnectivity {
     }
 
     foreach ($targetHost in ($AllHosts | Where-Object Name -ne $SourceHost.Name)) {
+        if (-not (Test-HostQueryable -HostObject $targetHost)) {
+            [pscustomobject]@{
+                SourceHost = $SourceHost.Name
+                TargetHost = $targetHost.Name
+                Result     = 'SKIP'
+                Detail     = "Target host connection state is $($targetHost.ConnectionState); skipped."
+            }
+
+            continue
+        }
+
         $targetVmks = @(
             Get-VMHostNetworkAdapter -VMHost $targetHost -VMKernel |
                 Where-Object VsanTrafficEnabled |
@@ -904,6 +946,16 @@ function Test-VmkJumboConnectivity {
         [int]$PingCount = 3
     )
 
+    if (-not (Test-HostQueryable -HostObject $SourceHost)) {
+        return [pscustomobject]@{
+            TrafficType = 'ALL'
+            SourceHost  = $SourceHost.Name
+            TargetHost  = $null
+            Result      = 'SKIP'
+            Detail      = "Source host connection state is $($SourceHost.ConnectionState); jumbo ping test skipped."
+        }
+    }
+
     $trafficTypes = @(
         [pscustomobject]@{
             Name  = 'vSAN'
@@ -958,6 +1010,22 @@ function Test-VmkJumboConnectivity {
         }
 
         foreach ($targetHost in ($AllHosts | Where-Object Name -ne $SourceHost.Name)) {
+            if (-not (Test-HostQueryable -HostObject $targetHost)) {
+                [pscustomobject]@{
+                    TrafficType = $trafficType.Name
+                    SourceHost  = $SourceHost.Name
+                    SourceVmk   = $null
+                    SourceIP    = $null
+                    TargetHost  = $targetHost.Name
+                    TargetIP    = $null
+                    Size        = $Size
+                    Result      = 'SKIP'
+                    Detail      = "Target host connection state is $($targetHost.ConnectionState); skipped."
+                }
+
+                continue
+            }
+
             $targetVmks = @(
                 Get-VMHostNetworkAdapter -VMHost $targetHost -VMKernel |
                     Where-Object { & $trafficType.Match $_ } |
@@ -2248,6 +2316,7 @@ function Invoke-HostValidationParallel {
 
     $functionNames = @(
         'ConvertTo-SafeFileName'
+        'Test-HostQueryable'
         'Export-CsvSafe'
         'Get-HostSummary'
         'Get-PhysicalNicDetail'
