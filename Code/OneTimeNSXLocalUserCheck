@@ -1,247 +1,73 @@
 <#
-    Get-NsxLocalUserOrigin.ps1
+    Search-NsxSyslogArchive.ps1
 
-    Purpose : Read-only. For a named NSX local user, queries every NSX Manager
-              node for the account record, then searches each node's appliance
-              audit log for the event that created it.
+    Purpose : Search rotated NSX syslog archives for the audit event that created
+              a local user account. Works on files copied off the appliances -
+              the log API cannot reach rotated .gz archives.
 
-    Runtime : Windows PowerShell 5.1. No PowerCLI dependency.
-              Paste into ISE and press F5, or run the .ps1 directly.
+    Runtime : Windows PowerShell 5.1. No modules required.
 
-    Scope   : GET requests only. Nothing is created, modified or deleted.
+    Input   : A folder containing syslog files copied from the managers.
+              Handles .gz and plain files. Decompresses as a stream, so large
+              archives do not need to fit in memory.
 
-    Notes   : Query each manager node by its own FQDN/IP, NOT the cluster VIP.
-              The audit entry for the creation event exists only on the node
-              that serviced the original request.
+    Naming  : Include the node name in each copied filename so the output can
+              attribute a hit to the right manager, e.g.
+                  nsxmgr-01_syslog.1.gz
+                  nsxmgr-02_syslog.3.gz
 #>
 
 #region Configuration ---------------------------------------------------------
 
-# Replace with your three manager node FQDNs or IPs. Do not use the VIP.
-$NsxNodes = @(
-    'CHANGEME-nsxmgr-01'
-    'CHANGEME-nsxmgr-02'
-    'CHANGEME-nsxmgr-03'
-)
+# Folder holding the copied log files.
+$ArchiveDir = 'C:\Temp\NsxLogs'
 
-# The local user account under investigation.
+# Account under investigation.
 $TargetUser = 'OnfrAut2NSXT'
 
-# Where reports are written.
-$OutputDir = 'C:\Temp\NsxUserAudit'
-
-# Extra strings to search the audit log for, on top of the target username.
-# 'node/users' catches the local-user create/modify API path.
+# Additional patterns. 'node/users' is the local-user API path.
 $SearchPatterns = @(
     'node/users'
 )
 
-# Candidate log endpoints, tried in order until one returns content.
-# The documented paths do not specify a supported HTTP method, so each is
-# probed with GET and then POST.
-$LogPaths = @(
-    '/api/v1/administration/audit-logs'
-    '/api/v1/administration/syslog'
-)
-
-# Authentication scheme against NSX Manager.
-#   'Auto'   - try Basic first, fall back to 'Remote' if the node rejects it.
-#   'Basic'  - Authorization: Basic  <base64(user@domain:password)>
-#              Newer NSX accepts a remote (vIDM/LDAP) username directly via Basic,
-#              provided the domain matches a configured identity source.
-#   'Remote' - Authorization: Remote <base64(user@domain:password)>
-#              The scheme older NSX-T builds required for vIDM-backed accounts.
-$AuthScheme = 'Auto'
-
-#endregion --------------------------------------------------------------------
-
-
-#region Session setup ---------------------------------------------------------
-
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
-# Self-signed certificate handling for PowerShell 5.1.
-if (-not ([System.Management.Automation.PSTypeName]'NsxTrustAllCerts').Type) {
-    Add-Type -TypeDefinition @"
-using System.Net;
-using System.Security.Cryptography.X509Certificates;
-public class NsxTrustAllCerts : ICertificatePolicy {
-    public bool CheckValidationResult(ServicePoint sp, X509Certificate cert, WebRequest req, int problem) {
-        return true;
-    }
-}
-"@
-}
-[System.Net.ServicePointManager]::CertificatePolicy = New-Object NsxTrustAllCerts
-
-$Cred = Get-Credential -Message 'NSX account with Enterprise Admin role. For vIDM use user@domain'
-if (-not $Cred) {
-    Write-Host 'No credentials supplied. Aborting.' -ForegroundColor Yellow
-    return
-}
-
-if ($Cred.UserName -notmatch '@') {
-    Write-Host ''
-    Write-Host ("Username '{0}' has no @domain suffix." -f $Cred.UserName) -ForegroundColor Yellow
-    Write-Host 'For a vIDM-backed account the domain must match a configured identity' -ForegroundColor Yellow
-    Write-Host 'source, e.g. jbloggs@corp.local. Continuing as entered.'               -ForegroundColor Yellow
-    Write-Host ''
-}
-
-# Get-Credential may prefix a domain if the name was typed as DOMAIN\user.
-# Strip it so the value sent is exactly what was entered.
-$userName = $Cred.GetNetworkCredential().UserName
-if ($Cred.UserName -match '@') { $userName = $Cred.UserName.TrimStart('\') }
-
-$pair = '{0}:{1}' -f $userName, $Cred.GetNetworkCredential().Password
-$script:AuthB64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($pair))
-Remove-Variable pair -ErrorAction SilentlyContinue
-
-# Populated on the first successful call so later calls skip the fallback attempt.
-$script:ResolvedScheme = $null
-
-if (-not (Test-Path -LiteralPath $OutputDir)) {
-    New-Item -Path $OutputDir -ItemType Directory -Force | Out-Null
-}
-$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$OutputDir = 'C:\Temp\NsxUserAudit'
 
 #endregion --------------------------------------------------------------------
 
 
 #region Helpers ---------------------------------------------------------------
 
-function Invoke-NsxGet {
-    param(
-        [Parameter(Mandatory)] [string] $Node,
-        [Parameter(Mandatory)] [string] $Path,
-        [switch] $Raw
-    )
+function Read-LogLines {
+    <# Streams lines from a .gz or plain text log file. #>
+    param([Parameter(Mandatory)] [string] $Path)
 
-    $uri = 'https://{0}{1}' -f $Node, $Path
+    $fs = $null; $gz = $null; $sr = $null
+    try {
+        $fs = [System.IO.File]::OpenRead($Path)
 
-    if ($script:ResolvedScheme)      { $order = @($script:ResolvedScheme) }
-    elseif ($AuthScheme -eq 'Auto')  { $order = @('Basic', 'Remote') }
-    else                             { $order = @($AuthScheme) }
-
-    $lastError = $null
-
-    foreach ($scheme in $order) {
-
-        $h = @{
-            Authorization  = '{0} {1}' -f $scheme, $script:AuthB64
-            'Content-Type' = 'application/json'
+        if ($Path -like '*.gz') {
+            $gz = New-Object System.IO.Compression.GzipStream(
+                      $fs, [System.IO.Compression.CompressionMode]::Decompress)
+            $sr = New-Object System.IO.StreamReader($gz)
+        }
+        else {
+            $sr = New-Object System.IO.StreamReader($fs)
         }
 
-        try {
-            if ($Raw) {
-                $r = Invoke-WebRequest -Uri $uri -Headers $h -Method Get `
-                                       -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
-                $script:ResolvedScheme = $scheme
-                return $r.Content
-            }
-            else {
-                $r = Invoke-RestMethod -Uri $uri -Headers $h -Method Get `
-                                       -TimeoutSec 120 -ErrorAction Stop
-                $script:ResolvedScheme = $scheme
-                return $r
-            }
-        }
-        catch {
-            $lastError = $_
-            $code = $null
-            if ($_.Exception.Response) {
-                $code = [int]$_.Exception.Response.StatusCode
-            }
-
-            if ($code -eq 401 -or $code -eq 403) {
-                Write-Host ("  [{0}] '{1}' scheme rejected (HTTP {2})" -f $node, $scheme, $code) `
-                           -ForegroundColor DarkYellow
-                continue
-            }
-            break
+        while (-not $sr.EndOfStream) {
+            $sr.ReadLine()
         }
     }
-
-    Write-Host ("  [{0}] request failed: {1}" -f $Node, $lastError.Exception.Message) -ForegroundColor Red
-    return $null
-}
-
-function Get-NsxLogContent {
-    <#
-        Probes each candidate log path with GET then POST.
-        On HTTP 405 the server's Allow header is printed - that header is the
-        authoritative list of methods the endpoint accepts on this build.
-    #>
-    param(
-        [Parameter(Mandatory)] [string]   $Node,
-        [Parameter(Mandatory)] [string[]] $Paths
-    )
-
-    if ($script:ResolvedScheme)     { $schemes = @($script:ResolvedScheme) }
-    elseif ($AuthScheme -eq 'Auto') { $schemes = @('Basic', 'Remote') }
-    else                            { $schemes = @($AuthScheme) }
-
-    foreach ($path in $Paths) {
-        foreach ($method in @('Get', 'Post')) {
-            foreach ($scheme in $schemes) {
-
-                $uri = 'https://{0}{1}' -f $Node, $path
-                $h = @{
-                    Authorization  = '{0} {1}' -f $scheme, $script:AuthB64
-                    'Content-Type' = 'application/json'
-                }
-
-                try {
-                    $params = @{
-                        Uri             = $uri
-                        Headers         = $h
-                        Method          = $method
-                        UseBasicParsing = $true
-                        TimeoutSec      = 180
-                        ErrorAction     = 'Stop'
-                    }
-                    if ($method -eq 'Post') { $params['Body'] = '{}' }
-
-                    $r = Invoke-WebRequest @params
-                    $script:ResolvedScheme = $scheme
-                    Write-Host ("  OK: {0} {1}" -f $method.ToUpper(), $path) -ForegroundColor Green
-                    return $r.Content
-                }
-                catch {
-                    $code  = $null
-                    $allow = $null
-                    if ($_.Exception.Response) {
-                        $code = [int]$_.Exception.Response.StatusCode
-                        try { $allow = $_.Exception.Response.Headers['Allow'] } catch { }
-                    }
-
-                    if ($code -eq 405) {
-                        $msg = "  405 on {0} {1}" -f $method.ToUpper(), $path
-                        if ($allow) { $msg += (" - server Allow header: {0}" -f $allow) }
-                        Write-Host $msg -ForegroundColor DarkYellow
-                        break   # method rejected outright; scheme is irrelevant
-                    }
-                    elseif ($code -eq 401 -or $code -eq 403) {
-                        Write-Host ("  {0} on {1} {2} using '{3}' scheme" -f $code, $method.ToUpper(), $path, $scheme) `
-                                   -ForegroundColor DarkYellow
-                        continue
-                    }
-                    else {
-                        Write-Host ("  {0} on {1} {2}" -f $(if ($code) { $code } else { 'error' }), $method.ToUpper(), $path) `
-                                   -ForegroundColor DarkGray
-                        break
-                    }
-                }
-            }
-        }
+    finally {
+        if ($sr) { $sr.Dispose() }
+        if ($gz) { $gz.Dispose() }
+        if ($fs) { $fs.Dispose() }
     }
-
-    return $null
 }
 
 function ConvertFrom-AuditLine {
     param(
-        [Parameter(Mandatory)] [string] $Node,
+        [Parameter(Mandatory)] [string] $SourceFile,
         [Parameter(Mandatory)] [string] $Line
     )
 
@@ -250,19 +76,21 @@ function ConvertFrom-AuditLine {
     $subcomp = ([regex]'subcomp="([^"]*)"').Match($Line).Groups[1].Value
     $comp    = ([regex]'comp="([^"]*)"').Match($Line).Groups[1].Value
 
-    $method = ''
+    $request = ''
     $m = ([regex]"'(GET|POST|PUT|DELETE|PATCH)\s+([^']*)'").Match($Line)
-    if ($m.Success) {
-        $method = '{0} {1}' -f $m.Groups[1].Value, $m.Groups[2].Value
-    }
+    if ($m.Success) { $request = '{0} {1}' -f $m.Groups[1].Value, $m.Groups[2].Value }
+
+    # CLI audit entries carry the command instead of an HTTP request.
+    $command = ([regex]'CMD:\s*(.+?)(?:\s*\(duration|$)').Match($Line).Groups[1].Value
 
     [pscustomobject]@{
-        Node       = $Node
         Timestamp  = $ts
         ActedBy    = $user
         Component  = $comp
         SubComp    = $subcomp
-        Request    = $method
+        Request    = $request
+        Command    = $command
+        SourceFile = [System.IO.Path]::GetFileName($SourceFile)
         RawLine    = $Line.Trim()
     }
 }
@@ -270,101 +98,82 @@ function ConvertFrom-AuditLine {
 #endregion --------------------------------------------------------------------
 
 
-#region Pass 1 - account record on each node ----------------------------------
+#region Search ----------------------------------------------------------------
 
-Write-Host ''
-Write-Host ("Looking for local user '{0}'" -f $TargetUser) -ForegroundColor Cyan
-Write-Host ('-' * 70)
-
-$accountFindings = New-Object System.Collections.Generic.List[object]
-
-foreach ($node in $NsxNodes) {
-
-    Write-Host ("[{0}] querying /api/v1/node/users" -f $node)
-
-    $users = Invoke-NsxGet -Node $node -Path '/api/v1/node/users'
-    if ($null -eq $users) { continue }
-
-    $list = $users
-    if ($users.PSObject.Properties.Name -contains 'results') { $list = $users.results }
-
-    $match = $list | Where-Object { $_.username -eq $TargetUser }
-
-    if ($match) {
-        Write-Host ("  FOUND on {0}" -f $node) -ForegroundColor Green
-        foreach ($p in $match.PSObject.Properties) {
-            Write-Host ("    {0,-28} : {1}" -f $p.Name, $p.Value)
-        }
-        $obj = $match | Select-Object *
-        $obj | Add-Member -NotePropertyName 'Node' -NotePropertyValue $node -Force
-        $accountFindings.Add($obj)
-    }
-    else {
-        Write-Host ("  not present on {0}" -f $node) -ForegroundColor DarkGray
-        Write-Host ("    accounts seen: {0}" -f (($list.username) -join ', ')) -ForegroundColor DarkGray
-    }
+if (-not (Test-Path -LiteralPath $ArchiveDir)) {
+    Write-Host ("Archive folder not found: {0}" -f $ArchiveDir) -ForegroundColor Red
+    return
+}
+if (-not (Test-Path -LiteralPath $OutputDir)) {
+    New-Item -Path $OutputDir -ItemType Directory -Force | Out-Null
 }
 
-if ($accountFindings.Count -eq 0) {
-    Write-Host ''
-    Write-Host ("'{0}' was not returned by the node users API on any node." -f $TargetUser) -ForegroundColor Yellow
-    Write-Host 'It may be a Principal Identity, an LDAP/vIDM-backed user, or an OS-level' -ForegroundColor Yellow
-    Write-Host 'account created outside NSX. Continuing to the audit log search anyway.'  -ForegroundColor Yellow
+$files = Get-ChildItem -LiteralPath $ArchiveDir -File |
+         Where-Object { $_.Name -match 'syslog|\.gz$|\.log$' } |
+         Sort-Object Name
+
+if (-not $files) {
+    Write-Host ("No log files found in {0}" -f $ArchiveDir) -ForegroundColor Yellow
+    return
 }
-
-#endregion --------------------------------------------------------------------
-
-
-#region Pass 2 - audit log search ---------------------------------------------
-
-Write-Host ''
-Write-Host 'Searching appliance audit logs' -ForegroundColor Cyan
-Write-Host ('-' * 70)
-
-$auditHits = New-Object System.Collections.Generic.List[object]
-$coverage  = New-Object System.Collections.Generic.List[object]
 
 $patterns = @($TargetUser) + $SearchPatterns
+$hits     = New-Object System.Collections.Generic.List[object]
+$coverage = New-Object System.Collections.Generic.List[object]
 
-foreach ($node in $NsxNodes) {
+Write-Host ''
+Write-Host ("Searching {0} file(s) for '{1}'" -f $files.Count, $TargetUser) -ForegroundColor Cyan
+Write-Host ('-' * 70)
 
-    Write-Host ("[{0}] retrieving log content" -f $node)
+foreach ($file in $files) {
 
-    $log = Get-NsxLogContent -Node $node -Paths $LogPaths
-    if ([string]::IsNullOrWhiteSpace($log)) {
-        Write-Host '  no log content retrieved from this node' -ForegroundColor Yellow
+    Write-Host ("[{0}] {1:N1} MB" -f $file.Name, ($file.Length / 1MB))
+
+    $lineCount = 0
+    $fileHits  = 0
+    $firstTs   = $null
+    $lastTs    = $null
+
+    try {
+        foreach ($line in (Read-LogLines -Path $file.FullName)) {
+
+            $lineCount++
+
+            $ts = ([regex]'\d{4}-\d{2}-\d{2}T[\d:.]+Z').Match($line).Value
+            if ($ts) {
+                if (-not $firstTs) { $firstTs = $ts }
+                $lastTs = $ts
+            }
+
+            foreach ($pattern in $patterns) {
+                if ($line -like ('*{0}*' -f $pattern)) {
+                    $parsed = ConvertFrom-AuditLine -SourceFile $file.FullName -Line $line
+                    $parsed | Add-Member -NotePropertyName 'MatchedPattern' -NotePropertyValue $pattern -Force
+                    $hits.Add($parsed)
+                    $fileHits++
+                    break   # one hit record per line
+                }
+            }
+        }
+    }
+    catch {
+        Write-Host ("  read failed: {0}" -f $_.Exception.Message) -ForegroundColor Red
         continue
     }
 
-    $lines = $log -split "`r?`n" | Where-Object { $_ -match '\S' }
-    Write-Host ("  {0} lines returned" -f $lines.Count) -ForegroundColor DarkGray
+    $coverage.Add([pscustomobject]@{
+        File        = $file.Name
+        Lines       = $lineCount
+        OldestEntry = $firstTs
+        NewestEntry = $lastTs
+        Hits        = $fileHits
+    })
 
-    # Record the retention window this node's response actually covers.
-    $tsAll = foreach ($l in $lines) {
-        $t = ([regex]'\d{4}-\d{2}-\d{2}T[\d:.]+Z').Match($l).Value
-        if ($t) { $t }
+    if ($fileHits -gt 0) {
+        Write-Host ("  {0} hit(s)" -f $fileHits) -ForegroundColor Green
     }
-    if ($tsAll) {
-        $sorted = $tsAll | Sort-Object
-        $coverage.Add([pscustomobject]@{
-            Node           = $node
-            OldestEntry    = $sorted[0]
-            NewestEntry    = $sorted[-1]
-            LinesReturned  = $lines.Count
-        })
-        Write-Host ("  covers {0}  ->  {1}" -f $sorted[0], $sorted[-1]) -ForegroundColor DarkGray
-    }
-
-    foreach ($pattern in $patterns) {
-        $matches = $lines | Where-Object { $_ -like ('*{0}*' -f $pattern) }
-        foreach ($line in $matches) {
-            $parsed = ConvertFrom-AuditLine -Node $node -Line $line
-            $parsed | Add-Member -NotePropertyName 'MatchedPattern' -NotePropertyValue $pattern -Force
-            $auditHits.Add($parsed)
-        }
-        if ($matches) {
-            Write-Host ("  {0} hit(s) for '{1}'" -f @($matches).Count, $pattern) -ForegroundColor Green
-        }
+    else {
+        Write-Host '  no hits' -ForegroundColor DarkGray
     }
 }
 
@@ -373,56 +182,44 @@ foreach ($node in $NsxNodes) {
 
 #region Output ----------------------------------------------------------------
 
-Write-Host ''
-if ($script:ResolvedScheme) {
-    Write-Host ("Authenticated using the '{0}' scheme." -f $script:ResolvedScheme) -ForegroundColor Gray
-}
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 
 Write-Host ''
-Write-Host 'Audit log coverage per node' -ForegroundColor Cyan
+Write-Host 'Coverage' -ForegroundColor Cyan
 Write-Host ('-' * 70)
-if ($coverage.Count -gt 0) {
-    $coverage | Format-Table -AutoSize | Out-Host
-    Write-Host 'If the account predates the OldestEntry values above, the creation event has' -ForegroundColor Yellow
-    Write-Host 'already rotated out of the live log. Check rotated .gz files on the appliance' -ForegroundColor Yellow
-    Write-Host 'or your syslog collector instead.'                                            -ForegroundColor Yellow
-}
+$coverage | Format-Table -AutoSize | Out-Host
+Write-Host 'Check that the combined OldestEntry values reach back past the account'  -ForegroundColor Gray
+Write-Host 'creation date. If they do not, you are missing archives from the managers.' -ForegroundColor Gray
 
 Write-Host ''
-Write-Host 'Audit matches' -ForegroundColor Cyan
+Write-Host 'Matches' -ForegroundColor Cyan
 Write-Host ('-' * 70)
 
-if ($auditHits.Count -eq 0) {
-    Write-Host 'No matching audit entries found in the live log on any node.' -ForegroundColor Yellow
+if ($hits.Count -eq 0) {
+    Write-Host 'No matching entries in the supplied archives.' -ForegroundColor Yellow
 }
 else {
-    $auditHits |
-        Sort-Object Timestamp |
-        Select-Object Timestamp, Node, ActedBy, SubComp, Request, MatchedPattern |
-        Format-Table -AutoSize | Out-Host
+    $hits | Sort-Object Timestamp |
+        Select-Object Timestamp, ActedBy, SubComp, Request, Command, SourceFile |
+        Format-Table -AutoSize -Wrap | Out-Host
 
-    Write-Host 'ActedBy is the account that performed the action.' -ForegroundColor Gray
-    Write-Host 'SubComp indicates the channel: node-mgmt = UI/API, cli = SSH session.' -ForegroundColor Gray
-}
+    Write-Host 'ActedBy   : the account that performed the action.'          -ForegroundColor Gray
+    Write-Host 'SubComp   : node-mgmt = UI/API call, cli = SSH session.'     -ForegroundColor Gray
+    Write-Host 'Command   : populated for CLI-originated audit entries.'     -ForegroundColor Gray
 
-$csvPath = Join-Path $OutputDir ("NsxUserAudit-{0}-{1}.csv" -f $TargetUser, $stamp)
-$rawPath = Join-Path $OutputDir ("NsxUserAudit-{0}-{1}-raw.txt" -f $TargetUser, $stamp)
-$acctPath = Join-Path $OutputDir ("NsxUserAccount-{0}-{1}.csv" -f $TargetUser, $stamp)
+    $csv = Join-Path $OutputDir ("NsxArchiveSearch-{0}-{1}.csv" -f $TargetUser, $stamp)
+    $raw = Join-Path $OutputDir ("NsxArchiveSearch-{0}-{1}-raw.txt" -f $TargetUser, $stamp)
 
-if ($auditHits.Count -gt 0) {
-    $auditHits | Sort-Object Timestamp |
-        Select-Object Timestamp, Node, ActedBy, Component, SubComp, Request, MatchedPattern |
-        Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
-    $auditHits | Sort-Object Timestamp | ForEach-Object { $_.RawLine } |
-        Set-Content -Path $rawPath -Encoding UTF8
+    $hits | Sort-Object Timestamp |
+        Select-Object Timestamp, ActedBy, Component, SubComp, Request, Command, SourceFile, MatchedPattern |
+        Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8
+
+    $hits | Sort-Object Timestamp | ForEach-Object { $_.RawLine } |
+        Set-Content -Path $raw -Encoding UTF8
+
     Write-Host ''
-    Write-Host ("Parsed matches : {0}" -f $csvPath) -ForegroundColor Green
-    Write-Host ("Raw log lines  : {0}" -f $rawPath) -ForegroundColor Green
-}
-
-if ($accountFindings.Count -gt 0) {
-    $accountFindings | Export-Csv -Path $acctPath -NoTypeInformation -Encoding UTF8
-    Write-Host ("Account record : {0}" -f $acctPath) -ForegroundColor Green
+    Write-Host ("Parsed : {0}" -f $csv) -ForegroundColor Green
+    Write-Host ("Raw    : {0}" -f $raw) -ForegroundColor Green
 }
 
 Write-Host ''
