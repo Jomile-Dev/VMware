@@ -1,0 +1,292 @@
+<#
+    Get-NsxLocalUserOrigin.ps1
+
+    Purpose : Read-only. For a named NSX local user, queries every NSX Manager
+              node for the account record, then searches each node's appliance
+              audit log for the event that created it.
+
+    Runtime : Windows PowerShell 5.1. No PowerCLI dependency.
+              Paste into ISE and press F5, or run the .ps1 directly.
+
+    Scope   : GET requests only. Nothing is created, modified or deleted.
+
+    Notes   : Query each manager node by its own FQDN/IP, NOT the cluster VIP.
+              The audit entry for the creation event exists only on the node
+              that serviced the original request.
+#>
+
+#region Configuration ---------------------------------------------------------
+
+# Replace with your three manager node FQDNs or IPs. Do not use the VIP.
+$NsxNodes = @(
+    'CHANGEME-nsxmgr-01'
+    'CHANGEME-nsxmgr-02'
+    'CHANGEME-nsxmgr-03'
+)
+
+# The local user account under investigation.
+$TargetUser = 'OnfrAut2NSXT'
+
+# Where reports are written.
+$OutputDir = 'C:\Temp\NsxUserAudit'
+
+# Extra strings to search the audit log for, on top of the target username.
+# 'node/users' catches the local-user create/modify API path.
+$SearchPatterns = @(
+    'node/users'
+)
+
+#endregion --------------------------------------------------------------------
+
+
+#region Session setup ---------------------------------------------------------
+
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# Self-signed certificate handling for PowerShell 5.1.
+if (-not ([System.Management.Automation.PSTypeName]'NsxTrustAllCerts').Type) {
+    Add-Type -TypeDefinition @"
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+public class NsxTrustAllCerts : ICertificatePolicy {
+    public bool CheckValidationResult(ServicePoint sp, X509Certificate cert, WebRequest req, int problem) {
+        return true;
+    }
+}
+"@
+}
+[System.Net.ServicePointManager]::CertificatePolicy = New-Object NsxTrustAllCerts
+
+$Cred = Get-Credential -Message 'NSX Manager account with Enterprise Admin role (e.g. admin)'
+if (-not $Cred) {
+    Write-Host 'No credentials supplied. Aborting.' -ForegroundColor Yellow
+    return
+}
+
+$pair    = '{0}:{1}' -f $Cred.UserName, $Cred.GetNetworkCredential().Password
+$b64     = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
+$Headers = @{
+    Authorization  = "Basic $b64"
+    'Content-Type' = 'application/json'
+}
+Remove-Variable pair, b64 -ErrorAction SilentlyContinue
+
+if (-not (Test-Path -LiteralPath $OutputDir)) {
+    New-Item -Path $OutputDir -ItemType Directory -Force | Out-Null
+}
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+
+#endregion --------------------------------------------------------------------
+
+
+#region Helpers ---------------------------------------------------------------
+
+function Invoke-NsxGet {
+    param(
+        [Parameter(Mandatory)] [string] $Node,
+        [Parameter(Mandatory)] [string] $Path,
+        [switch] $Raw
+    )
+
+    $uri = 'https://{0}{1}' -f $Node, $Path
+    try {
+        if ($Raw) {
+            $r = Invoke-WebRequest -Uri $uri -Headers $Headers -Method Get `
+                                   -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
+            return $r.Content
+        }
+        else {
+            return Invoke-RestMethod -Uri $uri -Headers $Headers -Method Get `
+                                     -TimeoutSec 120 -ErrorAction Stop
+        }
+    }
+    catch {
+        Write-Host ("  [{0}] request failed: {1}" -f $Node, $_.Exception.Message) -ForegroundColor Red
+        return $null
+    }
+}
+
+function ConvertFrom-AuditLine {
+    param(
+        [Parameter(Mandatory)] [string] $Node,
+        [Parameter(Mandatory)] [string] $Line
+    )
+
+    $ts      = ([regex]'\d{4}-\d{2}-\d{2}T[\d:.]+Z').Match($Line).Value
+    $user    = ([regex]'username="([^"]*)"').Match($Line).Groups[1].Value
+    $subcomp = ([regex]'subcomp="([^"]*)"').Match($Line).Groups[1].Value
+    $comp    = ([regex]'comp="([^"]*)"').Match($Line).Groups[1].Value
+
+    $method = ''
+    $m = ([regex]"'(GET|POST|PUT|DELETE|PATCH)\s+([^']*)'").Match($Line)
+    if ($m.Success) {
+        $method = '{0} {1}' -f $m.Groups[1].Value, $m.Groups[2].Value
+    }
+
+    [pscustomobject]@{
+        Node       = $Node
+        Timestamp  = $ts
+        ActedBy    = $user
+        Component  = $comp
+        SubComp    = $subcomp
+        Request    = $method
+        RawLine    = $Line.Trim()
+    }
+}
+
+#endregion --------------------------------------------------------------------
+
+
+#region Pass 1 - account record on each node ----------------------------------
+
+Write-Host ''
+Write-Host ("Looking for local user '{0}'" -f $TargetUser) -ForegroundColor Cyan
+Write-Host ('-' * 70)
+
+$accountFindings = New-Object System.Collections.Generic.List[object]
+
+foreach ($node in $NsxNodes) {
+
+    Write-Host ("[{0}] querying /api/v1/node/users" -f $node)
+
+    $users = Invoke-NsxGet -Node $node -Path '/api/v1/node/users'
+    if ($null -eq $users) { continue }
+
+    $list = $users
+    if ($users.PSObject.Properties.Name -contains 'results') { $list = $users.results }
+
+    $match = $list | Where-Object { $_.username -eq $TargetUser }
+
+    if ($match) {
+        Write-Host ("  FOUND on {0}" -f $node) -ForegroundColor Green
+        foreach ($p in $match.PSObject.Properties) {
+            Write-Host ("    {0,-28} : {1}" -f $p.Name, $p.Value)
+        }
+        $obj = $match | Select-Object *
+        $obj | Add-Member -NotePropertyName 'Node' -NotePropertyValue $node -Force
+        $accountFindings.Add($obj)
+    }
+    else {
+        Write-Host ("  not present on {0}" -f $node) -ForegroundColor DarkGray
+        Write-Host ("    accounts seen: {0}" -f (($list.username) -join ', ')) -ForegroundColor DarkGray
+    }
+}
+
+if ($accountFindings.Count -eq 0) {
+    Write-Host ''
+    Write-Host ("'{0}' was not returned by the node users API on any node." -f $TargetUser) -ForegroundColor Yellow
+    Write-Host 'It may be a Principal Identity, an LDAP/vIDM-backed user, or an OS-level' -ForegroundColor Yellow
+    Write-Host 'account created outside NSX. Continuing to the audit log search anyway.'  -ForegroundColor Yellow
+}
+
+#endregion --------------------------------------------------------------------
+
+
+#region Pass 2 - audit log search ---------------------------------------------
+
+Write-Host ''
+Write-Host 'Searching appliance audit logs' -ForegroundColor Cyan
+Write-Host ('-' * 70)
+
+$auditHits = New-Object System.Collections.Generic.List[object]
+$coverage  = New-Object System.Collections.Generic.List[object]
+
+$patterns = @($TargetUser) + $SearchPatterns
+
+foreach ($node in $NsxNodes) {
+
+    Write-Host ("[{0}] pulling /api/v1/administration/audit-logs" -f $node)
+
+    $log = Invoke-NsxGet -Node $node -Path '/api/v1/administration/audit-logs' -Raw
+    if ([string]::IsNullOrWhiteSpace($log)) {
+        Write-Host '  no content returned' -ForegroundColor DarkGray
+        continue
+    }
+
+    $lines = $log -split "`r?`n" | Where-Object { $_ -match '\S' }
+    Write-Host ("  {0} lines returned" -f $lines.Count) -ForegroundColor DarkGray
+
+    # Record the retention window this node's response actually covers.
+    $tsAll = foreach ($l in $lines) {
+        $t = ([regex]'\d{4}-\d{2}-\d{2}T[\d:.]+Z').Match($l).Value
+        if ($t) { $t }
+    }
+    if ($tsAll) {
+        $sorted = $tsAll | Sort-Object
+        $coverage.Add([pscustomobject]@{
+            Node           = $node
+            OldestEntry    = $sorted[0]
+            NewestEntry    = $sorted[-1]
+            LinesReturned  = $lines.Count
+        })
+        Write-Host ("  covers {0}  ->  {1}" -f $sorted[0], $sorted[-1]) -ForegroundColor DarkGray
+    }
+
+    foreach ($pattern in $patterns) {
+        $matches = $lines | Where-Object { $_ -like ('*{0}*' -f $pattern) }
+        foreach ($line in $matches) {
+            $parsed = ConvertFrom-AuditLine -Node $node -Line $line
+            $parsed | Add-Member -NotePropertyName 'MatchedPattern' -NotePropertyValue $pattern -Force
+            $auditHits.Add($parsed)
+        }
+        if ($matches) {
+            Write-Host ("  {0} hit(s) for '{1}'" -f @($matches).Count, $pattern) -ForegroundColor Green
+        }
+    }
+}
+
+#endregion --------------------------------------------------------------------
+
+
+#region Output ----------------------------------------------------------------
+
+Write-Host ''
+Write-Host 'Audit log coverage per node' -ForegroundColor Cyan
+Write-Host ('-' * 70)
+if ($coverage.Count -gt 0) {
+    $coverage | Format-Table -AutoSize | Out-Host
+    Write-Host 'If the account predates the OldestEntry values above, the creation event has' -ForegroundColor Yellow
+    Write-Host 'already rotated out of the live log. Check rotated .gz files on the appliance' -ForegroundColor Yellow
+    Write-Host 'or your syslog collector instead.'                                            -ForegroundColor Yellow
+}
+
+Write-Host ''
+Write-Host 'Audit matches' -ForegroundColor Cyan
+Write-Host ('-' * 70)
+
+if ($auditHits.Count -eq 0) {
+    Write-Host 'No matching audit entries found in the live log on any node.' -ForegroundColor Yellow
+}
+else {
+    $auditHits |
+        Sort-Object Timestamp |
+        Select-Object Timestamp, Node, ActedBy, SubComp, Request, MatchedPattern |
+        Format-Table -AutoSize | Out-Host
+
+    Write-Host 'ActedBy is the account that performed the action.' -ForegroundColor Gray
+    Write-Host 'SubComp indicates the channel: node-mgmt = UI/API, cli = SSH session.' -ForegroundColor Gray
+}
+
+$csvPath = Join-Path $OutputDir ("NsxUserAudit-{0}-{1}.csv" -f $TargetUser, $stamp)
+$rawPath = Join-Path $OutputDir ("NsxUserAudit-{0}-{1}-raw.txt" -f $TargetUser, $stamp)
+$acctPath = Join-Path $OutputDir ("NsxUserAccount-{0}-{1}.csv" -f $TargetUser, $stamp)
+
+if ($auditHits.Count -gt 0) {
+    $auditHits | Sort-Object Timestamp |
+        Select-Object Timestamp, Node, ActedBy, Component, SubComp, Request, MatchedPattern |
+        Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+    $auditHits | Sort-Object Timestamp | ForEach-Object { $_.RawLine } |
+        Set-Content -Path $rawPath -Encoding UTF8
+    Write-Host ''
+    Write-Host ("Parsed matches : {0}" -f $csvPath) -ForegroundColor Green
+    Write-Host ("Raw log lines  : {0}" -f $rawPath) -ForegroundColor Green
+}
+
+if ($accountFindings.Count -gt 0) {
+    $accountFindings | Export-Csv -Path $acctPath -NoTypeInformation -Encoding UTF8
+    Write-Host ("Account record : {0}" -f $acctPath) -ForegroundColor Green
+}
+
+Write-Host ''
+
+#endregion --------------------------------------------------------------------
