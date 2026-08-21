@@ -36,6 +36,15 @@ $SearchPatterns = @(
     'node/users'
 )
 
+# Authentication scheme against NSX Manager.
+#   'Auto'   - try Basic first, fall back to 'Remote' if the node rejects it.
+#   'Basic'  - Authorization: Basic  <base64(user@domain:password)>
+#              Newer NSX accepts a remote (vIDM/LDAP) username directly via Basic,
+#              provided the domain matches a configured identity source.
+#   'Remote' - Authorization: Remote <base64(user@domain:password)>
+#              The scheme older NSX-T builds required for vIDM-backed accounts.
+$AuthScheme = 'Auto'
+
 #endregion --------------------------------------------------------------------
 
 
@@ -57,19 +66,31 @@ public class NsxTrustAllCerts : ICertificatePolicy {
 }
 [System.Net.ServicePointManager]::CertificatePolicy = New-Object NsxTrustAllCerts
 
-$Cred = Get-Credential -Message 'NSX Manager account with Enterprise Admin role (e.g. admin)'
+$Cred = Get-Credential -Message 'NSX account with Enterprise Admin role. For vIDM use user@domain'
 if (-not $Cred) {
     Write-Host 'No credentials supplied. Aborting.' -ForegroundColor Yellow
     return
 }
 
-$pair    = '{0}:{1}' -f $Cred.UserName, $Cred.GetNetworkCredential().Password
-$b64     = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
-$Headers = @{
-    Authorization  = "Basic $b64"
-    'Content-Type' = 'application/json'
+if ($Cred.UserName -notmatch '@') {
+    Write-Host ''
+    Write-Host ("Username '{0}' has no @domain suffix." -f $Cred.UserName) -ForegroundColor Yellow
+    Write-Host 'For a vIDM-backed account the domain must match a configured identity' -ForegroundColor Yellow
+    Write-Host 'source, e.g. jbloggs@corp.local. Continuing as entered.'               -ForegroundColor Yellow
+    Write-Host ''
 }
-Remove-Variable pair, b64 -ErrorAction SilentlyContinue
+
+# Get-Credential may prefix a domain if the name was typed as DOMAIN\user.
+# Strip it so the value sent is exactly what was entered.
+$userName = $Cred.GetNetworkCredential().UserName
+if ($Cred.UserName -match '@') { $userName = $Cred.UserName.TrimStart('\') }
+
+$pair = '{0}:{1}' -f $userName, $Cred.GetNetworkCredential().Password
+$script:AuthB64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($pair))
+Remove-Variable pair -ErrorAction SilentlyContinue
+
+# Populated on the first successful call so later calls skip the fallback attempt.
+$script:ResolvedScheme = $null
 
 if (-not (Test-Path -LiteralPath $OutputDir)) {
     New-Item -Path $OutputDir -ItemType Directory -Force | Out-Null
