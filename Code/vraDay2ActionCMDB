@@ -23,6 +23,29 @@ $getVmAppsUri     = "$vroBase.returns/getVmApplications"
 $getCagAppsUri    = "$vroBase.returns/getCagApplications"
 $returnAppVmsUri  = "$vroBase.returns/returnApplicationsVms"
 
+# ---------------------------------------------------------------------------
+# UPSTREAM VIA WORKFLOW LOGS (vRO/Aria 8.18.1)
+# The upstream JSON (retrieveCIRelationshipInfoByKey.upstreamCIs) is written to
+# the getVmApplications *log*, and on 8.x an ACTION execution does not expose its
+# log over REST - only workflow executions do. So wrap getVmApplications in a thin
+# workflow, run THAT via REST, and read the workflow run log.
+#
+# One-time vRO setup:
+#   1. Workflows -> New Workflow (e.g. "wf-getVmApplications")
+#   2. Add input parameters: vmName (string), projectName (string)
+#   3. Drag the getVmApplications action onto the schema; bind vmName + projectName
+#   4. Save, then copy the workflow ID (URL or the General tab) into $UpstreamWorkflowId
+#
+# When $UseWorkflowLogs = $true the review reads upstream from the workflow log.
+# When $false it falls back to the action-log path (returns nothing on 8.18.1).
+$UseWorkflowLogs      = $true
+$UpstreamWorkflowId   = "<workflow-id-guid>"     # e.g. 9d95c7f5-a563-413f-af42-fd7e09275216
+# Workflow input parameter names -> mapped from the VM row at runtime.
+$UpstreamWfInputVmName      = "vmName"
+$UpstreamWfInputProjectName = "projectName"
+# Max seconds to wait for a workflow run to leave "running" before giving up.
+$WorkflowWaitSec      = 60
+
 # Field(s) on the upstream object that hold "Application" / "SubApplication".
 # UpstreamCIType is the current candidate; UpstreamCICMSClass is kept as a fallback.
 $UpstreamClassFields = @('UpstreamCICMSClass', 'UpstreamCIType')
@@ -310,6 +333,87 @@ function Get-CiStatusesFromLog {
     return @(Get-CiStatuses -Obj $obj)
 }
 
+# Run a WORKFLOW via REST and fetch that run's logs. On vRO/Aria 8.x a workflow
+# execution exposes its log at /executions/{execId}/syslogs (and /logs), where the
+# wrapped action's System.log output - including retrieveCIRelationshipInfoByKey -
+# appears. Poll state until the run leaves "running", then read the log.
+# Returns the same shape as Invoke-VroActionWithLogs: Value/LogText/LogEndpoint/ExecId.
+function Invoke-VroWorkflowWithLogs {
+    param(
+        $VraServer, $AuthToken, $WorkflowId, [hashtable]$Parameters,
+        [int]$WaitSec = 60, [int]$TimeoutSec = 60
+    )
+
+    $headers = @{
+        "Authorization" = "Bearer $AuthToken"
+        "Content-Type"  = "application/json"
+        "Accept"        = "application/json"
+    }
+
+    # Workflow execution body: parameters use the same typed envelope as actions.
+    $paramList = foreach ($k in $Parameters.Keys) {
+        $val = $Parameters[$k]
+        if ($val -is [bool]) { @{ name = $k; type = "boolean"; value = @{ boolean = @{ value = $val } } } }
+        else                 { @{ name = $k; type = "string";  value = @{ string  = @{ value = [string]$val } } } }
+    }
+    $body = @{ parameters = @($paramList) } | ConvertTo-Json -Depth 6
+
+    $base   = "https://$VraServer/vco/api/workflows/$WorkflowId"
+    $execId = $null
+
+    try {
+        $resp = Invoke-WebRequest -Uri "$base/executions" -Method Post -Headers $headers -Body $body -TimeoutSec $TimeoutSec -UseBasicParsing
+        if ($resp.Headers.Location) { $execId = ([string]$resp.Headers.Location).TrimEnd('/').Split('/')[-1] }
+        if (-not $execId -and $resp.Content) {
+            try { $p = $resp.Content | ConvertFrom-Json; if ($p.id) { $execId = $p.id } } catch { }
+        }
+    }
+    catch {
+        return [PSCustomObject]@{ Value = $null; LogText = ""; LogEndpoint = "wf-run-failed: $($_.Exception.Message)"; ExecId = $null }
+    }
+
+    if (-not $execId) {
+        return [PSCustomObject]@{ Value = $null; LogText = ""; LogEndpoint = "wf-no-execId"; ExecId = $null }
+    }
+
+    # Poll state until it leaves "running" (or we hit the wait cap)
+    $waited = 0
+    do {
+        Start-Sleep -Milliseconds 1000
+        $waited++
+        $state = "unknown"
+        try {
+            $st = Invoke-RestMethod -Uri "$base/executions/$execId/state" -Method Get -Headers $headers -TimeoutSec 30
+            if ($st.value) { $state = [string]$st.value } elseif ($st.'state') { $state = [string]$st.'state' }
+        } catch { }
+    } while ($state -eq "running" -and $waited -lt $WaitSec)
+
+    # Read the run log (syslogs carries the detailed System.log lines; /logs is the fallback)
+    $logText = ""; $usedEndpoint = "none"
+    $candidates = @(
+        "$base/executions/$execId/syslogs?maxResult=10000",
+        "$base/executions/$execId/logs?maxResult=10000"
+    )
+    foreach ($cand in $candidates) {
+        try {
+            $logResp = Invoke-RestMethod -Uri $cand -Method Get -Headers $headers -TimeoutSec 30
+            $lines = @()
+            foreach ($e in @($logResp.logs)) {
+                $m = $null
+                if     ($e.entry.'long-message')  { $m = $e.entry.'long-message' }
+                elseif ($e.entry.'short-message') { $m = $e.entry.'short-message' }
+                elseif ($e.message)               { $m = $e.message }
+                if ($m) { $lines += $m }
+            }
+            if (-not $lines -and $logResp -is [string]) { $lines = @($logResp) }
+            if ($lines) { $logText = ($lines -join "`n"); $usedEndpoint = $cand; break }
+        }
+        catch { continue }
+    }
+
+    return [PSCustomObject]@{ Value = $null; LogText = $logText; LogEndpoint = $usedEndpoint; ExecId = $execId }
+}
+
 # Run an action (same module/name URI as everywhere else) and fetch that run's
 # logs - the same data the GUI Logs tab shows. Also returns the action's value.
 function Invoke-VroActionWithLogs {
@@ -376,7 +480,11 @@ function Invoke-VroActionWithLogs {
 
 # Build the six review fields for one VM result object
 function Invoke-CmdbReview {
-    param($Vm, $Catalog, $VraServer, $AuthToken, $GetVmAppsUri, $ReturnAppVmsUri, $PhasedOut, $ClassFields, $DebugPath)
+    param(
+        $Vm, $Catalog, $VraServer, $AuthToken, $GetVmAppsUri, $ReturnAppVmsUri,
+        $PhasedOut, $ClassFields, $DebugPath,
+        $UseWorkflowLogs, $WorkflowId, $WfInputVmName, $WfInputProjectName, $WorkflowWaitSec
+    )
 
     $nsxMatch = switch ($Vm.CompareResult) {
         "Match"                 { "NSX tag matches CMDB" }
@@ -402,19 +510,32 @@ function Invoke-CmdbReview {
 
     # --- Upstream relationship from getVmApplications LOGS ---
     # The upstream data (retrieveCIRelationshipInfoByKey.upstreamCIs) is written to
-    # the getVmApplications run's LOG output, not its return value. Call the action
-    # via the vRO Action REST API keyed on vmName + projectName (one call per VM,
-    # not per tag) and scrape upstreamCIs out of the run log.
+    # the getVmApplications run's LOG output, not its return value. On vRO 8.18.1 an
+    # ACTION execution does not expose its log over REST, so the reliable path is to
+    # run a thin WORKFLOW that wraps getVmApplications and read the WORKFLOW run log.
+    # Keyed on vmName + projectName (one call per VM). Falls back to the action-log
+    # path when $UseWorkflowLogs is off.
     $upstreamCIs = @()
     $ciStatuses  = @()
     $returnRaws  = @()
     try {
-        # One call: runs getVmApplications and grabs that run's logs too
-        $runRes = Invoke-VroActionWithLogs -VraServer $VraServer -AuthToken $AuthToken -ActionUri $GetVmAppsUri -Parameters @{
-            vmName      = $Vm.VMName
-            projectName = $Vm.ProjectName
+        if ($UseWorkflowLogs -and $WorkflowId -and $WorkflowId -notmatch '^<') {
+            # Run the wrapper workflow and read its run log
+            $wfInputs = @{}
+            $wfInputs[$WfInputVmName]      = $Vm.VMName
+            $wfInputs[$WfInputProjectName] = $Vm.ProjectName
+            $runRes = Invoke-VroWorkflowWithLogs -VraServer $VraServer -AuthToken $AuthToken -WorkflowId $WorkflowId -Parameters $wfInputs -WaitSec $WorkflowWaitSec
+            $runMode = "workflow"
         }
-        $returnRaws += [ordered]@{ vmName = $Vm.VMName; execId = $runRes.ExecId; logEndpoint = $runRes.LogEndpoint; logChars = @($runRes.LogText).Length; log = $runRes.LogText; value = $runRes.Value }
+        else {
+            # Fallback: action execution (log not retrievable via REST on 8.18.1)
+            $runRes = Invoke-VroActionWithLogs -VraServer $VraServer -AuthToken $AuthToken -ActionUri $GetVmAppsUri -Parameters @{
+                vmName      = $Vm.VMName
+                projectName = $Vm.ProjectName
+            }
+            $runMode = "action"
+        }
+        $returnRaws += [ordered]@{ vmName = $Vm.VMName; runMode = $runMode; execId = $runRes.ExecId; logEndpoint = $runRes.LogEndpoint; logChars = @($runRes.LogText).Length; log = $runRes.LogText; value = $runRes.Value }
         # Upstream CIs: from the log's retrieveCIRelationshipInfoByKey block
         # (falls back to the return value if it ever carries the JSON)
         $upstreamCIs += @(Get-UpstreamCIsFromLog -LogText $runRes.LogText)
@@ -1139,7 +1260,7 @@ if ($RunReview) {
     foreach ($vm in $reviewSet) {
         Write-Log " [$($reviewed + 1)/$reviewTotal] $($vm.VMName)..." -Color DarkGray
         $cat = Get-CagForProject -ProjectName $vm.ProjectName -VraServer $vraServer -AuthToken $authToken -CagUri $getCagAppsUri -PhasedOut $phasedOutEnabled
-        $rev = Invoke-CmdbReview -Vm $vm -Catalog $cat -VraServer $vraServer -AuthToken $authToken -GetVmAppsUri $getVmAppsUri -ReturnAppVmsUri $returnAppVmsUri -PhasedOut $phasedOutEnabled -ClassFields $UpstreamClassFields -DebugPath $(if ($ReviewDebug) { $ReviewDebugPath } else { $null })
+        $rev = Invoke-CmdbReview -Vm $vm -Catalog $cat -VraServer $vraServer -AuthToken $authToken -GetVmAppsUri $getVmAppsUri -ReturnAppVmsUri $returnAppVmsUri -PhasedOut $phasedOutEnabled -ClassFields $UpstreamClassFields -DebugPath $(if ($ReviewDebug) { $ReviewDebugPath } else { $null }) -UseWorkflowLogs $UseWorkflowLogs -WorkflowId $UpstreamWorkflowId -WfInputVmName $UpstreamWfInputVmName -WfInputProjectName $UpstreamWfInputProjectName -WorkflowWaitSec $WorkflowWaitSec
 
         Add-Member -InputObject $vm -NotePropertyName NSXMatchCMDB           -NotePropertyValue $rev.NSXMatchCMDB           -Force
         Add-Member -InputObject $vm -NotePropertyName AppOrSubApp            -NotePropertyValue $rev.AppOrSubApp            -Force
