@@ -1,361 +1,680 @@
-# ================================================================
-# VMware Aria Automation - Bulk CMDB Relations Extractor + Review
-#
-# Phase 1 (parallel, runspace pool - via form-service external-values):
-#   showVmDetails       -> NSX scope/tag per VM
-#   getVmApplications   -> CMDB CI list per VM (NSX-vs-CMDB match)
-#
-# Phase 2 (per unique VM, serial - via /vco/api/actions REST):
-#   getVmApplications   -> called again to capture LOG output, which
-#                          carries retrieveCIRelationshipInfoByKey with
-#                          upstreamCIs[] and downstreamCIs[].
-#   getCagApplications  -> classify tag as App vs Sub-App
-#
-# Six review columns appended per VM row:
-#   NSXMatchCMDB, AppOrSubApp, UpstreamToApp, MultipleUpstream,
-#   NoUpstreamRelationship, Upstream App Decomm
-# CompareResult is kept internal (not exported).
-#
-# Encoding: Export-Csv -Encoding UTF8; text normalised via
-# ConvertTo-CleanText to strip smart quotes / em-dash / NBSP.
-# ================================================================
+# VMware Aria Automation - Bulk CMDB Relations Extractor
+# Calls the vRO form external-values endpoint to retrieve CMDB data for all VMs
+# Uses runspace pooling for parallel execution (ISE compatible)
 
-# ============================ CONFIG ============================
-$vraServer  = "<vra-server-fqdn>"
+$vraServer = "vra.yourdomain.com"
 $resultsDir = "C:\Logs"
 
-# vRO action URIs (module/name form)
-$showVmDetailsUri = "<module>/showVmDetails"
-$getVmAppsUri     = "<module>/getVmApplications"
-$getCagAppsUri    = "<module>/getCagApplications"
-
-# NSX Manager (fallback for VMs with empty AppApplication)
-$NSXManager    = "<nsx-manager-fqdn>"
-$NSXAuthMode   = "vIDM"          # "Local" or "vIDM"
-$NSXvIDMDomain = "<domain>"
-$NSXCredPath   = "C:\Scripts\Creds\nsx_cred.xml"
-
-# Email
-$SendEmail    = $true
-$EmailTo      = "<recipient@company>"
-$EmailFrom    = "<sender@company>"
+# Email Configuration
+$SendEmail = $true
+$EmailTo = "admin@company.com"
+$EmailFrom = "vmware-reports@company.com"
 $EmailSubject = "CMDB Relations Comparison Report - $(Get-Date -Format 'yyyy-MM-dd')"
-$SMTPServer   = "<smtp-server>"
-$SMTPPort     = 465
-$UseSSL       = $true
+$SMTPServer = "mail.company.com"
+$SMTPPort = 465
+$UseSSL = $true
 
-# Runspace tuning (Phase 1)
-$PoolSize          = 30
-$JobTimeoutSeconds = 120
+# vRO action URIs - update the base once; actions build off it.
+# The review-phase actions (getCag, returnAppVms) are called via the vRO Action
+# REST API (/vco/api/actions), not the form external-values endpoint.
+$vroBase          = "somethingsomething.something"
+$showVmDetailsUri = "$vroBase.wrappers/showVmDetails"
+$getVmAppsUri     = "$vroBase.returns/getVmApplications"
+$getCagAppsUri    = "$vroBase.returns/getCagApplications"
+$returnAppVmsUri  = "$vroBase.returns/returnApplicationsVms"
 
-# Review-phase debug
-$ReviewDebugPath = Join-Path $resultsDir "review_debug.txt"
-# ================================================================
+# Field(s) on the upstream object that hold "Application" / "SubApplication".
+# UpstreamCIType is the current candidate; UpstreamCICMSClass is kept as a fallback.
+$UpstreamClassFields = @('UpstreamCICMSClass', 'UpstreamCIType')
 
+$phasedOutEnabled = $true
+$RunReview        = $true
+
+# Replay: skip the slow deployment fetch + main runspace phase and load a prior
+# snapshot CSV straight into $results, then run the review against it.
+$ReplayFromCsv    = $false
+$ReplayCsvPath    = "C:\Logs\results_snapshot.csv"
+
+# Probe: before the full review, run ONE getVmApplications call and dump the raw
+# response, so you can confirm the /vco/api/actions endpoint works and see the shape.
+$ProbeVroActions  = $false
+$ProbeVMName      = ""            # blank = first VM in $results
+
+# Review only the first N VMs (0 = all). Handy for troubleshooting.
+$ReviewLimit      = 0
+
+# Fetch only the first N deployments that contain eligible VMs (0 = all).
+# Handy for troubleshooting - empty/deleted deployments don't count toward N.
+$MaxDeployments   = 0
+
+# Write raw + parsed vRO responses per reviewed VM to a file for troubleshooting.
+$ReviewDebug      = $false
+$ReviewDebugPath  = "C:\Logs\review_debug.txt"
+
+# Per-action REST timeout (seconds) so a bad/blocked endpoint fails fast
+# instead of hanging the whole review.
+$VroTimeoutSec    = 30
+
+# NSX Manager Configuration (fallback for VMs with empty AppApplication)
+$NSXManager    = "nsx-manager.company.com"
+$NSXAuthMode   = "vIDM"
+$NSXvIDMDomain = "COMPANY"
+$NSXCredPath   = "C:\Scripts\Creds\nsx_cred.xml"
 
 function Write-Log {
     param($Message, $Color = "White")
     Write-Host $Message -ForegroundColor $Color
 }
 
-
-# ---------------- Helpers ----------------
-
-function Normalize-AppName {
-    param($Name)
-    if (-not $Name) { return "" }
-    return ($Name.ToLower().Trim() -replace '[_\s\-\.]+', '')
-}
-
-
-function ConvertTo-CleanText {
-    # Normalise typographic chars (em/en dash, NBSP, curly quotes) to ASCII.
-    param([string]$Text)
-    if (-not $Text) { return $Text }
-    $map = @{
-        [char]0x2013 = '-'
-        [char]0x2014 = '-'
-        [char]0x2018 = "'"
-        [char]0x2019 = "'"
-        [char]0x201C = '"'
-        [char]0x201D = '"'
-        [char]0x00A0 = ' '
-        [char]0x2026 = '...'
-    }
-    $sb = [System.Text.StringBuilder]::new($Text.Length)
-    foreach ($ch in $Text.ToCharArray()) {
-        if ($map.ContainsKey($ch)) { [void]$sb.Append($map[$ch]) }
-        else                       { [void]$sb.Append($ch) }
-    }
-    return $sb.ToString()
-}
-
-
-function Get-JsonBlockFromText {
-    # Brace-matched JSON block extractor.
-    param(
-        [Parameter(Mandatory)][string]$Text,
-        [Parameter(Mandatory)][string]$Key
-    )
-    $pattern = '"' + [regex]::Escape($Key) + '"\s*:\s*\{'
-    $m = [regex]::Match($Text, $pattern)
-    if (-not $m.Success) { return $null }
-
-    $start = $m.Index + $m.Length - 1
-    $depth = 0
-    for ($i = $start; $i -lt $Text.Length; $i++) {
-        $c = $Text[$i]
-        if     ($c -eq '{') { $depth++ }
-        elseif ($c -eq '}') {
-            $depth--
-            if ($depth -eq 0) { return $Text.Substring($start, $i - $start + 1) }
-        }
-    }
-    return $null
-}
-
-
-function Get-UpstreamCIsFromLog {
-    # Extract upstreamCIs[] from retrieveCIRelationshipInfoByKey block in log text.
-    param([string]$LogText)
-    $out = [System.Collections.Generic.List[object]]::new()
-    if (-not $LogText) { return ,$out }
-
-    $block = Get-JsonBlockFromText -Text $LogText -Key 'retrieveCIRelationshipInfoByKey'
-    if (-not $block) { return ,$out }
-
-    try { $obj = $block | ConvertFrom-Json -ErrorAction Stop }
-    catch { return ,$out }
-
-    $upstream = if     ($obj.upstreamCIs) { $obj.upstreamCIs }
-                elseif ($obj.UpstreamCIs) { $obj.UpstreamCIs }
-                else                      { $null }
-    if (-not $upstream) { return ,$out }
-
-    foreach ($u in @($upstream)) {
-        $out.Add([PSCustomObject]@{
-            UpstreamCIID                = [string]$u.UpstreamCIID
-            UpstreamCIName              = [string]$u.UpstreamCIName
-            UpstreamCICMSClass          = [string]$u.UpstreamCICMSClass
-            UpstreamCIType              = [string]$u.UpstreamCIType
-            UpstreamCISubtype           = [string]$u.UpstreamCISubtype
-            UpstreamCIStatus            = [string]$u.UpstreamCIStatus
-            UpstreamRelationshipSubtype = [string]$u.UpstreamRelationshipSubtype
-        })
-    }
-    return ,$out
-}
-
-
-function Invoke-VroActionWithLogs {
-    # POST /vco/api/actions/{module}/{name}/executions, capture execId,
-    # then GET /syslogs then /logs.
-    # Returns @{ ReturnBody; LogText; ExecId; LogEndpoint; LogChars }
-    param(
-        [Parameter(Mandatory)][string]$Server,
-        [Parameter(Mandatory)][string]$ActionUri,   # "<module>/<name>"
-        [Parameter(Mandatory)][hashtable]$Headers,
-        [Parameter(Mandatory)][hashtable]$Inputs    # key = param name, value = string
-    )
-
-    $parts = $ActionUri -split "/"
-    if ($parts.Count -ne 2) { throw "ActionUri must be '<module>/<name>' - got '$ActionUri'" }
-    $module = $parts[0]; $name = $parts[1]
-    $execUri = "https://$Server/vco/api/actions/$module/$name/executions"
-
-    $paramList = @()
-    foreach ($k in $Inputs.Keys) {
-        $paramList += @{
-            name  = $k
-            type  = "string"
-            value = @{ string = @{ value = [string]$Inputs[$k] } }
-        }
-    }
-    $body = @{ parameters = $paramList } | ConvertTo-Json -Depth 10
-
-    $execId = $null
-    $returnBody = ""
-    try {
-        $r = Invoke-WebRequest -Uri $execUri -Method Post -Headers $Headers -Body $body -UseBasicParsing
-        $returnBody = $r.Content
-        if ($r.Headers["Location"]) { $execId = ($r.Headers["Location"] -split "/")[-1] }
-        if (-not $execId -and $r.Content) {
-            try { $b = $r.Content | ConvertFrom-Json; if ($b.id) { $execId = $b.id } } catch { }
-        }
-    } catch {
-        return @{ ReturnBody=""; LogText=""; ExecId=$null; LogEndpoint="none"; LogChars=0; Error=$_.Exception.Message }
-    }
-
-    if (-not $execId) {
-        return @{ ReturnBody=$returnBody; LogText=""; ExecId=$null; LogEndpoint="none"; LogChars=0 }
-    }
-
-    Start-Sleep -Milliseconds 1500
-
-    $endpoints = @( "$execUri/$execId/syslogs", "$execUri/$execId/logs" )
-    $logText = ""; $hit = "none"
-    foreach ($ep in $endpoints) {
-        try {
-            $lr = Invoke-WebRequest -Uri $ep -Method Get -Headers $Headers -UseBasicParsing
-            if ($lr.Content -and $lr.Content.Length -gt 0) {
-                $logText = $lr.Content
-                $hit = $ep
-                break
-            }
-        } catch { }
-    }
-
-    return @{
-        ReturnBody  = $returnBody
-        LogText     = $logText
-        ExecId      = $execId
-        LogEndpoint = $hit
-        LogChars    = $logText.Length
-    }
-}
-
-
-# --------- TLS / cert bypass ---------
+# Configure TLS 1.2 and bypass SSL for vRA
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
 
-
-# ---------------- AUTH ----------------
+# Authenticate to VMware Aria
 Write-Log "=== AUTHENTICATION ===" -Color Cyan
 $credential = Get-Credential -Message "Enter VMware Aria Automation credentials"
 $authBody = @{
     username = $credential.UserName
     password = $credential.GetNetworkCredential().Password
 } | ConvertTo-Json
+
 $authResponse = Invoke-RestMethod -Uri "https://$vraServer/csp/gateway/am/api/login" `
-    -Method Post -Headers @{ "Content-Type" = "application/json" } -Body $authBody
+    -Method Post -Headers @{"Content-Type"="application/json"} -Body $authBody
 $authToken = $authResponse.cspAuthToken
 Write-Log "Authentication successful!" -Color Green
 
-$vroHeaders = @{
-    "Authorization" = "Bearer $authToken"
-    "Content-Type"  = "application/json"
-    "Accept"        = "application/json"
+# Normalise application name for comparison
+function Normalize-AppName {
+    param($Name)
+    if (-not $Name) { return "" }
+    return ($Name.ToLower().Trim() -replace '[_\s\-\.]+', '')
 }
 
+# ---------------------------------------------------------------------------
+# vRO Action REST API helper
+# Runs a vRO action synchronously and returns its output normalised:
+#   - string return  -> [string]
+#   - array return   -> [string[]]
+#   - anything else  -> raw .value object
+# CONFIRM this against your environment: endpoint path, auth scheme, and the
+# request/response envelope. Swap in your own helper if it differs.
+# ---------------------------------------------------------------------------
+function Invoke-VroActionRest {
+    param(
+        [string]$VraServer,
+        [string]$AuthToken,
+        [string]$ActionUri,      # "module/actionName"
+        [hashtable]$Parameters,
+        [switch]$Raw,
+        [int]$TimeoutSec = $(if ($VroTimeoutSec) { $VroTimeoutSec } else { 30 })
+    )
 
-# --------- Project ID -> Name map ---------
-Write-Log "`n=== BUILDING PROJECT MAP ===" -Color Cyan
+    $lastSlash  = $ActionUri.LastIndexOf('/')
+    $module     = $ActionUri.Substring(0, $lastSlash)
+    $actionName = $ActionUri.Substring($lastSlash + 1)
+
+    $paramList = foreach ($k in $Parameters.Keys) {
+        $val = $Parameters[$k]
+        if ($val -is [bool]) {
+            @{ name = $k; type = "boolean"; value = @{ boolean = @{ value = $val } } }
+        }
+        else {
+            @{ name = $k; type = "string"; value = @{ string = @{ value = [string]$val } } }
+        }
+    }
+
+    $body = @{ parameters = @($paramList) } | ConvertTo-Json -Depth 6
+    $uri  = "https://$VraServer/vco/api/actions/$module/$actionName/executions"
+    $headers = @{
+        "Authorization" = "Bearer $AuthToken"
+        "Content-Type"  = "application/json"
+        "Accept"        = "application/json"
+    }
+
+    $resp = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body -TimeoutSec $TimeoutSec
+    if ($Raw) { return $resp }
+    $v = $resp.value
+    if ($null -ne $v.string) { return $v.string.value }
+    elseif ($null -ne $v.array) { return @($v.array.elements | ForEach-Object { $_.string.value }) }
+    else { return $v }
+}
+
+# Parse the flat getCagApplications string array into App / Sub-App buckets.
+# Shape: ["--- Applications ---","app01","app02","--- Sub-Applications ---","sub01",...]
+function Get-CagCatalog {
+    param($RawArray)
+    $apps    = [System.Collections.Generic.List[string]]::new()
+    $subApps = [System.Collections.Generic.List[string]]::new()
+    $bucket  = $null
+    foreach ($line in @($RawArray)) {
+        $t = ("" + $line).Trim()
+        if (-not $t) { continue }
+        if     ($t -match '^-+\s*Applications\s*-+$')      { $bucket = 'app'; continue }
+        elseif ($t -match '^-+\s*Sub-?Applications\s*-+$') { $bucket = 'sub'; continue }
+        if     ($bucket -eq 'app') { $apps.Add($t) }
+        elseif ($bucket -eq 'sub') { $subApps.Add($t) }
+    }
+    return [PSCustomObject]@{ Apps = $apps; SubApps = $subApps }
+}
+
+# Per-project cache so getCagApplications is called once per project, not per VM
+$cagCache = @{}
+function Get-CagForProject {
+    param($ProjectName, $VraServer, $AuthToken, $CagUri, $PhasedOut)
+    if (-not $ProjectName) { return [PSCustomObject]@{ Apps = @(); SubApps = @() } }
+    if ($cagCache.ContainsKey($ProjectName)) { return $cagCache[$ProjectName] }
+    try {
+        $raw = Invoke-VroActionRest -VraServer $VraServer -AuthToken $AuthToken -ActionUri $CagUri -Parameters @{
+            projectName      = $ProjectName
+            phasedOutEnabled = $PhasedOut
+        }
+        $cat = Get-CagCatalog -RawArray $raw
+    }
+    catch {
+        $cat = [PSCustomObject]@{ Apps = @(); SubApps = @() }
+    }
+    $cagCache[$ProjectName] = $cat
+    return $cat
+}
+
+# Defensively pull an array of objects out of a vRO action REST response.
+# Handles a native array in .value.array.elements (either .properties key/value
+# pairs or a JSON string per element), a single JSON-string return, or an
+# already-native array/object. Confirm the actual envelope against your logs.
+function Get-VroObjectArray {
+    param($Response)
+    if ($null -eq $Response) { return @() }
+
+    $v = $Response.value
+    if ($v -and $v.array -and $v.array.elements) {
+        $out = foreach ($el in $v.array.elements) {
+            if ($el.properties) {
+                $o = @{}
+                foreach ($p in $el.properties) { $o[$p.key] = $p.value.string.value }
+                [PSCustomObject]$o
+            }
+            elseif ($el.string -and $el.string.value) {
+                try { $el.string.value | ConvertFrom-Json -ErrorAction Stop } catch { $el.string.value }
+            }
+            else { $el }
+        }
+        return @($out)
+    }
+    if ($v -and $v.string -and $v.string.value) {
+        try { return @($v.string.value | ConvertFrom-Json -ErrorAction Stop) } catch { return @() }
+    }
+    if ($Response -is [string]) {
+        try { return @($Response | ConvertFrom-Json -ErrorAction Stop) } catch { return @() }
+    }
+    return @($Response)
+}
+
+# First non-empty value across a set of candidate field names
+function Get-FirstFieldValue {
+    param($Object, [string[]]$Fields)
+    foreach ($f in $Fields) {
+        $val = $Object.$f
+        if ($val) { return [string]$val }
+    }
+    return ""
+}
+
+# Unwrap a returnApplicationVms REST response to a JSON object.
+# The action returns a JSON string (vRO envelope at value.string.value); ConvertFrom-Json it.
+function Get-VroJson {
+    param($Response)
+    if ($null -eq $Response) { return $null }
+    $s = $null
+    if ($Response.value -and $Response.value.string) { $s = $Response.value.string.value }
+    elseif ($Response -is [string]) { $s = $Response }
+    if ($s) { try { return ($s | ConvertFrom-Json -ErrorAction Stop) } catch { return $null } }
+    # Array return: scan each string element for one that parses as JSON
+    if ($Response.value -and $Response.value.array -and $Response.value.array.elements) {
+        foreach ($el in $Response.value.array.elements) {
+            $ev = $el.string.value
+            if ($ev -and ($ev.TrimStart().StartsWith('{'))) {
+                try { return ($ev | ConvertFrom-Json -ErrorAction Stop) } catch { }
+            }
+        }
+        return $null
+    }
+    return $Response
+}
+
+# Pull the upstreamCIs array out of a parsed returnApplicationVms object,
+# handling retrieveCiInfoByKey.Information[] nesting or a flatter shape.
+function Get-UpstreamCIs {
+    param($Obj)
+    if ($null -eq $Obj) { return @() }
+    $ups = @()
+    if ($Obj.retrieveCiInfoByKey.Information) {
+        foreach ($info in @($Obj.retrieveCiInfoByKey.Information)) { $ups += @($info.upstreamCIs) }
+    }
+    elseif ($Obj.Information) {
+        foreach ($info in @($Obj.Information)) { $ups += @($info.upstreamCIs) }
+    }
+    elseif ($Obj.retrieveCIRelationshipInfoByKey.upstreamCIs) {
+        $ups += @($Obj.retrieveCIRelationshipInfoByKey.upstreamCIs)
+    }
+    elseif ($Obj.upstreamCIs) {
+        $ups += @($Obj.upstreamCIs)
+    }
+    return @($ups | Where-Object { $_ })
+}
+
+# CI-level Status values from retrieveCiInfoByKey.Information[] - this is where
+# a disposed/retired sub-app shows even when there is no upstream relationship.
+function Get-CiStatuses {
+    param($Obj)
+    if ($null -eq $Obj) { return @() }
+    $infos = @()
+    if     ($Obj.retrieveCiInfoByKey.Information) { $infos = @($Obj.retrieveCiInfoByKey.Information) }
+    elseif ($Obj.Information)                     { $infos = @($Obj.Information) }
+    return @($infos | ForEach-Object { $_.Status } | Where-Object { $_ })
+}
+
+# Extract the JSON object surrounding a marker string from log text.
+# Brace-matching - fragile if values contain literal braces.
+function Get-JsonBlockFromText {
+    param($Text, $Marker)
+    if (-not $Text) { return $null }
+    $idx = $Text.IndexOf($Marker)
+    if ($idx -lt 0) { return $null }
+    $start = $Text.LastIndexOf('{', $idx)
+    if ($start -lt 0) { return $null }
+    $depth = 0; $end = -1
+    for ($i = $start; $i -lt $Text.Length; $i++) {
+        $c = $Text[$i]
+        if     ($c -eq '{') { $depth++ }
+        elseif ($c -eq '}') { $depth--; if ($depth -eq 0) { $end = $i; break } }
+    }
+    if ($end -lt 0) { return $null }
+    $json = $Text.Substring($start, $end - $start + 1)
+    try { return ($json | ConvertFrom-Json -ErrorAction Stop) } catch { return $null }
+}
+
+# From log text: upstreamCIs out of the retrieveCIRelationshipInfoByKey block.
+function Get-UpstreamCIsFromLog {
+    param($LogText)
+    $obj = Get-JsonBlockFromText -Text $LogText -Marker '"retrieveCIRelationshipInfoByKey"'
+    if (-not $obj) { $obj = Get-JsonBlockFromText -Text $LogText -Marker '"upstreamCIs"' }
+    if (-not $obj) { return @() }
+    return @(Get-UpstreamCIs -Obj $obj)
+}
+
+# From log text: CI Status values out of the retrieveCiInfoByKey block.
+function Get-CiStatusesFromLog {
+    param($LogText)
+    $obj = Get-JsonBlockFromText -Text $LogText -Marker '"retrieveCiInfoByKey"'
+    if (-not $obj) { return @() }
+    return @(Get-CiStatuses -Obj $obj)
+}
+
+# Run an action (same module/name URI as everywhere else) and fetch that run's
+# logs - the same data the GUI Logs tab shows. Also returns the action's value.
+function Invoke-VroActionWithLogs {
+    param($VraServer, $AuthToken, $ActionUri, [hashtable]$Parameters, [int]$TimeoutSec = 60)
+
+    $lastSlash  = $ActionUri.LastIndexOf('/')
+    $module     = $ActionUri.Substring(0, $lastSlash)
+    $actionName = $ActionUri.Substring($lastSlash + 1)
+
+    $headers = @{
+        "Authorization" = "Bearer $AuthToken"
+        "Content-Type"  = "application/json"
+        "Accept"        = "application/json"
+    }
+    $paramList = foreach ($k in $Parameters.Keys) {
+        $val = $Parameters[$k]
+        if ($val -is [bool]) { @{ name = $k; type = "boolean"; value = @{ boolean = @{ value = $val } } } }
+        else { @{ name = $k; type = "string"; value = @{ string = @{ value = [string]$val } } } }
+    }
+    $body = @{ parameters = @($paramList) } | ConvertTo-Json -Depth 6
+
+    $base   = "https://$VraServer/vco/api/actions/$module/$actionName"
+    $execId = $null; $value = $null
+    try {
+        $resp = Invoke-WebRequest -Uri "$base/executions" -Method Post -Headers $headers -Body $body -TimeoutSec $TimeoutSec -UseBasicParsing
+        if ($resp.Headers.Location) { $execId = ([string]$resp.Headers.Location).TrimEnd('/').Split('/')[-1] }
+        if ($resp.Content) {
+            try {
+                $parsed = $resp.Content | ConvertFrom-Json
+                $value = $parsed
+                if (-not $execId -and $parsed.id) { $execId = $parsed.id }
+                if (-not $execId -and $parsed.'execution-id') { $execId = $parsed.'execution-id' }
+            } catch { }
+        }
+    }
+    catch { return [PSCustomObject]@{ Value = $null; LogText = ""; LogEndpoint = "run-failed: $($_.Exception.Message)"; ExecId = $null } }
+
+    $logText = ""; $usedEndpoint = "none"
+    if ($execId) {
+        $candidates = @(
+            "$base/executions/$execId/syslogs?maxResult=10000",
+            "$base/executions/$execId/logs?maxResult=10000"
+        )
+        foreach ($cand in $candidates) {
+            try {
+                $logResp = Invoke-RestMethod -Uri $cand -Method Get -Headers $headers -TimeoutSec 30
+                $lines = @()
+                foreach ($e in @($logResp.logs)) {
+                    $m = $null
+                    if     ($e.entry.'long-message')  { $m = $e.entry.'long-message' }
+                    elseif ($e.entry.'short-message') { $m = $e.entry.'short-message' }
+                    elseif ($e.message)               { $m = $e.message }
+                    if ($m) { $lines += $m }
+                }
+                if (-not $lines -and $logResp -is [string]) { $lines = @($logResp) }
+                if ($lines) { $logText = ($lines -join "`n"); $usedEndpoint = $cand; break }
+            }
+            catch { continue }
+        }
+    }
+
+    return [PSCustomObject]@{ Value = $value; LogText = $logText; LogEndpoint = $usedEndpoint; ExecId = $execId }
+}
+
+# Build the six review fields for one VM result object
+function Invoke-CmdbReview {
+    param($Vm, $Catalog, $VraServer, $AuthToken, $GetVmAppsUri, $ReturnAppVmsUri, $PhasedOut, $ClassFields, $DebugPath)
+
+    $nsxMatch = switch ($Vm.CompareResult) {
+        "Match"                 { "NSX tag matches CMDB" }
+        "Match - Multiple Tags" { "NSX tag matches CMDB (multiple tags)" }
+        "Mismatch"              { "No match - review segment or tag" }
+        "Missing Data"          { "Missing data - review" }
+        default                 { [string]$Vm.CompareResult }
+    }
+
+    $tags = if ($Vm.AppApplication) { $Vm.AppApplication -split ";\s*" } else { @() }
+
+    # --- App vs Sub-App per tag (from getCagApplications catalogue) ---
+    $appOrSub = @()
+    foreach ($tag in $tags) {
+        $normTag = ($tag.ToLower().Trim() -replace '[_\s\-\.]+', '')
+        $isApp = $Catalog.Apps    | Where-Object { (($_.ToLower().Trim()) -replace '[_\s\-\.]+', '') -eq $normTag }
+        $isSub = $Catalog.SubApps | Where-Object { (($_.ToLower().Trim()) -replace '[_\s\-\.]+', '') -eq $normTag }
+        if     ($isApp) { $appOrSub += "${tag}: Application - convert to sub-app" }
+        elseif ($isSub) { $appOrSub += "${tag}: Sub-Application" }
+        else            { $appOrSub += "${tag}: Not found in CAG" }
+    }
+    if ($appOrSub.Count -eq 0) { $appOrSub = @("No tag") }
+
+    # --- Upstream relationship from getVmApplications LOGS ---
+    # The upstream data (retrieveCIRelationshipInfoByKey.upstreamCIs) is written to
+    # the getVmApplications run's LOG output, not its return value. Call the action
+    # via the vRO Action REST API keyed on vmName + projectName (one call per VM,
+    # not per tag) and scrape upstreamCIs out of the run log.
+    $upstreamCIs = @()
+    $ciStatuses  = @()
+    $returnRaws  = @()
+    try {
+        # One call: runs getVmApplications and grabs that run's logs too
+        $runRes = Invoke-VroActionWithLogs -VraServer $VraServer -AuthToken $AuthToken -ActionUri $GetVmAppsUri -Parameters @{
+            vmName      = $Vm.VMName
+            projectName = $Vm.ProjectName
+        }
+        $returnRaws += [ordered]@{ vmName = $Vm.VMName; execId = $runRes.ExecId; logEndpoint = $runRes.LogEndpoint; logChars = @($runRes.LogText).Length; log = $runRes.LogText; value = $runRes.Value }
+        # Upstream CIs: from the log's retrieveCIRelationshipInfoByKey block
+        # (falls back to the return value if it ever carries the JSON)
+        $upstreamCIs += @(Get-UpstreamCIsFromLog -LogText $runRes.LogText)
+        $obj = Get-VroJson -Response $runRes.Value
+        $upstreamCIs += @(Get-UpstreamCIs -Obj $obj)
+        # CI Status (disposed/retired) : from retrieveCiInfoByKey.Information[]
+        # in the return AND the log - covers decomm even with no upstream
+        $ciStatuses += @(Get-CiStatuses -Obj $obj)
+        $ciStatuses += @(Get-CiStatusesFromLog -LogText $runRes.LogText)
+    }
+    catch { }
+    $upstreamCIs = @($upstreamCIs | Where-Object { $_ })
+    $ciStatuses  = @($ciStatuses  | Where-Object { $_ })
+
+    $upstreamToApp = "N/A"; $multiUpstream = "No multiple upstream"; $noUpstream = "N/A"; $decomm = "N/A"
+
+    if ($upstreamCIs.Count -gt 0) {
+        $classes = @($upstreamCIs | ForEach-Object { Get-FirstFieldValue -Object $_ -Fields $ClassFields })
+        if ($classes -contains "Application") {
+            $upstreamToApp = "Upstream to Application"
+        }
+        elseif ($classes -contains "SubApplication") {
+            $upstreamToApp = "Upstream is Sub-Application - review upstream relationship"
+        }
+        else {
+            $upstreamToApp = "Upstream class unknown ($($classes -join ',')) - review"
+        }
+
+        if ($upstreamCIs.Count -gt 1) {
+            $multiUpstream = "Multiple upstreams ($($upstreamCIs.Count)) - review"
+        }
+    }
+    elseif ($tags.Count -eq 0) {
+        $noUpstream = "No CMDB relationship - add"
+    }
+    else {
+        $noUpstream = "No upstream - review/fix upstream relationship"
+    }
+
+    # Decommissioned: upstream CI statuses AND the CI's own Status - so a
+    # disposed sub-app with no upstream relationship still gets flagged
+    $allStatuses = @($upstreamCIs | ForEach-Object { $_.UpstreamCIStatus }) + $ciStatuses
+    $decommed = @($allStatuses | Where-Object { $_ -match 'dispos|retire|decommission' } | Select-Object -Unique)
+    if ($decommed.Count -gt 0) {
+        $decomm = "App/Sub-App decommissioned ($($decommed -join '; ')) - review"
+    }
+
+    # --- Debug dump: raw + parsed data per VM for troubleshooting ---
+    if ($DebugPath) {
+        $dbg = [ordered]@{
+            VMName           = $Vm.VMName
+            ProjectName      = $Vm.ProjectName
+            Tags             = $tags
+            CagApps          = @($Catalog.Apps).Count
+            CagSubApps       = @($Catalog.SubApps).Count
+            UpstreamCount    = $upstreamCIs.Count
+            UpstreamCIs      = @($upstreamCIs | ForEach-Object {
+                @($_.PSObject.Properties | ForEach-Object { "$($_.Name) = $($_.Value)" })
+            })
+            ClassFieldsRead  = @($upstreamCIs | ForEach-Object { Get-FirstFieldValue -Object $_ -Fields $ClassFields })
+            UpstreamStatuses = @($upstreamCIs | ForEach-Object { $_.UpstreamCIStatus })
+            CiStatuses       = $ciStatuses
+            RawReturnAppVms  = $returnRaws
+        }
+        "==================== $($Vm.VMName) ====================" | Add-Content -Path $DebugPath -Encoding UTF8
+        ($dbg | ConvertTo-Json -Depth 12) | Add-Content -Path $DebugPath -Encoding UTF8
+    }
+
+    return [PSCustomObject]@{
+        NSXMatchCMDB           = $nsxMatch
+        AppOrSubApp            = ($appOrSub -join "; ")
+        UpstreamToApp          = $upstreamToApp
+        MultipleUpstream       = $multiUpstream
+        NoUpstreamRelationship = $noUpstream
+        Decommissioned         = $decomm
+    }
+}
+
+if ($ReplayFromCsv) {
+    Write-Log "`n=== REPLAY MODE: loading $ReplayCsvPath ===" -Color Cyan
+    if (-not (Test-Path -LiteralPath $ReplayCsvPath)) {
+        Write-Log "Replay CSV not found: $ReplayCsvPath" -Color Red
+        return
+    }
+    $results = [System.Collections.Generic.List[object]]::new()
+    Import-Csv -LiteralPath $ReplayCsvPath | ForEach-Object { $results.Add($_) }
+    $vmQueue      = @($results)
+    $successCount = @($results).Count
+    $failCount    = 0
+    $stopwatch    = [System.Diagnostics.Stopwatch]::StartNew()
+    Write-Log "Loaded $($results.Count) rows from replay CSV" -Color Green
+}
+else {
+
+# Fetch all deployments with resources in one pass (size=1000, same as working export script)
+Write-Log "`n=== FETCHING DEPLOYMENTS ===" -Color Cyan
+$headers = @{
+    "Authorization" = "Bearer $authToken"
+    "Content-Type" = "application/json"
+}
+
+# Build projectId -> projectName map. The deployment API frequently returns
+# projectId but a blank projectName, and the vRO actions need projectName.
+# Endpoint may differ in your environment - wrapped so a miss can't break the run.
 $projectMap = @{}
 try {
-    $projResp = Invoke-RestMethod -Uri "https://$vraServer/iaas/api/projects?`$top=1000" `
-        -Method Get -Headers $vroHeaders
-    $projList = if ($projResp.content) { $projResp.content } else { $projResp }
-    foreach ($p in $projList) {
-        if ($p.id -and $p.name) { $projectMap[$p.id] = $p.name }
-    }
-    Write-Log "  Cached $($projectMap.Count) project(s)" -Color Green
-} catch {
-    Write-Log "  Project map failed: $($_.Exception.Message) (continuing with deployment.projectName only)" -Color Yellow
+    $projResp = Invoke-RestMethod -Uri "https://$vraServer/iaas/api/projects?`$top=1000" -Method Get -Headers $headers -TimeoutSec 60
+    foreach ($p in @($projResp.content)) { $projectMap[$p.id] = $p.name }
+    Write-Log "Loaded $($projectMap.Count) projects for id->name resolution" -Color Green
+}
+catch {
+    Write-Log "Could not load project map: $($_.Exception.Message)" -Color Yellow
 }
 
-
-# --------- Fetch deployments ---------
-Write-Log "`n=== FETCHING DEPLOYMENTS ===" -Color Cyan
 $vmQueue = [System.Collections.Generic.List[hashtable]]::new()
+$seenVMs = [System.Collections.Generic.HashSet[string]]::new()
 $page = 0
-$size = 1000
+$size = 200          # smaller pages: expand=resources at size=1000 can drop the connection
 $totalProcessed = 0
+$deploymentsWithVMs = 0
 $skippedCount = 0
+$maxRetries = 3
 
 do {
     $uri = "https://$vraServer/deployment/api/deployments?page=$page&size=$size&expand=resources"
-    Write-Log "  Page $($page + 1)..." -Color Gray
-    $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $vroHeaders
+    Write-Log " Page $($page + 1)..." -Color Gray
+
+    $response = $null
+    for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
+        try {
+            $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers -TimeoutSec 120
+            break
+        }
+        catch {
+            Write-Log "  Page $($page + 1) attempt $attempt failed: $($_.Exception.Message)" -Color Yellow
+            if ($attempt -lt $maxRetries) { Start-Sleep -Seconds ($attempt * 3) }
+            else { Write-Log "  Giving up on page $($page + 1) after $maxRetries attempts - stopping fetch" -Color Red }
+        }
+    }
+    if (-not $response) { break }   # don't reprocess a stale $response from a prior page
+
     $deployments = if ($response.content) { $response.content } else { $response }
 
+    $capReached = $false
     foreach ($dep in $deployments) {
-        if ($dep.status -and $dep.status -in @("DELETE_SUCCESSFUL","FAILED","DELETE_INPROGRESS")) {
-            $skippedCount++; continue
+        # Skip deleted/failed deployments
+        if ($dep.status -and $dep.status -in @("DELETE_SUCCESSFUL", "FAILED", "DELETE_INPROGRESS")) {
+            $skippedCount++
+            continue
         }
+
         $machines = @($dep.resources | Where-Object { $_.type -eq "Cloud.vSphere.Machine" })
         if ($machines.Count -eq 0) { continue }
 
-        $projName = $dep.projectName
-        if (-not $projName -and $dep.projectId -and $projectMap.ContainsKey($dep.projectId)) {
-            $projName = $projectMap[$dep.projectId]
-        }
-
+        $addedForThisDep = 0
         foreach ($machine in $machines) {
-            if ($machine.state -and $machine.state -notin @("OK","STARTED","")) { continue }
+            # Skip failed or missing VMs
+            if ($machine.state -and $machine.state -notin @("OK", "STARTED", "")) { continue }
 
             $vmName = if ($machine.properties.resourceName) { $machine.properties.resourceName }
                       elseif ($machine.properties.hostname) { $machine.properties.hostname }
                       else { $machine.name }
 
+            # Dedupe: a retried or re-run page can't add the same VM twice
+            if (-not $seenVMs.Add("$($dep.name)|$vmName")) { continue }
+
+            $projName = if ($dep.projectName) { $dep.projectName }
+                        elseif ($dep.projectId -and $projectMap.ContainsKey($dep.projectId)) { $projectMap[$dep.projectId] }
+                        else { "" }
+
             $vmQueue.Add(@{
                 DeploymentName = $dep.name
-                VMName         = $vmName
-                ProjectId      = $dep.projectId
-                ProjectName    = $projName
+                VMName = $vmName
+                ProjectId = $dep.projectId
+                ProjectName = $projName
             })
+            $addedForThisDep++
+        }
+
+        # Cap counts only deployments that actually contributed VMs
+        if ($addedForThisDep -gt 0) {
+            $deploymentsWithVMs++
+            if ($MaxDeployments -gt 0 -and $deploymentsWithVMs -ge $MaxDeployments) {
+                $capReached = $true
+                break
+            }
         }
     }
 
     $totalProcessed += $deployments.Count
     $page++
-    $hasMore = if ($response.totalPages) { $page -lt $response.totalPages }
-               elseif ($response.totalElements) { $totalProcessed -lt $response.totalElements }
-               else { $deployments.Count -eq $size }
+    if ($capReached) {
+        Write-Log " Reached $MaxDeployments deployments with VMs - stopping fetch" -Color Yellow
+        break
+    }
+    $hasMore = if ($response.totalPages) {
+        $page -lt $response.totalPages
+    } elseif ($response.totalElements) {
+        $totalProcessed -lt $response.totalElements
+    } else {
+        $deployments.Count -eq $size
+    }
 } while ($hasMore)
 
-Write-Log "Scanned: $totalProcessed deployments (skipped $skippedCount deleted/failed)" -Color Cyan
+Write-Log "Scanned: $totalProcessed deployments ($deploymentsWithVMs with VMs, skipped $skippedCount deleted/failed)" -Color Cyan
 Write-Log "VMs to process: $($vmQueue.Count)" -Color Cyan
 
-
-# ---------------- Phase 1: parallel runspace pool ----------------
+# Scriptblock that runs in each runspace
 $scriptBlock = {
-    param($VraServer, $AuthToken, $ShowVmDetailsUri, $GetVmAppsUri,
-          $VMName, $ProjectId, $ProjectName, $DeploymentName)
+    param($VraServer, $AuthToken, $ShowVmDetailsUri, $GetVmAppsUri, $VMName, $ProjectId, $ProjectName, $DeploymentName)
 
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
 
     $headers = @{
         "Authorization" = "Bearer $AuthToken"
-        "Content-Type"  = "application/json"
+        "Content-Type" = "application/json"
     }
+
     $uri = "https://$VraServer/form-service/api/forms/renderer/external-values?projectId=$ProjectId"
 
     $bodyArray = @(
         @{
-            uri         = $ShowVmDetailsUri
-            dataSource  = "scriptAction"
-            parameters  = @( @{ name = "vmName"; value = $VMName } )
-            useResultsFromRequestId = -1
-            fieldType   = @{ dataType = "complex" }
-            fields      = @(
-                @{ label = "Scope"; type = @{ dataType = "string" }; id = "scope" },
-                @{ label = "Tag";   type = @{ dataType = "string" }; id = "tag" }
+            uri = $ShowVmDetailsUri
+            dataSource = "scriptAction"
+            parameters = @(
+                @{ name = "vmName"; value = $VMName }
             )
-            isMultiple  = $true
-            requestId   = 1
+            useResultsFromRequestId = -1
+            fieldType = @{ dataType = "complex" }
+            fields = @(
+                @{ label = "Scope"; type = @{ dataType = "string" }; id = "scope" },
+                @{ label = "Tag"; type = @{ dataType = "string" }; id = "tag" }
+            )
+            isMultiple = $true
+            requestId = 1
         },
         @{
-            uri         = $GetVmAppsUri
-            dataSource  = "scriptAction"
-            parameters  = @(
-                @{ name = "vmName";      value = $VMName },
+            uri = $GetVmAppsUri
+            dataSource = "scriptAction"
+            parameters = @(
+                @{ name = "vmName"; value = $VMName },
                 @{ name = "projectName"; value = $ProjectName }
             )
             useResultsFromRequestId = -1
-            fieldType   = @{ dataType = "string" }
-            isMultiple  = $true
-            requestId   = 2
+            fieldType = @{ dataType = "string" }
+            isMultiple = $true
+            requestId = 2
         }
     )
+
     $body = "[" + (($bodyArray | ForEach-Object { $_ | ConvertTo-Json -Depth 5 -Compress }) -join ",") + "]"
 
     try {
         $response = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body
 
         $appApplications = [System.Collections.ArrayList]::new()
-        $infraOs = ""; $appLayer = ""; $vmApplications = ""
+        $infraOs = ""
+        $appLayer = ""
+        $vmApplications = ""
 
         foreach ($result in $response) {
             switch ($result.requestId) {
@@ -363,10 +682,14 @@ $scriptBlock = {
                     if ($result.data -is [array]) {
                         foreach ($item in $result.data) {
                             if ($item.scope -and $item.tag) {
-                                switch ($item.scope) {
-                                    "app-application" { [void]$appApplications.Add($item.tag) }
-                                    "infra-os"        { $infraOs  = $item.tag }
-                                    "app-layer"       { $appLayer = $item.tag }
+                                if ($item.scope -eq "app-application") {
+                                    [void]$appApplications.Add($item.tag)
+                                }
+                                elseif ($item.scope -eq "infra-os") {
+                                    $infraOs = $item.tag
+                                }
+                                elseif ($item.scope -eq "app-layer") {
+                                    $appLayer = $item.tag
                                 }
                             }
                         }
@@ -382,112 +705,144 @@ $scriptBlock = {
 
         $appApplication = ($appApplications | Select-Object -Unique) -join "; "
 
-        $match = "Missing Data"; $matchedApps = @()
+        # Compare each tag against each CMDB CI entry
+        $match = "Missing Data"
+        $matchedApps = @()
         if ($appApplications.Count -gt 0 -and $vmApplications) {
             $ciList = $vmApplications -split ";\s*"
             foreach ($tag in $appApplications) {
                 $normTag = ($tag.ToLower().Trim() -replace '[_\s\-\.]+', '')
                 foreach ($ci in $ciList) {
                     $normCI = ($ci.ToLower().Trim() -replace '[_\s\-\.]+', '')
-                    if ($normTag -and $normCI -and $normTag -eq $normCI) { $matchedApps += $tag; break }
+                    if ($normTag -and $normCI -and $normTag -eq $normCI) {
+                        $matchedApps += $tag
+                        break
+                    }
                 }
             }
             if ($matchedApps.Count -gt 0) {
-                $match = if ($appApplications.Count -gt 1) { "Match - Multiple Tags" } else { "Match" }
-            } else { $match = "Mismatch" }
+                if ($appApplications.Count -gt 1) {
+                    $match = "Match - Multiple Tags"
+                } else {
+                    $match = "Match"
+                }
+            } else {
+                $match = "Mismatch"
+            }
         }
+
+        $matchedAppsStr = ($matchedApps | Select-Object -Unique) -join "; "
 
         return [PSCustomObject]@{
             DeploymentName = $DeploymentName
-            VMName         = $VMName
-            ProjectId      = $ProjectId
-            ProjectName    = $ProjectName
+            VMName = $VMName
+            ProjectName = $ProjectName
+            ProjectId = $ProjectId
             AppApplication = $appApplication
-            InfraOS        = $infraOs
-            AppLayer       = $appLayer
-            CMDBCI         = $vmApplications
-            CompareResult  = $match
-            Status         = "Success"
+            InfraOS = $infraOs
+            AppLayer = $appLayer
+            CMDBCI = $vmApplications
+            CompareResult = $match
+            Status = "Success"
         }
     }
     catch {
         return [PSCustomObject]@{
             DeploymentName = $DeploymentName
-            VMName         = $VMName
-            ProjectId      = $ProjectId
-            ProjectName    = $ProjectName
+            VMName = $VMName
+            ProjectName = $ProjectName
+            ProjectId = $ProjectId
             AppApplication = ""
-            InfraOS        = ""
-            AppLayer       = ""
-            CMDBCI         = ""
-            CompareResult  = ""
-            Status         = "Failed: $($_.Exception.Message)"
+            InfraOS = ""
+            AppLayer = ""
+            CMDBCI = ""
+            CompareResult = ""
+            Status = "Failed: $($_.Exception.Message)"
         }
     }
 }
 
-Write-Log "`n=== PHASE 1: $($vmQueue.Count) VMs ($PoolSize parallel, ${JobTimeoutSeconds}s timeout) ===" -Color Cyan
+# Process with single runspace pool and timeout per job
+$poolSize = 30
+$jobTimeoutSeconds = 120
+Write-Log "`n=== PROCESSING $($vmQueue.Count) VMs ($poolSize parallel threads, ${jobTimeoutSeconds}s timeout) ===" -Color Cyan
 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
-$runspacePool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $PoolSize)
+$runspacePool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $poolSize)
 $runspacePool.Open()
 
-$results      = [System.Collections.Generic.List[object]]::new()
-$jobs         = [System.Collections.Generic.List[object]]::new()
-$completed    = 0
+$results = [System.Collections.Generic.List[object]]::new()
+$jobs = [System.Collections.Generic.List[object]]::new()
+$completed = 0
 $successCount = 0
-$failCount    = 0
+$failCount = 0
 
+# Queue all jobs
 foreach ($vm in $vmQueue) {
     $ps = [PowerShell]::Create().AddScript($scriptBlock)
-    $ps.AddArgument($vraServer)         | Out-Null
-    $ps.AddArgument($authToken)         | Out-Null
-    $ps.AddArgument($showVmDetailsUri)  | Out-Null
-    $ps.AddArgument($getVmAppsUri)      | Out-Null
-    $ps.AddArgument($vm.VMName)         | Out-Null
-    $ps.AddArgument($vm.ProjectId)      | Out-Null
-    $ps.AddArgument($vm.ProjectName)    | Out-Null
+    $ps.AddArgument($vraServer) | Out-Null
+    $ps.AddArgument($authToken) | Out-Null
+    $ps.AddArgument($showVmDetailsUri) | Out-Null
+    $ps.AddArgument($getVmAppsUri) | Out-Null
+    $ps.AddArgument($vm.VMName) | Out-Null
+    $ps.AddArgument($vm.ProjectId) | Out-Null
+    $ps.AddArgument($vm.ProjectName) | Out-Null
     $ps.AddArgument($vm.DeploymentName) | Out-Null
     $ps.RunspacePool = $runspacePool
-    $jobs.Add(@{ PowerShell = $ps; Handle = $ps.BeginInvoke(); VMName = $vm.VMName })
+
+    $jobs.Add(@{
+        PowerShell = $ps
+        Handle = $ps.BeginInvoke()
+        VMName = $vm.VMName
+    })
 }
 
+# Collect results with timeout
 foreach ($job in $jobs) {
     $completed++
-    if ($job.Handle.AsyncWaitHandle.WaitOne($JobTimeoutSeconds * 1000)) {
+    if ($job.Handle.AsyncWaitHandle.WaitOne($jobTimeoutSeconds * 1000)) {
         $result = $job.PowerShell.EndInvoke($job.Handle)
         if ($result) {
             foreach ($r in $result) {
                 if ($r.Status -eq "Success") {
                     $successCount++
                     $matchColor = switch ($r.CompareResult) {
-                        "Match"                  { "Green" }
-                        "Match - Multiple Tags"  { "Green" }
-                        "Mismatch"               { "Red" }
-                        default                  { "Gray" }
+                        "Match" { "Green" }
+                        "Mismatch" { "Red" }
+                        default { "Gray" }
                     }
-                    Write-Log "[$completed/$($vmQueue.Count)] $($r.VMName) | $($r.AppApplication) | $($r.CompareResult)" -Color $matchColor
-                } else {
+                    # Show what was returned for Missing Data so you can see what's empty
+                    if ($r.CompareResult -eq "Missing Data") {
+                        $tagVal = if ($r.AppApplication) { $r.AppApplication } else { "(empty)" }
+                        $appVal = if ($r.CMDBCI) { $r.CMDBCI } else { "(empty)" }
+                        Write-Log "[$completed/$($vmQueue.Count)] $($r.VMName) | Tag: $tagVal | CMDB CI: $appVal | Missing Data" -Color Gray
+                    }
+                    else {
+                        Write-Log "[$completed/$($vmQueue.Count)] $($r.VMName) | $($r.AppApplication) | $($r.CompareResult)" -Color $matchColor
+                    }
+                }
+                else {
                     $failCount++
                     Write-Log "[$completed/$($vmQueue.Count)] $($r.VMName) | FAILED - $($r.Status)" -Color Red
                 }
 
                 $results.Add([PSCustomObject]@{
                     DeploymentName = [string]$r.DeploymentName
-                    VMName         = [string]$r.VMName
-                    ProjectId      = [string]$r.ProjectId
-                    ProjectName    = [string]$r.ProjectName
+                    VMName = [string]$r.VMName
+                    ProjectName = [string]$r.ProjectName
+                    ProjectId = [string]$r.ProjectId
                     AppApplication = [string]$r.AppApplication
-                    InfraOS        = [string]$r.InfraOS
-                    AppLayer       = [string]$r.AppLayer
-                    CMDBCI         = [string]$r.CMDBCI
-                    CompareResult  = [string]$r.CompareResult
+                    InfraOS = [string]$r.InfraOS
+                    AppLayer = [string]$r.AppLayer
+                    CMDBCI = [string]$r.CMDBCI
+                    CompareResult = [string]$r.CompareResult
                 })
             }
         }
-    } else {
+    }
+    else {
         $failCount++
-        Write-Log "[$completed/$($vmQueue.Count)] $($job.VMName) | TIMEOUT after ${JobTimeoutSeconds}s" -Color Red
+        Write-Log "[$completed/$($vmQueue.Count)] $($job.VMName) | TIMEOUT after ${jobTimeoutSeconds}s" -Color Red
         $job.PowerShell.Stop()
     }
     $job.PowerShell.Dispose()
@@ -495,50 +850,95 @@ foreach ($job in $jobs) {
 
 if ($runspacePool) { $runspacePool.Close(); $runspacePool.Dispose() }
 $stopwatch.Stop()
+}
 
-
-# ---------------- NSX FALLBACK ----------------
+# NSX Fallback - fill in missing AppApplication from NSX VM tags
 $missingAppVMs = @($results | Where-Object { -not $_.AppApplication })
-if ($missingAppVMs.Count -gt 0) {
+if (-not $ReplayFromCsv -and $missingAppVMs.Count -gt 0) {
     Write-Log "`n=== NSX FALLBACK: $($missingAppVMs.Count) VMs with empty AppApplication ===" -Color Cyan
 
+    # NSX Auth functions (from working NSX firewall script)
     function Connect-NSXManagerFallback {
-        param([string]$Server, [PSCredential]$Credential,
-              [string]$AuthMode = "Local", [string]$VIDMDomain = "")
-        $headers = @{ "Content-Type" = "application/json"; "Accept" = "application/json" }
+        param(
+            [string]$Server,
+            [PSCredential]$Credential,
+            [string]$AuthMode = "Local",
+            [string]$VIDMDomain = ""
+        )
+
+        $headers = @{
+            "Content-Type" = "application/json"
+            "Accept" = "application/json"
+        }
 
         if ($AuthMode -eq "Local") {
             $pair = "{0}:{1}" -f $Credential.UserName, $Credential.GetNetworkCredential().Password
             $bytes = [System.Text.Encoding]::ASCII.GetBytes($pair)
-            $headers["Authorization"] = "Basic " + [System.Convert]::ToBase64String($bytes)
-            Write-Log "  NSX authenticating (Local/Basic)..." -Color Cyan
-        } else {
-            Write-Log "  NSX authenticating via vIDM session..." -Color Cyan
+            $base64 = [System.Convert]::ToBase64String($bytes)
+            $headers["Authorization"] = "Basic $base64"
+            Write-Log " NSX authenticating (Local/Basic)..." -Color Cyan
+        }
+        else {
+            Write-Log " NSX authenticating via vIDM session..." -Color Cyan
             $sessionUri = "https://${Server}/api/session/create"
             $rawUser = $Credential.UserName
             $password = $Credential.GetNetworkCredential().Password
-            if ($rawUser -match '^(.+)\\(.+)$')  { $samName = $Matches[2] }
+
+            if ($rawUser -match '^(.+)\\(.+)$') { $samName = $Matches[2] }
             elseif ($rawUser -match '^([^@]+)@') { $samName = $Matches[1] }
             else { $samName = $rawUser }
 
-            $body = "j_username=$([uri]::EscapeDataString($samName))&j_password=$([uri]::EscapeDataString($password))"
-            $sessionResponse = Invoke-WebRequest -Uri $sessionUri -Method Post `
-                -ContentType "application/x-www-form-urlencoded" -Body $body `
-                -SessionVariable "nsxSession" -UseBasicParsing -ErrorAction Stop
-            $xsrfToken = $sessionResponse.Headers["X-XSRF-TOKEN"]
-            if (-not $xsrfToken) { throw "NSX vIDM: no X-XSRF-TOKEN for $samName" }
-            $headers["X-XSRF-TOKEN"] = $xsrfToken
-            $script:NSXFallbackSession = $nsxSession
-            Write-Log "  NSX authenticated as: $samName" -Color Green
+            $usernamesToTry = @(
+                $samName
+            )
+
+            $authenticated = $false
+            foreach ($username in $usernamesToTry) {
+                Write-Log " Trying: $username" -Color Gray
+                $body = "j_username=$([uri]::EscapeDataString($username))&j_password=$([uri]::EscapeDataString($password))"
+                try {
+                    $sessionResponse = Invoke-WebRequest -Uri $sessionUri `
+                        -Method Post `
+                        -ContentType "application/x-www-form-urlencoded" `
+                        -Body $body `
+                        -SessionVariable "nsxSession" `
+                        -UseBasicParsing `
+                        -ErrorAction Stop
+
+                    $xsrfToken = $sessionResponse.Headers["X-XSRF-TOKEN"]
+                    if (-not $xsrfToken) {
+                        Write-Log " No X-XSRF-TOKEN for '$username', trying next..." -Color Yellow
+                        continue
+                    }
+
+                    $headers["X-XSRF-TOKEN"] = $xsrfToken
+                    $script:NSXFallbackSession = $nsxSession
+                    $authenticated = $true
+                    Write-Log " NSX authenticated as: $username" -Color Green
+                    break
+                }
+                catch {
+                    Write-Log " Failed: $username - $($_.Exception.Message)" -Color Yellow
+                    continue
+                }
+            }
+
+            if (-not $authenticated) {
+                throw "NSX vIDM authentication failed for all username formats"
+            }
         }
 
-        $testParams = @{ Uri = "https://${Server}/policy/api/v1/infra"; Headers = $headers; Method = "Get"; ErrorAction = "Stop" }
+        # Test connectivity
+        $testUri = "https://${Server}/policy/api/v1/infra"
+        $testParams = @{ Uri = $testUri; Headers = $headers; Method = "Get"; ErrorAction = "Stop" }
         if ($script:NSXFallbackSession) { $testParams["WebSession"] = $script:NSXFallbackSession }
         $null = Invoke-RestMethod @testParams
-        Write-Log "  NSX connection verified" -Color Green
+        Write-Log " NSX connection verified" -Color Green
+
         return $headers
     }
 
+    # Switch SSL mode for NSX (NSX requires TrustAllCertsPolicy, not ServerCertificateValidationCallback)
     [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $null
     if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
         Add-Type @"
@@ -553,44 +953,60 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
     }
     [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
 
+    # Import NSX credentials
     $script:NSXFallbackSession = $null
     if (Test-Path $NSXCredPath) {
         $nsxCred = Import-Clixml -Path $NSXCredPath
+        Write-Log " Credentials imported from: $NSXCredPath" -Color Green
     } else {
         $nsxCred = Get-Credential -Message "Enter NSX Manager credentials"
         $credDir = Split-Path $NSXCredPath -Parent
         if (-not (Test-Path $credDir)) { New-Item -ItemType Directory -Path $credDir -Force | Out-Null }
         $nsxCred | Export-Clixml -Path $NSXCredPath
+        Write-Log " Credentials saved to: $NSXCredPath" -Color Green
     }
 
     try {
-        $nsxHeaders = Connect-NSXManagerFallback -Server $NSXManager -Credential $nsxCred `
-            -AuthMode $NSXAuthMode -VIDMDomain $NSXvIDMDomain
+        $nsxHeaders = Connect-NSXManagerFallback -Server $NSXManager -Credential $nsxCred -AuthMode $NSXAuthMode -VIDMDomain $NSXvIDMDomain
         $nsxFilled = 0
+
         foreach ($vm in $missingAppVMs) {
             try {
                 $nsxUri = "https://${NSXManager}/api/v1/fabric/virtual-machines?display_name=$($vm.VMName)"
-                $inv = @{ Uri = $nsxUri; Headers = $nsxHeaders; Method = "Get" }
-                if ($script:NSXFallbackSession) { $inv["WebSession"] = $script:NSXFallbackSession }
-                $nsxResponse = Invoke-RestMethod @inv
+                $invokeParams = @{
+                    Uri = $nsxUri
+                    Headers = $nsxHeaders
+                    Method = "Get"
+                }
+                if ($script:NSXFallbackSession) { $invokeParams["WebSession"] = $script:NSXFallbackSession }
+                $nsxResponse = Invoke-RestMethod @invokeParams
 
                 if ($nsxResponse.results -and $nsxResponse.results.Count -gt 0) {
                     $nsxVM = $nsxResponse.results[0]
                     if ($nsxVM.tags) {
                         $nsxAppTags = @()
                         foreach ($tag in $nsxVM.tags) {
+                            # Strip ST- prefix from NSX tags for consistency
                             $tagValue = $tag.tag -replace '^ST-', ''
                             switch ($tag.scope) {
-                                "app-application" { $nsxAppTags += $tagValue }
-                                "infra-os"        { if (-not $vm.InfraOS)  { $vm.InfraOS  = $tagValue } }
-                                "app-layer"       { if (-not $vm.AppLayer) { $vm.AppLayer = $tagValue } }
+                                "app-application" {
+                                    $nsxAppTags += $tagValue
+                                }
+                                "infra-os" {
+                                    if (-not $vm.InfraOS) { $vm.InfraOS = $tagValue }
+                                }
+                                "app-layer" {
+                                    if (-not $vm.AppLayer) { $vm.AppLayer = $tagValue }
+                                }
                             }
                         }
+
                         if ($nsxAppTags.Count -gt 0) {
                             $vm.AppApplication = ($nsxAppTags | Select-Object -Unique) -join "; "
                             $nsxFilled++
-                            Write-Log "  $($vm.VMName) | NSX Tags: $($vm.AppApplication)" -Color Green
+                            Write-Log " $($vm.VMName) | NSX Tags: $($vm.AppApplication)" -Color Green
 
+                            # Re-run comparison with multiple tags
                             $matchedApps = @()
                             if ($vm.CMDBCI) {
                                 $ciList = $vm.CMDBCI -split ";\s*"
@@ -598,307 +1014,256 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
                                     $normTag = ($tag.ToLower().Trim() -replace '[_\s\-\.]+', '')
                                     foreach ($ci in $ciList) {
                                         $normCI = ($ci.ToLower().Trim() -replace '[_\s\-\.]+', '')
-                                        if ($normTag -and $normCI -and $normTag -eq $normCI) { $matchedApps += $tag; break }
+                                        if ($normTag -and $normCI -and $normTag -eq $normCI) {
+                                            $matchedApps += $tag
+                                            break
+                                        }
                                     }
                                 }
                             }
-                            $vm.CompareResult = if ($matchedApps.Count -gt 0) {
-                                if ($nsxAppTags.Count -gt 1) { "Match - Multiple Tags" } else { "Match" }
-                            } else { "Mismatch" }
+
+                            if ($matchedApps.Count -gt 0) {
+                                if ($nsxAppTags.Count -gt 1) {
+                                    $vm.CompareResult = "Match - Multiple Tags"
+                                } else {
+                                    $vm.CompareResult = "Match"
+                                }
+                            } else {
+                                $vm.CompareResult = "Mismatch"
+                            }
+                        }
+                        else {
+                            Write-Log " $($vm.VMName) | No app-application tag in NSX" -Color Gray
                         }
                     }
                 }
-            } catch {
-                Write-Log "  $($vm.VMName) | NSX lookup failed: $($_.Exception.Message)" -Color Red
+                else {
+                    Write-Log " $($vm.VMName) | Not found in NSX" -Color Gray
+                }
+            }
+            catch {
+                Write-Log " $($vm.VMName) | NSX lookup failed: $($_.Exception.Message)" -Color Red
             }
             Start-Sleep -Milliseconds 100
         }
-        Write-Log "  NSX filled: $nsxFilled / $($missingAppVMs.Count)" -Color Cyan
-    } catch {
-        Write-Log "  NSX authentication failed: $($_.Exception.Message) (skipping)" -Color Red
+
+        Write-Log " NSX filled: $nsxFilled / $($missingAppVMs.Count)" -Color Cyan
+    }
+    catch {
+        Write-Log " NSX authentication failed: $($_.Exception.Message)" -Color Red
+        Write-Log " Skipping NSX fallback" -Color Yellow
     }
 }
 
+# ---------------------------------------------------------------------------
+# CMDB Relationship Review phase
+# Runs after NSX fallback so AppApplication is as complete as possible.
+# Adds six columns: NSXMatchCMDB, AppOrSubApp, UpstreamToApp,
+# MultipleUpstream, NoUpstreamRelationship, Decommissioned.
+# Sequential first cut - parallelise with a runspace pool once the vRO
+# action calls are confirmed working.
+# ---------------------------------------------------------------------------
+if ($RunReview) {
+    Write-Log "`n=== CMDB RELATIONSHIP REVIEW ($($results.Count) VMs) ===" -Color Cyan
 
-# ---------------- Phase 2: REVIEW ----------------
-Write-Log "`n=== PHASE 2: REVIEW (getVmApplications logs + getCagApplications) ===" -Color Cyan
+    # Reset SSL callback to vRA mode (NSX fallback may have cleared/changed it)
+    [System.Net.ServicePointManager]::CertificatePolicy = $null
+    [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
 
-# Reset TLS/cert callback in case NSX section altered it
-[System.Net.ServicePointManager]::CertificatePolicy = $null
-[System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+    # Probe: confirm the /vco/api/actions endpoint responds and see the raw shape
+    if ($ProbeVroActions) {
+        $probeVm = if ($ProbeVMName) { $results | Where-Object { $_.VMName -eq $ProbeVMName } | Select-Object -First 1 }
+                   else { $results | Select-Object -First 1 }
+        if ($probeVm) {
+            Write-Log " ===== PROBE: $($probeVm.VMName) | project $($probeVm.ProjectName) | tags '$($probeVm.AppApplication)' =====" -Color Yellow
 
-$vroHeaders = @{
-    "Authorization" = "Bearer $authToken"
-    "Content-Type"  = "application/json"
-    "Accept"        = "application/json"
-}
+            # 1) getCagApplications - does the catalogue return anything, and how does it parse?
+            Write-Log "`n --- getCagApplications (raw) ---" -Color Yellow
+            try {
+                $cagRaw = Invoke-VroActionRest -VraServer $vraServer -AuthToken $authToken -ActionUri $getCagAppsUri -Parameters @{
+                    projectName      = $probeVm.ProjectName
+                    phasedOutEnabled = $phasedOutEnabled
+                }
+                Write-Log ($cagRaw | ConvertTo-Json -Depth 8) -Color Gray
+                $cagCat = Get-CagCatalog -RawArray $cagRaw
+                Write-Log " Parsed CAG -> Apps: $($cagCat.Apps.Count), SubApps: $($cagCat.SubApps.Count)" -Color Cyan
+                Write-Log ("  Apps sample:    " + (($cagCat.Apps    | Select-Object -First 5) -join ' | ')) -Color Gray
+                Write-Log ("  SubApps sample: " + (($cagCat.SubApps | Select-Object -First 5) -join ' | ')) -Color Gray
+            }
+            catch { Write-Log " getCagApplications failed: $($_.Exception.Message)" -Color Red }
 
-# Per-project CAG classification cache
-$cagCache = @{}
-# Per-VM upstream cache: "$projectName|$vmName" -> @{ UpstreamCIs; Meta }
-$vmCache  = @{}
+            # 2) getVmApplications - raw shape AND the real property names on each object
+            Write-Log "`n --- getVmApplications (raw) ---" -Color Yellow
+            try {
+                $vmRaw = Invoke-VroActionRest -VraServer $vraServer -AuthToken $authToken -ActionUri $getVmAppsUri -Raw -Parameters @{
+                    projectName = $probeVm.ProjectName
+                    vmName      = $probeVm.VMName
+                }
+                Write-Log ($vmRaw | ConvertTo-Json -Depth 10) -Color Gray
+                $objs = @(Get-VroObjectArray -Response $vmRaw)
+                Write-Log " Parsed objects: $($objs.Count)" -Color Cyan
+                if ($objs.Count -gt 0) {
+                    Write-Log ("  Property names on object[0]: " + (($objs[0].PSObject.Properties.Name) -join ', ')) -Color Green
+                    Write-Log ($objs[0] | ConvertTo-Json -Depth 6) -Color Gray
+                }
+            }
+            catch { Write-Log " getVmApplications failed: $($_.Exception.Message)" -Color Red }
 
-function Get-CagForProject {
-    param([string]$ProjectName)
-    if (-not $ProjectName) { return @{ Apps = @(); SubApps = @() } }
-    if ($cagCache.ContainsKey($ProjectName)) { return $cagCache[$ProjectName] }
-
-    $apps = @(); $subApps = @()
-    try {
-        $res = Invoke-VroActionWithLogs -Server $vraServer -ActionUri $getCagAppsUri -Headers $vroHeaders `
-            -Inputs @{ projectName = $ProjectName; phasedOutEnabled = "true" }
-
-        $data = $null
-        if ($res.ReturnBody) {
-            try { $data = $res.ReturnBody | ConvertFrom-Json } catch { $data = $res.ReturnBody }
-        }
-        $arr = @()
-        if     ($data -is [array])         { $arr = $data }
-        elseif ($data.value -is [array])   { $arr = $data.value }
-        elseif ($data -is [string])        { $arr = $data -split "`r?`n" }
-
-        $bucket = "none"
-        foreach ($line in $arr) {
-            $s = ([string]$line).Trim()
-            if (-not $s) { continue }
-            if     ($s -match '^---\s*Applications\s*---$')      { $bucket = "apps";    continue }
-            elseif ($s -match '^---\s*Sub-?Applications\s*---$') { $bucket = "subapps"; continue }
-            switch ($bucket) {
-                "apps"    { $apps    += $s }
-                "subapps" { $subApps += $s }
+            # 3) returnApplicationVms - raw shape for the first tag
+            $firstTag = ($probeVm.AppApplication -split ";\s*" | Where-Object { $_ } | Select-Object -First 1)
+            if ($firstTag) {
+                Write-Log "`n --- returnApplicationVms (raw) for tag '$firstTag' ---" -Color Yellow
+                try {
+                    $rRaw = Invoke-VroActionRest -VraServer $vraServer -AuthToken $authToken -ActionUri $returnAppVmsUri -Raw -Parameters @{
+                        applicationName  = ($firstTag -replace '_', ' ')
+                        projectName      = $probeVm.ProjectName
+                        vmName           = $probeVm.VMName
+                        phasedOutEnabled = $phasedOutEnabled
+                    }
+                    Write-Log ($rRaw | ConvertTo-Json -Depth 10) -Color Gray
+                }
+                catch { Write-Log " returnApplicationVms failed: $($_.Exception.Message)" -Color Red }
             }
         }
-    } catch {
-        Write-Log "  CAG lookup failed for project '$ProjectName': $($_.Exception.Message)" -Color Yellow
+        Write-Log "`n Probe done - set `$ProbeVroActions = `$false to run the full review." -Color Yellow
+        return
     }
 
-    $entry = @{ Apps = $apps; SubApps = $subApps }
-    $cagCache[$ProjectName] = $entry
-    return $entry
+    if ($ReviewDebug -and (Test-Path $ReviewDebugPath)) { Remove-Item $ReviewDebugPath -Force }
+
+    $reviewSet = if ($ReviewLimit -gt 0) { @($results | Select-Object -First $ReviewLimit) } else { $results }
+    $reviewTotal = @($reviewSet).Count
+    if ($ReviewLimit -gt 0) { Write-Log " (limited to first $reviewTotal VMs)" -Color Yellow }
+
+    $reviewed = 0
+    foreach ($vm in $reviewSet) {
+        Write-Log " [$($reviewed + 1)/$reviewTotal] $($vm.VMName)..." -Color DarkGray
+        $cat = Get-CagForProject -ProjectName $vm.ProjectName -VraServer $vraServer -AuthToken $authToken -CagUri $getCagAppsUri -PhasedOut $phasedOutEnabled
+        $rev = Invoke-CmdbReview -Vm $vm -Catalog $cat -VraServer $vraServer -AuthToken $authToken -GetVmAppsUri $getVmAppsUri -ReturnAppVmsUri $returnAppVmsUri -PhasedOut $phasedOutEnabled -ClassFields $UpstreamClassFields -DebugPath $(if ($ReviewDebug) { $ReviewDebugPath } else { $null })
+
+        Add-Member -InputObject $vm -NotePropertyName NSXMatchCMDB           -NotePropertyValue $rev.NSXMatchCMDB           -Force
+        Add-Member -InputObject $vm -NotePropertyName AppOrSubApp            -NotePropertyValue $rev.AppOrSubApp            -Force
+        Add-Member -InputObject $vm -NotePropertyName UpstreamToApp          -NotePropertyValue $rev.UpstreamToApp          -Force
+        Add-Member -InputObject $vm -NotePropertyName MultipleUpstream       -NotePropertyValue $rev.MultipleUpstream       -Force
+        Add-Member -InputObject $vm -NotePropertyName NoUpstreamRelationship -NotePropertyValue $rev.NoUpstreamRelationship -Force
+        Add-Member -InputObject $vm -NotePropertyName Decommissioned         -NotePropertyValue $rev.Decommissioned         -Force
+
+        $reviewed++
+        if ($reviewed % 25 -eq 0) { Write-Log " Reviewed $reviewed / $reviewTotal" -Color Gray }
+    }
+    Write-Log " Review complete: $reviewed VMs" -Color Green
 }
 
-function Get-UpstreamForVm {
-    # Call getVmApplications via /vco/api/actions to get access to LOGS,
-    # then scrape retrieveCIRelationshipInfoByKey.upstreamCIs from log text.
-    param([string]$VmName, [string]$ProjectName)
-    $key = "$ProjectName|$VmName"
-    if (-not $VmName) { return @{ UpstreamCIs = @(); Meta = @{} } }
-    if ($vmCache.ContainsKey($key)) { return $vmCache[$key] }
-
-    $res = Invoke-VroActionWithLogs -Server $vraServer -ActionUri $getVmAppsUri -Headers $vroHeaders `
-        -Inputs @{ vmName = $VmName; projectName = $ProjectName }
-
-    $upstream = @()
-    if ($res.LogText) {
-        $upstream = Get-UpstreamCIsFromLog -LogText $res.LogText
-    }
-
-    $entry = @{
-        UpstreamCIs = $upstream
-        Meta        = @{
-            ExecId      = $res.ExecId
-            LogEndpoint = $res.LogEndpoint
-            LogChars    = $res.LogChars
-        }
-    }
-    $vmCache[$key] = $entry
-    return $entry
-}
-
-if (-not (Test-Path (Split-Path $ReviewDebugPath))) {
-    New-Item -ItemType Directory -Path (Split-Path $ReviewDebugPath) -Force | Out-Null
-}
-"# Review debug - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" | Out-File -FilePath $ReviewDebugPath -Encoding UTF8
-
-$reviewOut = [System.Collections.Generic.List[object]]::new()
-$rIdx = 0
-foreach ($row in $results) {
-    $rIdx++
-
-    $nsxMatch               = if ($row.CompareResult) { $row.CompareResult } else { "N/A" }
-    $appOrSubApp            = "N/A"
-    $upstreamToApp          = "N/A"
-    $multipleUpstream       = "No multiple upstream"
-    $noUpstreamRelationship = "N/A"
-    $upstreamAppDecomm      = "N/A"
-
-    $tags = @()
-    if ($row.AppApplication) { $tags = @($row.AppApplication -split ";\s*" | Where-Object { $_ }) }
-
-    if ($tags.Count -gt 0) {
-        # AppOrSubApp classification via CAG (per project)
-        $cag = Get-CagForProject -ProjectName $row.ProjectName
-        $classifyBits = @()
-        foreach ($t in $tags) {
-            $normT = Normalize-AppName $t
-            $inApps    = $cag.Apps    | Where-Object { (Normalize-AppName $_) -eq $normT } | Select-Object -First 1
-            $inSubApps = $cag.SubApps | Where-Object { (Normalize-AppName $_) -eq $normT } | Select-Object -First 1
-            if     ($inApps)    { $classifyBits += "$t - convert to sub-app" }
-            elseif ($inSubApps) { $classifyBits += "$t - sub-app" }
-            else                { $classifyBits += "$t - not found in CAG" }
-        }
-        $appOrSubApp = ($classifyBits | Select-Object -Unique) -join "; "
-
-        # Upstream via getVmApplications logs (per VM)
-        $u = Get-UpstreamForVm -VmName $row.VMName -ProjectName $row.ProjectName
-        $upstreamCIs = $u.UpstreamCIs
-
-        # UpstreamToApp: any upstream whose CMSClass is Application / SubApplication
-        $appLinked = $upstreamCIs | Where-Object {
-            $_.UpstreamCICMSClass -match '^(Application|SubApplication)$'
-        }
-        if ($appLinked.Count -gt 0) {
-            $upstreamToApp = (($appLinked | ForEach-Object {
-                "$($_.UpstreamCIName) ($($_.UpstreamCICMSClass))"
-            }) | Select-Object -Unique) -join "; "
-        }
-
-        # MultipleUpstream
-        if ($upstreamCIs.Count -gt 1) {
-            $multipleUpstream = (($upstreamCIs | ForEach-Object { $_.UpstreamCIName }) | Select-Object -Unique) -join "; "
-        }
-
-        # NoUpstreamRelationship
-        if ($upstreamCIs.Count -eq 0) {
-            $noUpstreamRelationship = "No upstream - review/fix upstream relationship"
-        } else {
-            $noUpstreamRelationship = "Has upstream"
-        }
-
-        # Upstream App Decomm - upstream with disposed/retired/phased status
-        $decomm = $upstreamCIs |
-            Where-Object { $_.UpstreamCIStatus -match '(?i)disposed|retired|phased' } |
-            ForEach-Object { "$($_.UpstreamCIName): $($_.UpstreamCIStatus)" } |
-            Select-Object -Unique
-        if ($decomm) { $upstreamAppDecomm = ($decomm -join "; ") }
-
-        Add-Content -Path $ReviewDebugPath -Encoding UTF8 -Value @"
-[$rIdx/$($results.Count)] $($row.VMName) (project=$($row.ProjectName))
-  Tags: $($row.AppApplication)
-  NSXMatchCMDB: $nsxMatch
-  AppOrSubApp: $appOrSubApp
-  execId=$($u.Meta.ExecId) endpoint=$($u.Meta.LogEndpoint) chars=$($u.Meta.LogChars) upstream=$($upstreamCIs.Count)
-  UpstreamToApp: $upstreamToApp
-  MultipleUpstream: $multipleUpstream
-  NoUpstreamRelationship: $noUpstreamRelationship
-  Upstream App Decomm: $upstreamAppDecomm
-"@
-    }
-
-    $reviewOut.Add([PSCustomObject]@{
-        DeploymentName          = ConvertTo-CleanText $row.DeploymentName
-        VMName                  = ConvertTo-CleanText $row.VMName
-        ProjectId               = ConvertTo-CleanText $row.ProjectId
-        ProjectName             = ConvertTo-CleanText $row.ProjectName
-        AppApplication          = ConvertTo-CleanText $row.AppApplication
-        InfraOS                 = ConvertTo-CleanText $row.InfraOS
-        AppLayer                = ConvertTo-CleanText $row.AppLayer
-        CMDBCI                  = ConvertTo-CleanText $row.CMDBCI
-        NSXMatchCMDB            = ConvertTo-CleanText $nsxMatch
-        AppOrSubApp             = ConvertTo-CleanText $appOrSubApp
-        UpstreamToApp           = ConvertTo-CleanText $upstreamToApp
-        MultipleUpstream        = ConvertTo-CleanText $multipleUpstream
-        NoUpstreamRelationship  = ConvertTo-CleanText $noUpstreamRelationship
-        'Upstream App Decomm'   = ConvertTo-CleanText $upstreamAppDecomm
-    })
-
-    if ($rIdx % 25 -eq 0) {
-        Write-Log "  reviewed $rIdx / $($results.Count)" -Color Gray
-    }
-}
-
-
-# ---------------- SUMMARY ----------------
+# Summary
 Write-Log "`n=== SUMMARY ===" -Color Cyan
 Write-Log "VMs processed: $($vmQueue.Count)" -Color White
-Write-Log "Successful:    $successCount" -Color Green
-Write-Log "Failed:        $failCount" -Color Red
-Write-Log "Matches:            $((@($results | Where-Object { $_.CompareResult -eq 'Match' })).Count)" -Color Green
-Write-Log "Match (Multi):      $((@($results | Where-Object { $_.CompareResult -eq 'Match - Multiple Tags' })).Count)" -Color Green
-Write-Log "Mismatches:         $((@($results | Where-Object { $_.CompareResult -eq 'Mismatch' })).Count)" -Color Red
-Write-Log "Missing Data:       $((@($results | Where-Object { $_.CompareResult -eq 'Missing Data' })).Count)" -Color Gray
-Write-Log "Review-phase debug: $ReviewDebugPath" -Color Gray
-Write-Log "Time elapsed:       $($stopwatch.Elapsed.ToString('hh\:mm\:ss'))" -Color White
+Write-Log "Successful: $successCount" -Color Green
+Write-Log "Failed: $failCount" -Color Red
+Write-Log "Matches: $(($results | Where-Object { $_.CompareResult -eq 'Match' }).Count)" -Color Green
+Write-Log "Match (Multi): $(($results | Where-Object { $_.CompareResult -eq 'Match - Multiple Tags' }).Count)" -Color Green
+Write-Log "Mismatches: $(($results | Where-Object { $_.CompareResult -eq 'Mismatch' }).Count)" -Color Red
+Write-Log "Missing Data: $(($results | Where-Object { $_.CompareResult -eq 'Missing Data' }).Count)" -Color Gray
+Write-Log "Time elapsed: $($stopwatch.Elapsed.ToString('hh\:mm\:ss'))" -Color White
 
+# Normalise typographic characters that mangle in CSV (en/em dashes -> '-',
+# NBSP -> space, curly quotes -> straight) so CI names export cleanly.
+function ConvertTo-CleanText {
+    param($s)
+    if ($null -eq $s) { return $s }
+    $s = [string]$s
+    $s = $s -replace [char]0x2013, '-' -replace [char]0x2014, '-'
+    $s = $s -replace [char]0x00A0, ' '
+    $s = $s -replace [char]0x2018, "'" -replace [char]0x2019, "'"
+    $s = $s -replace [char]0x201C, '"' -replace [char]0x201D, '"'
+    return $s
+}
 
-# ---------------- EXPORT ----------------
-if (-not (Test-Path $resultsDir)) { New-Item -ItemType Directory -Path $resultsDir -Force | Out-Null }
-$resultsPath = Join-Path $resultsDir ("CMDBRelations_{0}.csv" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
-$reviewOut | Export-Csv -Path $resultsPath -NoTypeInformation -Encoding UTF8
+# Export results (CompareResult kept internal for console/summary; CSV uses NSXMatchCMDB)
+foreach ($r in $results) {
+    foreach ($p in $r.PSObject.Properties) {
+        if ($p.Value -is [string]) { $p.Value = ConvertTo-CleanText $p.Value }
+    }
+}
+$exportColumns = @(
+    'DeploymentName', 'VMName', 'ProjectName', 'AppApplication', 'InfraOS', 'AppLayer', 'CMDBCI',
+    'NSXMatchCMDB', 'AppOrSubApp', 'UpstreamToApp', 'MultipleUpstream',
+    'NoUpstreamRelationship',
+    @{ Name = 'Upstream App Decomm'; Expression = { $_.Decommissioned } }
+)
+$resultsPath = "$resultsDir\CMDBRelations_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+$results | Select-Object $exportColumns | Export-Csv -Path $resultsPath -NoTypeInformation -Encoding UTF8
 Write-Log "`nResults saved: $resultsPath" -Color White
 
-
-# ---------------- EMAIL ----------------
+# Email report
 if ($SendEmail) {
     Write-Log "`n=== SENDING EMAIL ===" -Color Cyan
 
-    $matchCount      = @($results | Where-Object { $_.CompareResult -eq 'Match' }).Count
+    $matchCount = @($results | Where-Object { $_.CompareResult -eq 'Match' }).Count
     $matchMultiCount = @($results | Where-Object { $_.CompareResult -eq 'Match - Multiple Tags' }).Count
-    $mismatchCount   = @($results | Where-Object { $_.CompareResult -eq 'Mismatch' }).Count
-    $missingCount    = @($results | Where-Object { $_.CompareResult -eq 'Missing Data' }).Count
-    $noUpstreamCount = @($reviewOut | Where-Object { $_.NoUpstreamRelationship -match 'No upstream' }).Count
-    $multiUpstream   = @($reviewOut | Where-Object { $_.MultipleUpstream -ne 'No multiple upstream' }).Count
-    $decommCount     = @($reviewOut | Where-Object { $_.'Upstream App Decomm' -ne 'N/A' }).Count
-    $totalVMs        = @($reviewOut).Count
-    $generatedAt     = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $mismatchCount = @($results | Where-Object { $_.CompareResult -eq 'Mismatch' }).Count
+    $missingCount = @($results | Where-Object { $_.CompareResult -eq 'Missing Data' }).Count
+    $totalVMs = @($results).Count
+    $generatedAt = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
 
-    $rowsHtml = @"
-<tr style='background:#e8f5e9;'><td style='padding:6px 16px; border:1px solid #ddd;'>Match</td>
-<td style='padding:6px 16px; border:1px solid #ddd; text-align:right; color:green; font-weight:bold;'>$matchCount</td></tr>
-<tr style='background:#e8f5e9;'><td style='padding:6px 16px; border:1px solid #ddd;'>Match - Multiple Tags</td>
-<td style='padding:6px 16px; border:1px solid #ddd; text-align:right; color:green; font-weight:bold;'>$matchMultiCount</td></tr>
-<tr style='background:#ffebee;'><td style='padding:6px 16px; border:1px solid #ddd;'>Mismatch</td>
-<td style='padding:6px 16px; border:1px solid #ddd; text-align:right; color:red; font-weight:bold;'>$mismatchCount</td></tr>
-<tr style='background:#f5f5f5;'><td style='padding:6px 16px; border:1px solid #ddd;'>Missing Data</td>
-<td style='padding:6px 16px; border:1px solid #ddd; text-align:right; color:gray; font-weight:bold;'>$missingCount</td></tr>
-<tr><td style='padding:6px 16px; border:1px solid #ddd;'>No Upstream Relationship</td>
-<td style='padding:6px 16px; border:1px solid #ddd; text-align:right;'>$noUpstreamCount</td></tr>
-<tr><td style='padding:6px 16px; border:1px solid #ddd;'>Multiple Upstream</td>
-<td style='padding:6px 16px; border:1px solid #ddd; text-align:right;'>$multiUpstream</td></tr>
-<tr><td style='padding:6px 16px; border:1px solid #ddd;'>Upstream App Decomm</td>
-<td style='padding:6px 16px; border:1px solid #ddd; text-align:right;'>$decommCount</td></tr>
-<tr style='background:#e3f2fd;'><td style='padding:6px 16px; border:1px solid #ddd; font-weight:bold;'>Total VMs</td>
-<td style='padding:6px 16px; border:1px solid #ddd; text-align:right; font-weight:bold;'>$totalVMs</td></tr>
-"@
-
-    $emailBody = @"
-<html><body style='font-family: Segoe UI, Arial, sans-serif; color: #333;'>
-<h2 style='color: #2c3e50;'>CMDB Relations Comparison Report</h2>
-<p>Generated: $generatedAt</p>
-<h3 style='color: #2c3e50;'>Summary</h3>
-<table style='border-collapse:collapse; margin-bottom:20px;'>
-<tr style='background:#2c3e50; color:white;'>
-<th style='padding:8px 16px; border:1px solid #ddd; text-align:left;'>Category</th>
-<th style='padding:8px 16px; border:1px solid #ddd; text-align:right;'>Count</th>
-</tr>
-$rowsHtml
-</table>
-</body></html>
-"@
+    $emailBody = "<html>"
+    $emailBody += "<body style='font-family: Segoe UI, Arial, sans-serif; color: #333;'>"
+    $emailBody += "<h2 style='color: #2c3e50;'>CMDB Relations Comparison Report</h2>"
+    $emailBody += "<p>Generated: $generatedAt</p>"
+    $emailBody += "<h3 style='color: #2c3e50;'>Summary</h3>"
+    $emailBody += "<table style='border-collapse:collapse; margin-bottom:20px;'>"
+    $emailBody += "<tr style='background:#2c3e50; color:white;'>"
+    $emailBody += "<th style='padding:8px 16px; border:1px solid #ddd; text-align:left;'>Category</th>"
+    $emailBody += "<th style='padding:8px 16px; border:1px solid #ddd; text-align:right;'>Count</th>"
+    $emailBody += "</tr>"
+    $emailBody += "<tr style='background:#e8f5e9;'>"
+    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd;'>Match</td>"
+    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd; text-align:right; color:green; font-weight:bold;'>$matchCount</td>"
+    $emailBody += "</tr>"
+    $emailBody += "<tr style='background:#e8f5e9;'>"
+    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd;'>Match - Multiple Tags</td>"
+    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd; text-align:right; color:green; font-weight:bold;'>$matchMultiCount</td>"
+    $emailBody += "</tr>"
+    $emailBody += "<tr style='background:#ffebee;'>"
+    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd;'>Mismatch</td>"
+    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd; text-align:right; color:red; font-weight:bold;'>$mismatchCount</td>"
+    $emailBody += "</tr>"
+    $emailBody += "<tr style='background:#f5f5f5;'>"
+    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd;'>Missing Data</td>"
+    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd; text-align:right; color:gray; font-weight:bold;'>$missingCount</td>"
+    $emailBody += "</tr>"
+    $emailBody += "<tr style='background:#e3f2fd;'>"
+    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd; font-weight:bold;'>Total VMs</td>"
+    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd; text-align:right; font-weight:bold;'>$totalVMs</td>"
+    $emailBody += "</tr>"
+    $emailBody += "</table>"
+    $emailBody += "</body></html>"
 
     try {
+        # Reset SSL policies so they don't interfere with SMTP TLS
         [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $null
         [System.Net.ServicePointManager]::CertificatePolicy = $null
 
         $emailParams = @{
-            To          = $EmailTo
-            From        = $EmailFrom
-            Subject     = $EmailSubject
-            Body        = $emailBody
-            BodyAsHtml  = $true
-            SmtpServer  = $SMTPServer
-            Port        = $SMTPPort
-            UseSsl      = $UseSSL
+            To = $EmailTo
+            From = $EmailFrom
+            Subject = $EmailSubject
+            Body = $emailBody
+            BodyAsHtml = $true
+            SmtpServer = $SMTPServer
+            Port = $SMTPPort
+            UseSsl = $UseSSL
             Attachments = $resultsPath
         }
         Send-MailMessage @emailParams
         Write-Log "Email sent to $EmailTo" -Color Green
 
+        # Clean up CSV after sending
         if (Test-Path $resultsPath) {
             Remove-Item -Path $resultsPath -Force
             Write-Log "CSV cleaned up" -Color Gray
         }
-    } catch {
+    }
+    catch {
         Write-Log "Failed to send email: $($_.Exception.Message)" -Color Red
         Write-Log "CSV retained: $resultsPath" -Color Yellow
     }
