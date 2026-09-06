@@ -24,22 +24,19 @@ $getCagAppsUri    = "$vroBase.returns/getCagApplications"
 $returnAppVmsUri  = "$vroBase.returns/returnApplicationsVms"
 
 # ---------------------------------------------------------------------------
-# UPSTREAM VIA WORKFLOW LOGS (vRO/Aria 8.18.1)
+# UPSTREAM VIA ACTION LOGS (vRO/Aria 8.x)
 # The upstream JSON (retrieveCIRelationshipInfoByKey.upstreamCIs) is written to
-# the getVmApplications *log*, and on 8.x an ACTION execution does not expose its
-# log over REST - only workflow executions do. So wrap getVmApplications in a thin
-# workflow, run THAT via REST, and read the workflow run log.
+# the getVmApplications LOG. On 8.x an action run's log IS retrievable over REST,
+# but at a different path than the execution resource:
+#   GET /vco/api/actions/{executionId}/logs   (NOT /actions/{module}/{name}/executions/{id}/logs)
+# Invoke-VroActionWithLogs now hits that correct path first, so no workflow or
+# action edit is required. Leave $UseWorkflowLogs = $false to use it.
 #
-# One-time vRO setup:
-#   1. Workflows -> New Workflow (e.g. "wf-getVmApplications")
-#   2. Add input parameters: vmName (string), projectName (string)
-#   3. Drag the getVmApplications action onto the schema; bind vmName + projectName
-#   4. Save, then copy the workflow ID (URL or the General tab) into $UpstreamWorkflowId
-#
-# When $UseWorkflowLogs = $true the review reads upstream from the workflow log.
-# When $false it falls back to the action-log path (returns nothing on 8.18.1).
-$UseWorkflowLogs      = $true
-$UpstreamWorkflowId   = "<workflow-id-guid>"     # e.g. 9d95c7f5-a563-413f-af42-fd7e09275216
+# WORKFLOW FALLBACK (only if the action-log path is blocked in your build):
+# set $UseWorkflowLogs = $true and point $UpstreamWorkflowId at a thin wrapper
+# workflow that calls getVmApplications with vmName + projectName.
+$UseWorkflowLogs      = $false
+$UpstreamWorkflowId   = "<workflow-id-guid>"     # only used when $UseWorkflowLogs = $true
 # Workflow input parameter names -> mapped from the VM row at runtime.
 $UpstreamWfInputVmName      = "vmName"
 $UpstreamWfInputProjectName = "projectName"
@@ -453,7 +450,13 @@ function Invoke-VroActionWithLogs {
 
     $logText = ""; $usedEndpoint = "none"
     if ($execId) {
+        # Correct action-log endpoint (vRO 8.x): keyed on the EXECUTION ID directly,
+        # NOT under module/name. Documented as "Export Action Logs":
+        #   GET /vco/api/actions/{executionId}/logs   -> WsSysLogsList { logs[] }
+        # /runs/{execId} returns the async result; kept as a secondary probe.
+        $actionsRoot = "https://$VraServer/vco/api/actions"
         $candidates = @(
+            "$actionsRoot/$execId/logs?maxResult=10000",
             "$base/executions/$execId/syslogs?maxResult=10000",
             "$base/executions/$execId/logs?maxResult=10000"
         )
@@ -463,7 +466,11 @@ function Invoke-VroActionWithLogs {
                 $lines = @()
                 foreach ($e in @($logResp.logs)) {
                     $m = $null
-                    if     ($e.entry.'long-message')  { $m = $e.entry.'long-message' }
+                    # WsSysLogsList shape: long-description / short-description
+                    if     ($e.'long-description')    { $m = $e.'long-description' }
+                    elseif ($e.'short-description')   { $m = $e.'short-description' }
+                    # Workflow-log shape (fallback): entry.long-message / short-message
+                    elseif ($e.entry.'long-message')  { $m = $e.entry.'long-message' }
                     elseif ($e.entry.'short-message') { $m = $e.entry.'short-message' }
                     elseif ($e.message)               { $m = $e.message }
                     if ($m) { $lines += $m }
