@@ -625,13 +625,20 @@ function Invoke-CmdbReview {
 
     $nsxMatch = switch ($Vm.CompareResult) {
         "Match"                 { "NSX tag matches CMDB" }
-        "Match - Multiple Tags" { "NSX tag matches CMDB (multiple tags)" }
-        "Mismatch"              { "No match - review segment or tag" }
-        "Missing Data"          { "Missing data - review" }
+        "Match - Multiple Tags" {
+            # List which tags actually matched, rather than just saying "multiple"
+            if ($Vm.MatchedApps) { "NSX tag matches CMDB (multiple tags: $($Vm.MatchedApps))" }
+            else                 { "NSX tag matches CMDB (multiple tags)" }
+        }
+        "Mismatch"              { "No match - review CMDB or NSX tag" }
+        "Missing Data"          { "CMDB data missing - review" }
         default                 { [string]$Vm.CompareResult }
     }
 
-    $tags = if ($Vm.AppApplication) { $Vm.AppApplication -split ";\s*" } else { @() }
+    # NON_NSX is a marker, not an application - exclude it from every review check
+    $tags = if ($Vm.AppApplication) {
+        @($Vm.AppApplication -split ";\s*" | Where-Object { $_ -and ($_ -notmatch '^(?i)non[_\s\-]?nsx$') })
+    } else { @() }
 
     # --- App vs Sub-App per tag (from getCagApplications catalogue) ---
     $appOrSub = @()
@@ -1025,12 +1032,16 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
 
         $appApplication = ($appApplications | Select-Object -Unique) -join "; "
 
-        # Compare each tag against each CMDB CI entry
+        # Compare each tag against each CMDB CI entry.
+        # NON_NSX is a marker meaning the VM isn't NSX-managed - it is not an
+        # application name and must never be looked up in CMDB.
+        $matchableTags = @($appApplications | Where-Object { $_ -and ($_ -notmatch '^(?i)non[_\s\-]?nsx$') })
+
         $match = "Missing Data"
         $matchedApps = @()
-        if ($appApplications.Count -gt 0 -and $vmApplications) {
+        if ($matchableTags.Count -gt 0 -and $vmApplications) {
             $ciList = $vmApplications -split ";\s*"
-            foreach ($tag in $appApplications) {
+            foreach ($tag in $matchableTags) {
                 $normTag = ($tag.ToLower().Trim() -replace '[_\s\-\.]+', '')
                 foreach ($ci in $ciList) {
                     $normCI = ($ci.ToLower().Trim() -replace '[_\s\-\.]+', '')
@@ -1041,7 +1052,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
                 }
             }
             if ($matchedApps.Count -gt 0) {
-                if ($appApplications.Count -gt 1) {
+                if ($matchableTags.Count -gt 1) {
                     $match = "Match - Multiple Tags"
                 } else {
                     $match = "Match"
@@ -1063,6 +1074,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
             AppLayer = $appLayer
             CMDBCI = $vmApplications
             CompareResult = $match
+            MatchedApps = $matchedAppsStr
             Status = "Success"
         }
     }
@@ -1077,6 +1089,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
             AppLayer = ""
             CMDBCI = ""
             CompareResult = ""
+            MatchedApps = ""
             Status = "Failed: $($_.Exception.Message)"
         }
     }
@@ -1156,6 +1169,7 @@ foreach ($job in $jobs) {
                     AppLayer = [string]$r.AppLayer
                     CMDBCI = [string]$r.CMDBCI
                     CompareResult = [string]$r.CompareResult
+                    MatchedApps = [string]$r.MatchedApps
                 })
             }
         }
@@ -1682,6 +1696,22 @@ function ConvertTo-CleanText {
     param($s)
     if ($null -eq $s) { return $s }
     $s = [string]$s
+
+    # Repair mojibake first. When UTF-8 bytes are read as Windows-1252, an en dash
+    # (U+2013 = E2 80 93) renders as "a-with-circumflex + euro + quote" etc. Round-
+    # tripping the string back through CP1252 -> UTF-8 reverses that mis-decode.
+    # Guarded: only applied when the tell-tale sequence is present, and only kept
+    # if the result no longer contains the replacement character.
+    if ($s -match [char]0x00E2 -or $s -match [char]0x00C2) {
+        try {
+            $bytes    = [Text.Encoding]::GetEncoding(1252).GetBytes($s)
+            $repaired = [Text.Encoding]::UTF8.GetString($bytes)
+            if ($repaired -notmatch [char]0xFFFD) { $s = $repaired }
+        }
+        catch { }
+    }
+
+    # Then normalise typographic characters to plain ASCII for CSV
     $s = $s -replace [char]0x2013, '-' -replace [char]0x2014, '-'
     $s = $s -replace [char]0x00A0, ' '
     $s = $s -replace [char]0x2018, "'" -replace [char]0x2019, "'"
