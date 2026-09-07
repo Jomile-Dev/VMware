@@ -641,22 +641,25 @@ function Invoke-CmdbReview {
         } | Select-Object -Unique)
         $upstreamToApp = ($appNames -join "; ")
 
+        # There IS an app/sub-app upstream, so nothing to flag here
+        $noUpstream = "No"
+
         # Multiple = more than one APP/SUB-APP upstream (not counting agents/software)
         if ($appUpstreams.Count -gt 1) {
             $multiUpstream = "Multiple upstream apps ($($appUpstreams.Count)) - review: " + ($appNames -join "; ")
         }
     }
     elseif ($tags.Count -eq 0) {
-        $noUpstream = "No CMDB relationship - add"
+        $noUpstream = "Yes - no CMDB relationship, add"
     }
     else {
         # Upstreams may exist, but none is an Application/SubApplication
         if ($otherUpstreams.Count -gt 0) {
             $otherCls = @($otherUpstreams | ForEach-Object { Get-FirstFieldValue -Object $_ -Fields $ClassFields } | Select-Object -Unique)
-            $noUpstream = "No app/sub-app upstream - review/fix (found only: $($otherCls -join ', '))"
+            $noUpstream = "Yes - no app/sub-app upstream, review/fix (found only: $($otherCls -join ', '))"
         }
         else {
-            $noUpstream = "No upstream - review/fix upstream relationship"
+            $noUpstream = "Yes - no upstream at all, review/fix upstream relationship"
         }
     }
 
@@ -1421,10 +1424,19 @@ foreach ($r in $results) {
     }
 }
 $exportColumns = @(
-    'DeploymentName', 'VMName', 'ProjectName', 'AppApplication', 'InfraOS', 'AppLayer', 'CMDBCI',
-    'NSXMatchCMDB', 'AppOrSubApp', 'UpstreamToApp', 'MultipleUpstream',
-    'NoUpstreamRelationship',
-    @{ Name = 'Upstream App Decomm'; Expression = { $_.Decommissioned } }
+    @{ Name = 'Deployment Name';               Expression = { $_.DeploymentName } }
+    @{ Name = 'VM Name';                       Expression = { $_.VMName } }
+    @{ Name = 'Project Name';                  Expression = { $_.ProjectName } }
+    @{ Name = 'App Application';               Expression = { $_.AppApplication } }
+    @{ Name = 'Infra OS';                      Expression = { $_.InfraOS } }
+    @{ Name = 'App Layer';                     Expression = { $_.AppLayer } }
+    @{ Name = 'CMDB CI';                       Expression = { $_.CMDBCI } }
+    @{ Name = 'NSX Match CMDB';                Expression = { $_.NSXMatchCMDB } }
+    @{ Name = 'App or Sub-App';                Expression = { $_.AppOrSubApp } }
+    @{ Name = 'Upstream to App or Sub-App';    Expression = { $_.UpstreamToApp } }
+    @{ Name = 'Multiple Upstream';             Expression = { $_.MultipleUpstream } }
+    @{ Name = 'No Upstream Relationship';      Expression = { $_.NoUpstreamRelationship } }
+    @{ Name = 'Upstream App Decomm';           Expression = { $_.Decommissioned } }
 )
 $resultsPath = "$resultsDir\CMDBRelations_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
 $results | Select-Object $exportColumns | Export-Csv -Path $resultsPath -NoTypeInformation -Encoding UTF8
