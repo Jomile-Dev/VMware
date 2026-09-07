@@ -1,9 +1,10 @@
 # --- config (fill in locally; do not commit real values) ---
 $vraServer = "<vra-server-fqdn>"
-$module    = "<module-namespace>"        # the part before /getVmApplications (try the .returns tail; if POST 404s, try .actions)
+$module    = "<module-namespace>"        # the .returns namespace before /getVmApplications
 $vmName    = "<vm-name>"
 $project   = "<project-name>"
 $credPath  = "<path-to-cred-xml>"        # e.g. C:\Scripts\Creds\getCred.xml
+$logDump   = "<local-log-path>"          # folder for the raw dump, e.g. C:\Logs
 
 # --- tls ---
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -28,22 +29,29 @@ $id  = $run.'execution-id'; if (-not $id) { $id = $run.id }
 
 Start-Sleep -Seconds 3
 
-# --- fetch the run log WITH the full condition set the GUI uses ---
-# type=both is the key param; without it you only get the 4 info summary lines.
-$logUri = "https://$vraServer/vco/api/actions/$id/logs?conditions=severity=info&conditions=locallyOnly=false&conditions=type=both&maxResult=100000"
-$r = Invoke-RestMethod -Uri $logUri -Headers $getH -Method Get
-"logs count: " + @($r.logs).Count
+# --- fetch the run log with the full condition set the GUI uses ---
+# type=both is the key param; build the query so all conditions survive.
+$conds  = @("conditions=severity=info","conditions=locallyOnly=false","conditions=type=both") -join "&"
+$logUri = "https://$vraServer/vco/api/actions/$id/logs?$conds&maxResult=100000"
+"URL: $logUri"     # confirm this still contains type=both and all conditions
+
+$logResp = Invoke-RestMethod -Uri $logUri -Headers $getH -Method Get
+
+# --- raw inspection: dump full response + list severity per record ---
+if (-not (Test-Path $logDump)) { New-Item -ItemType Directory -Path $logDump -Force | Out-Null }
+$logResp | ConvertTo-Json -Depth 20 | Set-Content (Join-Path $logDump "action-log-raw.json")
+
+"logs count: " + @($logResp.logs).Count
+"severities: " + (@($logResp.logs | ForEach-Object { $_.severity }) -join ", ")
 
 # --- does the log contain the upstream block? ---
-$json = $r | ConvertTo-Json -Depth 40
+$json = $logResp | ConvertTo-Json -Depth 40
 "has upstream block: " + [bool]($json -match 'retrieveCIRelationshipInfoByKey')
 "has upstreamCIs:     " + [bool]($json -match 'upstreamCIs')
 
-# --- if found, show it; else dump all short-descriptions ---
+# --- show per-record summary; dump full JSON if the block is present ---
+$logResp.logs | Select-Object severity, origin, 'short-description' | Format-List
+
 if ($json -match 'retrieveCIRelationshipInfoByKey') {
-    "----- MATCH: dumping full log JSON -----"
-    $json
-} else {
-    "----- no upstream block; here is every log line's short-description -----"
-    $r.logs | ForEach-Object { $_.entry.'short-description' }
+    "----- MATCH: full log JSON written to action-log-raw.json -----"
 }
