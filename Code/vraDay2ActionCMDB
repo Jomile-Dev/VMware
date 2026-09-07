@@ -1,22 +1,36 @@
+# --- config (fill in locally) ---
+$vraServer = "<vra-server-fqdn>"
+$id        = "<execId>"
+
+# --- tls + compiled cert bypass (no scriptblock - avoids the ISE runspace error) ---
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-[System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
 [System.Net.ServicePointManager]::Expect100Continue = $false
 [System.Net.ServicePointManager]::DefaultConnectionLimit = 50
 
-$vraServer = "<vra-server-fqdn>"
-$id        = "<execId>"
-$getH      = @{ Authorization = "Bearer $authToken"; Accept = "application/json" }
+if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
+Add-Type @"
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+public class TrustAllCertsPolicy : ICertificatePolicy {
+    public bool CheckValidationResult(
+        ServicePoint srvPoint, X509Certificate certificate,
+        WebRequest request, int certificateProblem) { return true; }
+}
+"@
+}
+[System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+[System.Net.ServicePointManager]::ServerCertificateValidationCallback = $null
 
-# clear the stale variable so we can't be fooled again
+# --- headers (reuses the token already in this session) ---
+$getH    = @{ Authorization = "Bearer $authToken"; Accept = "application/json" }
 $logResp = $null
 
+# --- the query the GUI uses: severity=debug is the key one ---
 $conds = @(
     "conditions=severity=debug"
     "conditions=localonly=false"
     "conditions=type=both"
 ) -join "&"
-
-# match the GUI: maxResult=300, not 100000
 $logUri = "https://$vraServer/vco/api/actions/$id/logs?$conds&maxResult=300"
 "URL: $logUri"
 
@@ -25,6 +39,7 @@ try {
     "logs count: " + @($logResp.logs).Count
     $json = $logResp | ConvertTo-Json -Depth 40
     "has upstream block: " + [bool]($json -match 'retrieveCIRelationshipInfoByKey')
+    "has upstreamCIs:     " + [bool]($json -match 'upstreamCIs')
     "has UpstreamCIType:  " + [bool]($json -match 'UpstreamCIType')
 } catch {
     "FAILED: " + $_.Exception.Message
