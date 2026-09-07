@@ -621,37 +621,51 @@ function Invoke-CmdbReview {
     $upstreamCIs = @($upstreamCIs | Where-Object { $_ })
     $ciStatuses  = @($ciStatuses  | Where-Object { $_ })
 
-    $upstreamToApp = "N/A"; $multiUpstream = "No multiple upstream"; $noUpstream = "N/A"; $decomm = "N/A"
+    $upstreamToApp = "N/A"; $multiUpstream = "No multiple upstream"; $noUpstream = "N/A"; $decomm = "No"
 
-    if ($upstreamCIs.Count -gt 0) {
-        $classes = @($upstreamCIs | ForEach-Object { Get-FirstFieldValue -Object $_ -Fields $ClassFields })
-        if ($classes -contains "Application") {
-            $upstreamToApp = "Upstream to Application"
-        }
-        elseif ($classes -contains "SubApplication") {
-            $upstreamToApp = "Upstream is Sub-Application - review upstream relationship"
-        }
-        else {
-            $upstreamToApp = "Upstream class unknown ($($classes -join ',')) - review"
-        }
+    # Only Application / SubApplication upstreams count as a real app relationship.
+    # A VM commonly has extra upstreams (OBM Agent, Running Software, etc.) which are
+    # NOT app relationships - counting those would wrongly report multiple upstreams
+    # and would mask a genuinely missing app/sub-app link.
+    $appUpstreams = @($upstreamCIs | Where-Object {
+        (Get-FirstFieldValue -Object $_ -Fields $ClassFields) -match '^(Application|SubApplication)$'
+    })
+    $otherUpstreams = @($upstreamCIs | Where-Object {
+        (Get-FirstFieldValue -Object $_ -Fields $ClassFields) -notmatch '^(Application|SubApplication)$'
+    })
 
-        if ($upstreamCIs.Count -gt 1) {
-            $multiUpstream = "Multiple upstreams ($($upstreamCIs.Count)) - review"
+    if ($appUpstreams.Count -gt 0) {
+        $appNames = @($appUpstreams | ForEach-Object {
+            $cls = Get-FirstFieldValue -Object $_ -Fields $ClassFields
+            "$($_.UpstreamCIName) [$cls]"
+        } | Select-Object -Unique)
+        $upstreamToApp = ($appNames -join "; ")
+
+        # Multiple = more than one APP/SUB-APP upstream (not counting agents/software)
+        if ($appUpstreams.Count -gt 1) {
+            $multiUpstream = "Multiple upstream apps ($($appUpstreams.Count)) - review: " + ($appNames -join "; ")
         }
     }
     elseif ($tags.Count -eq 0) {
         $noUpstream = "No CMDB relationship - add"
     }
     else {
-        $noUpstream = "No upstream - review/fix upstream relationship"
+        # Upstreams may exist, but none is an Application/SubApplication
+        if ($otherUpstreams.Count -gt 0) {
+            $otherCls = @($otherUpstreams | ForEach-Object { Get-FirstFieldValue -Object $_ -Fields $ClassFields } | Select-Object -Unique)
+            $noUpstream = "No app/sub-app upstream - review/fix (found only: $($otherCls -join ', '))"
+        }
+        else {
+            $noUpstream = "No upstream - review/fix upstream relationship"
+        }
     }
 
-    # Decommissioned: upstream CI statuses AND the CI's own Status - so a
-    # disposed sub-app with no upstream relationship still gets flagged
-    $allStatuses = @($upstreamCIs | ForEach-Object { $_.UpstreamCIStatus }) + $ciStatuses
-    $decommed = @($allStatuses | Where-Object { $_ -match 'dispos|retire|decommission' } | Select-Object -Unique)
+    # Upstream App Decomm: Yes/No, based on the APP/SUB-APP upstream status, plus the
+    # CI's own Status so a disposed sub-app with no upstream link still gets flagged.
+    $decommStatuses = @($appUpstreams | ForEach-Object { $_.UpstreamCIStatus }) + $ciStatuses
+    $decommed = @($decommStatuses | Where-Object { $_ -match 'dispos|retire|decommission|phased' } | Select-Object -Unique)
     if ($decommed.Count -gt 0) {
-        $decomm = "App/Sub-App decommissioned ($($decommed -join '; ')) - review"
+        $decomm = "Yes - " + ($decommed -join '; ')
     }
 
     # --- Debug dump: raw + parsed data per VM for troubleshooting ---
@@ -663,6 +677,9 @@ function Invoke-CmdbReview {
             CagApps          = @($Catalog.Apps).Count
             CagSubApps       = @($Catalog.SubApps).Count
             UpstreamCount    = $upstreamCIs.Count
+            AppUpstreamCount = $appUpstreams.Count
+            AppUpstreams     = @($appUpstreams | ForEach-Object { "$($_.UpstreamCIName) [$(Get-FirstFieldValue -Object $_ -Fields $ClassFields)] status=$($_.UpstreamCIStatus)" })
+            OtherUpstreams   = @($otherUpstreams | ForEach-Object { "$($_.UpstreamCIName) [$(Get-FirstFieldValue -Object $_ -Fields $ClassFields)]" })
             UpstreamCIs      = @($upstreamCIs | ForEach-Object {
                 @($_.PSObject.Properties | ForEach-Object { "$($_.Name) = $($_.Value)" })
             })
