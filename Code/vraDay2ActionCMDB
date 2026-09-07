@@ -1,51 +1,16 @@
-# --- config (fill in locally) ---
-$vraServer = "<vra-server-fqdn>"
-$module    = "<module-namespace>"        # the .returns namespace
-$vmName    = "<vm-name>"
-$project   = "<project-name>"
-$credPath  = "<path-to-cred-xml>"
-$logDump   = "<local-log-path>"
+$id = "<execId>"
 
-# --- tls ---
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-[System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+$conds = @(
+    "conditions=severity=debug"
+    "conditions=localonly=false"
+    "conditions=type=both"
+) -join "&"
+$logUri = "https://$vraServer/vco/api/actions/$id/logs?$conds&maxResult=100000"
+"URL: $logUri"
 
-# --- auth ---
-$cred = Import-Clixml -Path $credPath
-$authToken = (Invoke-RestMethod -Uri "https://$vraServer/csp/gateway/am/api/login" -Method Post -ContentType "application/json" -Body (@{ username = $cred.UserName; password = $cred.GetNetworkCredential().Password } | ConvertTo-Json)).cspAuthToken
-$getH  = @{ Authorization = "Bearer $authToken"; Accept = "application/json" }
-$postH = @{ Authorization = "Bearer $authToken"; "Content-Type" = "application/json"; Accept = "application/json" }
-
-# --- run the action FRESH (must be after DEBUG is enabled) ---
-$body = @{ parameters = @(
-    @{ name = 'vmName';      type = 'string'; value = @{ string = @{ value = $vmName } } },
-    @{ name = 'projectName'; type = 'string'; value = @{ string = @{ value = $project } } }
-) } | ConvertTo-Json -Depth 6
-$run = Invoke-RestMethod -Uri "https://$vraServer/vco/api/actions/$module/getVmApplications/executions" -Method Post -Headers $postH -Body $body
-$id  = $run.'execution-id'; if (-not $id) { $id = $run.id }
-"execId: $id"
-Start-Sleep -Seconds 3
-
-# --- fetch the run log (bare = retrieve everything; no severity filter) ---
-$logUri  = "https://$vraServer/vco/api/actions/$id/logs?maxResult=100000"
 $logResp = Invoke-RestMethod -Uri $logUri -Headers $getH -Method Get
-if (-not (Test-Path $logDump)) { New-Item -ItemType Directory -Path $logDump -Force | Out-Null }
-$logResp | ConvertTo-Json -Depth 30 | Set-Content (Join-Path $logDump "action-log-raw.json")
-
-# --- compatibility-safe parser (handles nested .entry or top-level) ---
-$parsedLogs = foreach ($record in @($logResp.logs)) {
-    $entry = if ($record.entry) { $record.entry } else { $record }
-    [PSCustomObject]@{
-        Severity = $entry.severity
-        Origin   = $entry.origin
-        Short    = if ($entry.'short-message') { $entry.'short-message' } else { $entry.'short-description' }
-        Long     = if ($entry.'long-message')  { $entry.'long-message' }  else { $entry.'long-description' }
-    }
-}
-
 "logs count: " + @($logResp.logs).Count
-"severities:  " + (@($parsedLogs.Severity) -join ", ")
 $json = $logResp | ConvertTo-Json -Depth 40
 "has upstream block: " + [bool]($json -match 'retrieveCIRelationshipInfoByKey')
 "has upstreamCIs:     " + [bool]($json -match 'upstreamCIs')
-$parsedLogs | Format-List *
+"has UpstreamCIType:  " + [bool]($json -match 'UpstreamCIType')
