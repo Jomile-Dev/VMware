@@ -1,24 +1,27 @@
-# OAuth password-grant request: local System Domain account
-$tokenUri = "https://$vidmTenant/SAAS/auth/oauthtoken"
-
-$tokenBody = @{
-    grant_type = 'password'
-    client_id  = 'local-reset-automation' # replace with your OAuth User Client ID
-    username   = $vidmTenantCreds.UserName
-    password   = $vidmTenantCreds.GetNetworkCredential().Password
-    domain     = 'System Domain'
-    scope      = 'admin'
-}
-
-$tokenResponse = Invoke-RestMethod `
-    -Uri $tokenUri `
-    -Method Post `
-    -ContentType 'application/x-www-form-urlencoded' `
-    -Body $tokenBody `
-    -ErrorAction Stop
-
-# Headers for the existing SCIM calls below
+# Authenticate as the local System Domain admin
 $header = New-Object 'System.Collections.Generic.Dictionary[String,String]'
 $header.Add('Accept', 'application/json')
 $header.Add('Content-Type', 'application/json')
-$header.Add('Authorization', "Bearer $($tokenResponse.access_token)")
+
+$authBody = @{
+    username   = $vidmTenantCreds.UserName
+    password   = $vidmTenantCreds.GetNetworkCredential().Password
+    issueToken = 'true'
+} | ConvertTo-Json -Compress
+
+$uri = "https://$vidmTenant/SAAS/API/1.0/REST/auth/system/login"
+
+$authResponse = Invoke-RestMethod `
+    -Uri $uri `
+    -Headers $header `
+    -Method Post `
+    -Body $authBody `
+    -ErrorAction Stop
+
+$vidmSessionToken = $authResponse.sessionToken
+
+if (-not $vidmSessionToken) {
+    throw "No System Domain session token was returned."
+}
+
+$header.Add('Authorization', "HZN $vidmSessionToken")
