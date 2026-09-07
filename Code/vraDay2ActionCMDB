@@ -1,6 +1,7 @@
 # --- config (fill in locally) ---
 $vraServer = "<vra-server-fqdn>"
 $id        = "<execId>"
+$credPath  = "<path-to-cred-xml>"
 
 # --- tls + compiled cert bypass (no scriptblock - avoids the ISE runspace error) ---
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -21,7 +22,11 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
 [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
 [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $null
 
-# --- headers (reuses the token already in this session) ---
+# --- fresh token ---
+$cred = Import-Clixml -Path $credPath
+$authToken = (Invoke-RestMethod -Uri "https://$vraServer/csp/gateway/am/api/login" -Method Post -ContentType "application/json" -Body (@{ username = $cred.UserName; password = $cred.GetNetworkCredential().Password } | ConvertTo-Json)).cspAuthToken
+"token length: " + $authToken.Length
+
 $getH    = @{ Authorization = "Bearer $authToken"; Accept = "application/json" }
 $logResp = $null
 
