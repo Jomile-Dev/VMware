@@ -1,6 +1,6 @@
-# --- config (fill these in locally; do not commit real values) ---
+# --- config (fill in locally; do not commit real values) ---
 $vraServer = "<vra-server-fqdn>"
-$module    = "<module-namespace>"        # e.g. <org>.<team>.<area>.returns  (if POST 404s, try the .actions variant)
+$module    = "<module-namespace>"        # the part before /getVmApplications (try the .returns tail; if POST 404s, try .actions)
 $vmName    = "<vm-name>"
 $project   = "<project-name>"
 $credPath  = "<path-to-cred-xml>"        # e.g. C:\Scripts\Creds\getCred.xml
@@ -28,8 +28,10 @@ $id  = $run.'execution-id'; if (-not $id) { $id = $run.id }
 
 Start-Sleep -Seconds 3
 
-# --- fetch the run log ---
-$r = Invoke-RestMethod -Uri "https://$vraServer/vco/api/actions/$id/logs?maxResult=100000" -Headers $getH -Method Get
+# --- fetch the run log WITH the full condition set the GUI uses ---
+# type=both is the key param; without it you only get the 4 info summary lines.
+$logUri = "https://$vraServer/vco/api/actions/$id/logs?conditions=severity=info&conditions=locallyOnly=false&conditions=type=both&maxResult=100000"
+$r = Invoke-RestMethod -Uri $logUri -Headers $getH -Method Get
 "logs count: " + @($r.logs).Count
 
 # --- does the log contain the upstream block? ---
@@ -37,7 +39,7 @@ $json = $r | ConvertTo-Json -Depth 40
 "has upstream block: " + [bool]($json -match 'retrieveCIRelationshipInfoByKey')
 "has upstreamCIs:     " + [bool]($json -match 'upstreamCIs')
 
-# --- if found, show it; else dump all short-descriptions so we can see what IS logged ---
+# --- if found, show it; else dump all short-descriptions ---
 if ($json -match 'retrieveCIRelationshipInfoByKey') {
     "----- MATCH: dumping full log JSON -----"
     $json
