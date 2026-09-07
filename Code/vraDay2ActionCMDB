@@ -231,17 +231,53 @@ function Get-CagCatalog {
 $cagCache = @{}
 function Get-CagForProject {
     param($ProjectName, $VraServer, $AuthToken, $CagUri, $PhasedOut)
-    if (-not $ProjectName) { return [PSCustomObject]@{ Apps = @(); SubApps = @() } }
+    if (-not $ProjectName) { return [PSCustomObject]@{ Apps = @(); SubApps = @(); PhasedOutApps = @(); PhasedOutSubApps = @() } }
     if ($cagCache.ContainsKey($ProjectName)) { return $cagCache[$ProjectName] }
     try {
+        # Full catalogue (includes phased-out entries when $PhasedOut is true)
         $raw = Invoke-VroActionRest -VraServer $VraServer -AuthToken $AuthToken -ActionUri $CagUri -Parameters @{
             projectName      = $ProjectName
             phasedOutEnabled = $PhasedOut
         }
         $cat = Get-CagCatalog -RawArray $raw
+
+        # Live-only catalogue. The catalogue carries no phased-out marker, so the
+        # difference between the two calls IS the phased-out set. Used to answer
+        # "was the app this NSX tag points at previously decommissioned?" when the
+        # VM has no upstream relationship left to inspect.
+        $liveApps = @(); $liveSubApps = @()
+        if ($PhasedOut) {
+            try {
+                $rawLive = Invoke-VroActionRest -VraServer $VraServer -AuthToken $AuthToken -ActionUri $CagUri -Parameters @{
+                    projectName      = $ProjectName
+                    phasedOutEnabled = $false
+                }
+                $live = Get-CagCatalog -RawArray $rawLive
+                $liveApps    = @($live.Apps)
+                $liveSubApps = @($live.SubApps)
+            }
+            catch { }
+        }
+
+        $liveAppKeys = @{}; foreach ($a in $liveApps)    { $liveAppKeys[(Normalize-AppName $a)] = $true }
+        $liveSubKeys = @{}; foreach ($a in $liveSubApps) { $liveSubKeys[(Normalize-AppName $a)] = $true }
+
+        $phasedApps = @()
+        $phasedSubs = @()
+        if ($PhasedOut -and ($liveApps.Count -gt 0 -or $liveSubApps.Count -gt 0)) {
+            $phasedApps = @($cat.Apps    | Where-Object { -not $liveAppKeys[(Normalize-AppName $_)] })
+            $phasedSubs = @($cat.SubApps | Where-Object { -not $liveSubKeys[(Normalize-AppName $_)] })
+        }
+
+        $cat = [PSCustomObject]@{
+            Apps             = $cat.Apps
+            SubApps          = $cat.SubApps
+            PhasedOutApps    = $phasedApps
+            PhasedOutSubApps = $phasedSubs
+        }
     }
     catch {
-        $cat = [PSCustomObject]@{ Apps = @(); SubApps = @() }
+        $cat = [PSCustomObject]@{ Apps = @(); SubApps = @(); PhasedOutApps = @(); PhasedOutSubApps = @() }
     }
     $cagCache[$ProjectName] = $cat
     return $cat
@@ -655,52 +691,78 @@ function Invoke-CmdbReview {
 
     $upstreamToApp = "N/A"; $multiUpstream = "No multiple upstream"; $noUpstream = "N/A"; $decomm = "No"
 
-    # Only Application / SubApplication upstreams count as a real app relationship.
-    # A VM commonly has extra upstreams (OBM Agent, Running Software, etc.) which are
-    # NOT app relationships - counting those would wrongly report multiple upstreams
-    # and would mask a genuinely missing app/sub-app link.
+    # RULE: the chain should be VM > Sub-App > Application.
+    # Only Application / SubApplication upstreams are relationship-relevant; the
+    # other upstreams a VM carries (OBM Agent, Running Software, etc.) are not app
+    # relationships and must not count toward "multiple upstream" or mask a
+    # genuinely missing app link.
     $appUpstreams = @($upstreamCIs | Where-Object {
         (Get-FirstFieldValue -Object $_ -Fields $ClassFields) -match '^(Application|SubApplication)$'
     })
     $otherUpstreams = @($upstreamCIs | Where-Object {
         (Get-FirstFieldValue -Object $_ -Fields $ClassFields) -notmatch '^(Application|SubApplication)$'
     })
+    # Upstream to an Application is the correct end state; upstream to another
+    # Sub-Application does not satisfy the rule and needs review.
+    $toApplication    = @($appUpstreams | Where-Object { (Get-FirstFieldValue -Object $_ -Fields $ClassFields) -eq 'Application' })
+    $toSubApplication = @($appUpstreams | Where-Object { (Get-FirstFieldValue -Object $_ -Fields $ClassFields) -eq 'SubApplication' })
 
     if ($appUpstreams.Count -gt 0) {
-        $appNames = @($appUpstreams | ForEach-Object {
-            $cls = Get-FirstFieldValue -Object $_ -Fields $ClassFields
-            "$($_.UpstreamCIName) [$cls]"
-        } | Select-Object -Unique)
-        $upstreamToApp = ($appNames -join "; ")
-
-        # Yes = has an app/sub-app upstream relationship
         $noUpstream = "Yes"
 
-        # Multiple = more than one APP/SUB-APP upstream (not counting agents/software)
+        if ($toApplication.Count -gt 0) {
+            $names = @($toApplication | ForEach-Object { $_.UpstreamCIName } | Select-Object -Unique)
+            $upstreamToApp = "Good - upstream to Application: " + ($names -join "; ")
+        }
+        else {
+            # Only sub-app upstreams: VM > Sub-App > Sub-App, needs review
+            $names = @($toSubApplication | ForEach-Object { $_.UpstreamCIName } | Select-Object -Unique)
+            $upstreamToApp = "Review - upstream is Sub-Application (not an Application): " + ($names -join "; ")
+        }
+
+        # Multiple = more than one app/sub-app upstream
         if ($appUpstreams.Count -gt 1) {
-            $multiUpstream = "Multiple upstream apps ($($appUpstreams.Count)) - review: " + ($appNames -join "; ")
+            $allNames = @($appUpstreams | ForEach-Object {
+                "$($_.UpstreamCIName) [$(Get-FirstFieldValue -Object $_ -Fields $ClassFields)]"
+            } | Select-Object -Unique)
+            $multiUpstream = "Review - multiple upstream app/sub-app ($($appUpstreams.Count)): " + ($allNames -join "; ")
+        }
+        else {
+            $multiUpstream = "Good - single upstream"
         }
     }
     elseif ($tags.Count -eq 0) {
         $noUpstream = "No - no CMDB relationship, add"
     }
     else {
-        # Upstreams may exist, but none is an Application/SubApplication
         if ($otherUpstreams.Count -gt 0) {
             $otherCls = @($otherUpstreams | ForEach-Object { Get-FirstFieldValue -Object $_ -Fields $ClassFields } | Select-Object -Unique)
-            $noUpstream = "No - no app/sub-app upstream, review/fix (found only: $($otherCls -join ', '))"
+            $noUpstream = "No - no app/sub-app upstream, add relationship (found only: $($otherCls -join ', '))"
         }
         else {
-            $noUpstream = "No - no upstream at all, review/fix upstream relationship"
+            $noUpstream = "No - no upstream relationship, add"
         }
     }
 
-    # Upstream App Decomm: Yes/No, based on the APP/SUB-APP upstream status, plus the
-    # CI's own Status so a disposed sub-app with no upstream link still gets flagged.
+    # Upstream App Decomm.
+    # 1) status carried on the app/sub-app upstream, and the CI's own status
+    # 2) RULE: when there is NO relationship left to inspect, check the app the NSX
+    #    tag points at against the phased-out CAG set - i.e. was it decommissioned?
     $decommStatuses = @($appUpstreams | ForEach-Object { $_.UpstreamCIStatus }) + $ciStatuses
     $decommed = @($decommStatuses | Where-Object { $_ -match 'dispos|retire|decommission|phased' } | Select-Object -Unique)
     if ($decommed.Count -gt 0) {
         $decomm = "Yes - " + ($decommed -join '; ')
+    }
+    elseif ($appUpstreams.Count -eq 0 -and $tags.Count -gt 0) {
+        $phasedHits = @()
+        foreach ($t in $tags) {
+            $k = Normalize-AppName $t
+            foreach ($p in @($Catalog.PhasedOutApps))    { if ((Normalize-AppName $p) -eq $k) { $phasedHits += "$p (App)" } }
+            foreach ($p in @($Catalog.PhasedOutSubApps)) { if ((Normalize-AppName $p) -eq $k) { $phasedHits += "$p (Sub-App)" } }
+        }
+        if ($phasedHits.Count -gt 0) {
+            $decomm = "Yes - NSX tag app is phased out: " + (($phasedHits | Select-Object -Unique) -join '; ')
+        }
     }
 
     # --- Debug dump: raw + parsed data per VM for troubleshooting ---
