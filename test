@@ -1,27 +1,42 @@
-# Authenticate as the local System Domain admin
-$header = New-Object 'System.Collections.Generic.Dictionary[String,String]'
-$header.Add('Accept', 'application/json')
-$header.Add('Content-Type', 'application/json')
+# Create Remote App Access client credentials
+# (client_id and client_secret from vIDM Catalog > Settings > Remote App Access)
+$vidmClientId     = $vidmClientCreds.UserName
+$vidmClientSecret = $vidmClientCreds.GetNetworkCredential().Password
 
-$authBody = @{
-    username   = $vidmTenantCreds.UserName
-    password   = $vidmTenantCreds.GetNetworkCredential().Password
-    issueToken = 'true'
-} | ConvertTo-Json -Compress
+# Build Basic auth header from client_id:client_secret
+$basicAuth = [Convert]::ToBase64String(
+    [Text.Encoding]::UTF8.GetBytes("${vidmClientId}:${vidmClientSecret}")
+)
 
-$uri = "https://$vidmTenant/SAAS/API/1.0/REST/auth/system/login"
-
-$authResponse = Invoke-RestMethod `
-    -Uri $uri `
-    -Headers $header `
-    -Method Post `
-    -Body $authBody `
-    -ErrorAction Stop
-
-$vidmSessionToken = $authResponse.sessionToken
-
-if (-not $vidmSessionToken) {
-    throw "No System Domain session token was returned."
+$header = @{
+    Accept          = 'application/json'
+    'Content-Type'  = 'application/x-www-form-urlencoded'
+    Authorization   = "Basic $basicAuth"
 }
 
-$header.Add('Authorization', "HZN $vidmSessionToken")
+# Request access token via client_credentials grant
+$uri = "https://$vidmTenant/SAAS/auth/oauthtoken?grant_type=client_credentials"
+
+try {
+    $authResponse = Invoke-RestMethod -Uri $uri -Headers $header `
+        -Method Post -ErrorAction Stop
+}
+catch {
+    Write-Warning "OAuth token request failed: $($_.ErrorDetails.Message)"
+    throw
+}
+
+$vidmAccessToken = $authResponse.access_token
+
+if ($vidmAccessToken) {
+    # Switch header for subsequent SCIM calls
+    $header = @{
+        Accept          = 'application/json'
+        'Content-Type'  = 'application/json'
+        Authorization   = "Bearer $vidmAccessToken"
+    }
+}
+else {
+    Write-Warning "Token missing, cannot continue"
+    break
+}
