@@ -1,5 +1,24 @@
-$authBody = @{
+# OAuth password-grant request: local System Domain account
+$tokenUri = "https://$vidmTenant/SAAS/auth/oauthtoken"
+
+$tokenBody = @{
+    grant_type = 'password'
+    client_id  = 'local-reset-automation' # replace with your OAuth User Client ID
     username   = $vidmTenantCreds.UserName
     password   = $vidmTenantCreds.GetNetworkCredential().Password
-    issueToken = 'true'
-} | ConvertTo-Json
+    domain     = 'System Domain'
+    scope      = 'admin'
+}
+
+$tokenResponse = Invoke-RestMethod `
+    -Uri $tokenUri `
+    -Method Post `
+    -ContentType 'application/x-www-form-urlencoded' `
+    -Body $tokenBody `
+    -ErrorAction Stop
+
+# Headers for the existing SCIM calls below
+$header = New-Object 'System.Collections.Generic.Dictionary[String,String]'
+$header.Add('Accept', 'application/json')
+$header.Add('Content-Type', 'application/json')
+$header.Add('Authorization', "Bearer $($tokenResponse.access_token)")
