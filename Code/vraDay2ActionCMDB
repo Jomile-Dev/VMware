@@ -98,8 +98,8 @@ $exportColumns = @(
     @{ Name = 'CMDB CI';                       Expression = { $_.CMDBCI } }
     @{ Name = 'NSX Match CMDB';                Expression = { $_.NSXMatchCMDB } }
     @{ Name = 'App or Sub-App';                Expression = { $_.AppOrSubApp } }
-    @{ Name = 'Upstream to App or Sub-App';    Expression = { $_.UpstreamToApp } }
     @{ Name = 'Multiple Upstream';             Expression = { $_.MultipleUpstream } }
+    @{ Name = 'Sub-App to App Upstream';       Expression = { $_.UpstreamToApp } }
     @{ Name = 'Has Upstream Relationship';     Expression = { $_.NoUpstreamRelationship } }
     @{ Name = 'Upstream App Decomm';           Expression = { $_.Decommissioned } }
 )
@@ -229,58 +229,94 @@ function Get-CagCatalog {
 
 # Per-project cache so getCagApplications is called once per project, not per VM
 $cagCache = @{}
+# Fetch the CAG catalogue through the form-service external-values endpoint - the
+# same call the vRO/vRA UI makes. This is the mechanism Phase 1 already uses
+# successfully; the /vco/api/actions/.../executions route returns nothing for this
+# action in some environments, which silently produced an empty catalogue and made
+# every tag report "Not found in CAG".
+function Get-CagViaExternalValues {
+    param($VraServer, $AuthToken, $ProjectId, $ProjectName, $CagUri, $PhasedOut)
+
+    if (-not $ProjectId) { return @() }
+    $headers = @{ Authorization = "Bearer $AuthToken"; "Content-Type" = "application/json" }
+    $uri = "https://$VraServer/form-service/api/forms/renderer/external-values?projectId=$ProjectId"
+
+    $req = @{
+        uri                     = $CagUri
+        dataSource              = "scriptAction"
+        parameters              = @(
+            @{ name = "projectName";      value = $ProjectName },
+            @{ name = "phasedOutEnabled"; value = $PhasedOut }
+        )
+        useResultsFromRequestId = -1
+        fieldType               = @{ dataType = "string" }
+        isMultiple              = $true
+        requestId               = 1
+    }
+    $body = "[" + ($req | ConvertTo-Json -Depth 6 -Compress) + "]"
+
+    try {
+        $resp = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body -TimeoutSec 60
+        foreach ($r in @($resp)) {
+            if ($r.data) { return @($r.data) }
+        }
+    }
+    catch { }
+    return @()
+}
+
 function Get-CagForProject {
-    param($ProjectName, $VraServer, $AuthToken, $CagUri, $PhasedOut)
+    param($ProjectName, $ProjectId, $VraServer, $AuthToken, $CagUri, $PhasedOut)
     if (-not $ProjectName) { return [PSCustomObject]@{ Apps = @(); SubApps = @(); PhasedOutApps = @(); PhasedOutSubApps = @() } }
     if ($cagCache.ContainsKey($ProjectName)) { return $cagCache[$ProjectName] }
-    try {
-        # Full catalogue (includes phased-out entries when $PhasedOut is true)
-        $raw = Invoke-VroActionRest -VraServer $VraServer -AuthToken $AuthToken -ActionUri $CagUri -Parameters @{
-            projectName      = $ProjectName
-            phasedOutEnabled = $PhasedOut
+
+    # Full catalogue (external-values first, actions REST as fallback)
+    $raw = Get-CagViaExternalValues -VraServer $VraServer -AuthToken $AuthToken -ProjectId $ProjectId -ProjectName $ProjectName -CagUri $CagUri -PhasedOut $PhasedOut
+    if (-not $raw -or @($raw).Count -eq 0) {
+        try {
+            $raw = Get-VroObjectArray -Response (Invoke-VroActionRest -VraServer $VraServer -AuthToken $AuthToken -ActionUri $CagUri -Parameters @{
+                projectName      = $ProjectName
+                phasedOutEnabled = $PhasedOut
+            })
         }
-        $cat = Get-CagCatalog -RawArray $raw
+        catch { $raw = @() }
+    }
+    $cat = Get-CagCatalog -RawArray $raw
 
-        # Live-only catalogue. The catalogue carries no phased-out marker, so the
-        # difference between the two calls IS the phased-out set. Used to answer
-        # "was the app this NSX tag points at previously decommissioned?" when the
-        # VM has no upstream relationship left to inspect.
-        $liveApps = @(); $liveSubApps = @()
-        if ($PhasedOut) {
-            try {
-                $rawLive = Invoke-VroActionRest -VraServer $VraServer -AuthToken $AuthToken -ActionUri $CagUri -Parameters @{
-                    projectName      = $ProjectName
-                    phasedOutEnabled = $false
-                }
-                $live = Get-CagCatalog -RawArray $rawLive
-                $liveApps    = @($live.Apps)
-                $liveSubApps = @($live.SubApps)
-            }
-            catch { }
-        }
-
-        $liveAppKeys = @{}; foreach ($a in $liveApps)    { $liveAppKeys[(Normalize-AppName $a)] = $true }
-        $liveSubKeys = @{}; foreach ($a in $liveSubApps) { $liveSubKeys[(Normalize-AppName $a)] = $true }
-
-        $phasedApps = @()
-        $phasedSubs = @()
-        if ($PhasedOut -and ($liveApps.Count -gt 0 -or $liveSubApps.Count -gt 0)) {
-            $phasedApps = @($cat.Apps    | Where-Object { -not $liveAppKeys[(Normalize-AppName $_)] })
-            $phasedSubs = @($cat.SubApps | Where-Object { -not $liveSubKeys[(Normalize-AppName $_)] })
-        }
-
-        $cat = [PSCustomObject]@{
-            Apps             = $cat.Apps
-            SubApps          = $cat.SubApps
-            PhasedOutApps    = $phasedApps
-            PhasedOutSubApps = $phasedSubs
+    # Live-only catalogue: the difference against the full list IS the phased-out set
+    $liveApps = @(); $liveSubApps = @()
+    if ($PhasedOut) {
+        $rawLive = Get-CagViaExternalValues -VraServer $VraServer -AuthToken $AuthToken -ProjectId $ProjectId -ProjectName $ProjectName -CagUri $CagUri -PhasedOut $false
+        if ($rawLive -and @($rawLive).Count -gt 0) {
+            $live = Get-CagCatalog -RawArray $rawLive
+            $liveApps    = @($live.Apps)
+            $liveSubApps = @($live.SubApps)
         }
     }
-    catch {
-        $cat = [PSCustomObject]@{ Apps = @(); SubApps = @(); PhasedOutApps = @(); PhasedOutSubApps = @() }
+
+    $liveAppKeys = @{}; foreach ($a in $liveApps)    { $liveAppKeys[(Normalize-AppName $a)] = $true }
+    $liveSubKeys = @{}; foreach ($a in $liveSubApps) { $liveSubKeys[(Normalize-AppName $a)] = $true }
+
+    $phasedApps = @(); $phasedSubs = @()
+    if ($PhasedOut -and ($liveApps.Count -gt 0 -or $liveSubApps.Count -gt 0)) {
+        $phasedApps = @($cat.Apps    | Where-Object { -not $liveAppKeys[(Normalize-AppName $_)] })
+        $phasedSubs = @($cat.SubApps | Where-Object { -not $liveSubKeys[(Normalize-AppName $_)] })
     }
-    $cagCache[$ProjectName] = $cat
-    return $cat
+
+    $result = [PSCustomObject]@{
+        Apps             = $cat.Apps
+        SubApps          = $cat.SubApps
+        PhasedOutApps    = $phasedApps
+        PhasedOutSubApps = $phasedSubs
+    }
+
+    # Do not fail silently - an empty catalogue makes every tag look "Not found in CAG"
+    if (@($result.Apps).Count -eq 0 -and @($result.SubApps).Count -eq 0) {
+        Write-Log "  WARNING: CAG catalogue is EMPTY for project '$ProjectName' - every tag will report 'Not found in CAG'" -Color Yellow
+    }
+
+    $cagCache[$ProjectName] = $result
+    return $result
 }
 
 # Defensively pull an array of objects out of a vRO action REST response.
@@ -616,11 +652,10 @@ function Invoke-VroActionWithLogs {
 }
 
 # Build the six review fields for one VM result object
-# Resolve whether a named application / sub-application is decommissioned.
-# Second hop of the chain: the VM's upstream gives us the app NAME, but not that
-# app's own status. returnApplicationVms takes applicationName, so run it and read
-# the CI status out of its debug log (same mechanism as the VM lookup).
-# Results are cached per app name - many VMs share the same upstream app.
+# Resolve an application / sub-application: its own status AND its own upstreams.
+# Second hop of the chain. The VM's upstream gives us the Sub-App name only;
+# returnApplicationVms takes applicationName, so run it and read both the CI status
+# and that app's upstreamCIs out of its debug log. Cached per app name.
 function Get-AppDecommStatus {
     param($AppName, $VraServer, $AuthToken, $ReturnAppVmsUri, $Cache)
 
@@ -629,21 +664,21 @@ function Get-AppDecommStatus {
     if ($Cache -and $Cache.ContainsKey($key)) { return $Cache[$key] }
 
     $statuses = @()
+    $ownUpstreams = @()
     try {
         $res = Invoke-VroActionWithLogs -VraServer $VraServer -AuthToken $AuthToken `
             -ActionUri $ReturnAppVmsUri -Parameters @{ applicationName = $AppName }
 
         if ($res.LogText) {
-            # CI status block for the application itself
-            $statuses += @(Get-CiStatusesFromLog -LogText $res.LogText)
-
-            # Some responses carry the status only on the relationship records
-            $ups = @(Get-UpstreamCIsFromLog -LogText $res.LogText)
-            foreach ($u in $ups) { if ($u.UpstreamCIStatus) { $statuses += $u.UpstreamCIStatus } }
+            $statuses     += @(Get-CiStatusesFromLog -LogText $res.LogText)
+            $ownUpstreams += @(Get-UpstreamCIsFromLog -LogText $res.LogText)
         }
         if (-not $statuses -and $res.Value) {
             $obj = Get-VroJson -Response $res.Value
-            if ($obj) { $statuses += @(Get-CiStatuses -Obj $obj) }
+            if ($obj) {
+                $statuses     += @(Get-CiStatuses  -Obj $obj)
+                $ownUpstreams += @(Get-UpstreamCIs -Obj $obj)
+            }
         }
     }
     catch { }
@@ -652,10 +687,11 @@ function Get-AppDecommStatus {
     $disposed = @($statuses | Where-Object { $_ -match 'dispos|retire|decommission|phased' })
 
     $result = [PSCustomObject]@{
-        AppName    = $AppName
-        Statuses   = $statuses
-        IsDisposed = ($disposed.Count -gt 0)
-        Disposed   = $disposed
+        AppName      = $AppName
+        Statuses     = $statuses
+        IsDisposed   = ($disposed.Count -gt 0)
+        Disposed     = $disposed
+        OwnUpstreams = $ownUpstreams
     }
     if ($Cache) { $Cache[$key] = $result }
     return $result
@@ -762,28 +798,70 @@ function Invoke-CmdbReview {
     $toSubApplication = @($appUpstreams | Where-Object { (Get-FirstFieldValue -Object $_ -Fields $ClassFields) -eq 'SubApplication' })
 
     if ($appUpstreams.Count -gt 0) {
-        $noUpstream = "Yes"
+        # ---- FIRST HOP: what the VM is linked to ----
+        $firstHopNames = @($appUpstreams | ForEach-Object {
+            "$($_.UpstreamCIName) [$(Get-FirstFieldValue -Object $_ -Fields $ClassFields)]"
+        } | Select-Object -Unique)
 
-        if ($toApplication.Count -gt 0) {
-            $names = @($toApplication | ForEach-Object { $_.UpstreamCIName } | Select-Object -Unique)
-            $upstreamToApp = "Good - upstream to Application: " + ($names -join "; ")
-        }
-        else {
-            # Only sub-app upstreams: VM > Sub-App > Sub-App, needs review
-            $names = @($toSubApplication | ForEach-Object { $_.UpstreamCIName } | Select-Object -Unique)
-            $upstreamToApp = "Review - upstream is Sub-Application (not an Application): " + ($names -join "; ")
-        }
-
-        # Multiple = more than one app/sub-app upstream
         if ($appUpstreams.Count -gt 1) {
-            $allNames = @($appUpstreams | ForEach-Object {
-                "$($_.UpstreamCIName) [$(Get-FirstFieldValue -Object $_ -Fields $ClassFields)]"
-            } | Select-Object -Unique)
-            $multiUpstream = "Review - multiple upstream app/sub-app ($($appUpstreams.Count)): " + ($allNames -join "; ")
+            $multiUpstream = "Review - multiple upstream app/sub-app ($($appUpstreams.Count)): " + ($firstHopNames -join "; ")
         }
         else {
-            $multiUpstream = "Good - single upstream"
+            $multiUpstream = "Good - single upstream: " + ($firstHopNames -join "; ")
         }
+
+        # ---- SECOND HOP: does the VM's upstream itself have an upstream? ----
+        # Ideal chain is VM > Sub-App > App. A Sub-App with no upstream App needs
+        # review; an Application at the first hop is already top of the chain, so
+        # "App to nothing" is expected rather than a fault.
+        $hopDetails = @()
+        $anySecondHop = $false
+        $anySubAppMissingApp = $false
+
+        foreach ($u in $appUpstreams) {
+            $uName  = $u.UpstreamCIName
+            $uClass = Get-FirstFieldValue -Object $u -Fields $ClassFields
+            if (-not $uName) { continue }
+
+            $info = Get-AppDecommStatus -AppName $uName -VraServer $VraServer `
+                -AuthToken $AuthToken -ReturnAppVmsUri $ReturnAppVmsUri -Cache $AppStatusCache
+
+            $ownApps = @()
+            $ownSubs = @()
+            if ($info -and $info.OwnUpstreams) {
+                foreach ($ou in $info.OwnUpstreams) {
+                    $ouClass = Get-FirstFieldValue -Object $ou -Fields $ClassFields
+                    if     ($ouClass -eq 'Application')    { $ownApps += $ou.UpstreamCIName }
+                    elseif ($ouClass -eq 'SubApplication') { $ownSubs += $ou.UpstreamCIName }
+                }
+            }
+            $ownApps = @($ownApps | Where-Object { $_ } | Select-Object -Unique)
+            $ownSubs = @($ownSubs | Where-Object { $_ } | Select-Object -Unique)
+
+            if ($uClass -eq 'Application') {
+                # VM linked straight to an Application - top of chain, nothing above
+                $hopDetails += "$uName [App] > nothing (App is top of chain)"
+            }
+            elseif ($ownApps.Count -gt 0) {
+                $anySecondHop = $true
+                $hopDetails += "$uName [Sub-App] > $($ownApps -join ', ') [App]"
+            }
+            elseif ($ownSubs.Count -gt 0) {
+                $anySecondHop = $true
+                $hopDetails += "$uName [Sub-App] > $($ownSubs -join ', ') [Sub-App] - review, should point to an App"
+            }
+            else {
+                $anySubAppMissingApp = $true
+                $hopDetails += "$uName [Sub-App] > nothing - review, no upstream App"
+            }
+        }
+
+        $upstreamToApp = ($hopDetails -join "; ")
+
+        # Has Upstream Relationship = does the Sub-App/App above the VM have its own upstream?
+        if ($anySecondHop)              { $noUpstream = "Yes" }
+        elseif ($anySubAppMissingApp)   { $noUpstream = "No - Sub-App has no upstream App, add relationship" }
+        else                            { $noUpstream = "N/A - VM upstream is an Application (top of chain)" }
     }
     elseif ($tags.Count -eq 0) {
         $noUpstream = "No - no CMDB relationship, add"
@@ -1566,11 +1644,19 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
     # --- Pre-build the CAG catalogue per unique project (main thread) ---
     # Far fewer projects than VMs, and it keeps the per-project cache out of the
     # runspaces (each runspace would otherwise have its own empty cache and refetch).
-    $projectNames = @($reviewSet | ForEach-Object { $_.ProjectName } | Where-Object { $_ } | Select-Object -Unique)
-    Write-Log " Pre-loading CAG catalogue for $($projectNames.Count) project(s)..." -Color Gray
+    # ProjectId is required: the external-values endpoint is keyed on it.
+    $projectMap = @{}
+    foreach ($r in $reviewSet) {
+        if ($r.ProjectName -and $r.ProjectId -and -not $projectMap.ContainsKey($r.ProjectName)) {
+            $projectMap[$r.ProjectName] = $r.ProjectId
+        }
+    }
+    Write-Log " Pre-loading CAG catalogue for $($projectMap.Count) project(s)..." -Color Gray
     $cagByProject = @{}
-    foreach ($pn in $projectNames) {
-        $cagByProject[$pn] = Get-CagForProject -ProjectName $pn -VraServer $vraServer -AuthToken $authToken -CagUri $getCagAppsUri -PhasedOut $phasedOutEnabled
+    foreach ($pn in $projectMap.Keys) {
+        $cagByProject[$pn] = Get-CagForProject -ProjectName $pn -ProjectId $projectMap[$pn] -VraServer $vraServer -AuthToken $authToken -CagUri $getCagAppsUri -PhasedOut $phasedOutEnabled
+        $c = $cagByProject[$pn]
+        Write-Log ("   {0}: {1} app(s), {2} sub-app(s), {3} phased-out" -f $pn, @($c.Apps).Count, @($c.SubApps).Count, (@($c.PhasedOutApps).Count + @($c.PhasedOutSubApps).Count)) -Color DarkGray
     }
     Write-Log " CAG catalogue ready" -Color Gray
 
