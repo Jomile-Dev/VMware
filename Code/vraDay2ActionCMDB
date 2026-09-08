@@ -92,7 +92,7 @@ $exportColumns = @(
     @{ Name = 'Deployment Name';               Expression = { $_.DeploymentName } }
     @{ Name = 'VM Name';                       Expression = { $_.VMName } }
     @{ Name = 'Project Name';                  Expression = { $_.ProjectName } }
-    @{ Name = 'App Application';               Expression = { $_.AppApplication } }
+    @{ Name = 'NSX Tag';                       Expression = { $_.AppApplication } }
     @{ Name = 'Infra OS';                      Expression = { $_.InfraOS } }
     @{ Name = 'App Layer';                     Expression = { $_.AppLayer } }
     @{ Name = 'CMDB CI';                       Expression = { $_.CMDBCI } }
@@ -616,11 +616,58 @@ function Invoke-VroActionWithLogs {
 }
 
 # Build the six review fields for one VM result object
+# Resolve whether a named application / sub-application is decommissioned.
+# Second hop of the chain: the VM's upstream gives us the app NAME, but not that
+# app's own status. returnApplicationVms takes applicationName, so run it and read
+# the CI status out of its debug log (same mechanism as the VM lookup).
+# Results are cached per app name - many VMs share the same upstream app.
+function Get-AppDecommStatus {
+    param($AppName, $VraServer, $AuthToken, $ReturnAppVmsUri, $Cache)
+
+    if (-not $AppName) { return $null }
+    $key = ($AppName.ToLower().Trim())
+    if ($Cache -and $Cache.ContainsKey($key)) { return $Cache[$key] }
+
+    $statuses = @()
+    try {
+        $res = Invoke-VroActionWithLogs -VraServer $VraServer -AuthToken $AuthToken `
+            -ActionUri $ReturnAppVmsUri -Parameters @{ applicationName = $AppName }
+
+        if ($res.LogText) {
+            # CI status block for the application itself
+            $statuses += @(Get-CiStatusesFromLog -LogText $res.LogText)
+
+            # Some responses carry the status only on the relationship records
+            $ups = @(Get-UpstreamCIsFromLog -LogText $res.LogText)
+            foreach ($u in $ups) { if ($u.UpstreamCIStatus) { $statuses += $u.UpstreamCIStatus } }
+        }
+        if (-not $statuses -and $res.Value) {
+            $obj = Get-VroJson -Response $res.Value
+            if ($obj) { $statuses += @(Get-CiStatuses -Obj $obj) }
+        }
+    }
+    catch { }
+
+    $statuses = @($statuses | Where-Object { $_ } | Select-Object -Unique)
+    $disposed = @($statuses | Where-Object { $_ -match 'dispos|retire|decommission|phased' })
+
+    $result = [PSCustomObject]@{
+        AppName    = $AppName
+        Statuses   = $statuses
+        IsDisposed = ($disposed.Count -gt 0)
+        Disposed   = $disposed
+    }
+    if ($Cache) { $Cache[$key] = $result }
+    return $result
+}
+
+
 function Invoke-CmdbReview {
     param(
         $Vm, $Catalog, $VraServer, $AuthToken, $GetVmAppsUri, $ReturnAppVmsUri,
         $PhasedOut, $ClassFields, $DebugPath,
-        $UseWorkflowLogs, $WorkflowId, $WfInputVmName, $WfInputProjectName, $WorkflowWaitSec
+        $UseWorkflowLogs, $WorkflowId, $WfInputVmName, $WfInputProjectName, $WorkflowWaitSec,
+        $AppStatusCache
     )
 
     $nsxMatch = switch ($Vm.CompareResult) {
@@ -752,15 +799,49 @@ function Invoke-CmdbReview {
     }
 
     # Upstream App Decomm.
-    # 1) status carried on the app/sub-app upstream, and the CI's own status
-    # 2) RULE: when there is NO relationship left to inspect, check the app the NSX
-    #    tag points at against the phased-out CAG set - i.e. was it decommissioned?
-    $decommStatuses = @($appUpstreams | ForEach-Object { $_.UpstreamCIStatus }) + $ciStatuses
-    $decommed = @($decommStatuses | Where-Object { $_ -match 'dispos|retire|decommission|phased' } | Select-Object -Unique)
-    if ($decommed.Count -gt 0) {
-        $decomm = "Yes - " + ($decommed -join '; ')
+    # Second hop: the VM's upstream gives us the app NAME only. Run
+    # returnApplicationVms against that name and read ITS status from the log to
+    # answer "is the upstream app decommissioned?" - Yes if disposed, else No.
+    $decommHits = @()
+    foreach ($u in $appUpstreams) {
+        if (-not $u.UpstreamCIName) { continue }
+
+        # status already carried on the relationship record
+        if ($u.UpstreamCIStatus -match 'dispos|retire|decommission|phased') {
+            $decommHits += "$($u.UpstreamCIName): $($u.UpstreamCIStatus)"
+            continue
+        }
+
+        # otherwise look the app up directly
+        $appStat = Get-AppDecommStatus -AppName $u.UpstreamCIName -VraServer $VraServer `
+            -AuthToken $AuthToken -ReturnAppVmsUri $ReturnAppVmsUri -Cache $AppStatusCache
+        if ($appStat -and $appStat.IsDisposed) {
+            $decommHits += "$($u.UpstreamCIName): $($appStat.Disposed -join ', ')"
+        }
+    }
+
+    # the VM's own CI status still counts
+    $ownDecomm = @($ciStatuses | Where-Object { $_ -match 'dispos|retire|decommission|phased' } | Select-Object -Unique)
+
+    if ($decommHits.Count -gt 0) {
+        $decomm = "Yes - " + (($decommHits | Select-Object -Unique) -join '; ')
+    }
+    elseif ($ownDecomm.Count -gt 0) {
+        $decomm = "Yes - CI status: " + ($ownDecomm -join '; ')
     }
     elseif ($appUpstreams.Count -eq 0 -and $tags.Count -gt 0) {
+        # No upstream at all. If the VM's own CMDB CI is an Application (VM > App)
+        # then the chain is wrong - it should be VM > Sub-App > App.
+        $vmIsApp = $false
+        foreach ($t in $tags) {
+            $k = Normalize-AppName $t
+            foreach ($a in @($Catalog.Apps)) { if ((Normalize-AppName $a) -eq $k) { $vmIsApp = $true } }
+        }
+        if ($vmIsApp) {
+            $noUpstream = "No - VM linked directly to an Application (VM > App), fix relationship/segment"
+        }
+
+        # and check whether the tag's app was previously phased out
         $phasedHits = @()
         foreach ($t in $tags) {
             $k = Normalize-AppName $t
@@ -1493,6 +1574,10 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
     }
     Write-Log " CAG catalogue ready" -Color Gray
 
+    # Shared across runspaces: app-name -> decommission status. Many VMs share the
+    # same upstream app, so this avoids re-running returnApplicationVms per VM.
+    $appStatusCache = [hashtable]::Synchronized(@{})
+
     $reviewed = 0
     $reviewFailed = [System.Collections.Generic.List[object]]::new()
 
@@ -1502,7 +1587,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
             Write-Log " [$($reviewed + 1)/$reviewTotal] $($vm.VMName)..." -Color DarkGray
             $cat = if ($vm.ProjectName -and $cagByProject.ContainsKey($vm.ProjectName)) { $cagByProject[$vm.ProjectName] } else { [PSCustomObject]@{ Apps = @(); SubApps = @() } }
             try {
-                $rev = Invoke-CmdbReview -Vm $vm -Catalog $cat -VraServer $vraServer -AuthToken $authToken -GetVmAppsUri $getVmAppsUri -ReturnAppVmsUri $returnAppVmsUri -PhasedOut $phasedOutEnabled -ClassFields $UpstreamClassFields -DebugPath $(if ($ReviewDebug) { $ReviewDebugPath } else { $null }) -UseWorkflowLogs $UseWorkflowLogs -WorkflowId $UpstreamWorkflowId -WfInputVmName $UpstreamWfInputVmName -WfInputProjectName $UpstreamWfInputProjectName -WorkflowWaitSec $WorkflowWaitSec
+                $rev = Invoke-CmdbReview -Vm $vm -Catalog $cat -VraServer $vraServer -AuthToken $authToken -GetVmAppsUri $getVmAppsUri -ReturnAppVmsUri $returnAppVmsUri -PhasedOut $phasedOutEnabled -ClassFields $UpstreamClassFields -DebugPath $(if ($ReviewDebug) { $ReviewDebugPath } else { $null }) -UseWorkflowLogs $UseWorkflowLogs -WorkflowId $UpstreamWorkflowId -WfInputVmName $UpstreamWfInputVmName -WfInputProjectName $UpstreamWfInputProjectName -WorkflowWaitSec $WorkflowWaitSec -AppStatusCache $appStatusCache
                 Add-Member -InputObject $vm -NotePropertyName NSXMatchCMDB           -NotePropertyValue $rev.NSXMatchCMDB           -Force
                 Add-Member -InputObject $vm -NotePropertyName AppOrSubApp            -NotePropertyValue $rev.AppOrSubApp            -Force
                 Add-Member -InputObject $vm -NotePropertyName UpstreamToApp          -NotePropertyValue $rev.UpstreamToApp          -Force
@@ -1530,7 +1615,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
             'Normalize-AppName','Invoke-VroActionRest','Get-CagCatalog','Get-VroObjectArray',
             'Get-FirstFieldValue','Get-VroJson','Get-UpstreamCIs','Get-CiStatuses',
             'Get-JsonBlockFromText','Get-UpstreamCIsFromLog','Get-CiStatusesFromLog',
-            'Invoke-VroWorkflowWithLogs','Invoke-VroActionWithLogs','Invoke-CmdbReview'
+            'Invoke-VroWorkflowWithLogs','Invoke-VroActionWithLogs','Get-AppDecommStatus','Invoke-CmdbReview'
         )
         $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
         foreach ($fn in $fnNames) {
@@ -1551,7 +1636,8 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
         $reviewBlock = {
             param($Vm, $Catalog, $VraServer, $AuthToken, $GetVmAppsUri, $ReturnAppVmsUri,
                   $PhasedOut, $ClassFields, $WantDebug,
-                  $UseWorkflowLogs, $WorkflowId, $WfInputVmName, $WfInputProjectName, $WorkflowWaitSec)
+                  $UseWorkflowLogs, $WorkflowId, $WfInputVmName, $WfInputProjectName, $WorkflowWaitSec,
+                  $AppStatusCache)
 
             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
             [System.Net.ServicePointManager]::Expect100Continue = $false
@@ -1577,7 +1663,8 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
                     -GetVmAppsUri $GetVmAppsUri -ReturnAppVmsUri $ReturnAppVmsUri -PhasedOut $PhasedOut `
                     -ClassFields $ClassFields -DebugPath $tmpDebug `
                     -UseWorkflowLogs $UseWorkflowLogs -WorkflowId $WorkflowId `
-                    -WfInputVmName $WfInputVmName -WfInputProjectName $WfInputProjectName -WorkflowWaitSec $WorkflowWaitSec
+                    -WfInputVmName $WfInputVmName -WfInputProjectName $WfInputProjectName -WorkflowWaitSec $WorkflowWaitSec `
+                    -AppStatusCache $AppStatusCache
 
                 $dbgText = ""
                 if ($tmpDebug -and (Test-Path $tmpDebug)) {
@@ -1622,6 +1709,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
             $ps.AddArgument($UpstreamWfInputVmName)      | Out-Null
             $ps.AddArgument($UpstreamWfInputProjectName) | Out-Null
             $ps.AddArgument($WorkflowWaitSec)            | Out-Null
+            $ps.AddArgument($appStatusCache)             | Out-Null
             $ps.RunspacePool = $reviewPool
             $reviewJobs.Add(@{ PowerShell = $ps; Handle = $ps.BeginInvoke(); VMName = $vm.VMName; Vm = $vm })
         }
