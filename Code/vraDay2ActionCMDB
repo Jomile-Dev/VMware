@@ -947,6 +947,31 @@ function Invoke-CmdbReview {
             $noUpstream = "No - VM linked directly to an Application (VM > App), fix relationship/segment"
         }
 
+        # Direct tag -> CI status lookup.
+        # With no upstream there is nothing for the per-upstream decomm loop above to
+        # check, so a disposed app whose relationship was REMOVED on decommission
+        # would otherwise export "No" - telling the operator to add a relationship to
+        # something that was deliberately retired. Query the tagged app itself instead.
+        # This is the one place the tag has to be converted into a CMDB key:
+        # underscores become spaces (TAG_NAME_HERE -> TAG NAME HERE).
+        # Uses the same $AppStatusCache, so a tag shared across many VMs costs one call.
+        # NOT VERIFIED: whether returnApplicationVms returns a retrieveCiInfoByKey block
+        # for an app that is already disposed. If it returns nothing for those, this
+        # check yields nothing and behaviour falls back to the phased-out test below.
+        $tagDecommHits = @()
+        foreach ($t in $tags) {
+            $ciKey = ($t -replace '_', ' ').Trim()
+            if (-not $ciKey) { continue }
+            try {
+                $tagApp = Get-AppDecommStatus -AppName $ciKey -VraServer $VraServer `
+                    -AuthToken $AuthToken -ReturnAppVmsUri $ReturnAppVmsUri -Cache $AppStatusCache
+                if ($tagApp -and $tagApp.IsDisposed) {
+                    $tagDecommHits += "$ciKey : $($tagApp.Disposed -join ', ')"
+                }
+            }
+            catch { }
+        }
+
         # and check whether the tag's app was previously phased out
         $phasedHits = @()
         foreach ($t in $tags) {
@@ -954,7 +979,13 @@ function Invoke-CmdbReview {
             foreach ($p in @($Catalog.PhasedOutApps))    { if ((Normalize-AppName $p) -eq $k) { $phasedHits += "$p (App)" } }
             foreach ($p in @($Catalog.PhasedOutSubApps)) { if ((Normalize-AppName $p) -eq $k) { $phasedHits += "$p (Sub-App)" } }
         }
-        if ($phasedHits.Count -gt 0) {
+
+        # CI status wins over the CAG phased-out flag: it is the authoritative source.
+        if ($tagDecommHits.Count -gt 0) {
+            $decomm = "Yes - tagged app disposed, relationship removed: " + (($tagDecommHits | Select-Object -Unique) -join '; ')
+            $noUpstream = "No upstream - tagged app is disposed, likely decommissioned (no action)"
+        }
+        elseif ($phasedHits.Count -gt 0) {
             $decomm = "Yes - NSX tag app is phased out: " + (($phasedHits | Select-Object -Unique) -join '; ')
         }
     }
