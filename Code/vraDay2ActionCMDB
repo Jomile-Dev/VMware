@@ -130,12 +130,8 @@ $exportColumns = @(
         if ($_.MultipleUpstream -match '^\s*(.+?)\s*:\s*(.+)$') { $Matches[2] } else { '' }
     } }
 
-    @{ Name = 'Upstream From';                 Expression = {
-        if ($_.UpstreamToApp -match '^\s*(.+?)\s*>\s*(.+)$') { $Matches[1] } else { $_.UpstreamToApp }
-    } }
-    @{ Name = 'Upstream To';                   Expression = {
-        if ($_.UpstreamToApp -match '^\s*(.+?)\s*>\s*(.+)$') { $Matches[2] } else { '' }
-    } }
+    @{ Name = 'Upstream From';                 Expression = { $_.UpstreamFrom } }
+    @{ Name = 'Upstream To';                   Expression = { $_.UpstreamTo } }
 
     @{ Name = 'Has Upstream Relationship';     Expression = { $_.NoUpstreamRelationship } }
     @{ Name = 'Project Placement';             Expression = { $_.ProjectPlacement } }
@@ -769,7 +765,22 @@ function Invoke-CmdbReview {
         $isSub = $Catalog.SubApps | Where-Object { (($_.ToLower().Trim()) -replace '[_\s\-\.]+', '') -eq $normTag }
         if     ($isApp) { $appOrSub += "${tag}: Application - convert to sub-app" }
         elseif ($isSub) { $appOrSub += "${tag}: Sub-Application" }
-        else            { $appOrSub += "${tag}: Not found in CAG" }
+        else {
+            # Miss against THIS project's catalogue only. Before calling it missing,
+            # check the all-projects index: an app that exists under a different
+            # project's CAG means the VM is in the wrong project, which is a different
+            # remediation from "the CI does not exist anywhere".
+            # $AppToProject is $null when $CheckProjectPlacement is off - then the
+            # original "Not found in CAG" wording stands, since nothing was searched.
+            $tagOwner = if ($AppToProject) { $AppToProject[$normTag] } else { $null }
+            $tagOwnerList = @($tagOwner) | Where-Object { $_ -and $_ -ne $Vm.ProjectName } | Select-Object -Unique
+            if ($tagOwnerList.Count -gt 0) {
+                $appOrSub += "${tag}: Found in CAG of project $($tagOwnerList -join ' or ') - move VM"
+            }
+            else {
+                $appOrSub += "${tag}: Not found in CAG"
+            }
+        }
     }
     if ($appOrSub.Count -eq 0) { $appOrSub = @("No tag") }
 
@@ -818,6 +829,7 @@ function Invoke-CmdbReview {
     $ciStatuses  = @($ciStatuses  | Where-Object { $_ })
 
     $upstreamToApp = "N/A"; $multiUpstream = "No multiple upstream"; $noUpstream = "N/A"; $decomm = "No"
+    $upstreamFrom = "N/A"; $upstreamTo = ""
 
     # RULE: the chain should be VM > Sub-App > Application.
     # Only Application / SubApplication upstreams are relationship-relevant; the
@@ -853,6 +865,8 @@ function Invoke-CmdbReview {
         # review; an Application at the first hop is already top of the chain, so
         # "App to nothing" is expected rather than a fault.
         $hopDetails = @()
+        $hopFrom    = @()
+        $hopTo      = @()
         $anySecondHop = $false
         $anySubAppMissingApp = $false
 
@@ -879,22 +893,38 @@ function Invoke-CmdbReview {
             if ($uClass -eq 'Application') {
                 # VM linked straight to an Application - top of chain, nothing above
                 $hopDetails += "$uName [App] > nothing (App is top of chain)"
+                $hopFrom    += "$uName [App]"
+                $hopTo      += "nothing (App is top of chain)"
             }
             elseif ($ownApps.Count -gt 0) {
                 $anySecondHop = $true
                 $hopDetails += "$uName [Sub-App] > $($ownApps -join ', ') [App]"
+                $hopFrom    += "$uName [Sub-App]"
+                $hopTo      += "$($ownApps -join ', ') [App]"
             }
             elseif ($ownSubs.Count -gt 0) {
                 $anySecondHop = $true
                 $hopDetails += "$uName [Sub-App] > $($ownSubs -join ', ') [Sub-App] - review, should point to an App"
+                $hopFrom    += "$uName [Sub-App]"
+                $hopTo      += "$($ownSubs -join ', ') [Sub-App] - review, should point to an App"
             }
             else {
                 $anySubAppMissingApp = $true
                 $hopDetails += "$uName [Sub-App] > nothing - review, no upstream App"
+                $hopFrom    += "$uName [Sub-App]"
+                $hopTo      += "nothing - review, no upstream App"
             }
         }
 
         $upstreamToApp = ($hopDetails -join "; ")
+
+        # From/To are built as separate lists rather than parsed back out of the
+        # joined chain string: with several upstreams the joined form holds multiple
+        # "A > B" chains, and splitting it on the first ">" pushes the remaining
+        # chains into the To column. Deduped because several sub-apps under one VM
+        # commonly resolve to the SAME parent app, which would otherwise repeat.
+        $upstreamFrom = (@($hopFrom | Where-Object { $_ } | Select-Object -Unique) -join "; ")
+        $upstreamTo   = (@($hopTo   | Where-Object { $_ } | Select-Object -Unique) -join "; ")
 
         # Has Upstream Relationship = does the Sub-App/App above the VM have its own upstream?
         if ($anySecondHop)              { $noUpstream = "Yes" }
@@ -1080,6 +1110,8 @@ function Invoke-CmdbReview {
         NSXMatchCMDB           = $nsxMatch
         AppOrSubApp            = ($appOrSub -join "; ")
         UpstreamToApp          = $upstreamToApp
+        UpstreamFrom           = $upstreamFrom
+        UpstreamTo             = $upstreamTo
         MultipleUpstream       = $multiUpstream
         NoUpstreamRelationship = $noUpstream
         ProjectPlacement       = $projectPlacement
@@ -1856,6 +1888,8 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
                 Add-Member -InputObject $vm -NotePropertyName NSXMatchCMDB           -NotePropertyValue $rev.NSXMatchCMDB           -Force
                 Add-Member -InputObject $vm -NotePropertyName AppOrSubApp            -NotePropertyValue $rev.AppOrSubApp            -Force
                 Add-Member -InputObject $vm -NotePropertyName UpstreamToApp          -NotePropertyValue $rev.UpstreamToApp          -Force
+                Add-Member -InputObject $vm -NotePropertyName UpstreamFrom           -NotePropertyValue $rev.UpstreamFrom           -Force
+                Add-Member -InputObject $vm -NotePropertyName UpstreamTo             -NotePropertyValue $rev.UpstreamTo             -Force
                 Add-Member -InputObject $vm -NotePropertyName MultipleUpstream       -NotePropertyValue $rev.MultipleUpstream       -Force
                 Add-Member -InputObject $vm -NotePropertyName NoUpstreamRelationship -NotePropertyValue $rev.NoUpstreamRelationship -Force
                 Add-Member -InputObject $vm -NotePropertyName ProjectPlacement       -NotePropertyValue $rev.ProjectPlacement       -Force
@@ -2004,6 +2038,8 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
                 Add-Member -InputObject $vm -NotePropertyName NSXMatchCMDB           -NotePropertyValue $rev.NSXMatchCMDB           -Force
                 Add-Member -InputObject $vm -NotePropertyName AppOrSubApp            -NotePropertyValue $rev.AppOrSubApp            -Force
                 Add-Member -InputObject $vm -NotePropertyName UpstreamToApp          -NotePropertyValue $rev.UpstreamToApp          -Force
+                Add-Member -InputObject $vm -NotePropertyName UpstreamFrom           -NotePropertyValue $rev.UpstreamFrom           -Force
+                Add-Member -InputObject $vm -NotePropertyName UpstreamTo             -NotePropertyValue $rev.UpstreamTo             -Force
                 Add-Member -InputObject $vm -NotePropertyName MultipleUpstream       -NotePropertyValue $rev.MultipleUpstream       -Force
                 Add-Member -InputObject $vm -NotePropertyName NoUpstreamRelationship -NotePropertyValue $rev.NoUpstreamRelationship -Force
                 Add-Member -InputObject $vm -NotePropertyName ProjectPlacement       -NotePropertyValue $rev.ProjectPlacement       -Force
