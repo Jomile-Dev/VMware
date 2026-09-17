@@ -134,7 +134,8 @@ $exportColumns = @(
     @{ Name = 'Upstream To';                   Expression = { $_.UpstreamTo } }
 
     @{ Name = 'Has Upstream Relationship';     Expression = { $_.NoUpstreamRelationship } }
-    @{ Name = 'Project Placement';             Expression = { $_.ProjectPlacement } }
+    @{ Name = 'Project Placement CI';          Expression = { $_.ProjectPlacementCI } }
+    @{ Name = 'Project Placement Result';      Expression = { $_.ProjectPlacementResult } }
     @{ Name = 'Upstream App Decomm';           Expression = { $_.Decommissioned } }
 )
 
@@ -763,24 +764,12 @@ function Invoke-CmdbReview {
         $normTag = ($tag.ToLower().Trim() -replace '[_\s\-\.]+', '')
         $isApp = $Catalog.Apps    | Where-Object { (($_.ToLower().Trim()) -replace '[_\s\-\.]+', '') -eq $normTag }
         $isSub = $Catalog.SubApps | Where-Object { (($_.ToLower().Trim()) -replace '[_\s\-\.]+', '') -eq $normTag }
+        # Classification ONLY - App vs Sub-App vs absent from this project's catalogue.
+        # Whether the tag exists under a DIFFERENT project's CAG is a placement
+        # question, not a classification one, and is reported in Project Placement.
         if     ($isApp) { $appOrSub += "${tag}: Application - convert to sub-app" }
         elseif ($isSub) { $appOrSub += "${tag}: Sub-Application" }
-        else {
-            # Miss against THIS project's catalogue only. Before calling it missing,
-            # check the all-projects index: an app that exists under a different
-            # project's CAG means the VM is in the wrong project, which is a different
-            # remediation from "the CI does not exist anywhere".
-            # $AppToProject is $null when $CheckProjectPlacement is off - then the
-            # original "Not found in CAG" wording stands, since nothing was searched.
-            $tagOwner = if ($AppToProject) { $AppToProject[$normTag] } else { $null }
-            $tagOwnerList = @($tagOwner) | Where-Object { $_ -and $_ -ne $Vm.ProjectName } | Select-Object -Unique
-            if ($tagOwnerList.Count -gt 0) {
-                $appOrSub += "${tag}: Found in CAG of project $($tagOwnerList -join ' or ') - move VM"
-            }
-            else {
-                $appOrSub += "${tag}: Not found in CAG"
-            }
-        }
+        else            { $appOrSub += "${tag}: Not found in CAG" }
     }
     if ($appOrSub.Count -eq 0) { $appOrSub = @("No tag") }
 
@@ -945,56 +934,66 @@ function Invoke-CmdbReview {
     }
 
     # --- Project placement -------------------------------------------------
-    # The VM's upstream app should appear in the CAG catalogue of the VM's OWN
-    # project. If it appears in a different project's catalogue instead, the VM is
-    # deployed into the wrong project and should be moved to the one that owns the app.
+    # Reported as two fields: the CI being judged, and the verdict on it.
+    # Source is the upstream app when there is one, otherwise the NSX tag - so a VM
+    # with no CMDB relationship still gets a placement answer.
     # $AppToProject is a normalised app-name -> project-name index built on the main
     # thread from every project's CAG; $null when $CheckProjectPlacement is off.
-    $projectPlacement = "N/A"
+    $placementCIs     = @()
+    $placementResults = @()
+
     if ($null -eq $AppToProject) {
-        $projectPlacement = "Not checked"
-    }
-    elseif ($appUpstreams.Count -eq 0) {
-        $projectPlacement = "N/A - no upstream app to check"
+        $placementCIs     = @("N/A")
+        $placementResults = @("Not checked")
     }
     else {
-        $placementHits = @()
-        foreach ($u in $appUpstreams) {
-            $uName = $u.UpstreamCIName
-            if (-not $uName) { continue }
-            $uKey = Normalize-AppName $uName
+        # What to judge: upstream app names if present, else the tags themselves
+        $placementSubjects = @()
+        if ($appUpstreams.Count -gt 0) {
+            $placementSubjects = @($appUpstreams | ForEach-Object { $_.UpstreamCIName } | Where-Object { $_ } | Select-Object -Unique)
+        }
+        else {
+            $placementSubjects = @($tags)
+        }
 
-            # Is the upstream app in THIS project's catalogue?
-            $inOwnCag = $false
-            foreach ($a in @($Catalog.Apps))    { if ((Normalize-AppName $a) -eq $uKey) { $inOwnCag = $true; break } }
-            if (-not $inOwnCag) {
-                foreach ($a in @($Catalog.SubApps)) { if ((Normalize-AppName $a) -eq $uKey) { $inOwnCag = $true; break } }
-            }
+        if ($placementSubjects.Count -eq 0) {
+            $placementCIs     = @("N/A")
+            $placementResults = @("N/A - no app to check")
+        }
+        else {
+            foreach ($subject in $placementSubjects) {
+                $sKey = Normalize-AppName $subject
+                if (-not $sKey) { continue }
 
-            if ($inOwnCag) {
-                $placementHits += "$uName : in project CAG"
-            }
-            else {
-                $owner = $AppToProject[$uKey]
-                if ($owner) {
-                    # $owner may hold several projects if the app name is not unique
-                    $ownerList = @($owner) | Where-Object { $_ -and $_ -ne $Vm.ProjectName } | Select-Object -Unique
-                    if ($ownerList.Count -gt 0) {
-                        $placementHits += "$uName : move VM to project $($ownerList -join ' or ')"
-                    }
-                    else {
-                        $placementHits += "$uName : in project CAG"
-                    }
+                # Is it in THIS project's catalogue?
+                $inOwnCag = $false
+                foreach ($a in @($Catalog.Apps))    { if ((Normalize-AppName $a) -eq $sKey) { $inOwnCag = $true; break } }
+                if (-not $inOwnCag) {
+                    foreach ($a in @($Catalog.SubApps)) { if ((Normalize-AppName $a) -eq $sKey) { $inOwnCag = $true; break } }
+                }
+
+                $placementCIs += $subject
+
+                if ($inOwnCag) {
+                    $placementResults += "In project CAG"
                 }
                 else {
-                    $placementHits += "$uName : not in any project CAG, review"
+                    # $owner may hold several projects when the name is not unique
+                    $owner = $AppToProject[$sKey]
+                    $ownerList = @($owner) | Where-Object { $_ -and $_ -ne $Vm.ProjectName } | Select-Object -Unique
+                    if ($ownerList.Count -gt 0) {
+                        $placementResults += "Move VM to project $($ownerList -join ' or ')"
+                    }
+                    else {
+                        $placementResults += "Not in any project CAG, review"
+                    }
                 }
             }
         }
-        if ($placementHits.Count -gt 0) {
-            $projectPlacement = ($placementHits | Select-Object -Unique) -join "; "
-        }
     }
+
+    $projectPlacementCI     = (@($placementCIs     | Where-Object { $_ }) -join "; ")
+    $projectPlacementResult = (@($placementResults | Where-Object { $_ } | Select-Object -Unique) -join "; ")
 
     # Upstream App Decomm.
     # Second hop: the VM's upstream gives us the app NAME only. Run
@@ -1114,7 +1113,8 @@ function Invoke-CmdbReview {
         UpstreamTo             = $upstreamTo
         MultipleUpstream       = $multiUpstream
         NoUpstreamRelationship = $noUpstream
-        ProjectPlacement       = $projectPlacement
+        ProjectPlacementCI     = $projectPlacementCI
+        ProjectPlacementResult = $projectPlacementResult
         Decommissioned         = $decomm
     }
 }
@@ -1892,7 +1892,8 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
                 Add-Member -InputObject $vm -NotePropertyName UpstreamTo             -NotePropertyValue $rev.UpstreamTo             -Force
                 Add-Member -InputObject $vm -NotePropertyName MultipleUpstream       -NotePropertyValue $rev.MultipleUpstream       -Force
                 Add-Member -InputObject $vm -NotePropertyName NoUpstreamRelationship -NotePropertyValue $rev.NoUpstreamRelationship -Force
-                Add-Member -InputObject $vm -NotePropertyName ProjectPlacement       -NotePropertyValue $rev.ProjectPlacement       -Force
+                Add-Member -InputObject $vm -NotePropertyName ProjectPlacementCI     -NotePropertyValue $rev.ProjectPlacementCI     -Force
+                Add-Member -InputObject $vm -NotePropertyName ProjectPlacementResult -NotePropertyValue $rev.ProjectPlacementResult -Force
                 Add-Member -InputObject $vm -NotePropertyName Decommissioned         -NotePropertyValue $rev.Decommissioned         -Force
             }
             catch {
@@ -2042,7 +2043,8 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
                 Add-Member -InputObject $vm -NotePropertyName UpstreamTo             -NotePropertyValue $rev.UpstreamTo             -Force
                 Add-Member -InputObject $vm -NotePropertyName MultipleUpstream       -NotePropertyValue $rev.MultipleUpstream       -Force
                 Add-Member -InputObject $vm -NotePropertyName NoUpstreamRelationship -NotePropertyValue $rev.NoUpstreamRelationship -Force
-                Add-Member -InputObject $vm -NotePropertyName ProjectPlacement       -NotePropertyValue $rev.ProjectPlacement       -Force
+                Add-Member -InputObject $vm -NotePropertyName ProjectPlacementCI     -NotePropertyValue $rev.ProjectPlacementCI     -Force
+                Add-Member -InputObject $vm -NotePropertyName ProjectPlacementResult -NotePropertyValue $rev.ProjectPlacementResult -Force
                 Add-Member -InputObject $vm -NotePropertyName Decommissioned         -NotePropertyValue $rev.Decommissioned         -Force
 
                 if ($ReviewDebug -and $out.DebugText) {
