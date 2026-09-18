@@ -110,33 +110,29 @@ $exportColumns = @(
     @{ Name = 'Deployment Name';               Expression = { $_.DeploymentName } }
     @{ Name = 'VM Name';                       Expression = { $_.VMName } }
     @{ Name = 'Project Name';                  Expression = { $_.ProjectName } }
+
+    # The one column to filter on. Everything to its right is supporting evidence.
+    @{ Name = 'Action';                        Expression = { $_.Action } }
+
     @{ Name = 'NSX Tag';                       Expression = { $_.AppApplication } }
     @{ Name = 'Infra OS';                      Expression = { $_.InfraOS } }
     @{ Name = 'App Layer';                     Expression = { $_.AppLayer } }
-    @{ Name = 'CMDB CI';                       Expression = { $_.CMDBCI } }
+    @{ Name = 'InfraPortal CMDB CI';           Expression = { $_.CMDBCI } }
     @{ Name = 'NSX Match CMDB';                Expression = { $_.NSXMatchCMDB } }
 
-    @{ Name = 'App or Sub-App CI';             Expression = {
-        if ($_.AppOrSubApp -match '^\s*(.+?)\s*:\s*(.+)$') { $Matches[1] } else { $_.AppOrSubApp }
-    } }
-    @{ Name = 'App or Sub-App Result';         Expression = {
-        if ($_.AppOrSubApp -match '^\s*(.+?)\s*:\s*(.+)$') { $Matches[2] } else { '' }
-    } }
+    @{ Name = 'App or Sub-App CI';             Expression = { $_.AppOrSubAppCI } }
+    @{ Name = 'App or Sub-App Result';         Expression = { $_.AppOrSubAppResult } }
 
-    @{ Name = 'Multiple Upstream Result';      Expression = {
-        if ($_.MultipleUpstream -match '^\s*(.+?)\s*:\s*(.+)$') { $Matches[1] } else { $_.MultipleUpstream }
-    } }
-    @{ Name = 'Multiple Upstream CI';          Expression = {
-        if ($_.MultipleUpstream -match '^\s*(.+?)\s*:\s*(.+)$') { $Matches[2] } else { '' }
-    } }
+    @{ Name = 'Multiple Upstream Result';      Expression = { $_.MultipleUpstream } }
+    @{ Name = 'Multiple Upstream CI';          Expression = { $_.MultipleUpstreamCI } }
 
     @{ Name = 'Upstream From';                 Expression = { $_.UpstreamFrom } }
     @{ Name = 'Upstream To';                   Expression = { $_.UpstreamTo } }
 
-    @{ Name = 'Has Upstream Relationship';     Expression = { $_.NoUpstreamRelationship } }
     @{ Name = 'Project Placement CI';          Expression = { $_.ProjectPlacementCI } }
     @{ Name = 'Project Placement Result';      Expression = { $_.ProjectPlacementResult } }
-    @{ Name = 'Upstream App Decomm';           Expression = { $_.Decommissioned } }
+
+    @{ Name = 'NSX vs CMDB Decomm';            Expression = { $_.DecommCompare } }
 )
 
 # Per-action REST timeout (seconds) so a bad/blocked endpoint fails fast
@@ -394,6 +390,17 @@ function Get-FirstFieldValue {
         if ($val) { return [string]$val }
     }
     return ""
+}
+
+# Normalise a CMDB class value to one notation for the CSV.
+# The raw values are "Application" / "SubApplication"; every column that prints a
+# class uses [App] / [Sub-App] so the same CI reads identically across columns.
+function Format-CiClass {
+    param([string]$Class)
+    if ($Class -eq 'SubApplication') { return 'Sub-App' }
+    if ($Class -eq 'Application')    { return 'App' }
+    if ($Class)                      { return $Class }
+    return 'Unknown'
 }
 
 # Unwrap a returnApplicationVms REST response to a JSON object.
@@ -759,19 +766,44 @@ function Invoke-CmdbReview {
     } else { @() }
 
     # --- App vs Sub-App per tag (from getCagApplications catalogue) ---
-    $appOrSub = @()
+    # Reported as a SINGLE CI plus its verdict, not a joined list. When a VM carries
+    # several tags one is chosen as primary, preferring a tag that actually resolves
+    # in CAG over one that does not: a real classification beats "Not found".
+    # Order of preference: Sub-Application, then Application, then unresolved.
+    # $tagClasses keeps every tag's verdict for the columns further down.
+    $tagClasses = @{}
+    $primaryTag = $null; $primaryClass = $null
     foreach ($tag in $tags) {
         $normTag = ($tag.ToLower().Trim() -replace '[_\s\-\.]+', '')
         $isApp = $Catalog.Apps    | Where-Object { (($_.ToLower().Trim()) -replace '[_\s\-\.]+', '') -eq $normTag }
         $isSub = $Catalog.SubApps | Where-Object { (($_.ToLower().Trim()) -replace '[_\s\-\.]+', '') -eq $normTag }
-        # Classification ONLY - App vs Sub-App vs absent from this project's catalogue.
-        # Whether the tag exists under a DIFFERENT project's CAG is a placement
-        # question, not a classification one, and is reported in Project Placement.
-        if     ($isApp) { $appOrSub += "${tag}: Application - convert to sub-app" }
-        elseif ($isSub) { $appOrSub += "${tag}: Sub-Application" }
-        else            { $appOrSub += "${tag}: Not found in CAG" }
+
+        if     ($isSub) { $cls = 'Sub-Application' }
+        elseif ($isApp) { $cls = 'Application - convert to sub-app' }
+        else            { $cls = 'Not found in CAG' }
+        $tagClasses[$tag] = $cls
+
+        # First sub-app wins outright; an app only takes the slot if no sub-app has
+        # been seen; an unresolved tag only if nothing else has claimed it.
+        if ($cls -eq 'Sub-Application') {
+            if ($primaryClass -ne 'Sub-Application') { $primaryTag = $tag; $primaryClass = $cls }
+        }
+        elseif ($cls -eq 'Application - convert to sub-app') {
+            if ($primaryClass -notin @('Sub-Application', 'Application - convert to sub-app')) { $primaryTag = $tag; $primaryClass = $cls }
+        }
+        else {
+            if (-not $primaryTag) { $primaryTag = $tag; $primaryClass = $cls }
+        }
     }
-    if ($appOrSub.Count -eq 0) { $appOrSub = @("No tag") }
+
+    if (-not $primaryTag) {
+        $appOrSubCI     = "No tag"
+        $appOrSubResult = "No tag"
+    }
+    else {
+        $appOrSubCI     = $primaryTag
+        $appOrSubResult = $primaryClass
+    }
 
     # --- Upstream relationship from getVmApplications LOGS ---
     # The upstream data (retrieveCIRelationshipInfoByKey.upstreamCIs) is written to
@@ -818,7 +850,7 @@ function Invoke-CmdbReview {
     $ciStatuses  = @($ciStatuses  | Where-Object { $_ })
 
     $upstreamToApp = "N/A"; $multiUpstream = "No multiple upstream"; $noUpstream = "N/A"; $decomm = "No"
-    $upstreamFrom = "N/A"; $upstreamTo = ""
+    $upstreamFrom = "N/A"; $upstreamTo = ""; $multiUpstreamCI = ""
 
     # RULE: the chain should be VM > Sub-App > Application.
     # Only Application / SubApplication upstreams are relationship-relevant; the
@@ -839,15 +871,18 @@ function Invoke-CmdbReview {
     if ($appUpstreams.Count -gt 0) {
         # ---- FIRST HOP: what the VM is linked to ----
         $firstHopNames = @($appUpstreams | ForEach-Object {
-            "$($_.UpstreamCIName) [$(Get-FirstFieldValue -Object $_ -Fields $ClassFields)]"
+            "$($_.UpstreamCIName) [$(Format-CiClass (Get-FirstFieldValue -Object $_ -Fields $ClassFields))]"
         } | Select-Object -Unique)
 
+        # Verdict and evidence kept as separate fields rather than one joined string,
+        # so neither has to be parsed back out at export time.
         if ($appUpstreams.Count -gt 1) {
-            $multiUpstream = "Review - multiple upstream app/sub-app ($($appUpstreams.Count)): " + ($firstHopNames -join "; ")
+            $multiUpstream = "Review - multiple upstream app/sub-app ($($appUpstreams.Count))"
         }
         else {
-            $multiUpstream = "Good - single upstream: " + ($firstHopNames -join "; ")
+            $multiUpstream = "Good - single upstream"
         }
+        $multiUpstreamCI = ($firstHopNames -join "; ")
 
         # ---- SECOND HOP: does the VM's upstream itself have an upstream? ----
         # Ideal chain is VM > Sub-App > App. A Sub-App with no upstream App needs
@@ -1081,6 +1116,97 @@ function Invoke-CmdbReview {
         }
     }
 
+    # --- NSX tag vs CMDB upstream decommission comparison -------------------
+    # Answers the two sides independently, then reports whether they agree:
+    #   NSX side  - is the app the TAG names disposed / phased out?
+    #   CMDB side - is the app the VM's upstream RELATIONSHIP points at disposed?
+    # They can disagree, and each disagreement is a different piece of work: a
+    # disposed tag on a live app means the tag is stale, a live tag pointing at a
+    # disposed app means the relationship is stale.
+    # Tag lookups reuse $AppStatusCache, so a tag shared across many VMs is one call.
+    $nsxTagDisposed  = $false
+    $nsxTagDetail    = @()
+    $cmdbDisposed    = ($decommHits.Count -gt 0)
+    $cmdbDetail      = @($decommHits | Select-Object -Unique)
+
+    foreach ($t in $tags) {
+        # Phased out per the CAG catalogue diff
+        $k = Normalize-AppName $t
+        foreach ($pp in (@($Catalog.PhasedOutApps) + @($Catalog.PhasedOutSubApps))) {
+            if ((Normalize-AppName $pp) -eq $k) { $nsxTagDisposed = $true; $nsxTagDetail += "$t (phased out)" }
+        }
+
+        # Disposed per the CI record. Tag -> CMDB key is underscores to spaces.
+        $ciKey = ($t -replace '_', ' ').Trim()
+        if ($ciKey) {
+            try {
+                $tagStat = Get-AppDecommStatus -AppName $ciKey -VraServer $VraServer `
+                    -AuthToken $AuthToken -ReturnAppVmsUri $ReturnAppVmsUri -Cache $AppStatusCache
+                if ($tagStat -and $tagStat.IsDisposed) {
+                    $nsxTagDisposed = $true
+                    $nsxTagDetail += "$t ($($tagStat.Disposed -join ', '))"
+                }
+            }
+            catch { }
+        }
+    }
+    $nsxTagDetail = @($nsxTagDetail | Select-Object -Unique)
+
+    if ($tags.Count -eq 0) {
+        $decommCompare = "No tag to compare"
+    }
+    elseif ($nsxTagDisposed -and $cmdbDisposed) {
+        $decommCompare = "Both disposed - review: NSX $($nsxTagDetail -join '; ') | CMDB $($cmdbDetail -join '; ')"
+    }
+    elseif ($nsxTagDisposed) {
+        $decommCompare = "NSX tag disposed, CMDB good - review: $($nsxTagDetail -join '; ')"
+    }
+    elseif ($cmdbDisposed) {
+        $decommCompare = "NSX good, CMDB upstream disposed - review: $($cmdbDetail -join '; ')"
+    }
+    else {
+        $decommCompare = "Both good"
+    }
+
+    # --- Action -------------------------------------------------------------
+    # One column holding the single highest-priority thing to do on this row. Every
+    # other column is evidence: facts, not verdicts, so no judgement is restated.
+    #
+    # Priority is deliberately "dead things first": there is no point converting a
+    # tag or adding a relationship for an application that has been decommissioned,
+    # so a disposal outranks the structural fixes even though a structural fix is
+    # the more common outcome.
+    #
+    # A row can have several problems. Only the top one is shown - filter on this
+    # column, fix that pass, re-run, and the next tier surfaces.
+    if ($tags.Count -eq 0) {
+        $action = "Review - no NSX tag"
+    }
+    elseif ($nsxTagDisposed -or $cmdbDisposed) {
+        $action = "Review - disposed"
+    }
+    elseif ($appOrSubResult -eq 'Not found in CAG') {
+        $action = "Review - tag not in CAG"
+    }
+    elseif ($noUpstream -like 'No - *' -or $noUpstream -like 'No upstream*') {
+        $action = "Add upstream relationship"
+    }
+    elseif ($projectPlacementResult -like 'Move VM to project*') {
+        $action = $projectPlacementResult
+    }
+    elseif ($appOrSubResult -eq 'Application - convert to sub-app') {
+        $action = "Convert tag to sub-app"
+    }
+    elseif ($multiUpstream -like 'Review - multiple upstream*') {
+        $action = "Review - multiple upstream"
+    }
+    elseif ($nsxMatch -notlike 'NSX tag matches CMDB*') {
+        $action = "Review - NSX tag does not match CMDB"
+    }
+    else {
+        $action = "OK"
+    }
+
     # --- Debug dump: raw + parsed data per VM for troubleshooting ---
     if ($DebugPath) {
         $dbg = [ordered]@{
@@ -1106,12 +1232,16 @@ function Invoke-CmdbReview {
     }
 
     return [PSCustomObject]@{
+        Action                 = $action
         NSXMatchCMDB           = $nsxMatch
-        AppOrSubApp            = ($appOrSub -join "; ")
+        AppOrSubAppCI          = $appOrSubCI
+        AppOrSubAppResult      = $appOrSubResult
+        DecommCompare          = $decommCompare
         UpstreamToApp          = $upstreamToApp
         UpstreamFrom           = $upstreamFrom
         UpstreamTo             = $upstreamTo
         MultipleUpstream       = $multiUpstream
+        MultipleUpstreamCI     = $multiUpstreamCI
         NoUpstreamRelationship = $noUpstream
         ProjectPlacementCI     = $projectPlacementCI
         ProjectPlacementResult = $projectPlacementResult
@@ -1885,12 +2015,16 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
             $cat = if ($vm.ProjectName -and $cagByProject.ContainsKey($vm.ProjectName)) { $cagByProject[$vm.ProjectName] } else { [PSCustomObject]@{ Apps = @(); SubApps = @() } }
             try {
                 $rev = Invoke-CmdbReview -Vm $vm -Catalog $cat -VraServer $vraServer -AuthToken $authToken -GetVmAppsUri $getVmAppsUri -ReturnAppVmsUri $returnAppVmsUri -PhasedOut $phasedOutEnabled -ClassFields $UpstreamClassFields -DebugPath $(if ($ReviewDebug) { $ReviewDebugPath } else { $null }) -UseWorkflowLogs $UseWorkflowLogs -WorkflowId $UpstreamWorkflowId -WfInputVmName $UpstreamWfInputVmName -WfInputProjectName $UpstreamWfInputProjectName -WorkflowWaitSec $WorkflowWaitSec -AppStatusCache $appStatusCache -AppToProject $appToProject
+                Add-Member -InputObject $vm -NotePropertyName Action                 -NotePropertyValue $rev.Action                 -Force
                 Add-Member -InputObject $vm -NotePropertyName NSXMatchCMDB           -NotePropertyValue $rev.NSXMatchCMDB           -Force
-                Add-Member -InputObject $vm -NotePropertyName AppOrSubApp            -NotePropertyValue $rev.AppOrSubApp            -Force
+                Add-Member -InputObject $vm -NotePropertyName AppOrSubAppCI          -NotePropertyValue $rev.AppOrSubAppCI          -Force
+                Add-Member -InputObject $vm -NotePropertyName AppOrSubAppResult      -NotePropertyValue $rev.AppOrSubAppResult      -Force
+                Add-Member -InputObject $vm -NotePropertyName DecommCompare          -NotePropertyValue $rev.DecommCompare          -Force
                 Add-Member -InputObject $vm -NotePropertyName UpstreamToApp          -NotePropertyValue $rev.UpstreamToApp          -Force
                 Add-Member -InputObject $vm -NotePropertyName UpstreamFrom           -NotePropertyValue $rev.UpstreamFrom           -Force
                 Add-Member -InputObject $vm -NotePropertyName UpstreamTo             -NotePropertyValue $rev.UpstreamTo             -Force
                 Add-Member -InputObject $vm -NotePropertyName MultipleUpstream       -NotePropertyValue $rev.MultipleUpstream       -Force
+                Add-Member -InputObject $vm -NotePropertyName MultipleUpstreamCI     -NotePropertyValue $rev.MultipleUpstreamCI     -Force
                 Add-Member -InputObject $vm -NotePropertyName NoUpstreamRelationship -NotePropertyValue $rev.NoUpstreamRelationship -Force
                 Add-Member -InputObject $vm -NotePropertyName ProjectPlacementCI     -NotePropertyValue $rev.ProjectPlacementCI     -Force
                 Add-Member -InputObject $vm -NotePropertyName ProjectPlacementResult -NotePropertyValue $rev.ProjectPlacementResult -Force
@@ -1914,7 +2048,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
         # Inject the helper functions this phase needs into every runspace
         $fnNames = @(
             'Normalize-AppName','Invoke-VroActionRest','Get-CagCatalog','Get-VroObjectArray',
-            'Get-FirstFieldValue','Get-VroJson','Get-UpstreamCIs','Get-CiStatuses',
+            'Get-FirstFieldValue','Format-CiClass','Get-VroJson','Get-UpstreamCIs','Get-CiStatuses',
             'Get-JsonBlockFromText','Get-UpstreamCIsFromLog','Get-CiStatusesFromLog',
             'Invoke-VroWorkflowWithLogs','Invoke-VroActionWithLogs','Get-AppDecommStatus','Invoke-CmdbReview'
         )
@@ -2036,12 +2170,16 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
 
             if ($out -and $out.Review) {
                 $vm = $job.Vm; $rev = $out.Review
+                Add-Member -InputObject $vm -NotePropertyName Action                 -NotePropertyValue $rev.Action                 -Force
                 Add-Member -InputObject $vm -NotePropertyName NSXMatchCMDB           -NotePropertyValue $rev.NSXMatchCMDB           -Force
-                Add-Member -InputObject $vm -NotePropertyName AppOrSubApp            -NotePropertyValue $rev.AppOrSubApp            -Force
+                Add-Member -InputObject $vm -NotePropertyName AppOrSubAppCI          -NotePropertyValue $rev.AppOrSubAppCI          -Force
+                Add-Member -InputObject $vm -NotePropertyName AppOrSubAppResult      -NotePropertyValue $rev.AppOrSubAppResult      -Force
+                Add-Member -InputObject $vm -NotePropertyName DecommCompare          -NotePropertyValue $rev.DecommCompare          -Force
                 Add-Member -InputObject $vm -NotePropertyName UpstreamToApp          -NotePropertyValue $rev.UpstreamToApp          -Force
                 Add-Member -InputObject $vm -NotePropertyName UpstreamFrom           -NotePropertyValue $rev.UpstreamFrom           -Force
                 Add-Member -InputObject $vm -NotePropertyName UpstreamTo             -NotePropertyValue $rev.UpstreamTo             -Force
                 Add-Member -InputObject $vm -NotePropertyName MultipleUpstream       -NotePropertyValue $rev.MultipleUpstream       -Force
+                Add-Member -InputObject $vm -NotePropertyName MultipleUpstreamCI     -NotePropertyValue $rev.MultipleUpstreamCI     -Force
                 Add-Member -InputObject $vm -NotePropertyName NoUpstreamRelationship -NotePropertyValue $rev.NoUpstreamRelationship -Force
                 Add-Member -InputObject $vm -NotePropertyName ProjectPlacementCI     -NotePropertyValue $rev.ProjectPlacementCI     -Force
                 Add-Member -InputObject $vm -NotePropertyName ProjectPlacementResult -NotePropertyValue $rev.ProjectPlacementResult -Force
@@ -2084,18 +2222,33 @@ Write-Log "Mismatches: $(($results | Where-Object { $_.CompareResult -eq 'Mismat
 Write-Log "Missing Data: $(($results | Where-Object { $_.CompareResult -eq 'Missing Data' }).Count)" -Color Gray
 Write-Log "Time elapsed: $($stopwatch.Elapsed.ToString('hh\:mm\:ss'))" -Color White
 
-# Normalise typographic characters that mangle in CSV (en/em dashes -> '-',
-# NBSP -> space, curly quotes -> straight) so CI names export cleanly.
+# Normalise typographic characters that mangle in CSV, and repair mojibake.
+#
+# Two distinct problems are handled here:
+#
+# 1. FULL mojibake - all the mis-decoded bytes survived, e.g. an en dash (U+2013 =
+#    E2 80 93) read as Windows-1252 becomes three characters. Round-tripping the
+#    string back through CP1252 -> UTF-8 reverses the mis-decode cleanly.
+#
+# 2. PARTIAL mojibake - only the lead byte survived, leaving an orphan "a-with-
+#    circumflex" with the trailing bytes gone. The round-trip CANNOT recover this
+#    (0xE2 alone is not valid UTF-8, so it decodes to the replacement character and
+#    the guard correctly rejects the result). These are matched as literal sequences
+#    instead. An orphan surrounded by spaces is treated as a dash, which is the
+#    overwhelmingly common source, but it IS a guess - the original bytes are gone.
+#
+# Root cause is upstream: Windows PowerShell's Invoke-RestMethod falls back to
+# ISO-8859-1 when a response carries no charset in its Content-Type, so UTF-8 bytes
+# are decoded as single-byte characters before this function ever sees them.
+# Repairing here is a workaround, not a fix at source.
 function ConvertTo-CleanText {
     param($s)
     if ($null -eq $s) { return $s }
     $s = [string]$s
 
-    # Repair mojibake first. When UTF-8 bytes are read as Windows-1252, an en dash
-    # (U+2013 = E2 80 93) renders as "a-with-circumflex + euro + quote" etc. Round-
-    # tripping the string back through CP1252 -> UTF-8 reverses that mis-decode.
-    # Guarded: only applied when the tell-tale sequence is present, and only kept
-    # if the result no longer contains the replacement character.
+    # --- 1. Full round-trip repair -----------------------------------------
+    # Guarded: only attempted when a tell-tale lead character is present, and the
+    # result is only kept when it contains no replacement character.
     if ($s -match [char]0x00E2 -or $s -match [char]0x00C2) {
         try {
             $bytes    = [Text.Encoding]::GetEncoding(1252).GetBytes($s)
@@ -2105,12 +2258,41 @@ function ConvertTo-CleanText {
         catch { }
     }
 
-    # Then normalise typographic characters to plain ASCII for CSV
+    # --- 2. Literal mojibake sequences -------------------------------------
+    # Derived from the actual byte sequences, not guessed: each key is what the
+    # UTF-8 encoding of that character looks like after a CP1252 mis-decode.
+    # Longest first, so a complete sequence is consumed before the orphan rules.
+    $map = [ordered]@{
+        "$([char]0x00E2)$([char]0x20AC)$([char]0x201C)" = '-'    # en dash   U+2013
+        "$([char]0x00E2)$([char]0x20AC)$([char]0x201D)" = '-'    # em dash   U+2014
+        "$([char]0x00E2)$([char]0x20AC)$([char]0x02DC)" = "'"    # open quote  U+2018
+        "$([char]0x00E2)$([char]0x20AC)$([char]0x2122)" = "'"    # close quote U+2019
+        "$([char]0x00E2)$([char]0x20AC)$([char]0x0153)" = '"'    # open dquote U+201C
+        "$([char]0x00E2)$([char]0x20AC)$([char]0x00A6)" = '...'  # ellipsis  U+2026
+        "$([char]0x00C2)$([char]0x00A0)"                = ' '    # NBSP      U+00A0
+    }
+    foreach ($k in $map.Keys) { $s = $s.Replace($k, $map[$k]) }
+
+    # --- 3. Orphan lead characters -----------------------------------------
+    # Trailing bytes already lost, so the original character is unrecoverable.
+    # A lone a-circumflex between spaces is almost always a dash - that IS a guess,
+    # but it is the overwhelmingly common case in CI names. Elsewhere the orphan is
+    # dropped rather than guessed at.
+    $s = $s -replace "\s$([char]0x00E2)\s", ' - '
+    $s = $s.Replace("$([char]0x00E2)$([char]0x20AC)", '-')
+    $s = $s.Replace([string][char]0x00C2, '')
+    $s = $s.Replace([string][char]0x20AC, '')
+
+    # --- 4. Typographic characters to plain ASCII --------------------------
     $s = $s -replace [char]0x2013, '-' -replace [char]0x2014, '-'
     $s = $s -replace [char]0x00A0, ' '
     $s = $s -replace [char]0x2018, "'" -replace [char]0x2019, "'"
     $s = $s -replace [char]0x201C, '"' -replace [char]0x201D, '"'
-    return $s
+    $s = $s -replace [char]0xFFFD, ''
+
+    # Collapse any double spacing the substitutions introduced
+    $s = $s -replace '  +', ' '
+    return $s.Trim()
 }
 
 # Export results (CompareResult kept internal for console/summary; CSV uses NSXMatchCMDB)
