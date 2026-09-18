@@ -2246,22 +2246,35 @@ function ConvertTo-CleanText {
     if ($null -eq $s) { return $s }
     $s = [string]$s
 
-    # --- 1. Full round-trip repair -----------------------------------------
-    # Guarded: only attempted when a tell-tale lead character is present, and the
-    # result is only kept when it contains no replacement character.
-    if ($s -match [char]0x00E2 -or $s -match [char]0x00C2) {
-        try {
-            $bytes    = [Text.Encoding]::GetEncoding(1252).GetBytes($s)
-            $repaired = [Text.Encoding]::UTF8.GetString($bytes)
-            if ($repaired -notmatch [char]0xFFFD) { $s = $repaired }
+    # --- 1. Round-trip repair ----------------------------------------------
+    # Windows PowerShell's Invoke-RestMethod falls back to ISO-8859-1 (Latin-1) when
+    # a response carries no charset in its Content-Type, so UTF-8 bytes arrive decoded
+    # one byte per character. An en dash (E2 80 93) becomes three characters:
+    # a-circumflex plus TWO C1 CONTROL characters, which render as nothing in Excel -
+    # so the cell LOOKS like a lone a-circumflex when the bytes are all still present.
+    #
+    # Latin-1 is tried FIRST because it is the actual PowerShell default and is a
+    # straight 1:1 byte mapping, so it can always re-encode what it decoded. CP1252
+    # is tried second for data that came through a CP1252 path instead; it cannot
+    # represent the C1 controls, so it must not be tried first.
+    # A repair is kept only when it parses as valid UTF-8 and yields no replacement
+    # character - otherwise the original string is left untouched.
+    if ($s -match "[$([char]0x0080)-$([char]0x009F)$([char]0x00E2)$([char]0x00C2)$([char]0x20AC)]") {
+        foreach ($cp in @(28591, 1252)) {
+            try {
+                $enc      = [Text.Encoding]::GetEncoding($cp, [Text.EncoderFallback]::ExceptionFallback, [Text.DecoderFallback]::ExceptionFallback)
+                $bytes    = $enc.GetBytes($s)
+                $strictU8 = [Text.Encoding]::GetEncoding('utf-8', [Text.EncoderFallback]::ExceptionFallback, [Text.DecoderFallback]::ExceptionFallback)
+                $repaired = $strictU8.GetString($bytes)
+                if ($repaired -notmatch [char]0xFFFD) { $s = $repaired; break }
+            }
+            catch { continue }   # not encodable in this codepage, or not valid UTF-8
         }
-        catch { }
     }
 
     # --- 2. Literal mojibake sequences -------------------------------------
-    # Derived from the actual byte sequences, not guessed: each key is what the
+    # Fallback for strings the round-trip could not repair. Each key is what the
     # UTF-8 encoding of that character looks like after a CP1252 mis-decode.
-    # Longest first, so a complete sequence is consumed before the orphan rules.
     $map = [ordered]@{
         "$([char]0x00E2)$([char]0x20AC)$([char]0x201C)" = '-'    # en dash   U+2013
         "$([char]0x00E2)$([char]0x20AC)$([char]0x201D)" = '-'    # em dash   U+2014
@@ -2273,15 +2286,11 @@ function ConvertTo-CleanText {
     }
     foreach ($k in $map.Keys) { $s = $s.Replace($k, $map[$k]) }
 
-    # --- 3. Orphan lead characters -----------------------------------------
-    # Trailing bytes already lost, so the original character is unrecoverable.
-    # A lone a-circumflex between spaces is almost always a dash - that IS a guess,
-    # but it is the overwhelmingly common case in CI names. Elsewhere the orphan is
-    # dropped rather than guessed at.
-    $s = $s -replace "\s$([char]0x00E2)\s", ' - '
-    $s = $s.Replace("$([char]0x00E2)$([char]0x20AC)", '-')
-    $s = $s.Replace([string][char]0x00C2, '')
-    $s = $s.Replace([string][char]0x20AC, '')
+    # --- 3. Latin-1 form that survived an unrepairable round-trip -----------
+    # a-circumflex followed by the C1 controls for an en/em dash.
+    $s = $s -replace "$([char]0x00E2)[$([char]0x0080)-$([char]0x009F)][$([char]0x0080)-$([char]0x009F)]", '-'
+    # Any remaining C1 control characters are never legitimate in a CI name.
+    $s = $s -replace "[$([char]0x0080)-$([char]0x009F)]", ''
 
     # --- 4. Typographic characters to plain ASCII --------------------------
     $s = $s -replace [char]0x2013, '-' -replace [char]0x2014, '-'
