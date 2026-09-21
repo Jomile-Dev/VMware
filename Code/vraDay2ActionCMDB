@@ -1924,6 +1924,43 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
     $reviewTotal = @($reviewSet).Count
     if ($ReviewLimit -gt 0) { Write-Log " (limited to first $reviewTotal VMs)" -Color Yellow }
 
+    # --- Project name -> id map (main thread) -----------------------------
+    # Fetched here so both the CAG preload below and the placement-index block
+    # further down share one call. Also lets us backfill ProjectId on rows loaded
+    # from a replay CSV, which doesn't carry ProjectId (it's not in $exportColumns)
+    # and so leaves the CAG preload seeing zero projects.
+    $allProjects = @{}
+    try {
+        $allProjResp = Invoke-RestMethod -Uri "https://$vraServer/iaas/api/projects?`$top=1000" -Method Get -Headers @{
+            "Authorization" = "Bearer $authToken"
+            "Content-Type"  = "application/json"
+        } -TimeoutSec 60
+        foreach ($p in @($allProjResp.content)) { if ($p.id -and $p.name) { $allProjects[$p.name] = $p.id } }
+        Write-Log " Loaded $($allProjects.Count) project(s) for name->id resolution" -Color Gray
+    }
+    catch {
+        Write-Log " Could not load project list: $($_.Exception.Message)" -Color Yellow
+    }
+
+    # Backfill ProjectId on rows that lack one (replay mode). Import-Csv rows are
+    # plain PSCustomObjects with only the exported columns, so Add-Member covers
+    # the case where the property doesn't yet exist.
+    if ($allProjects.Count -gt 0) {
+        $backfilled = 0
+        foreach ($r in $reviewSet) {
+            if ($r.ProjectName -and -not $r.ProjectId -and $allProjects.ContainsKey($r.ProjectName)) {
+                if ($r.PSObject.Properties.Name -contains 'ProjectId') {
+                    $r.ProjectId = $allProjects[$r.ProjectName]
+                }
+                else {
+                    Add-Member -InputObject $r -NotePropertyName ProjectId -NotePropertyValue $allProjects[$r.ProjectName] -Force
+                }
+                $backfilled++
+            }
+        }
+        if ($backfilled -gt 0) { Write-Log " Backfilled ProjectId for $backfilled row(s)" -Color Gray }
+    }
+
     # --- Pre-build the CAG catalogue per unique project (main thread) ---
     # Far fewer projects than VMs, and it keeps the per-project cache out of the
     # runspaces (each runspace would otherwise have its own empty cache and refetch).
