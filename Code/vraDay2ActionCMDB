@@ -98,10 +98,10 @@ $failedCsvPath    = "C:\Logs\CMDBRelations_FAILED.csv"
 # CSV column definition - defined early so the incremental partial saves during
 # the review phase can use the same layout as the final export.
 #
-# NSX Tag is column D, Action is column E. Action reports the classification of
-# the NSX tag as returned by getCagApplications: Sub-Application, Application -
-# convert to sub-app, Not found in CAG, or No tag. Everything to the right of
-# Action is supporting evidence.
+# NSX Tag is column D, NSX Tag Category is column E. NSX Tag Category reports the
+# classification of the NSX tag as returned by getCagApplications: Sub-Application,
+# Application - convert to sub-app, Not found in CAG, or No tag. Everything to the
+# right of NSX Tag Category is supporting evidence.
 #
 # Two review fields are split into two columns each at export time, so the CSV
 # is filterable on the verdict alone instead of "<CI>: <verdict>" in one cell:
@@ -118,7 +118,7 @@ $exportColumns = @(
     @{ Name = 'NSX Tag';                       Expression = { $_.AppApplication } }
 
     # Classification of the NSX tag from getCagApplications.
-    @{ Name = 'Action';                        Expression = { $_.Action } }
+    @{ Name = 'NSX Tag Category';              Expression = { $_.Action } }
 
     @{ Name = 'Infra OS';                      Expression = { $_.InfraOS } }
     @{ Name = 'App Layer';                     Expression = { $_.AppLayer } }
@@ -128,7 +128,6 @@ $exportColumns = @(
     @{ Name = 'Multiple Upstream Result';      Expression = { $_.MultipleUpstream } }
     @{ Name = 'Multiple Upstream CI';          Expression = { $_.MultipleUpstreamCI } }
 
-    @{ Name = 'Upstream From';                 Expression = { $_.UpstreamFrom } }
     @{ Name = 'Upstream To';                   Expression = { $_.UpstreamTo } }
 
     @{ Name = 'Project Placement CI';          Expression = { $_.ProjectPlacementCI } }
@@ -854,7 +853,7 @@ function Invoke-CmdbReview {
     $ciStatuses  = @($ciStatuses  | Where-Object { $_ })
 
     $upstreamToApp = "N/A"; $multiUpstream = "No multiple upstream"; $noUpstream = "N/A"; $decomm = "No"
-    $upstreamFrom = "N/A"; $upstreamTo = ""; $multiUpstreamCI = ""
+    $upstreamTo = ""; $multiUpstreamCI = ""
 
     # RULE: the chain should be VM > Sub-App > Application.
     # Only Application / SubApplication upstreams are relationship-relevant; the
@@ -893,7 +892,6 @@ function Invoke-CmdbReview {
         # review; an Application at the first hop is already top of the chain, so
         # "App to nothing" is expected rather than a fault.
         $hopDetails = @()
-        $hopFrom    = @()
         $hopTo      = @()
         $anySecondHop = $false
         $anySubAppMissingApp = $false
@@ -921,37 +919,32 @@ function Invoke-CmdbReview {
             if ($uClass -eq 'Application') {
                 # VM linked straight to an Application - top of chain, nothing above
                 $hopDetails += "$uName [App] > nothing (App is top of chain)"
-                $hopFrom    += "$uName [App]"
                 $hopTo      += "nothing (App is top of chain)"
             }
             elseif ($ownApps.Count -gt 0) {
                 $anySecondHop = $true
                 $hopDetails += "$uName [Sub-App] > $($ownApps -join ', ') [App]"
-                $hopFrom    += "$uName [Sub-App]"
                 $hopTo      += "$($ownApps -join ', ') [App]"
             }
             elseif ($ownSubs.Count -gt 0) {
                 $anySecondHop = $true
                 $hopDetails += "$uName [Sub-App] > $($ownSubs -join ', ') [Sub-App] - review, should point to an App"
-                $hopFrom    += "$uName [Sub-App]"
                 $hopTo      += "$($ownSubs -join ', ') [Sub-App] - review, should point to an App"
             }
             else {
                 $anySubAppMissingApp = $true
                 $hopDetails += "$uName [Sub-App] > nothing - review, no upstream App"
-                $hopFrom    += "$uName [Sub-App]"
                 $hopTo      += "nothing - review, no upstream App"
             }
         }
 
         $upstreamToApp = ($hopDetails -join "; ")
 
-        # From/To are built as separate lists rather than parsed back out of the
-        # joined chain string: with several upstreams the joined form holds multiple
-        # "A > B" chains, and splitting it on the first ">" pushes the remaining
-        # chains into the To column. Deduped because several sub-apps under one VM
+        # $upstreamTo is built as its own list rather than parsed out of the joined
+        # chain string: with several upstreams the joined form holds multiple
+        # "A > B" chains, and splitting on the first ">" would push the remaining
+        # chains into the wrong side. Deduped because several sub-apps under one VM
         # commonly resolve to the SAME parent app, which would otherwise repeat.
-        $upstreamFrom = (@($hopFrom | Where-Object { $_ } | Select-Object -Unique) -join "; ")
         $upstreamTo   = (@($hopTo   | Where-Object { $_ } | Select-Object -Unique) -join "; ")
 
         # Has Upstream Relationship = does the Sub-App/App above the VM have its own upstream?
@@ -1201,7 +1194,6 @@ function Invoke-CmdbReview {
         NSXMatchCMDB           = $nsxMatch
         DecommCompare          = $decommCompare
         UpstreamToApp          = $upstreamToApp
-        UpstreamFrom           = $upstreamFrom
         UpstreamTo             = $upstreamTo
         MultipleUpstream       = $multiUpstream
         MultipleUpstreamCI     = $multiUpstreamCI
@@ -1981,7 +1973,6 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
                 Add-Member -InputObject $vm -NotePropertyName NSXMatchCMDB           -NotePropertyValue $rev.NSXMatchCMDB           -Force
                 Add-Member -InputObject $vm -NotePropertyName DecommCompare          -NotePropertyValue $rev.DecommCompare          -Force
                 Add-Member -InputObject $vm -NotePropertyName UpstreamToApp          -NotePropertyValue $rev.UpstreamToApp          -Force
-                Add-Member -InputObject $vm -NotePropertyName UpstreamFrom           -NotePropertyValue $rev.UpstreamFrom           -Force
                 Add-Member -InputObject $vm -NotePropertyName UpstreamTo             -NotePropertyValue $rev.UpstreamTo             -Force
                 Add-Member -InputObject $vm -NotePropertyName MultipleUpstream       -NotePropertyValue $rev.MultipleUpstream       -Force
                 Add-Member -InputObject $vm -NotePropertyName MultipleUpstreamCI     -NotePropertyValue $rev.MultipleUpstreamCI     -Force
@@ -2134,7 +2125,6 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
                 Add-Member -InputObject $vm -NotePropertyName NSXMatchCMDB           -NotePropertyValue $rev.NSXMatchCMDB           -Force
                 Add-Member -InputObject $vm -NotePropertyName DecommCompare          -NotePropertyValue $rev.DecommCompare          -Force
                 Add-Member -InputObject $vm -NotePropertyName UpstreamToApp          -NotePropertyValue $rev.UpstreamToApp          -Force
-                Add-Member -InputObject $vm -NotePropertyName UpstreamFrom           -NotePropertyValue $rev.UpstreamFrom           -Force
                 Add-Member -InputObject $vm -NotePropertyName UpstreamTo             -NotePropertyValue $rev.UpstreamTo             -Force
                 Add-Member -InputObject $vm -NotePropertyName MultipleUpstream       -NotePropertyValue $rev.MultipleUpstream       -Force
                 Add-Member -InputObject $vm -NotePropertyName MultipleUpstreamCI     -NotePropertyValue $rev.MultipleUpstreamCI     -Force
