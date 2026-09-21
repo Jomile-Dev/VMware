@@ -125,7 +125,7 @@ $exportColumns = @(
     @{ Name = 'InfraPortal CMDB CI';           Expression = { $_.CMDBCI } }
     @{ Name = 'NSX Match CMDB';                Expression = { $_.NSXMatchCMDB } }
 
-    @{ Name = 'Multiple Upstream Result';      Expression = { $_.MultipleUpstream } }
+    @{ Name = 'VM Upstream Result';            Expression = { $_.MultipleUpstream } }
     @{ Name = 'Multiple Upstream CI';          Expression = { $_.MultipleUpstreamCI } }
 
     @{ Name = 'Upstream To';                   Expression = { $_.UpstreamTo } }
@@ -953,15 +953,18 @@ function Invoke-CmdbReview {
         else                            { $noUpstream = "N/A - VM upstream is an Application (top of chain)" }
     }
     elseif ($tags.Count -eq 0) {
-        $noUpstream = "No - no CMDB relationship, add"
+        $noUpstream    = "No - no CMDB relationship, add"
+        $multiUpstream = "No upstream"
     }
     else {
         if ($otherUpstreams.Count -gt 0) {
             $otherCls = @($otherUpstreams | ForEach-Object { Get-FirstFieldValue -Object $_ -Fields $ClassFields } | Select-Object -Unique)
-            $noUpstream = "No - no app/sub-app upstream, add relationship (found only: $($otherCls -join ', '))"
+            $noUpstream    = "No - no app/sub-app upstream, add relationship (found only: $($otherCls -join ', '))"
+            $multiUpstream = "No app/sub-app upstream (found: $($otherCls -join ', '))"
         }
         else {
-            $noUpstream = "No - no upstream relationship, add"
+            $noUpstream    = "No - no upstream relationship, add"
+            $multiUpstream = "No upstream"
         }
     }
 
