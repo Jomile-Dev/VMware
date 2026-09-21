@@ -134,6 +134,8 @@ $exportColumns = @(
     @{ Name = 'Project Placement Result';      Expression = { $_.ProjectPlacementResult } }
 
     @{ Name = 'NSX vs CMDB Decomm';            Expression = { $_.DecommCompare } }
+
+    @{ Name = 'Upstream Lifecycle Status';     Expression = { $_.UpstreamLifecycleStatus } }
 )
 
 # Per-action REST timeout (seconds) so a bad/blocked endpoint fails fast
@@ -751,7 +753,7 @@ function Invoke-CmdbReview {
         $Vm, $Catalog, $VraServer, $AuthToken, $GetVmAppsUri, $ReturnAppVmsUri,
         $PhasedOut, $ClassFields, $DebugPath,
         $UseWorkflowLogs, $WorkflowId, $WfInputVmName, $WfInputProjectName, $WorkflowWaitSec,
-        $AppStatusCache, $AppToProject
+        $AppStatusCache, $AppToProject, $AppClass
     )
 
     $nsxMatch = switch ($Vm.CompareResult) {
@@ -786,6 +788,15 @@ function Invoke-CmdbReview {
 
         if     ($isSub) { $cls = 'Sub-Application' }
         elseif ($isApp) { $cls = 'Application - convert to sub-app' }
+        elseif ($AppClass -and $AppClass[$normTag]) {
+            # Fallback: not in the VM's own project's CAG, but is in some project's CAG.
+            # Classify by the class found there. Project Placement column names the
+            # project(s) it actually belongs to.
+            $globalCls = $AppClass[$normTag]
+            if     ($globalCls -eq 'SubApplication') { $cls = 'Sub-Application' }
+            elseif ($globalCls -eq 'Application')    { $cls = 'Application - convert to sub-app' }
+            else                                     { $cls = 'Not found in CAG' }
+        }
         else            { $cls = 'Not found in CAG' }
         $tagClasses[$tag] = $cls
 
@@ -859,6 +870,7 @@ function Invoke-CmdbReview {
 
     $upstreamToApp = "N/A"; $multiUpstream = "No multiple upstream"; $noUpstream = "N/A"; $decomm = "No"
     $upstreamTo = ""; $multiUpstreamCI = ""
+    $lifecycleStatus = "N/A"
 
     # RULE: the chain should be VM > Sub-App > Application.
     # Only Application / SubApplication upstreams are relationship-relevant; the
@@ -900,11 +912,20 @@ function Invoke-CmdbReview {
         $hopTo      = @()
         $anySecondHop = $false
         $anySubAppMissingApp = $false
+        # Lifecycle: apps that came back with UpstreamCIStatus "Planned/On order".
+        # Checked at both hops. Distinct from Decomm (dispos|retire|decommission|phased) -
+        # this is "not yet live" rather than "no longer live".
+        $lifecycleHits = @()
 
         foreach ($u in $appUpstreams) {
             $uName  = $u.UpstreamCIName
             $uClass = Get-FirstFieldValue -Object $u -Fields $ClassFields
             if (-not $uName) { continue }
+
+            # 1st hop lifecycle: direct upstream's own status
+            if ($u.UpstreamCIStatus -match '(?i)planned/on\s*order') {
+                $lifecycleHits += "VM upstream: $uName [$(Format-CiClass $uClass)] - $($u.UpstreamCIStatus)"
+            }
 
             $info = Get-AppDecommStatus -AppName $uName -VraServer $VraServer `
                 -AuthToken $AuthToken -ReturnAppVmsUri $ReturnAppVmsUri -Cache $AppStatusCache
@@ -916,6 +937,11 @@ function Invoke-CmdbReview {
                     $ouClass = Get-FirstFieldValue -Object $ou -Fields $ClassFields
                     if     ($ouClass -eq 'Application')    { $ownApps += $ou.UpstreamCIName }
                     elseif ($ouClass -eq 'SubApplication') { $ownSubs += $ou.UpstreamCIName }
+
+                    # 2nd hop lifecycle: status of the upstream's own upstream
+                    if ($ou.UpstreamCIStatus -match '(?i)planned/on\s*order') {
+                        $lifecycleHits += "App above ${uName}: $($ou.UpstreamCIName) [$(Format-CiClass $ouClass)] - $($ou.UpstreamCIStatus)"
+                    }
                 }
             }
             $ownApps = @($ownApps | Where-Object { $_ } | Select-Object -Unique)
@@ -956,6 +982,16 @@ function Invoke-CmdbReview {
         if ($anySecondHop)              { $noUpstream = "Yes" }
         elseif ($anySubAppMissingApp)   { $noUpstream = "No - Sub-App has no upstream App, add relationship" }
         else                            { $noUpstream = "N/A - VM upstream is an Application (top of chain)" }
+
+        # Upstream Lifecycle Status: Planned/On order at either hop.
+        # "OK" when there ARE app upstreams but none are Planned/On order at either hop.
+        # "N/A" stays only for the no-upstream case (handled by the default init above).
+        if ($lifecycleHits.Count -gt 0) {
+            $lifecycleStatus = ($lifecycleHits | Select-Object -Unique) -join "; "
+        }
+        else {
+            $lifecycleStatus = "OK"
+        }
     }
     elseif ($tags.Count -eq 0) {
         $noUpstream    = "No - no CMDB relationship, add"
@@ -1209,6 +1245,7 @@ function Invoke-CmdbReview {
         ProjectPlacementCI     = $projectPlacementCI
         ProjectPlacementResult = $projectPlacementResult
         Decommissioned         = $decomm
+        UpstreamLifecycleStatus = $lifecycleStatus
     }
 }
 
@@ -1910,8 +1947,10 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
     # To say "move the VM to project X" we need a catalogue for EVERY project, not
     # just the ones in the review set, so any project's CAG list is fetched here once.
     # $appToProject stays $null when the check is off, which makes the review report
-    # "Not checked" rather than guessing.
+    # "Not checked" rather than guessing. $appClass follows the same lifecycle so
+    # the tag-classification fallback also stays inert when placement is off.
     $appToProject = $null
+    $appClass     = $null
     if ($CheckProjectPlacement) {
         # Full project list. Fetched here rather than reused from the deployment phase
         # because that map is rebuilt as name->id above, and replay mode skips it entirely.
@@ -1944,6 +1983,13 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
             # A name can map to several projects; the review reports them all rather
             # than picking one.
             $appToProject = @{}
+            # Parallel index: normalised app name -> class ('Application' | 'SubApplication').
+            # Used as a fallback for the tag classification when a tag isn't in the VM's
+            # OWN project CAG - a Sub-App living in another project should still be
+            # classified as Sub-App rather than reported as "Not found in CAG".
+            # Sub-App wins when a name appears as both across projects, matching the
+            # local per-VM classification preference.
+            $appClass = @{}
             foreach ($pn in $cagByProject.Keys) {
                 $c = $cagByProject[$pn]
                 foreach ($a in (@($c.Apps) + @($c.SubApps))) {
@@ -1954,6 +2000,17 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
                         if ($appToProject[$k] -notcontains $pn) { $appToProject[$k] = @($appToProject[$k]) + $pn }
                     }
                     else { $appToProject[$k] = @($pn) }
+                }
+                # Sub-Apps first so an App entry can't overwrite a Sub-App
+                foreach ($a in @($c.SubApps)) {
+                    if (-not $a) { continue }
+                    $k = Normalize-AppName $a
+                    if ($k) { $appClass[$k] = 'SubApplication' }
+                }
+                foreach ($a in @($c.Apps)) {
+                    if (-not $a) { continue }
+                    $k = Normalize-AppName $a
+                    if ($k -and -not $appClass.ContainsKey($k)) { $appClass[$k] = 'Application' }
                 }
             }
             Write-Log " Project placement index: $($appToProject.Count) distinct app/sub-app name(s)" -Color Gray
@@ -1976,7 +2033,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
             Write-Log " [$($reviewed + 1)/$reviewTotal] $($vm.VMName)..." -Color DarkGray
             $cat = if ($vm.ProjectName -and $cagByProject.ContainsKey($vm.ProjectName)) { $cagByProject[$vm.ProjectName] } else { [PSCustomObject]@{ Apps = @(); SubApps = @() } }
             try {
-                $rev = Invoke-CmdbReview -Vm $vm -Catalog $cat -VraServer $vraServer -AuthToken $authToken -GetVmAppsUri $getVmAppsUri -ReturnAppVmsUri $returnAppVmsUri -PhasedOut $phasedOutEnabled -ClassFields $UpstreamClassFields -DebugPath $(if ($ReviewDebug) { $ReviewDebugPath } else { $null }) -UseWorkflowLogs $UseWorkflowLogs -WorkflowId $UpstreamWorkflowId -WfInputVmName $UpstreamWfInputVmName -WfInputProjectName $UpstreamWfInputProjectName -WorkflowWaitSec $WorkflowWaitSec -AppStatusCache $appStatusCache -AppToProject $appToProject
+                $rev = Invoke-CmdbReview -Vm $vm -Catalog $cat -VraServer $vraServer -AuthToken $authToken -GetVmAppsUri $getVmAppsUri -ReturnAppVmsUri $returnAppVmsUri -PhasedOut $phasedOutEnabled -ClassFields $UpstreamClassFields -DebugPath $(if ($ReviewDebug) { $ReviewDebugPath } else { $null }) -UseWorkflowLogs $UseWorkflowLogs -WorkflowId $UpstreamWorkflowId -WfInputVmName $UpstreamWfInputVmName -WfInputProjectName $UpstreamWfInputProjectName -WorkflowWaitSec $WorkflowWaitSec -AppStatusCache $appStatusCache -AppToProject $appToProject -AppClass $appClass
                 Add-Member -InputObject $vm -NotePropertyName Action                 -NotePropertyValue $rev.Action                 -Force
                 Add-Member -InputObject $vm -NotePropertyName NSXMatchCMDB           -NotePropertyValue $rev.NSXMatchCMDB           -Force
                 Add-Member -InputObject $vm -NotePropertyName DecommCompare          -NotePropertyValue $rev.DecommCompare          -Force
@@ -1988,6 +2045,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
                 Add-Member -InputObject $vm -NotePropertyName ProjectPlacementCI     -NotePropertyValue $rev.ProjectPlacementCI     -Force
                 Add-Member -InputObject $vm -NotePropertyName ProjectPlacementResult -NotePropertyValue $rev.ProjectPlacementResult -Force
                 Add-Member -InputObject $vm -NotePropertyName Decommissioned         -NotePropertyValue $rev.Decommissioned         -Force
+                Add-Member -InputObject $vm -NotePropertyName UpstreamLifecycleStatus -NotePropertyValue $rev.UpstreamLifecycleStatus -Force
             }
             catch {
                 $reviewFailed.Add([PSCustomObject]@{ VMName = $vm.VMName; ProjectName = $vm.ProjectName; Error = $_.Exception.Message })
@@ -2031,7 +2089,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
             param($Vm, $Catalog, $VraServer, $AuthToken, $GetVmAppsUri, $ReturnAppVmsUri,
                   $PhasedOut, $ClassFields, $WantDebug,
                   $UseWorkflowLogs, $WorkflowId, $WfInputVmName, $WfInputProjectName, $WorkflowWaitSec,
-                  $AppStatusCache, $AppToProject)
+                  $AppStatusCache, $AppToProject, $AppClass)
 
             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
             [System.Net.ServicePointManager]::Expect100Continue = $false
@@ -2058,7 +2116,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
                     -ClassFields $ClassFields -DebugPath $tmpDebug `
                     -UseWorkflowLogs $UseWorkflowLogs -WorkflowId $WorkflowId `
                     -WfInputVmName $WfInputVmName -WfInputProjectName $WfInputProjectName -WorkflowWaitSec $WorkflowWaitSec `
-                    -AppStatusCache $AppStatusCache -AppToProject $AppToProject
+                    -AppStatusCache $AppStatusCache -AppToProject $AppToProject -AppClass $AppClass
 
                 $dbgText = ""
                 if ($tmpDebug -and (Test-Path $tmpDebug)) {
@@ -2105,6 +2163,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
             $ps.AddArgument($WorkflowWaitSec)            | Out-Null
             $ps.AddArgument($appStatusCache)             | Out-Null
             $ps.AddArgument($appToProject)               | Out-Null
+            $ps.AddArgument($appClass)                   | Out-Null
             $ps.RunspacePool = $reviewPool
             $reviewJobs.Add(@{ PowerShell = $ps; Handle = $ps.BeginInvoke(); VMName = $vm.VMName; Vm = $vm })
         }
@@ -2140,6 +2199,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
                 Add-Member -InputObject $vm -NotePropertyName ProjectPlacementCI     -NotePropertyValue $rev.ProjectPlacementCI     -Force
                 Add-Member -InputObject $vm -NotePropertyName ProjectPlacementResult -NotePropertyValue $rev.ProjectPlacementResult -Force
                 Add-Member -InputObject $vm -NotePropertyName Decommissioned         -NotePropertyValue $rev.Decommissioned         -Force
+                Add-Member -InputObject $vm -NotePropertyName UpstreamLifecycleStatus -NotePropertyValue $rev.UpstreamLifecycleStatus -Force
 
                 if ($ReviewDebug -and $out.DebugText) {
                     $out.DebugText | Add-Content -Path $ReviewDebugPath -Encoding UTF8
