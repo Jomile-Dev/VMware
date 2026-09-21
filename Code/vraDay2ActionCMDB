@@ -83,6 +83,12 @@ $MaxDeployments   = 0
 $ReviewPoolSize       = 6
 $ReviewJobTimeoutSec  = 180
 
+# Project placement CAG fetch parallelism. One CAG call per project in the estate
+# (two when $phasedOutEnabled is $true), done once on the main thread before the
+# review starts. 1 = sequential; raise for large estates.
+$PlacementPoolSize    = 6
+$PlacementJobTimeoutSec = 60
+
 # Save a partial CSV every N reviewed VMs, so a long run that dies part-way still
 # leaves usable output. Failed VMs are listed separately for a targeted re-run.
 $IncrementalSaveEvery = 50
@@ -305,9 +311,9 @@ function Get-CagViaExternalValues {
 }
 
 function Get-CagForProject {
-    param($ProjectName, $ProjectId, $VraServer, $AuthToken, $CagUri, $PhasedOut)
+    param($ProjectName, $ProjectId, $VraServer, $AuthToken, $CagUri, $PhasedOut, [switch]$Quiet)
     if (-not $ProjectName) { return [PSCustomObject]@{ Apps = @(); SubApps = @(); PhasedOutApps = @(); PhasedOutSubApps = @() } }
-    if ($cagCache.ContainsKey($ProjectName)) { return $cagCache[$ProjectName] }
+    if ($cagCache -and $cagCache.ContainsKey($ProjectName)) { return $cagCache[$ProjectName] }
 
     # Full catalogue (external-values first, actions REST as fallback)
     $raw = Get-CagViaExternalValues -VraServer $VraServer -AuthToken $AuthToken -ProjectId $ProjectId -ProjectName $ProjectName -CagUri $CagUri -PhasedOut $PhasedOut
@@ -349,12 +355,14 @@ function Get-CagForProject {
         PhasedOutSubApps = $phasedSubs
     }
 
-    # Do not fail silently - an empty catalogue makes every tag look "Not found in CAG"
-    if (@($result.Apps).Count -eq 0 -and @($result.SubApps).Count -eq 0) {
+    # Do not fail silently - an empty catalogue makes every tag look "Not found in CAG".
+    # -Quiet suppresses this: the placement bulk scan legitimately hits many empty
+    # projects and the warning would flood the console.
+    if (-not $Quiet -and @($result.Apps).Count -eq 0 -and @($result.SubApps).Count -eq 0) {
         Write-Log "  WARNING: CAG catalogue is EMPTY for project '$ProjectName' - every tag will report 'Not found in CAG'" -Color Yellow
     }
 
-    $cagCache[$ProjectName] = $result
+    if ($cagCache) { $cagCache[$ProjectName] = $result }
     return $result
 }
 
@@ -1989,31 +1997,110 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
     $appToProject = $null
     $appClass     = $null
     if ($CheckProjectPlacement) {
-        # Full project list. Fetched here rather than reused from the deployment phase
-        # because that map is rebuilt as name->id above, and replay mode skips it entirely.
-        $allProjects = @{}
-        try {
-            $allProjResp = Invoke-RestMethod -Uri "https://$vraServer/iaas/api/projects?`$top=1000" -Method Get -Headers @{
-                "Authorization" = "Bearer $authToken"
-                "Content-Type"  = "application/json"
-            } -TimeoutSec 60
-            foreach ($p in @($allProjResp.content)) { if ($p.id -and $p.name) { $allProjects[$p.name] = $p.id } }
-        }
-        catch {
-            Write-Log " Could not load full project list for placement check: $($_.Exception.Message)" -Color Yellow
-        }
-
+        # $allProjects was fetched above (shared with the CAG preload / replay backfill).
+        # If that fetch failed, the placement check has no project list to work with.
         if ($allProjects.Count -gt 0) {
             $toFetch = @($allProjects.Keys | Where-Object { -not $cagByProject.ContainsKey($_) })
-            Write-Log " Project placement: indexing $($allProjects.Count) project(s) ($($toFetch.Count) new CAG fetch(es))..." -Color Gray
+            Write-Log " Project placement: indexing $($allProjects.Count) project(s) ($($toFetch.Count) new CAG fetch(es), pool size $PlacementPoolSize)..." -Color Gray
 
-            foreach ($pn in $toFetch) {
-                try {
-                    $cagByProject[$pn] = Get-CagForProject -ProjectName $pn -ProjectId $allProjects[$pn] -VraServer $vraServer -AuthToken $authToken -CagUri $getCagAppsUri -PhasedOut $phasedOutEnabled
+            if ($toFetch.Count -gt 0) {
+                # Worker: fetch one project's CAG. Runs in a runspace so must set up
+                # its own cert policy. Emits the empty-CAG warning for every project
+                # whose catalogue comes back empty.
+                $placementBlock = {
+                    param($ProjectName, $ProjectId, $VraServer, $AuthToken, $CagUri, $PhasedOut)
+                    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+                    [System.Net.ServicePointManager]::Expect100Continue = $false
+                    if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
+                        Add-Type @"
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+public class TrustAllCertsPolicy : ICertificatePolicy {
+    public bool CheckValidationResult(
+        ServicePoint srvPoint, X509Certificate certificate,
+        WebRequest request, int certificateProblem) { return true; }
+}
+"@
+                    }
+                    [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+                    [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $null
+
+                    try {
+                        $cat = Get-CagForProject -ProjectName $ProjectName -ProjectId $ProjectId `
+                            -VraServer $VraServer -AuthToken $AuthToken -CagUri $CagUri -PhasedOut $PhasedOut
+                        return [PSCustomObject]@{ ProjectName = $ProjectName; Catalog = $cat; Error = $null }
+                    }
+                    catch {
+                        return [PSCustomObject]@{ ProjectName = $ProjectName; Catalog = $null; Error = $_.Exception.Message }
+                    }
                 }
-                catch {
-                    Write-Log "   $pn : CAG fetch failed - $($_.Exception.Message)" -Color Yellow
+
+                # InitialSessionState: inject the helpers Get-CagForProject depends on.
+                # Write-Log is included so the empty-CAG WARNING can surface from
+                # inside the runspace instead of throwing CommandNotFound.
+                $placementFns = @(
+                    'Write-Log','Normalize-AppName','Invoke-VroActionRest','Get-CagCatalog',
+                    'Get-VroObjectArray','Get-CagViaExternalValues','Get-CagForProject'
+                )
+                $placementIss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+                foreach ($fn in $placementFns) {
+                    $cmd = Get-Command $fn -ErrorAction SilentlyContinue
+                    if ($cmd) {
+                        $placementIss.Commands.Add(
+                            (New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry($fn, $cmd.Definition))
+                        )
+                    }
                 }
+
+                $placementPool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $PlacementPoolSize, $placementIss, $Host)
+                $placementPool.Open()
+
+                $placementJobs = [System.Collections.Generic.List[object]]::new()
+                foreach ($pn in $toFetch) {
+                    $ps = [PowerShell]::Create().AddScript($placementBlock)
+                    $ps.AddArgument($pn)                | Out-Null
+                    $ps.AddArgument($allProjects[$pn])  | Out-Null
+                    $ps.AddArgument($vraServer)         | Out-Null
+                    $ps.AddArgument($authToken)         | Out-Null
+                    $ps.AddArgument($getCagAppsUri)     | Out-Null
+                    $ps.AddArgument($phasedOutEnabled)  | Out-Null
+                    $ps.RunspacePool = $placementPool
+                    $placementJobs.Add(@{ PowerShell = $ps; Handle = $ps.BeginInvoke(); ProjectName = $pn })
+                }
+
+                $done = 0; $errCount = 0
+                foreach ($job in $placementJobs) {
+                    $out = $null
+                    try {
+                        if ($job.Handle.AsyncWaitHandle.WaitOne($PlacementJobTimeoutSec * 1000)) {
+                            $out = @($job.PowerShell.EndInvoke($job.Handle))[0]
+                        }
+                        else {
+                            $job.PowerShell.Stop()
+                            Write-Log "   $($job.ProjectName) : CAG fetch timeout after ${PlacementJobTimeoutSec}s" -Color Yellow
+                            $errCount++
+                        }
+                    }
+                    catch {
+                        Write-Log "   $($job.ProjectName) : CAG fetch failed - $($_.Exception.Message)" -Color Yellow
+                        $errCount++
+                    }
+                    finally { $job.PowerShell.Dispose() }
+
+                    if ($out -and $out.Catalog) {
+                        $cagByProject[$out.ProjectName] = $out.Catalog
+                    }
+                    elseif ($out -and $out.Error) {
+                        Write-Log "   $($out.ProjectName) : CAG fetch failed - $($out.Error)" -Color Yellow
+                        $errCount++
+                    }
+
+                    $done++
+                    if ($done % 20 -eq 0) { Write-Log "   $done / $($toFetch.Count) placement CAGs fetched" -Color DarkGray }
+                }
+
+                $placementPool.Close(); $placementPool.Dispose()
+                Write-Log " Placement CAG fetch complete ($($toFetch.Count) project(s), $errCount error(s))" -Color Gray
             }
 
             # Normalised app name -> list of projects whose CAG contains it.
