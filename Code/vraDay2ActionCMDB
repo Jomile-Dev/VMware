@@ -185,11 +185,16 @@ $authResponse = Invoke-RestMethod -Uri "https://$vraServer/csp/gateway/am/api/lo
 $authToken = $authResponse.cspAuthToken
 Write-Log "Authentication successful!" -Color Green
 
-# Normalise application name for comparison
+# Normalise application name for comparison.
+# Strips every non-alphanumeric character, not just [_\s\-\.], so typographic
+# variants a CMDB CI can carry (en-dash U+2013, em-dash U+2014, NBSP, curly
+# quotes, parentheses) don't leave a stray character in the normalised key and
+# break a match that should have succeeded. The mojibake cleanup runs at export
+# time - too late for the comparison.
 function Normalize-AppName {
     param($Name)
     if (-not $Name) { return "" }
-    return ($Name.ToLower().Trim() -replace '[_\s\-\.]+', '')
+    return ($Name.ToLower().Trim() -replace '[^a-z0-9]+', '')
 }
 
 # ---------------------------------------------------------------------------
@@ -775,9 +780,9 @@ function Invoke-CmdbReview {
     $tagClasses = @{}
     $primaryTag = $null; $primaryClass = $null
     foreach ($tag in $tags) {
-        $normTag = ($tag.ToLower().Trim() -replace '[_\s\-\.]+', '')
-        $isApp = $Catalog.Apps    | Where-Object { (($_.ToLower().Trim()) -replace '[_\s\-\.]+', '') -eq $normTag }
-        $isSub = $Catalog.SubApps | Where-Object { (($_.ToLower().Trim()) -replace '[_\s\-\.]+', '') -eq $normTag }
+        $normTag = ($tag.ToLower().Trim() -replace '[^a-z0-9]+', '')
+        $isApp = $Catalog.Apps    | Where-Object { (($_.ToLower().Trim()) -replace '[^a-z0-9]+', '') -eq $normTag }
+        $isSub = $Catalog.SubApps | Where-Object { (($_.ToLower().Trim()) -replace '[^a-z0-9]+', '') -eq $normTag }
 
         if     ($isSub) { $cls = 'Sub-Application' }
         elseif ($isApp) { $cls = 'Application - convert to sub-app' }
@@ -1443,9 +1448,9 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
         if ($matchableTags.Count -gt 0 -and $vmApplications) {
             $ciList = $vmApplications -split ";\s*"
             foreach ($tag in $matchableTags) {
-                $normTag = ($tag.ToLower().Trim() -replace '[_\s\-\.]+', '')
+                $normTag = ($tag.ToLower().Trim() -replace '[^a-z0-9]+', '')
                 foreach ($ci in $ciList) {
-                    $normCI = ($ci.ToLower().Trim() -replace '[_\s\-\.]+', '')
+                    $normCI = ($ci.ToLower().Trim() -replace '[^a-z0-9]+', '')
                     if ($normTag -and $normCI -and $normTag -eq $normCI) {
                         $matchedApps += $tag
                         break
@@ -1746,9 +1751,9 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
                             if ($vm.CMDBCI) {
                                 $ciList = $vm.CMDBCI -split ";\s*"
                                 foreach ($tag in $nsxAppTags) {
-                                    $normTag = ($tag.ToLower().Trim() -replace '[_\s\-\.]+', '')
+                                    $normTag = ($tag.ToLower().Trim() -replace '[^a-z0-9]+', '')
                                     foreach ($ci in $ciList) {
-                                        $normCI = ($ci.ToLower().Trim() -replace '[_\s\-\.]+', '')
+                                        $normCI = ($ci.ToLower().Trim() -replace '[^a-z0-9]+', '')
                                         if ($normTag -and $normCI -and $normTag -eq $normCI) {
                                             $matchedApps += $tag
                                             break
