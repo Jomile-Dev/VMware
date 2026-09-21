@@ -98,9 +98,13 @@ $failedCsvPath    = "C:\Logs\CMDBRelations_FAILED.csv"
 # CSV column definition - defined early so the incremental partial saves during
 # the review phase can use the same layout as the final export.
 #
-# Three review fields are split into two columns each at export time, so the CSV
+# NSX Tag is column D, Action is column E. Action reports the classification of
+# the NSX tag as returned by getCagApplications: Sub-Application, Application -
+# convert to sub-app, Not found in CAG, or No tag. Everything to the right of
+# Action is supporting evidence.
+#
+# Two review fields are split into two columns each at export time, so the CSV
 # is filterable on the verdict alone instead of "<CI>: <verdict>" in one cell:
-#   AppOrSubApp       "<CI>: <Result>"           -> CI     + Result
 #   MultipleUpstream  "<Result>: <CI details>"   -> Result + CI   (note: reversed)
 #   UpstreamToApp     "<From> > <To>"            -> From   + To
 # The underlying properties are unchanged - only the export layout differs.
@@ -111,17 +115,15 @@ $exportColumns = @(
     @{ Name = 'VM Name';                       Expression = { $_.VMName } }
     @{ Name = 'Project Name';                  Expression = { $_.ProjectName } }
 
-    # The one column to filter on. Everything to its right is supporting evidence.
+    @{ Name = 'NSX Tag';                       Expression = { $_.AppApplication } }
+
+    # Classification of the NSX tag from getCagApplications.
     @{ Name = 'Action';                        Expression = { $_.Action } }
 
-    @{ Name = 'NSX Tag';                       Expression = { $_.AppApplication } }
     @{ Name = 'Infra OS';                      Expression = { $_.InfraOS } }
     @{ Name = 'App Layer';                     Expression = { $_.AppLayer } }
     @{ Name = 'InfraPortal CMDB CI';           Expression = { $_.CMDBCI } }
     @{ Name = 'NSX Match CMDB';                Expression = { $_.NSXMatchCMDB } }
-
-    @{ Name = 'App or Sub-App CI';             Expression = { $_.AppOrSubAppCI } }
-    @{ Name = 'App or Sub-App Result';         Expression = { $_.AppOrSubAppResult } }
 
     @{ Name = 'Multiple Upstream Result';      Expression = { $_.MultipleUpstream } }
     @{ Name = 'Multiple Upstream CI';          Expression = { $_.MultipleUpstreamCI } }
@@ -693,7 +695,7 @@ function Invoke-VroActionWithLogs {
     return [PSCustomObject]@{ Value = $value; LogText = $logText; LogEndpoint = $usedEndpoint; ExecId = $execId }
 }
 
-# Build the six review fields for one VM result object
+# Build the review fields for one VM result object
 # Resolve an application / sub-application: its own status AND its own upstreams.
 # Second hop of the chain. The VM's upstream gives us the Sub-App name only;
 # returnApplicationVms takes applicationName, so run it and read both the CI status
@@ -766,11 +768,11 @@ function Invoke-CmdbReview {
     } else { @() }
 
     # --- App vs Sub-App per tag (from getCagApplications catalogue) ---
-    # Reported as a SINGLE CI plus its verdict, not a joined list. When a VM carries
+    # Classifies each tag against the project's CAG catalogue. When a VM carries
     # several tags one is chosen as primary, preferring a tag that actually resolves
     # in CAG over one that does not: a real classification beats "Not found".
     # Order of preference: Sub-Application, then Application, then unresolved.
-    # $tagClasses keeps every tag's verdict for the columns further down.
+    # The chosen tag's classification becomes the Action value for the row.
     $tagClasses = @{}
     $primaryTag = $null; $primaryClass = $null
     foreach ($tag in $tags) {
@@ -796,14 +798,16 @@ function Invoke-CmdbReview {
         }
     }
 
-    if (-not $primaryTag) {
-        $appOrSubCI     = "No tag"
-        $appOrSubResult = "No tag"
-    }
-    else {
-        $appOrSubCI     = $primaryTag
-        $appOrSubResult = $primaryClass
-    }
+    # --- Action -------------------------------------------------------------
+    # The classification of the NSX tag from the project's CAG catalogue:
+    #   Sub-Application
+    #   Application - convert to sub-app
+    #   Not found in CAG
+    #   No tag
+    # A property of the tag, not a verdict on the VM. Every column to its right
+    # is supporting evidence (upstream, project placement, decomm, etc.).
+    if (-not $primaryTag) { $action = "No tag" }
+    else                  { $action = $primaryClass }
 
     # --- Upstream relationship from getVmApplications LOGS ---
     # The upstream data (retrieveCIRelationshipInfoByKey.upstreamCIs) is written to
@@ -1168,45 +1172,6 @@ function Invoke-CmdbReview {
         $decommCompare = "Both good"
     }
 
-    # --- Action -------------------------------------------------------------
-    # One column holding the single highest-priority thing to do on this row. Every
-    # other column is evidence: facts, not verdicts, so no judgement is restated.
-    #
-    # Priority is deliberately "dead things first": there is no point converting a
-    # tag or adding a relationship for an application that has been decommissioned,
-    # so a disposal outranks the structural fixes even though a structural fix is
-    # the more common outcome.
-    #
-    # A row can have several problems. Only the top one is shown - filter on this
-    # column, fix that pass, re-run, and the next tier surfaces.
-    if ($tags.Count -eq 0) {
-        $action = "Review - no NSX tag"
-    }
-    elseif ($nsxTagDisposed -or $cmdbDisposed) {
-        $action = "Review - disposed"
-    }
-    elseif ($appOrSubResult -eq 'Not found in CAG') {
-        $action = "Review - tag not in CAG"
-    }
-    elseif ($noUpstream -like 'No - *' -or $noUpstream -like 'No upstream*') {
-        $action = "Add upstream relationship"
-    }
-    elseif ($projectPlacementResult -like 'Move VM to project*') {
-        $action = $projectPlacementResult
-    }
-    elseif ($appOrSubResult -eq 'Application - convert to sub-app') {
-        $action = "Convert tag to sub-app"
-    }
-    elseif ($multiUpstream -like 'Review - multiple upstream*') {
-        $action = "Review - multiple upstream"
-    }
-    elseif ($nsxMatch -notlike 'NSX tag matches CMDB*') {
-        $action = "Review - NSX tag does not match CMDB"
-    }
-    else {
-        $action = "OK"
-    }
-
     # --- Debug dump: raw + parsed data per VM for troubleshooting ---
     if ($DebugPath) {
         $dbg = [ordered]@{
@@ -1234,8 +1199,6 @@ function Invoke-CmdbReview {
     return [PSCustomObject]@{
         Action                 = $action
         NSXMatchCMDB           = $nsxMatch
-        AppOrSubAppCI          = $appOrSubCI
-        AppOrSubAppResult      = $appOrSubResult
         DecommCompare          = $decommCompare
         UpstreamToApp          = $upstreamToApp
         UpstreamFrom           = $upstreamFrom
@@ -1835,10 +1798,9 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
 # ---------------------------------------------------------------------------
 # CMDB Relationship Review phase
 # Runs after NSX fallback so AppApplication is as complete as possible.
-# Adds six columns: NSXMatchCMDB, AppOrSubApp, UpstreamToApp,
-# MultipleUpstream, NoUpstreamRelationship, Decommissioned.
-# Sequential first cut - parallelise with a runspace pool once the vRO
-# action calls are confirmed working.
+# Populates the review columns: Action (tag classification), NSXMatchCMDB,
+# UpstreamToApp, MultipleUpstream, NoUpstreamRelationship, ProjectPlacement,
+# Decommissioned. Runs sequentially or in a runspace pool per $ReviewPoolSize.
 # ---------------------------------------------------------------------------
 if ($RunReview) {
     Write-Log "`n=== CMDB RELATIONSHIP REVIEW ($($results.Count) VMs) ===" -Color Cyan
@@ -2017,8 +1979,6 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
                 $rev = Invoke-CmdbReview -Vm $vm -Catalog $cat -VraServer $vraServer -AuthToken $authToken -GetVmAppsUri $getVmAppsUri -ReturnAppVmsUri $returnAppVmsUri -PhasedOut $phasedOutEnabled -ClassFields $UpstreamClassFields -DebugPath $(if ($ReviewDebug) { $ReviewDebugPath } else { $null }) -UseWorkflowLogs $UseWorkflowLogs -WorkflowId $UpstreamWorkflowId -WfInputVmName $UpstreamWfInputVmName -WfInputProjectName $UpstreamWfInputProjectName -WorkflowWaitSec $WorkflowWaitSec -AppStatusCache $appStatusCache -AppToProject $appToProject
                 Add-Member -InputObject $vm -NotePropertyName Action                 -NotePropertyValue $rev.Action                 -Force
                 Add-Member -InputObject $vm -NotePropertyName NSXMatchCMDB           -NotePropertyValue $rev.NSXMatchCMDB           -Force
-                Add-Member -InputObject $vm -NotePropertyName AppOrSubAppCI          -NotePropertyValue $rev.AppOrSubAppCI          -Force
-                Add-Member -InputObject $vm -NotePropertyName AppOrSubAppResult      -NotePropertyValue $rev.AppOrSubAppResult      -Force
                 Add-Member -InputObject $vm -NotePropertyName DecommCompare          -NotePropertyValue $rev.DecommCompare          -Force
                 Add-Member -InputObject $vm -NotePropertyName UpstreamToApp          -NotePropertyValue $rev.UpstreamToApp          -Force
                 Add-Member -InputObject $vm -NotePropertyName UpstreamFrom           -NotePropertyValue $rev.UpstreamFrom           -Force
@@ -2172,8 +2132,6 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
                 $vm = $job.Vm; $rev = $out.Review
                 Add-Member -InputObject $vm -NotePropertyName Action                 -NotePropertyValue $rev.Action                 -Force
                 Add-Member -InputObject $vm -NotePropertyName NSXMatchCMDB           -NotePropertyValue $rev.NSXMatchCMDB           -Force
-                Add-Member -InputObject $vm -NotePropertyName AppOrSubAppCI          -NotePropertyValue $rev.AppOrSubAppCI          -Force
-                Add-Member -InputObject $vm -NotePropertyName AppOrSubAppResult      -NotePropertyValue $rev.AppOrSubAppResult      -Force
                 Add-Member -InputObject $vm -NotePropertyName DecommCompare          -NotePropertyValue $rev.DecommCompare          -Force
                 Add-Member -InputObject $vm -NotePropertyName UpstreamToApp          -NotePropertyValue $rev.UpstreamToApp          -Force
                 Add-Member -InputObject $vm -NotePropertyName UpstreamFrom           -NotePropertyValue $rev.UpstreamFrom           -Force
