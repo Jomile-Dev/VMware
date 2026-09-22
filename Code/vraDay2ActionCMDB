@@ -431,13 +431,49 @@ function Get-AppTier {
 function Get-TagClassPriority {
     param([string]$Cls)
     switch -Regex ($Cls) {
-        '^Sub-Application$'                      { return 100 }
-        '^Application - convert to sub-app$'     { return 90 }
-        '^Sub-Application \('                    { return 80 }   # class + status
-        '^Application \('                        { return 75 }   # class + status
-        '^(Disposed/Retired|Planned/On order)$'  { return 50 }   # status only, no class
-        default                                  { return 10 }   # Not found in CAG
+        '^Sub-Application \(In Use - (Production|Pilot|Test)'                    { return 105 }
+        '^Sub-Application \(In Use - Phasing'                                    { return 100 }
+        '^Sub-Application \(Planned'                                             { return 98 }
+        '^Sub-Application \(Disposed'                                            { return 95 }
+        '^Sub-Application$'                                                      { return 92 }
+        '^Sub-Application \('                                                    { return 90 }
+        '^Application - convert to sub-app \(In Use - (Production|Pilot|Test)'   { return 85 }
+        '^Application - convert to sub-app \(In Use - Phasing'                   { return 80 }
+        '^Application - convert to sub-app \(Planned'                            { return 78 }
+        '^Application - convert to sub-app \(Disposed'                           { return 75 }
+        '^Application - convert to sub-app$'                                     { return 72 }
+        '^Application - convert to sub-app'                                      { return 70 }
+        '^Application \('                                                        { return 65 }
+        '^Application$'                                                          { return 60 }
+        '^(In Use|Disposed|Planned)'                                             { return 40 }
+        '^No tag$'                                                               { return 0 }
+        default                                                                  { return 10 }
     }
+}
+
+# Normalise a set of raw CI Status strings to one canonical label.
+# Worst status wins so the operator sees the most alarming state first:
+# Disposed > Phasing > Planned > Test > Pilot > Production. Returns '' if
+# no status matches a known bucket.
+function Get-BestStatusLabel {
+    param($Statuses)
+    if (-not $Statuses) { return '' }
+    $arr = @($Statuses | Where-Object { $_ })
+    if ($arr.Count -eq 0) { return '' }
+    $rules = @(
+        @{ Pattern = '(?i)(dispos|retire|decommission)'; Label = 'Disposed/Retired' }
+        @{ Pattern = '(?i)phasing';                       Label = 'In Use - Phasing out' }
+        @{ Pattern = '(?i)planned|on\s*order';            Label = 'Planned/On order' }
+        @{ Pattern = '(?i)in use\s*-\s*test';             Label = 'In Use - Test' }
+        @{ Pattern = '(?i)in use\s*-\s*pilot';            Label = 'In Use - Pilot' }
+        @{ Pattern = '(?i)in use\s*-\s*production';       Label = 'In Use - Production' }
+    )
+    foreach ($r in $rules) {
+        foreach ($s in $arr) {
+            if ($s -match $r.Pattern) { return $r.Label }
+        }
+    }
+    return ''
 }
 
 # Normalise a CMDB class value to one notation for the CSV.
@@ -854,18 +890,17 @@ function Invoke-CmdbReview {
     } else { @() }
 
     # --- App vs Sub-App per tag (from getCagApplications catalogue) ---
-    # Classifies each tag against the project's CAG catalogue. When a VM carries
-    # several tags one is chosen as primary, preferring a tag that actually resolves
-    # in CAG over one that does not: a real classification beats "Not found".
-    # Order of preference: Sub-Application, then Application, then unresolved.
-    # The chosen tag's classification becomes the Action value for the row.
-    # Tiers (priority order, high to low), used by Get-TagClassPriority below:
-    #   Sub-Application                             live sub-app in CAG
-    #   Application - convert to sub-app            live app in CAG
-    #   <Class> (Disposed/Retired)                  CI record says disposed
-    #   <Class> (Planned/On order)                  CI record says planned
-    #   Disposed/Retired / Planned/On order         status found but class unknown
-    #   Not found in CAG                            nothing found anywhere
+    # Classifies each tag against the project's CAG catalogue AND always attaches
+    # the CI's current lifecycle status. When a VM carries several tags one is
+    # chosen as primary via Get-TagClassPriority (live > phasing > planned > disposed,
+    # sub-app > app within each state).
+    # Value shapes:
+    #   Sub-Application (In Use - Production)                    live in CAG, live in CMDB
+    #   Sub-Application (Disposed/Retired)                       not in CAG; CI says disposed
+    #   Application - convert to sub-app (In Use - Phasing out)  live-in-CAG App being retired
+    #   In Use - Phasing out                                     status found; class unknown
+    #   Not found in CAG                                         nothing found anywhere
+    # Get-AppDecommStatus is cached, so a tag shared across many VMs costs one call.
     $tagClasses = @{}
     $primaryTag = $null; $primaryClass = $null; $primaryPriority = -1
     foreach ($tag in $tags) {
@@ -873,54 +908,47 @@ function Invoke-CmdbReview {
         $isApp = $Catalog.Apps    | Where-Object { (($_.ToLower().Trim()) -replace '[^a-z0-9]+', '') -eq $normTag }
         $isSub = $Catalog.SubApps | Where-Object { (($_.ToLower().Trim()) -replace '[^a-z0-9]+', '') -eq $normTag }
 
-        if     ($isSub) { $cls = 'Sub-Application' }
-        elseif ($isApp) { $cls = 'Application - convert to sub-app' }
+        # Base class from CAG (local first, then global fallback)
+        $baseClass = ''
+        if     ($isSub) { $baseClass = 'Sub-Application' }
+        elseif ($isApp) { $baseClass = 'Application - convert to sub-app' }
         elseif ($AppClass -and $AppClass[$normTag]) {
-            # Fallback: not in the VM's own project's CAG, but is in some project's CAG.
-            # Classify by the class found there. Project Placement column names the
-            # project(s) it actually belongs to.
             $globalCls = $AppClass[$normTag]
-            if     ($globalCls -eq 'SubApplication') { $cls = 'Sub-Application' }
-            elseif ($globalCls -eq 'Application')    { $cls = 'Application - convert to sub-app' }
-            else                                     { $cls = 'Not found in CAG' }
+            if     ($globalCls -eq 'SubApplication') { $baseClass = 'Sub-Application' }
+            elseif ($globalCls -eq 'Application')    { $baseClass = 'Application - convert to sub-app' }
         }
-        else {
-            # CI-record fallback: CAG excludes disposed/retired items (and can exclude
-            # planned/on-order too), so a tag whose CI is in one of those states shows
-            # as "Not found in CAG" from the CAG lookups. Query the CI directly and
-            # surface the status - plus the CI's own class when available - so the row
-            # tells the operator WHY it isn't in CAG.
-            # Uses the shared $AppStatusCache; tags shared across VMs cost one call.
-            $cls = 'Not found in CAG'
-            $ciKey = ($tag -replace '_', ' ').Trim()
-            if ($ciKey) {
-                try {
-                    $tagInfo = Get-AppDecommStatus -AppName $ciKey -VraServer $VraServer `
-                        -AuthToken $AuthToken -ReturnAppVmsUri $ReturnAppVmsUri -Cache $AppStatusCache
-                    if ($tagInfo) {
-                        $statusLabel = ''
-                        if ($tagInfo.IsDisposed) {
-                            $statusLabel = 'Disposed/Retired'
-                        }
-                        elseif (@($tagInfo.Statuses) -match '(?i)planned/on\s*order') {
-                            $statusLabel = 'Planned/On order'
-                        }
 
-                        $classLabel = ''
-                        if     ($tagInfo.PrimaryClass -eq 'SubApplication') { $classLabel = 'Sub-Application' }
-                        elseif ($tagInfo.PrimaryClass -eq 'Application')    { $classLabel = 'Application' }
-
-                        if     ($statusLabel -and $classLabel) { $cls = "$classLabel ($statusLabel)" }
-                        elseif ($statusLabel)                  { $cls = $statusLabel }
-                        elseif ($classLabel)                   { $cls = $classLabel }
+        # CI record: always looked up. Provides the status label; also provides a
+        # class-of-last-resort when CAG had nothing.
+        $statusLabel = ''
+        $ciClassLabel = ''
+        $ciKey = ($tag -replace '_', ' ').Trim()
+        if ($ciKey) {
+            try {
+                $tagInfo = Get-AppDecommStatus -AppName $ciKey -VraServer $VraServer `
+                    -AuthToken $AuthToken -ReturnAppVmsUri $ReturnAppVmsUri -Cache $AppStatusCache
+                if ($tagInfo) {
+                    $statusLabel = Get-BestStatusLabel $tagInfo.Statuses
+                    if (-not $baseClass) {
+                        if     ($tagInfo.PrimaryClass -eq 'SubApplication') { $ciClassLabel = 'Sub-Application' }
+                        elseif ($tagInfo.PrimaryClass -eq 'Application')    { $ciClassLabel = 'Application' }
                     }
                 }
-                catch { }
             }
+            catch { }
         }
+
+        # Compose. baseClass (from CAG) wins over ciClassLabel (fallback) when both exist.
+        $classForLabel = if ($baseClass) { $baseClass } else { $ciClassLabel }
+
+        if     ($classForLabel -and $statusLabel) { $cls = "$classForLabel ($statusLabel)" }
+        elseif ($classForLabel)                   { $cls = $classForLabel }
+        elseif ($statusLabel)                     { $cls = $statusLabel }
+        else                                      { $cls = 'Not found in CAG' }
+
         $tagClasses[$tag] = $cls
 
-        # Priority-based primary tag pick: live > status-annotated > status-only > not found.
+        # Priority-based primary tag pick.
         $p = Get-TagClassPriority $cls
         if ($p -gt $primaryPriority) {
             $primaryTag      = $tag
@@ -2303,7 +2331,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
         # Inject the helper functions this phase needs into every runspace
         $fnNames = @(
             'Normalize-AppName','Invoke-VroActionRest','Get-CagCatalog','Get-VroObjectArray',
-            'Get-FirstFieldValue','Get-AppTier','Get-TagClassPriority','Format-CiClass','Get-VroJson','Get-UpstreamCIs','Get-CiStatuses','Get-CiClasses',
+            'Get-FirstFieldValue','Get-AppTier','Get-TagClassPriority','Get-BestStatusLabel','Format-CiClass','Get-VroJson','Get-UpstreamCIs','Get-CiStatuses','Get-CiClasses',
             'Get-JsonBlockFromText','Get-UpstreamCIsFromLog','Get-CiStatusesFromLog','Get-CiClassesFromLog',
             'Invoke-VroWorkflowWithLogs','Invoke-VroActionWithLogs','Get-AppDecommStatus','Invoke-CmdbReview'
         )
