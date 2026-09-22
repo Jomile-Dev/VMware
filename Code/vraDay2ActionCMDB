@@ -408,6 +408,38 @@ function Get-FirstFieldValue {
     return ""
 }
 
+# Normalise a raw CMDB class string (UpstreamCICMSClass / UpstreamCIType / CmsClass)
+# to the app-tier label used in chain analysis. Covers subtypes:
+#   Application, Application Resource, Application Platform, Application System, ...
+#     -> Application
+#   SubApplication, Sub Application, Sub Application X, ...
+#     -> SubApplication
+# Anything else -> "" (drops out of $appUpstreams into $otherUpstreams).
+# Used only for equality comparisons; the raw class string is still shown in labels
+# via Format-CiClass so specific subtypes stay visible in the CSV.
+function Get-AppTier {
+    param([string]$RawClass)
+    if (-not $RawClass) { return '' }
+    if ($RawClass -match '^\s*Sub[\s]?Application(\b|$)') { return 'SubApplication' }
+    if ($RawClass -match '^\s*Application(\b|$)')          { return 'Application' }
+    return ''
+}
+
+# Priority ranking for NSX Tag Category values, used to pick a VM's primary tag
+# when it carries several. Higher wins. Order: live in CAG beats status-annotated
+# (which still gives class + status) beats status-only (no class) beats not-found.
+function Get-TagClassPriority {
+    param([string]$Cls)
+    switch -Regex ($Cls) {
+        '^Sub-Application$'                      { return 100 }
+        '^Application - convert to sub-app$'     { return 90 }
+        '^Sub-Application \('                    { return 80 }   # class + status
+        '^Application \('                        { return 75 }   # class + status
+        '^(Disposed/Retired|Planned/On order)$'  { return 50 }   # status only, no class
+        default                                  { return 10 }   # Not found in CAG
+    }
+}
+
 # Normalise a CMDB class value to one notation for the CSV.
 # The raw values are "Application" / "SubApplication"; every column that prints a
 # class uses [App] / [Sub-App] so the same CI reads identically across columns.
@@ -471,6 +503,24 @@ function Get-CiStatuses {
     if     ($Obj.retrieveCiInfoByKey.Information) { $infos = @($Obj.retrieveCiInfoByKey.Information) }
     elseif ($Obj.Information)                     { $infos = @($Obj.Information) }
     return @($infos | ForEach-Object { $_.Status } | Where-Object { $_ })
+}
+
+# CI-level class strings from retrieveCiInfoByKey.Information[] - reads CmsClass
+# first (matches upstream records' UpstreamCICMSClass), falls back to CiType.
+# Raw values kept; Get-AppTier normalises them for comparison.
+function Get-CiClasses {
+    param($Obj)
+    if ($null -eq $Obj) { return @() }
+    $infos = @()
+    if     ($Obj.retrieveCiInfoByKey.Information) { $infos = @($Obj.retrieveCiInfoByKey.Information) }
+    elseif ($Obj.Information)                     { $infos = @($Obj.Information) }
+    $out = @()
+    foreach ($info in $infos) {
+        $c = $info.CmsClass
+        if (-not $c) { $c = $info.CiType }
+        if ($c) { $out += [string]$c }
+    }
+    return @($out)
 }
 
 # Extract the JSON object surrounding a marker string from log text.
@@ -542,6 +592,15 @@ function Get-CiStatusesFromLog {
     if (-not $obj) { $obj = Get-JsonBlockFromText -Text $LogText -Marker 'retrieveCiInfoByKey' }
     if (-not $obj) { return @() }
     return @(Get-CiStatuses -Obj $obj)
+}
+
+# From log text: CI class strings out of the retrieveCiInfoByKey block.
+function Get-CiClassesFromLog {
+    param($LogText)
+    $obj = Get-JsonBlockFromText -Text $LogText -Marker 'retrieveCiInfoByKey' -RequireProperty 'Information'
+    if (-not $obj) { $obj = Get-JsonBlockFromText -Text $LogText -Marker 'retrieveCiInfoByKey' }
+    if (-not $obj) { return @() }
+    return @(Get-CiClasses -Obj $obj)
 }
 
 # Run a WORKFLOW via REST and fetch that run's logs. On vRO/Aria 8.x a workflow
@@ -723,6 +782,7 @@ function Get-AppDecommStatus {
 
     $statuses = @()
     $ownUpstreams = @()
+    $classes = @()
     try {
         $res = Invoke-VroActionWithLogs -VraServer $VraServer -AuthToken $AuthToken `
             -ActionUri $ReturnAppVmsUri -Parameters @{ applicationName = $AppName }
@@ -730,12 +790,14 @@ function Get-AppDecommStatus {
         if ($res.LogText) {
             $statuses     += @(Get-CiStatusesFromLog -LogText $res.LogText)
             $ownUpstreams += @(Get-UpstreamCIsFromLog -LogText $res.LogText)
+            $classes      += @(Get-CiClassesFromLog  -LogText $res.LogText)
         }
         if (-not $statuses -and $res.Value) {
             $obj = Get-VroJson -Response $res.Value
             if ($obj) {
                 $statuses     += @(Get-CiStatuses  -Obj $obj)
                 $ownUpstreams += @(Get-UpstreamCIs -Obj $obj)
+                $classes      += @(Get-CiClasses   -Obj $obj)
             }
         }
     }
@@ -743,6 +805,14 @@ function Get-AppDecommStatus {
 
     $statuses = @($statuses | Where-Object { $_ } | Select-Object -Unique)
     $disposed = @($statuses | Where-Object { $_ -match 'dispos|retire|decommission|phased' })
+    $classes  = @($classes  | Where-Object { $_ } | Select-Object -Unique)
+
+    # PrimaryClass: normalised tier. SubApplication wins over Application when both
+    # are present (matches the CAG-side per-project preference).
+    $tiers = @($classes | ForEach-Object { Get-AppTier $_ } | Where-Object { $_ } | Select-Object -Unique)
+    $primaryClass = if ($tiers -contains 'SubApplication') { 'SubApplication' }
+                    elseif ($tiers -contains 'Application') { 'Application' }
+                    else { '' }
 
     $result = [PSCustomObject]@{
         AppName      = $AppName
@@ -750,6 +820,8 @@ function Get-AppDecommStatus {
         IsDisposed   = ($disposed.Count -gt 0)
         Disposed     = $disposed
         OwnUpstreams = $ownUpstreams
+        Classes      = $classes
+        PrimaryClass = $primaryClass
     }
     if ($Cache) { $Cache[$key] = $result }
     return $result
@@ -787,8 +859,15 @@ function Invoke-CmdbReview {
     # in CAG over one that does not: a real classification beats "Not found".
     # Order of preference: Sub-Application, then Application, then unresolved.
     # The chosen tag's classification becomes the Action value for the row.
+    # Tiers (priority order, high to low), used by Get-TagClassPriority below:
+    #   Sub-Application                             live sub-app in CAG
+    #   Application - convert to sub-app            live app in CAG
+    #   <Class> (Disposed/Retired)                  CI record says disposed
+    #   <Class> (Planned/On order)                  CI record says planned
+    #   Disposed/Retired / Planned/On order         status found but class unknown
+    #   Not found in CAG                            nothing found anywhere
     $tagClasses = @{}
-    $primaryTag = $null; $primaryClass = $null
+    $primaryTag = $null; $primaryClass = $null; $primaryPriority = -1
     foreach ($tag in $tags) {
         $normTag = ($tag.ToLower().Trim() -replace '[^a-z0-9]+', '')
         $isApp = $Catalog.Apps    | Where-Object { (($_.ToLower().Trim()) -replace '[^a-z0-9]+', '') -eq $normTag }
@@ -805,19 +884,48 @@ function Invoke-CmdbReview {
             elseif ($globalCls -eq 'Application')    { $cls = 'Application - convert to sub-app' }
             else                                     { $cls = 'Not found in CAG' }
         }
-        else            { $cls = 'Not found in CAG' }
+        else {
+            # CI-record fallback: CAG excludes disposed/retired items (and can exclude
+            # planned/on-order too), so a tag whose CI is in one of those states shows
+            # as "Not found in CAG" from the CAG lookups. Query the CI directly and
+            # surface the status - plus the CI's own class when available - so the row
+            # tells the operator WHY it isn't in CAG.
+            # Uses the shared $AppStatusCache; tags shared across VMs cost one call.
+            $cls = 'Not found in CAG'
+            $ciKey = ($tag -replace '_', ' ').Trim()
+            if ($ciKey) {
+                try {
+                    $tagInfo = Get-AppDecommStatus -AppName $ciKey -VraServer $VraServer `
+                        -AuthToken $AuthToken -ReturnAppVmsUri $ReturnAppVmsUri -Cache $AppStatusCache
+                    if ($tagInfo) {
+                        $statusLabel = ''
+                        if ($tagInfo.IsDisposed) {
+                            $statusLabel = 'Disposed/Retired'
+                        }
+                        elseif (@($tagInfo.Statuses) -match '(?i)planned/on\s*order') {
+                            $statusLabel = 'Planned/On order'
+                        }
+
+                        $classLabel = ''
+                        if     ($tagInfo.PrimaryClass -eq 'SubApplication') { $classLabel = 'Sub-Application' }
+                        elseif ($tagInfo.PrimaryClass -eq 'Application')    { $classLabel = 'Application' }
+
+                        if     ($statusLabel -and $classLabel) { $cls = "$classLabel ($statusLabel)" }
+                        elseif ($statusLabel)                  { $cls = $statusLabel }
+                        elseif ($classLabel)                   { $cls = $classLabel }
+                    }
+                }
+                catch { }
+            }
+        }
         $tagClasses[$tag] = $cls
 
-        # First sub-app wins outright; an app only takes the slot if no sub-app has
-        # been seen; an unresolved tag only if nothing else has claimed it.
-        if ($cls -eq 'Sub-Application') {
-            if ($primaryClass -ne 'Sub-Application') { $primaryTag = $tag; $primaryClass = $cls }
-        }
-        elseif ($cls -eq 'Application - convert to sub-app') {
-            if ($primaryClass -notin @('Sub-Application', 'Application - convert to sub-app')) { $primaryTag = $tag; $primaryClass = $cls }
-        }
-        else {
-            if (-not $primaryTag) { $primaryTag = $tag; $primaryClass = $cls }
+        # Priority-based primary tag pick: live > status-annotated > status-only > not found.
+        $p = Get-TagClassPriority $cls
+        if ($p -gt $primaryPriority) {
+            $primaryTag      = $tag
+            $primaryClass    = $cls
+            $primaryPriority = $p
         }
     }
 
@@ -885,16 +993,20 @@ function Invoke-CmdbReview {
     # other upstreams a VM carries (OBM Agent, Running Software, etc.) are not app
     # relationships and must not count toward "multiple upstream" or mask a
     # genuinely missing app link.
+    # Class comparison goes through Get-AppTier, which normalises subtypes
+    # (Application Resource / Platform / System, Sub Application X) to the plain
+    # tier name - otherwise those subtypes fall out of $appUpstreams and are
+    # reported as "no upstream" when there IS one, just with a more specific class.
     $appUpstreams = @($upstreamCIs | Where-Object {
-        (Get-FirstFieldValue -Object $_ -Fields $ClassFields) -match '^(Application|SubApplication)$'
+        (Get-AppTier (Get-FirstFieldValue -Object $_ -Fields $ClassFields)) -in @('Application','SubApplication')
     })
     $otherUpstreams = @($upstreamCIs | Where-Object {
-        (Get-FirstFieldValue -Object $_ -Fields $ClassFields) -notmatch '^(Application|SubApplication)$'
+        -not ((Get-AppTier (Get-FirstFieldValue -Object $_ -Fields $ClassFields)) -in @('Application','SubApplication'))
     })
     # Upstream to an Application is the correct end state; upstream to another
     # Sub-Application does not satisfy the rule and needs review.
-    $toApplication    = @($appUpstreams | Where-Object { (Get-FirstFieldValue -Object $_ -Fields $ClassFields) -eq 'Application' })
-    $toSubApplication = @($appUpstreams | Where-Object { (Get-FirstFieldValue -Object $_ -Fields $ClassFields) -eq 'SubApplication' })
+    $toApplication    = @($appUpstreams | Where-Object { (Get-AppTier (Get-FirstFieldValue -Object $_ -Fields $ClassFields)) -eq 'Application' })
+    $toSubApplication = @($appUpstreams | Where-Object { (Get-AppTier (Get-FirstFieldValue -Object $_ -Fields $ClassFields)) -eq 'SubApplication' })
 
     if ($appUpstreams.Count -gt 0) {
         # ---- FIRST HOP: what the VM is linked to ----
@@ -926,13 +1038,14 @@ function Invoke-CmdbReview {
         $lifecycleHits = @()
 
         foreach ($u in $appUpstreams) {
-            $uName  = $u.UpstreamCIName
-            $uClass = Get-FirstFieldValue -Object $u -Fields $ClassFields
+            $uName     = $u.UpstreamCIName
+            $uClassRaw = Get-FirstFieldValue -Object $u -Fields $ClassFields
+            $uClass    = Get-AppTier $uClassRaw
             if (-not $uName) { continue }
 
             # 1st hop lifecycle: direct upstream's own status
             if ($u.UpstreamCIStatus -match '(?i)planned/on\s*order') {
-                $lifecycleHits += "VM upstream: $uName [$(Format-CiClass $uClass)] - $($u.UpstreamCIStatus)"
+                $lifecycleHits += "VM upstream: $uName [$(Format-CiClass $uClassRaw)] - $($u.UpstreamCIStatus)"
             }
 
             $info = Get-AppDecommStatus -AppName $uName -VraServer $VraServer `
@@ -942,13 +1055,14 @@ function Invoke-CmdbReview {
             $ownSubs = @()
             if ($info -and $info.OwnUpstreams) {
                 foreach ($ou in $info.OwnUpstreams) {
-                    $ouClass = Get-FirstFieldValue -Object $ou -Fields $ClassFields
+                    $ouClassRaw = Get-FirstFieldValue -Object $ou -Fields $ClassFields
+                    $ouClass    = Get-AppTier $ouClassRaw
                     if     ($ouClass -eq 'Application')    { $ownApps += $ou.UpstreamCIName }
                     elseif ($ouClass -eq 'SubApplication') { $ownSubs += $ou.UpstreamCIName }
 
                     # 2nd hop lifecycle: status of the upstream's own upstream
                     if ($ou.UpstreamCIStatus -match '(?i)planned/on\s*order') {
-                        $lifecycleHits += "App above ${uName}: $($ou.UpstreamCIName) [$(Format-CiClass $ouClass)] - $($ou.UpstreamCIStatus)"
+                        $lifecycleHits += "App above ${uName}: $($ou.UpstreamCIName) [$(Format-CiClass $ouClassRaw)] - $($ou.UpstreamCIStatus)"
                     }
                 }
             }
@@ -2189,8 +2303,8 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
         # Inject the helper functions this phase needs into every runspace
         $fnNames = @(
             'Normalize-AppName','Invoke-VroActionRest','Get-CagCatalog','Get-VroObjectArray',
-            'Get-FirstFieldValue','Format-CiClass','Get-VroJson','Get-UpstreamCIs','Get-CiStatuses',
-            'Get-JsonBlockFromText','Get-UpstreamCIsFromLog','Get-CiStatusesFromLog',
+            'Get-FirstFieldValue','Get-AppTier','Get-TagClassPriority','Format-CiClass','Get-VroJson','Get-UpstreamCIs','Get-CiStatuses','Get-CiClasses',
+            'Get-JsonBlockFromText','Get-UpstreamCIsFromLog','Get-CiStatusesFromLog','Get-CiClassesFromLog',
             'Invoke-VroWorkflowWithLogs','Invoke-VroActionWithLogs','Get-AppDecommStatus','Invoke-CmdbReview'
         )
         $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
