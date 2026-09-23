@@ -435,17 +435,19 @@ function Get-TagClassPriority {
         '^Sub-Application \(In Use - Phasing'                                    { return 100 }
         '^Sub-Application \(Planned'                                             { return 98 }
         '^Sub-Application \(Disposed'                                            { return 95 }
+        '^Sub-Application \(Status'                                              { return 93 }   # not read / lookup failed
         '^Sub-Application$'                                                      { return 92 }
-        '^Sub-Application \('                                                    { return 90 }
+        '^Sub-Application \('                                                    { return 90 }   # raw unhandled status
         '^Application - convert to sub-app \(In Use - (Production|Pilot|Test)'   { return 85 }
         '^Application - convert to sub-app \(In Use - Phasing'                   { return 80 }
         '^Application - convert to sub-app \(Planned'                            { return 78 }
         '^Application - convert to sub-app \(Disposed'                           { return 75 }
+        '^Application - convert to sub-app \(Status'                             { return 73 }
         '^Application - convert to sub-app$'                                     { return 72 }
-        '^Application - convert to sub-app'                                      { return 70 }
+        '^Application - convert to sub-app'                                      { return 70 }   # raw unhandled status
         '^Application \('                                                        { return 65 }
         '^Application$'                                                          { return 60 }
-        '^(In Use|Disposed|Planned)'                                             { return 40 }
+        '^(In Use|Disposed|Planned|Status)'                                      { return 40 }
         '^No tag$'                                                               { return 0 }
         default                                                                  { return 10 }
     }
@@ -453,8 +455,10 @@ function Get-TagClassPriority {
 
 # Normalise a set of raw CI Status strings to one canonical label.
 # Worst status wins so the operator sees the most alarming state first:
-# Disposed > Phasing > Planned > Test > Pilot > Production. Returns '' if
-# no status matches a known bucket.
+# Disposed > Phasing > Planned > Test > Pilot > Production. If none of the raw
+# statuses match a known bucket, returns the first raw status verbatim rather
+# than an empty string - so nothing gets silently dropped when CMDB uses a
+# status wording we haven't seen. Returns '' only when there ARE no statuses.
 function Get-BestStatusLabel {
     param($Statuses)
     if (-not $Statuses) { return '' }
@@ -473,7 +477,10 @@ function Get-BestStatusLabel {
             if ($s -match $r.Pattern) { return $r.Label }
         }
     }
-    return ''
+    # No known bucket matched but there IS data - show the first raw status verbatim.
+    # These slip through to the CSV so unhandled wording can be spotted and a rule
+    # added to the bucket list above.
+    return [string]$arr[0]
 }
 
 # Normalise a CMDB class value to one notation for the CSV.
@@ -919,23 +926,38 @@ function Invoke-CmdbReview {
         }
 
         # CI record: always looked up. Provides the status label; also provides a
-        # class-of-last-resort when CAG had nothing.
+        # class-of-last-resort when CAG had nothing. If the lookup fails or returns
+        # nothing, a placeholder is emitted so the exported cell always carries a
+        # status - bare "Sub-Application" / "Application" never appears.
         $statusLabel = ''
         $ciClassLabel = ''
         $ciKey = ($tag -replace '_', ' ').Trim()
         if ($ciKey) {
+            $lookupErrored = $false
+            $tagInfo = $null
             try {
                 $tagInfo = Get-AppDecommStatus -AppName $ciKey -VraServer $VraServer `
                     -AuthToken $AuthToken -ReturnAppVmsUri $ReturnAppVmsUri -Cache $AppStatusCache
-                if ($tagInfo) {
-                    $statusLabel = Get-BestStatusLabel $tagInfo.Statuses
-                    if (-not $baseClass) {
-                        if     ($tagInfo.PrimaryClass -eq 'SubApplication') { $ciClassLabel = 'Sub-Application' }
-                        elseif ($tagInfo.PrimaryClass -eq 'Application')    { $ciClassLabel = 'Application' }
-                    }
+            }
+            catch { $lookupErrored = $true }
+
+            if ($lookupErrored) {
+                $statusLabel = 'Status lookup failed'
+            }
+            elseif ($tagInfo) {
+                $statusLabel = Get-BestStatusLabel $tagInfo.Statuses
+                if (-not $statusLabel) { $statusLabel = 'Status not read' }
+                if (-not $baseClass) {
+                    if     ($tagInfo.PrimaryClass -eq 'SubApplication') { $ciClassLabel = 'Sub-Application' }
+                    elseif ($tagInfo.PrimaryClass -eq 'Application')    { $ciClassLabel = 'Application' }
                 }
             }
-            catch { }
+            else {
+                $statusLabel = 'Status not read'
+            }
+        }
+        else {
+            $statusLabel = 'Status not read'
         }
 
         # Compose. baseClass (from CAG) wins over ciClassLabel (fallback) when both exist.
