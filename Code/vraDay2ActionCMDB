@@ -73,6 +73,15 @@ $ProbeVMName      = ""            # blank = first VM in $results
 # Review only the first N VMs (0 = all). Handy for troubleshooting.
 $ReviewLimit      = 0
 
+# Review only one specific VM (by exact name; blank = ignored). Overrides $ReviewLimit.
+# Both Phase 1 and the review are narrowed to just this VM, so runs are fast.
+# NOTE: the deployment fetch runs first and only sees VMs inside deployments it
+# fetched. If $MaxDeployments caps the fetch before the target VM's deployment,
+# nothing matches - keep $MaxDeployments = 0 when using $ReviewOnlyVM. Turn on
+# $ReviewDebug = $true and read $ReviewDebugPath to see the raw responses for
+# that VM.
+$ReviewOnlyVM     = ""
+
 # Fetch only the first N deployments that contain eligible VMs (0 = all).
 # Handy for troubleshooting - empty/deleted deployments don't count toward N.
 $MaxDeployments   = 0
@@ -1550,6 +1559,18 @@ do {
 Write-Log "Scanned: $totalProcessed deployments ($deploymentsWithVMs with VMs, skipped $skippedCount deleted/failed)" -Color Cyan
 Write-Log "VMs to process: $($vmQueue.Count)" -Color Cyan
 
+if ($ReviewOnlyVM) {
+    $matched = @($vmQueue | Where-Object { $_.VMName -eq $ReviewOnlyVM })
+    if ($matched.Count -eq 0) {
+        Write-Log "ReviewOnlyVM '$ReviewOnlyVM' not found in the $($vmQueue.Count) fetched VMs - if the VM exists, $MaxDeployments may be capping the fetch before its deployment" -Color Red
+    }
+    else {
+        $vmQueue.Clear()
+        foreach ($m in $matched) { $vmQueue.Add($m) }
+        Write-Log "ReviewOnlyVM: Phase 1 narrowed to '$ReviewOnlyVM' ($($vmQueue.Count) row(s))" -Color Yellow
+    }
+}
+
 # Scriptblock that runs in each runspace
 $scriptBlock = {
     param($VraServer, $AuthToken, $ShowVmDetailsUri, $GetVmAppsUri, $VMName, $ProjectId, $ProjectName, $DeploymentName)
@@ -2092,9 +2113,25 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
 
     if ($ReviewDebug -and (Test-Path $ReviewDebugPath)) { Remove-Item $ReviewDebugPath -Force }
 
-    $reviewSet = if ($ReviewLimit -gt 0) { @($results | Select-Object -First $ReviewLimit) } else { $results }
+    $reviewSet = if ($ReviewOnlyVM) {
+        @($results | Where-Object { $_.VMName -eq $ReviewOnlyVM })
+    }
+    elseif ($ReviewLimit -gt 0) {
+        @($results | Select-Object -First $ReviewLimit)
+    }
+    else {
+        $results
+    }
     $reviewTotal = @($reviewSet).Count
-    if ($ReviewLimit -gt 0) { Write-Log " (limited to first $reviewTotal VMs)" -Color Yellow }
+    if ($ReviewOnlyVM) {
+        if ($reviewTotal -eq 0) {
+            Write-Log " ReviewOnlyVM '$ReviewOnlyVM' not found in $($results.Count) row(s) - nothing to review" -Color Red
+        }
+        else {
+            Write-Log " (review narrowed to '$ReviewOnlyVM' - $reviewTotal row(s))" -Color Yellow
+        }
+    }
+    elseif ($ReviewLimit -gt 0) { Write-Log " (limited to first $reviewTotal VMs)" -Color Yellow }
 
     # --- Project name -> id map (main thread) -----------------------------
     # Fetched here so both the CAG preload below and the placement-index block
