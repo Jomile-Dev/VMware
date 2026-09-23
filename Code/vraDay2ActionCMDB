@@ -171,6 +171,7 @@ $exportColumns = @(
     @{ Name = 'NSX vs CMDB Decomm';            Expression = { $_.DecommCompare } }
 
     @{ Name = 'Upstream Lifecycle Status';     Expression = { $_.UpstreamLifecycleStatus } }
+    @{ Name = 'Upstream App CAG';              Expression = { $_.UpstreamAppCag } }
 )
 
 # Per-action REST timeout (seconds) so a bad/blocked endpoint fails fast
@@ -1188,6 +1189,10 @@ function Invoke-CmdbReview {
     $upstreamToApp = "N/A"; $multiUpstream = "No multiple upstream"; $noUpstream = "N/A"; $decomm = "No"
     $upstreamTo = ""; $multiUpstreamCI = ""
     $lifecycleStatus = "N/A"
+    # Upstream App CAG: which project CAG(s) own the 2nd-hop app. Defaults to
+    # N/A here so branches that never reach the 2nd-hop loop (no upstream,
+    # non-app upstreams only, etc.) get the right value with no extra code.
+    $upstreamAppCag = "N/A"
 
     # RULE: the chain should be VM > Sub-App > Application.
     # Only Application / SubApplication upstreams are relationship-relevant; the
@@ -1237,6 +1242,10 @@ function Invoke-CmdbReview {
         # Checked at both hops. Distinct from Decomm (dispos|retire|decommission|phased) -
         # this is "not yet live" rather than "no longer live".
         $lifecycleHits = @()
+        # 2nd-hop app name -> list of project CAG names owning it. Ordered so the
+        # display string keeps the order 2nd hops were seen in. Only populated
+        # when $AppToProject is available (placement scan wasn't skipped).
+        $secondHopCagMap = [ordered]@{}
 
         foreach ($u in $appUpstreams) {
             $uName     = $u.UpstreamCIName
@@ -1264,6 +1273,27 @@ function Invoke-CmdbReview {
                     # 2nd hop lifecycle: status of the upstream's own upstream
                     if ($ou.UpstreamCIStatus -match '(?i)planned/on\s*order') {
                         $lifecycleHits += "App above ${uName}: $($ou.UpstreamCIName) [$(Format-CiClass $ouClassRaw)] - $($ou.UpstreamCIStatus)"
+                    }
+
+                    # Track which project CAG(s) own the 2nd-hop app for the
+                    # "Upstream App CAG" column. Ordered dictionary so multiple
+                    # 2nd-hop apps render in a stable order. Empty entry means
+                    # the app was seen but is in no CAG - rendered as "Unknown".
+                    # Skipped when AppToProject is null (placement scan disabled
+                    # or ReviewOnlyVM mode) - handled after the loop.
+                    if ($ou.UpstreamCIName -and $AppToProject) {
+                        $ouKey = Normalize-AppName $ou.UpstreamCIName
+                        if ($ouKey) {
+                            if (-not $secondHopCagMap.Contains($ou.UpstreamCIName)) {
+                                $secondHopCagMap[$ou.UpstreamCIName] = @()
+                            }
+                            $ouProjects = @($AppToProject[$ouKey]) | Where-Object { $_ } | Select-Object -Unique
+                            foreach ($p in $ouProjects) {
+                                if ($secondHopCagMap[$ou.UpstreamCIName] -notcontains $p) {
+                                    $secondHopCagMap[$ou.UpstreamCIName] += $p
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1314,6 +1344,38 @@ function Invoke-CmdbReview {
         }
         else {
             $lifecycleStatus = "OK"
+        }
+
+        # Upstream App CAG: project CAG owning each 2nd-hop app.
+        #   - Not checked : placement scan skipped ($AppToProject null - typical
+        #                   under ReviewOnlyVM or when the scan is disabled)
+        #   - N/A         : no 2nd hop at all (VM's upstream is top of chain)
+        #   - Unknown     : 2nd hop exists but the app isn't in any project CAG
+        #   - One 2nd hop : CAG name(s) joined by "; "
+        #   - Multi hops  : "AppA: Proj1, Proj2 | AppB: Unknown" (different
+        #                   separator between apps vs between CAGs so a multi-
+        #                   CAG single-hop cell isn't ambiguous with a multi-
+        #                   hop one)
+        if ($null -eq $AppToProject) {
+            $upstreamAppCag = "Not checked"
+        }
+        elseif ($secondHopCagMap.Count -eq 0) {
+            $upstreamAppCag = "N/A"
+        }
+        elseif ($secondHopCagMap.Count -eq 1) {
+            $only = @($secondHopCagMap.Keys)[0]
+            $cags = @($secondHopCagMap[$only])
+            if ($cags.Count -eq 0) { $upstreamAppCag = "Unknown" }
+            else                   { $upstreamAppCag = ($cags -join "; ") }
+        }
+        else {
+            $parts = @()
+            foreach ($k in $secondHopCagMap.Keys) {
+                $cags = @($secondHopCagMap[$k])
+                if ($cags.Count -eq 0) { $parts += "${k}: Unknown" }
+                else                   { $parts += "${k}: $($cags -join ', ')" }
+            }
+            $upstreamAppCag = ($parts -join " | ")
         }
     }
     elseif ($tags.Count -eq 0) {
@@ -1569,6 +1631,7 @@ function Invoke-CmdbReview {
         ProjectPlacementResult = $projectPlacementResult
         Decommissioned         = $decomm
         UpstreamLifecycleStatus = $lifecycleStatus
+        UpstreamAppCag         = $upstreamAppCag
     }
 }
 
@@ -2561,6 +2624,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
                 Add-Member -InputObject $vm -NotePropertyName ProjectPlacementResult -NotePropertyValue $rev.ProjectPlacementResult -Force
                 Add-Member -InputObject $vm -NotePropertyName Decommissioned         -NotePropertyValue $rev.Decommissioned         -Force
                 Add-Member -InputObject $vm -NotePropertyName UpstreamLifecycleStatus -NotePropertyValue $rev.UpstreamLifecycleStatus -Force
+                Add-Member -InputObject $vm -NotePropertyName UpstreamAppCag         -NotePropertyValue $rev.UpstreamAppCag         -Force
             }
             catch {
                 $reviewFailed.Add([PSCustomObject]@{ VMName = $vm.VMName; ProjectName = $vm.ProjectName; Error = $_.Exception.Message })
