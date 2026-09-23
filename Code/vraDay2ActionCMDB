@@ -1028,7 +1028,19 @@ function Invoke-CmdbReview {
             }
             $runMode = "action"
         }
-        $returnRaws += [ordered]@{ vmName = $Vm.VMName; runMode = $runMode; execId = $runRes.ExecId; logEndpoint = $runRes.LogEndpoint; logChars = @($runRes.LogText).Length; log = $runRes.LogText; value = $runRes.Value }
+        $logTextStr = if ($runRes.LogText) { [string]$runRes.LogText } else { '' }
+        $returnRaws += [ordered]@{
+            vmName            = $Vm.VMName
+            runMode           = $runMode
+            execId            = $runRes.ExecId
+            logEndpoint       = $runRes.LogEndpoint
+            logChars          = $logTextStr.Length
+            hasRelMarker      = ($logTextStr -match 'retrieveCIRelationshipInfoByKey')
+            hasCiInfoMarker   = ($logTextStr -match 'retrieveCiInfoByKey')
+            hasUpstreamCIs    = ($logTextStr -match 'upstreamCIs')
+            log               = $logTextStr
+            value             = $runRes.Value
+        }
         # Upstream CIs: from the log's retrieveCIRelationshipInfoByKey block
         # (falls back to the return value if it ever carries the JSON)
         $upstreamCIs += @(Get-UpstreamCIsFromLog -LogText $runRes.LogText)
@@ -2195,9 +2207,18 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
     # $appToProject stays $null when the check is off, which makes the review report
     # "Not checked" rather than guessing. $appClass follows the same lifecycle so
     # the tag-classification fallback also stays inert when placement is off.
+    # $ReviewOnlyVM also skips placement: for a single-VM debug run the estate-wide
+    # scan is wasted work - the target VM's own project CAG is already loaded
+    # (from the reviewSet-driven preload above), and the upstream / status / decomm
+    # columns don't depend on placement. Trade-off: Project Placement CI/Result
+    # read "Not checked", and NSX Tag Category loses the global-CAG fallback for
+    # tags that live in another project's CAG. Acceptable for debug.
     $appToProject = $null
     $appClass     = $null
-    if ($CheckProjectPlacement) {
+    if ($CheckProjectPlacement -and $ReviewOnlyVM) {
+        Write-Log " Project placement skipped (ReviewOnlyVM='$ReviewOnlyVM' - single-VM debug mode)" -Color Yellow
+    }
+    elseif ($CheckProjectPlacement) {
         # $allProjects was fetched above (shared with the CAG preload / replay backfill).
         # If that fetch failed, the placement check has no project list to work with.
         if ($allProjects.Count -gt 0) {
