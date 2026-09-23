@@ -108,6 +108,16 @@ $MaxLogResults        = 2000
 $LogFetchRetries      = 2
 $LogFetchRetryDelayMs = 1500
 
+# Phase 1 form-service call for InfraPortal CMDB CI: getVmApplications sometimes
+# returns HTTP 200 with an empty CI list even when data exists on the backend
+# (same intermittency you see in the vRA GUI when reopening the day-2 form
+# repopulates the field). When the call succeeds but the CI list comes back
+# empty AND the VM has NSX tags, retry the whole call. Set $Phase1EmptyCIRetries
+# = 0 to disable. Retry only fires when tags are present, so VMs that legitimately
+# have no CMDB CI aren't penalised.
+$Phase1EmptyCIRetries      = 2
+$Phase1EmptyCIRetryDelayMs = 1500
+
 # Save a partial CSV every N reviewed VMs, so a long run that dies part-way still
 # leaves usable output. Failed VMs are listed separately for a targeted re-run.
 $IncrementalSaveEvery = 50
@@ -1705,7 +1715,7 @@ if ($ReviewOnlyVM) {
 
 # Scriptblock that runs in each runspace
 $scriptBlock = {
-    param($VraServer, $AuthToken, $ShowVmDetailsUri, $GetVmAppsUri, $VMName, $ProjectId, $ProjectName, $DeploymentName)
+    param($VraServer, $AuthToken, $ShowVmDetailsUri, $GetVmAppsUri, $VMName, $ProjectId, $ProjectName, $DeploymentName, $MaxAttempts, $RetryDelayMs)
 
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     # Compiled policy, not a scriptblock: runspace threads have no default runspace,
@@ -1764,41 +1774,67 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
     $body = "[" + (($bodyArray | ForEach-Object { $_ | ConvertTo-Json -Depth 5 -Compress }) -join ",") + "]"
 
     try {
-        # 60s per-call timeout so a hung form-service endpoint fails this VM's job
-        # fast, freeing the runspace for the next job, instead of waiting out the
-        # wall-clock $jobTimeoutSeconds (120s) that governs the whole runspace slot.
-        $response = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body -TimeoutSec 60
-
+        # Retry loop for the intermittent "empty CI list on a VM that has data"
+        # backend behaviour. Only retries when: the HTTP call succeeded, the VM
+        # has NSX tags AND the CI list came back empty. VMs that legitimately
+        # have no CMDB CI (no tags either) exit on the first attempt.
         $appApplications = [System.Collections.ArrayList]::new()
         $infraOs = ""
         $appLayer = ""
         $vmApplications = ""
+        $attempt = 0
+        $totalAttempts = [Math]::Max(1, [int]$MaxAttempts)
 
-        foreach ($result in $response) {
-            switch ($result.requestId) {
-                1 {
-                    if ($result.data -is [array]) {
-                        foreach ($item in $result.data) {
-                            if ($item.scope -and $item.tag) {
-                                if ($item.scope -eq "app-application") {
-                                    [void]$appApplications.Add($item.tag)
-                                }
-                                elseif ($item.scope -eq "infra-os") {
-                                    $infraOs = $item.tag
-                                }
-                                elseif ($item.scope -eq "app-layer") {
-                                    $appLayer = $item.tag
+        while ($attempt -lt $totalAttempts) {
+            $attempt++
+
+            # Reset per-attempt state so a previous empty attempt doesn't leak
+            # into the next parse.
+            $appApplications.Clear()
+            $infraOs = ""
+            $appLayer = ""
+            $vmApplications = ""
+
+            # 60s per-call timeout so a hung form-service endpoint fails this VM's
+            # job fast, freeing the runspace for the next job, instead of waiting
+            # out the wall-clock $jobTimeoutSeconds (120s) that governs the whole
+            # runspace slot.
+            $response = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body -TimeoutSec 60
+
+            foreach ($result in $response) {
+                switch ($result.requestId) {
+                    1 {
+                        if ($result.data -is [array]) {
+                            foreach ($item in $result.data) {
+                                if ($item.scope -and $item.tag) {
+                                    if ($item.scope -eq "app-application") {
+                                        [void]$appApplications.Add($item.tag)
+                                    }
+                                    elseif ($item.scope -eq "infra-os") {
+                                        $infraOs = $item.tag
+                                    }
+                                    elseif ($item.scope -eq "app-layer") {
+                                        $appLayer = $item.tag
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                2 {
-                    if ($result.data -is [array]) {
-                        $vmApplications = ($result.data | Where-Object { $_ -and $_ -notmatch "^---" }) -join "; "
+                    2 {
+                        if ($result.data -is [array]) {
+                            $vmApplications = ($result.data | Where-Object { $_ -and $_ -notmatch "^---" }) -join "; "
+                        }
                     }
                 }
             }
+
+            # Break out if CI populated, or no tags to correlate against (nothing
+            # to retry for), or attempts exhausted.
+            if ($vmApplications) { break }
+            if ($appApplications.Count -eq 0) { break }
+            if ($attempt -ge $totalAttempts) { break }
+
+            Start-Sleep -Milliseconds $RetryDelayMs
         }
 
         $appApplication = ($appApplications | Select-Object -Unique) -join "; "
@@ -1847,6 +1883,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
             CompareResult = $match
             MatchedApps = $matchedAppsStr
             Status = "Success"
+            CiFetchAttempts = $attempt
         }
     }
     catch {
@@ -1862,6 +1899,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
             CompareResult = ""
             MatchedApps = ""
             Status = "Failed: $($_.Exception.Message)"
+            CiFetchAttempts = $attempt
         }
     }
 }
@@ -1892,6 +1930,8 @@ foreach ($vm in $vmQueue) {
     $ps.AddArgument($vm.ProjectId) | Out-Null
     $ps.AddArgument($vm.ProjectName) | Out-Null
     $ps.AddArgument($vm.DeploymentName) | Out-Null
+    $ps.AddArgument(1 + $Phase1EmptyCIRetries) | Out-Null
+    $ps.AddArgument($Phase1EmptyCIRetryDelayMs) | Out-Null
     $ps.RunspacePool = $runspacePool
 
     $jobs.Add(@{
@@ -1915,14 +1955,20 @@ foreach ($job in $jobs) {
                         "Mismatch" { "Red" }
                         default { "Gray" }
                     }
+                    # Show a note when a retry actually rescued the CI fetch, so
+                    # the frequency of the intermittency is visible in the run log.
+                    $retryNote = ""
+                    if ($r.CiFetchAttempts -and $r.CiFetchAttempts -gt 1) {
+                        $retryNote = " [CI rescued on attempt $($r.CiFetchAttempts)]"
+                    }
                     # Show what was returned for Missing Data so you can see what's empty
                     if ($r.CompareResult -eq "Missing Data") {
                         $tagVal = if ($r.AppApplication) { $r.AppApplication } else { "(empty)" }
                         $appVal = if ($r.CMDBCI) { $r.CMDBCI } else { "(empty)" }
-                        Write-Log "[$completed/$($vmQueue.Count)] $($r.VMName) | Tag: $tagVal | CMDB CI: $appVal | Missing Data" -Color Gray
+                        Write-Log "[$completed/$($vmQueue.Count)] $($r.VMName) | Tag: $tagVal | CMDB CI: $appVal | Missing Data$retryNote" -Color Gray
                     }
                     else {
-                        Write-Log "[$completed/$($vmQueue.Count)] $($r.VMName) | $($r.AppApplication) | $($r.CompareResult)" -Color $matchColor
+                        Write-Log "[$completed/$($vmQueue.Count)] $($r.VMName) | $($r.AppApplication) | $($r.CompareResult)$retryNote" -Color $matchColor
                     }
                 }
                 else {
