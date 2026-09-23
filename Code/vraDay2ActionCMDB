@@ -98,6 +98,16 @@ $ReviewJobTimeoutSec  = 180
 $PlacementPoolSize    = 6
 $PlacementJobTimeoutSec = 60
 
+# vRO action log fetch: the debug-level endpoint caps its response, which can
+# chop off the retrieveCIRelationshipInfoByKey block on VMs whose action produced
+# many log lines. Raising $MaxLogResults grows the cap; retries re-fetch when the
+# log came back with CI info but no relationship block (the typical partial-log
+# signature), which usually clears on a second attempt because timing/pagination
+# shift. Set $LogFetchRetries = 0 to disable.
+$MaxLogResults        = 2000
+$LogFetchRetries      = 2
+$LogFetchRetryDelayMs = 1500
+
 # Save a partial CSV every N reviewed VMs, so a long run that dies part-way still
 # leaves usable output. Failed VMs are listed separately for a targeted re-run.
 $IncrementalSaveEvery = 50
@@ -503,6 +513,83 @@ function Format-CiClass {
     return 'Unknown'
 }
 
+# Normalise typographic characters that mangle in CSV, and repair mojibake.
+# Two distinct problems handled:
+# 1. FULL mojibake - all mis-decoded bytes present (e.g. en dash E2 80 93 read as
+#    Windows-1252 becomes three chars). Round-trip via CP1252 -> UTF-8 reverses it.
+# 2. PARTIAL mojibake - only the lead byte survived (orphan "a-with-circumflex"
+#    with trailing bytes gone). The round-trip CANNOT recover this (0xE2 alone
+#    isn't valid UTF-8, decodes to the replacement character, guard rejects).
+#    Matched as literal sequences instead. Orphan surrounded by spaces is treated
+#    as a dash - the common source - but IS a guess.
+# Root cause is upstream: Windows PowerShell's Invoke-RestMethod falls back to
+# ISO-8859-1 when a response has no charset in its Content-Type, so UTF-8 bytes
+# are decoded as single-byte chars before this function ever sees them.
+# Idempotent - safe to call repeatedly on the same row (e.g. before each partial save).
+function ConvertTo-CleanText {
+    param($s)
+    if ($null -eq $s) { return $s }
+    $s = [string]$s
+
+    # 1. Round-trip repair (Latin-1 first because it's the actual PS default and 1:1;
+    # CP1252 second because it can't represent C1 controls, so mustn't be tried first).
+    # Repair kept only when it parses as valid UTF-8 and yields no replacement char.
+    if ($s -match "[$([char]0x0080)-$([char]0x009F)$([char]0x00E2)$([char]0x00C2)$([char]0x20AC)]") {
+        foreach ($cp in @(28591, 1252)) {
+            try {
+                $enc      = [Text.Encoding]::GetEncoding($cp, [Text.EncoderFallback]::ExceptionFallback, [Text.DecoderFallback]::ExceptionFallback)
+                $bytes    = $enc.GetBytes($s)
+                $strictU8 = [Text.Encoding]::GetEncoding('utf-8', [Text.EncoderFallback]::ExceptionFallback, [Text.DecoderFallback]::ExceptionFallback)
+                $repaired = $strictU8.GetString($bytes)
+                if ($repaired -notmatch [char]0xFFFD) { $s = $repaired; break }
+            }
+            catch { continue }
+        }
+    }
+
+    # 2. Literal mojibake sequences (each key = UTF-8 bytes after CP1252 mis-decode).
+    $map = [ordered]@{
+        "$([char]0x00E2)$([char]0x20AC)$([char]0x201C)" = '-'    # en dash   U+2013
+        "$([char]0x00E2)$([char]0x20AC)$([char]0x201D)" = '-'    # em dash   U+2014
+        "$([char]0x00E2)$([char]0x20AC)$([char]0x02DC)" = "'"    # open quote  U+2018
+        "$([char]0x00E2)$([char]0x20AC)$([char]0x2122)" = "'"    # close quote U+2019
+        "$([char]0x00E2)$([char]0x20AC)$([char]0x0153)" = '"'    # open dquote U+201C
+        "$([char]0x00E2)$([char]0x20AC)$([char]0x00A6)" = '...'  # ellipsis  U+2026
+        "$([char]0x00C2)$([char]0x00A0)"                = ' '    # NBSP      U+00A0
+    }
+    foreach ($k in $map.Keys) { $s = $s.Replace($k, $map[$k]) }
+
+    # 3. Latin-1 form that survived an unrepairable round-trip:
+    # a-circumflex + C1 controls for an en/em dash. Any remaining C1 controls
+    # aren't legitimate in a CI name.
+    $s = $s -replace "$([char]0x00E2)[$([char]0x0080)-$([char]0x009F)][$([char]0x0080)-$([char]0x009F)]", '-'
+    $s = $s -replace "[$([char]0x0080)-$([char]0x009F)]", ''
+
+    # 4. Typographic characters to plain ASCII.
+    $s = $s -replace [char]0x2013, '-' -replace [char]0x2014, '-'
+    $s = $s -replace [char]0x00A0, ' '
+    $s = $s -replace [char]0x2018, "'" -replace [char]0x2019, "'"
+    $s = $s -replace [char]0x201C, '"' -replace [char]0x201D, '"'
+    $s = $s -replace [char]0xFFFD, ''
+
+    $s = $s -replace '  +', ' '
+    return $s.Trim()
+}
+
+# Apply ConvertTo-CleanText to every string property of every row, in place.
+# Idempotent - safe to run before each partial save AND before the final export.
+# Skips $null rows (defensive; shouldn't happen in practice).
+function Invoke-CleanResultsInPlace {
+    param($Rows)
+    if (-not $Rows) { return }
+    foreach ($r in $Rows) {
+        if ($null -eq $r) { continue }
+        foreach ($p in $r.PSObject.Properties) {
+            if ($p.Value -is [string]) { $p.Value = ConvertTo-CleanText $p.Value }
+        }
+    }
+}
+
 # Unwrap a returnApplicationVms REST response to a JSON object.
 # The action returns a JSON string (vRO envelope at value.string.value); ConvertFrom-Json it.
 function Get-VroJson {
@@ -773,7 +860,7 @@ function Invoke-VroActionWithLogs {
     }
     catch { return [PSCustomObject]@{ Value = $null; LogText = ""; LogEndpoint = "run-failed: $($_.Exception.Message)"; ExecId = $null } }
 
-    $logText = ""; $usedEndpoint = "none"
+    $logText = ""; $usedEndpoint = "none"; $logAttempts = 0
     if ($execId) {
         # Action-log endpoint (vRO 8.x): keyed on the EXECUTION ID directly,
         # NOT under module/name:
@@ -782,42 +869,68 @@ function Invoke-VroActionWithLogs {
         # DEBUG level. Without conditions=severity=debug the endpoint returns only the
         # handful of info-level factory lines and the upstream block is absent.
         # This condition set matches what the vRO web UI itself sends.
+        # $MaxLogResults caps the response - too low and the relationship block
+        # (which appears late in the run) gets chopped off. See the config comment.
         $actionsRoot = "https://$VraServer/vco/api/actions"
         $debugConds = @(
             "conditions=severity=debug"
             "conditions=localonly=false"
             "conditions=type=both"
         ) -join "&"
+        $capPrimary = if ($MaxLogResults -and $MaxLogResults -gt 0) { $MaxLogResults } else { 2000 }
         $candidates = @(
-            "$actionsRoot/$execId/logs?$debugConds&maxResult=300",
+            "$actionsRoot/$execId/logs?$debugConds&maxResult=$capPrimary",
             "$actionsRoot/$execId/logs?maxResult=10000",
             "$base/executions/$execId/syslogs?maxResult=10000",
             "$base/executions/$execId/logs?maxResult=10000"
         )
-        foreach ($cand in $candidates) {
-            try {
-                $logResp = Invoke-RestMethod -Uri $cand -Method Get -Headers $headers -TimeoutSec 60
-                $lines = @()
-                foreach ($e in @($logResp.logs)) {
-                    # This appliance serialises the nested form: logs[].entry.*
-                    # Newer published model uses top-level logs[].* - handle both.
-                    $entry = if ($e.entry) { $e.entry } else { $e }
-                    $m = $null
-                    if     ($entry.'long-message')     { $m = $entry.'long-message' }
-                    elseif ($entry.'long-description') { $m = $entry.'long-description' }
-                    elseif ($entry.'short-message')    { $m = $entry.'short-message' }
-                    elseif ($entry.'short-description'){ $m = $entry.'short-description' }
-                    elseif ($entry.message)            { $m = $entry.message }
-                    if ($m) { $lines += $m }
+
+        # Retry loop: re-fetches when the log came back with CI info but no
+        # relationship block, which is the partial-log signature (timing/pagination).
+        # Same execId, same URL - only the server-side log state may differ. Stops
+        # early when the relationship block appears or when there's genuinely no
+        # CI info (indicating the action's own query returned nothing to log).
+        $maxAttempts = 1 + [Math]::Max(0, [int]$LogFetchRetries)
+        for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            $logAttempts = $attempt
+            $logText = ""; $usedEndpoint = "none"
+            foreach ($cand in $candidates) {
+                try {
+                    $logResp = Invoke-RestMethod -Uri $cand -Method Get -Headers $headers -TimeoutSec 60
+                    $lines = @()
+                    foreach ($e in @($logResp.logs)) {
+                        # This appliance serialises the nested form: logs[].entry.*
+                        # Newer published model uses top-level logs[].* - handle both.
+                        $entry = if ($e.entry) { $e.entry } else { $e }
+                        $m = $null
+                        if     ($entry.'long-message')     { $m = $entry.'long-message' }
+                        elseif ($entry.'long-description') { $m = $entry.'long-description' }
+                        elseif ($entry.'short-message')    { $m = $entry.'short-message' }
+                        elseif ($entry.'short-description'){ $m = $entry.'short-description' }
+                        elseif ($entry.message)            { $m = $entry.message }
+                        if ($m) { $lines += $m }
+                    }
+                    if (-not $lines -and $logResp -is [string]) { $lines = @($logResp) }
+                    if ($lines) { $logText = ($lines -join "`n"); $usedEndpoint = $cand; break }
                 }
-                if (-not $lines -and $logResp -is [string]) { $lines = @($logResp) }
-                if ($lines) { $logText = ($lines -join "`n"); $usedEndpoint = $cand; break }
+                catch { continue }
             }
-            catch { continue }
+
+            # Decide whether to retry. Only retry the partial-log case (CI info yes,
+            # relationship no). Everything else - full log, empty log, log without
+            # any CI markers - is either done or a genuine "no data" case.
+            if ($attempt -ge $maxAttempts) { break }
+            $hasCi = ($logText -match 'retrieveCiInfoByKey')
+            $hasRel = ($logText -match 'upstreamCIs')
+            if ($hasCi -and -not $hasRel) {
+                Start-Sleep -Milliseconds ([Math]::Max(0, [int]$LogFetchRetryDelayMs))
+                continue
+            }
+            break
         }
     }
 
-    return [PSCustomObject]@{ Value = $value; LogText = $logText; LogEndpoint = $usedEndpoint; ExecId = $execId }
+    return [PSCustomObject]@{ Value = $value; LogText = $logText; LogEndpoint = $usedEndpoint; ExecId = $execId; LogAttempts = $logAttempts }
 }
 
 # Build the review fields for one VM result object
@@ -1034,6 +1147,7 @@ function Invoke-CmdbReview {
             runMode           = $runMode
             execId            = $runRes.ExecId
             logEndpoint       = $runRes.LogEndpoint
+            logAttempts       = $runRes.LogAttempts
             logChars          = $logTextStr.Length
             hasRelMarker      = ($logTextStr -match 'retrieveCIRelationshipInfoByKey')
             hasCiInfoMarker   = ($logTextStr -match 'retrieveCiInfoByKey')
@@ -1644,7 +1758,10 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
     $body = "[" + (($bodyArray | ForEach-Object { $_ | ConvertTo-Json -Depth 5 -Compress }) -join ",") + "]"
 
     try {
-        $response = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body
+        # 60s per-call timeout so a hung form-service endpoint fails this VM's job
+        # fast, freeing the runspace for the next job, instead of waiting out the
+        # wall-clock $jobTimeoutSeconds (120s) that governs the whole runspace slot.
+        $response = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body -TimeoutSec 60
 
         $appApplications = [System.Collections.ArrayList]::new()
         $infraOs = ""
@@ -2400,7 +2517,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
             $reviewed++
             if ($reviewed % $IncrementalSaveEvery -eq 0) {
                 Write-Log " Reviewed $reviewed / $reviewTotal (saving partial)" -Color Gray
-                try { $results | Select-Object $exportColumns | Export-Csv -Path $partialCsvPath -NoTypeInformation -Encoding UTF8 } catch { }
+                try { Invoke-CleanResultsInPlace -Rows $results; $results | Select-Object $exportColumns | Export-Csv -Path $partialCsvPath -NoTypeInformation -Encoding UTF8 } catch { }
             }
         }
     }
@@ -2559,7 +2676,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
             $reviewed++
             if ($reviewed % $IncrementalSaveEvery -eq 0) {
                 Write-Log " Reviewed $reviewed / $reviewTotal (saving partial)" -Color Gray
-                try { $results | Select-Object $exportColumns | Export-Csv -Path $partialCsvPath -NoTypeInformation -Encoding UTF8 } catch { }
+                try { Invoke-CleanResultsInPlace -Rows $results; $results | Select-Object $exportColumns | Export-Csv -Path $partialCsvPath -NoTypeInformation -Encoding UTF8 } catch { }
             }
         }
 
@@ -2569,7 +2686,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
     Write-Log " Review complete: $reviewed VMs" -Color Green
     if ($reviewFailed.Count -gt 0) {
         Write-Log " Review failures: $($reviewFailed.Count) - see $failedCsvPath" -Color Yellow
-        try { $reviewFailed | Export-Csv -Path $failedCsvPath -NoTypeInformation -Encoding UTF8 } catch { }
+        try { Invoke-CleanResultsInPlace -Rows $reviewFailed; $reviewFailed | Export-Csv -Path $failedCsvPath -NoTypeInformation -Encoding UTF8 } catch { }
     }
 }
 
@@ -2584,94 +2701,8 @@ Write-Log "Mismatches: $(($results | Where-Object { $_.CompareResult -eq 'Mismat
 Write-Log "Missing Data: $(($results | Where-Object { $_.CompareResult -eq 'Missing Data' }).Count)" -Color Gray
 Write-Log "Time elapsed: $($stopwatch.Elapsed.ToString('hh\:mm\:ss'))" -Color White
 
-# Normalise typographic characters that mangle in CSV, and repair mojibake.
-#
-# Two distinct problems are handled here:
-#
-# 1. FULL mojibake - all the mis-decoded bytes survived, e.g. an en dash (U+2013 =
-#    E2 80 93) read as Windows-1252 becomes three characters. Round-tripping the
-#    string back through CP1252 -> UTF-8 reverses the mis-decode cleanly.
-#
-# 2. PARTIAL mojibake - only the lead byte survived, leaving an orphan "a-with-
-#    circumflex" with the trailing bytes gone. The round-trip CANNOT recover this
-#    (0xE2 alone is not valid UTF-8, so it decodes to the replacement character and
-#    the guard correctly rejects the result). These are matched as literal sequences
-#    instead. An orphan surrounded by spaces is treated as a dash, which is the
-#    overwhelmingly common source, but it IS a guess - the original bytes are gone.
-#
-# Root cause is upstream: Windows PowerShell's Invoke-RestMethod falls back to
-# ISO-8859-1 when a response carries no charset in its Content-Type, so UTF-8 bytes
-# are decoded as single-byte characters before this function ever sees them.
-# Repairing here is a workaround, not a fix at source.
-function ConvertTo-CleanText {
-    param($s)
-    if ($null -eq $s) { return $s }
-    $s = [string]$s
-
-    # --- 1. Round-trip repair ----------------------------------------------
-    # Windows PowerShell's Invoke-RestMethod falls back to ISO-8859-1 (Latin-1) when
-    # a response carries no charset in its Content-Type, so UTF-8 bytes arrive decoded
-    # one byte per character. An en dash (E2 80 93) becomes three characters:
-    # a-circumflex plus TWO C1 CONTROL characters, which render as nothing in Excel -
-    # so the cell LOOKS like a lone a-circumflex when the bytes are all still present.
-    #
-    # Latin-1 is tried FIRST because it is the actual PowerShell default and is a
-    # straight 1:1 byte mapping, so it can always re-encode what it decoded. CP1252
-    # is tried second for data that came through a CP1252 path instead; it cannot
-    # represent the C1 controls, so it must not be tried first.
-    # A repair is kept only when it parses as valid UTF-8 and yields no replacement
-    # character - otherwise the original string is left untouched.
-    if ($s -match "[$([char]0x0080)-$([char]0x009F)$([char]0x00E2)$([char]0x00C2)$([char]0x20AC)]") {
-        foreach ($cp in @(28591, 1252)) {
-            try {
-                $enc      = [Text.Encoding]::GetEncoding($cp, [Text.EncoderFallback]::ExceptionFallback, [Text.DecoderFallback]::ExceptionFallback)
-                $bytes    = $enc.GetBytes($s)
-                $strictU8 = [Text.Encoding]::GetEncoding('utf-8', [Text.EncoderFallback]::ExceptionFallback, [Text.DecoderFallback]::ExceptionFallback)
-                $repaired = $strictU8.GetString($bytes)
-                if ($repaired -notmatch [char]0xFFFD) { $s = $repaired; break }
-            }
-            catch { continue }   # not encodable in this codepage, or not valid UTF-8
-        }
-    }
-
-    # --- 2. Literal mojibake sequences -------------------------------------
-    # Fallback for strings the round-trip could not repair. Each key is what the
-    # UTF-8 encoding of that character looks like after a CP1252 mis-decode.
-    $map = [ordered]@{
-        "$([char]0x00E2)$([char]0x20AC)$([char]0x201C)" = '-'    # en dash   U+2013
-        "$([char]0x00E2)$([char]0x20AC)$([char]0x201D)" = '-'    # em dash   U+2014
-        "$([char]0x00E2)$([char]0x20AC)$([char]0x02DC)" = "'"    # open quote  U+2018
-        "$([char]0x00E2)$([char]0x20AC)$([char]0x2122)" = "'"    # close quote U+2019
-        "$([char]0x00E2)$([char]0x20AC)$([char]0x0153)" = '"'    # open dquote U+201C
-        "$([char]0x00E2)$([char]0x20AC)$([char]0x00A6)" = '...'  # ellipsis  U+2026
-        "$([char]0x00C2)$([char]0x00A0)"                = ' '    # NBSP      U+00A0
-    }
-    foreach ($k in $map.Keys) { $s = $s.Replace($k, $map[$k]) }
-
-    # --- 3. Latin-1 form that survived an unrepairable round-trip -----------
-    # a-circumflex followed by the C1 controls for an en/em dash.
-    $s = $s -replace "$([char]0x00E2)[$([char]0x0080)-$([char]0x009F)][$([char]0x0080)-$([char]0x009F)]", '-'
-    # Any remaining C1 control characters are never legitimate in a CI name.
-    $s = $s -replace "[$([char]0x0080)-$([char]0x009F)]", ''
-
-    # --- 4. Typographic characters to plain ASCII --------------------------
-    $s = $s -replace [char]0x2013, '-' -replace [char]0x2014, '-'
-    $s = $s -replace [char]0x00A0, ' '
-    $s = $s -replace [char]0x2018, "'" -replace [char]0x2019, "'"
-    $s = $s -replace [char]0x201C, '"' -replace [char]0x201D, '"'
-    $s = $s -replace [char]0xFFFD, ''
-
-    # Collapse any double spacing the substitutions introduced
-    $s = $s -replace '  +', ' '
-    return $s.Trim()
-}
-
 # Export results (CompareResult kept internal for console/summary; CSV uses NSXMatchCMDB)
-foreach ($r in $results) {
-    foreach ($p in $r.PSObject.Properties) {
-        if ($p.Value -is [string]) { $p.Value = ConvertTo-CleanText $p.Value }
-    }
-}
+Invoke-CleanResultsInPlace -Rows $results
 $resultsPath = "$resultsDir\CMDBRelations_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
 $results | Select-Object $exportColumns | Export-Csv -Path $resultsPath -NoTypeInformation -Encoding UTF8
 Write-Log "`nResults saved: $resultsPath" -Color White
