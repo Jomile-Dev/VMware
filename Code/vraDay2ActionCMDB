@@ -585,7 +585,13 @@ function Invoke-CleanResultsInPlace {
     foreach ($r in $Rows) {
         if ($null -eq $r) { continue }
         foreach ($p in $r.PSObject.Properties) {
-            if ($p.Value -is [string]) { $p.Value = ConvertTo-CleanText $p.Value }
+            if ($p.Value -is [string]) {
+                # Per-property try/catch: a malformed string that trips the regex or
+                # encoding round-trip must not kill the whole export. On failure the
+                # original value is kept - imperfect but complete beats missing.
+                try   { $p.Value = ConvertTo-CleanText $p.Value }
+                catch { }
+            }
         }
     }
 }
@@ -2701,11 +2707,31 @@ Write-Log "Mismatches: $(($results | Where-Object { $_.CompareResult -eq 'Mismat
 Write-Log "Missing Data: $(($results | Where-Object { $_.CompareResult -eq 'Missing Data' }).Count)" -Color Gray
 Write-Log "Time elapsed: $($stopwatch.Elapsed.ToString('hh\:mm\:ss'))" -Color White
 
-# Export results (CompareResult kept internal for console/summary; CSV uses NSXMatchCMDB)
-Invoke-CleanResultsInPlace -Rows $results
+# Export results (CompareResult kept internal for console/summary; CSV uses NSXMatchCMDB).
+# The cleanup and export are wrapped so a failure in either doesn't silently leave
+# only PARTIAL.csv behind as the "output" - the console will say plainly whether
+# the timestamped file landed. On success PARTIAL is removed so the folder holds
+# just the definitive output.
 $resultsPath = "$resultsDir\CMDBRelations_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
-$results | Select-Object $exportColumns | Export-Csv -Path $resultsPath -NoTypeInformation -Encoding UTF8
-Write-Log "`nResults saved: $resultsPath" -Color White
+$finalExportOK = $false
+try {
+    Invoke-CleanResultsInPlace -Rows $results
+    $results | Select-Object $exportColumns | Export-Csv -Path $resultsPath -NoTypeInformation -Encoding UTF8
+    $finalExportOK = $true
+    Write-Log "`nResults saved: $resultsPath" -Color Green
+}
+catch {
+    Write-Log "`nFinal export FAILED: $($_.Exception.Message)" -Color Red
+    Write-Log "PARTIAL.csv (last incremental save) may still be at $partialCsvPath" -Color Yellow
+}
+
+if ($finalExportOK -and (Test-Path $partialCsvPath)) {
+    try {
+        Remove-Item -Path $partialCsvPath -Force
+        Write-Log "Removed superseded partial: $partialCsvPath" -Color Gray
+    }
+    catch { }
+}
 
 # Email report
 if ($SendEmail) {
