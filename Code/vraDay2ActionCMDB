@@ -90,7 +90,7 @@ $MaxDeployments   = 0
 # this well below the Phase 1 pool size. 1 = sequential (original behaviour).
 # Raise gradually and watch $failedCsvPath for throttling/timeouts.
 $ReviewPoolSize       = 6
-$ReviewJobTimeoutSec  = 180
+$ReviewJobTimeoutSec  = 300
 
 # Project placement CAG fetch parallelism. One CAG call per project in the estate
 # (two when $phasedOutEnabled is $true), done once on the main thread before the
@@ -111,6 +111,15 @@ $PlacementJobTimeoutSec = 180
 $MaxLogResults        = 2000
 $LogFetchRetries      = 2
 $LogFetchRetryDelayMs = 1500
+
+# Review-phase upstream rerun. When a VM's getVmApplications run yields no
+# Application / Sub-Application upstream (blank VM Upstream CI, "No upstream"),
+# the action is executed AGAIN as a fresh run - not just a log re-fetch - because
+# the empty result comes from the action's own CMDB query, the same intermittent
+# behaviour seen in the day-2 form. VMs that genuinely have no upstream pay the
+# extra runs, so keep this small. Set $UpstreamRerunRetries = 0 to disable.
+$UpstreamRerunRetries = 2
+$UpstreamRerunDelayMs = 3000
 
 # Save a partial CSV every N reviewed VMs, so a long run that dies part-way still
 # leaves usable output. Failed VMs are listed separately for a targeted re-run.
@@ -1169,50 +1178,77 @@ function Invoke-CmdbReview {
     $upstreamCIs = @()
     $ciStatuses  = @()
     $returnRaws  = @()
-    try {
-        if ($UseWorkflowLogs -and $WorkflowId -and $WorkflowId -notmatch '^<') {
-            # Optional: run a wrapper workflow and read its run log
-            $wfInputs = @{}
-            $wfInputs[$WfInputVmName]      = $Vm.VMName
-            $wfInputs[$WfInputProjectName] = $Vm.ProjectName
-            $runRes = Invoke-VroWorkflowWithLogs -VraServer $VraServer -AuthToken $AuthToken -WorkflowId $WorkflowId -Parameters $wfInputs -WaitSec $WorkflowWaitSec
-            $runMode = "workflow"
-        }
-        else {
-            # Default: action execution + debug-level action log (confirmed working)
-            $runRes = Invoke-VroActionWithLogs -VraServer $VraServer -AuthToken $AuthToken -ActionUri $GetVmAppsUri -Parameters @{
-                vmName      = $Vm.VMName
-                projectName = $Vm.ProjectName
+    $upstreamAttempts = 0
+    $maxUpstreamAttempts = 1 + [Math]::Max(0, [int]$UpstreamRerunRetries)
+    for ($uAttempt = 1; $uAttempt -le $maxUpstreamAttempts; $uAttempt++) {
+        $upstreamAttempts = $uAttempt
+        $attemptUpstreams = @()
+        $attemptStatuses  = @()
+        $runError = $null
+        try {
+            if ($UseWorkflowLogs -and $WorkflowId -and $WorkflowId -notmatch '^<') {
+                # Optional: run a wrapper workflow and read its run log
+                $wfInputs = @{}
+                $wfInputs[$WfInputVmName]      = $Vm.VMName
+                $wfInputs[$WfInputProjectName] = $Vm.ProjectName
+                $runRes = Invoke-VroWorkflowWithLogs -VraServer $VraServer -AuthToken $AuthToken -WorkflowId $WorkflowId -Parameters $wfInputs -WaitSec $WorkflowWaitSec
+                $runMode = "workflow"
             }
-            $runMode = "action"
+            else {
+                # Default: action execution + debug-level action log (confirmed working)
+                $runRes = Invoke-VroActionWithLogs -VraServer $VraServer -AuthToken $AuthToken -ActionUri $GetVmAppsUri -Parameters @{
+                    vmName      = $Vm.VMName
+                    projectName = $Vm.ProjectName
+                }
+                $runMode = "action"
+            }
+            $logTextStr = if ($runRes.LogText) { [string]$runRes.LogText } else { '' }
+            $returnRaws += [ordered]@{
+                vmName            = $Vm.VMName
+                upstreamAttempt   = $uAttempt
+                runMode           = $runMode
+                execId            = $runRes.ExecId
+                logEndpoint       = $runRes.LogEndpoint
+                logAttempts       = $runRes.LogAttempts
+                logChars          = $logTextStr.Length
+                hasRelMarker      = ($logTextStr -match 'retrieveCIRelationshipInfoByKey')
+                hasCiInfoMarker   = ($logTextStr -match 'retrieveCiInfoByKey')
+                hasUpstreamCIs    = ($logTextStr -match 'upstreamCIs')
+                log               = $logTextStr
+                value             = $runRes.Value
+            }
+            # Upstream CIs: from the log's retrieveCIRelationshipInfoByKey block
+            # (falls back to the return value if it ever carries the JSON)
+            $attemptUpstreams += @(Get-UpstreamCIsFromLog -LogText $runRes.LogText)
+            $obj = Get-VroJson -Response $runRes.Value
+            $attemptUpstreams += @(Get-UpstreamCIs -Obj $obj)
+            # CI Status (disposed/retired) : from retrieveCiInfoByKey.Information[]
+            # in the return AND the log - covers decomm even with no upstream
+            $attemptStatuses += @(Get-CiStatuses -Obj $obj)
+            $attemptStatuses += @(Get-CiStatusesFromLog -LogText $runRes.LogText)
         }
-        $logTextStr = if ($runRes.LogText) { [string]$runRes.LogText } else { '' }
-        $returnRaws += [ordered]@{
-            vmName            = $Vm.VMName
-            runMode           = $runMode
-            execId            = $runRes.ExecId
-            logEndpoint       = $runRes.LogEndpoint
-            logAttempts       = $runRes.LogAttempts
-            logChars          = $logTextStr.Length
-            hasRelMarker      = ($logTextStr -match 'retrieveCIRelationshipInfoByKey')
-            hasCiInfoMarker   = ($logTextStr -match 'retrieveCiInfoByKey')
-            hasUpstreamCIs    = ($logTextStr -match 'upstreamCIs')
-            log               = $logTextStr
-            value             = $runRes.Value
+        catch {
+            $runError = $_.Exception.Message
+            $returnRaws += [ordered]@{ vmName = $Vm.VMName; upstreamAttempt = $uAttempt; error = $runError }
         }
-        # Upstream CIs: from the log's retrieveCIRelationshipInfoByKey block
-        # (falls back to the return value if it ever carries the JSON)
-        $upstreamCIs += @(Get-UpstreamCIsFromLog -LogText $runRes.LogText)
-        $obj = Get-VroJson -Response $runRes.Value
-        $upstreamCIs += @(Get-UpstreamCIs -Obj $obj)
-        # CI Status (disposed/retired) : from retrieveCiInfoByKey.Information[]
-        # in the return AND the log - covers decomm even with no upstream
-        $ciStatuses += @(Get-CiStatuses -Obj $obj)
-        $ciStatuses += @(Get-CiStatusesFromLog -LogText $runRes.LogText)
+        $attemptUpstreams = @($attemptUpstreams | Where-Object { $_ })
+
+        # Keep the richest upstream set seen across attempts; statuses are unioned
+        # (the decomm check de-duplicates them).
+        if ($attemptUpstreams.Count -gt $upstreamCIs.Count) { $upstreamCIs = $attemptUpstreams }
+        $ciStatuses += @($attemptStatuses | Where-Object { $_ })
+
+        # Stop once an Application / Sub-Application upstream is present - that is
+        # what VM Upstream CI and the NSX comparison depend on.
+        $hasAppUpstream = @($upstreamCIs | Where-Object {
+            (Get-AppTier (Get-FirstFieldValue -Object $_ -Fields $ClassFields)) -in @('Application','SubApplication')
+        }).Count -gt 0
+        if ($hasAppUpstream -or $uAttempt -ge $maxUpstreamAttempts) { break }
+        Start-Sleep -Milliseconds ([Math]::Max(0, [int]$UpstreamRerunDelayMs))
     }
-    catch { }
     $upstreamCIs = @($upstreamCIs | Where-Object { $_ })
-    $ciStatuses  = @($ciStatuses  | Where-Object { $_ })
+    $ciStatuses  = @($ciStatuses  | Select-Object -Unique | Where-Object { $_ })
+    $upstreamFoundOnRerun = ($upstreamAttempts -gt 1 -and $hasAppUpstream)
 
     $upstreamToApp = "N/A"; $multiUpstream = "No multiple upstream"; $noUpstream = "N/A"; $decomm = "No"
     $upstreamTo = ""; $multiUpstreamCI = ""
@@ -1671,6 +1707,7 @@ function Invoke-CmdbReview {
             ClassFieldsRead  = @($upstreamCIs | ForEach-Object { Get-FirstFieldValue -Object $_ -Fields $ClassFields })
             UpstreamStatuses = @($upstreamCIs | ForEach-Object { $_.UpstreamCIStatus })
             CiStatuses       = $ciStatuses
+            UpstreamAttempts = $upstreamAttempts
             RawReturnAppVms  = $returnRaws
         }
         "==================== $($Vm.VMName) ====================" | Add-Content -Path $DebugPath -Encoding UTF8
@@ -1693,6 +1730,8 @@ function Invoke-CmdbReview {
         Decommissioned         = $decomm
         UpstreamLifecycleStatus = $lifecycleStatus
         UpstreamAppCag         = $upstreamAppCag
+        UpstreamAttempts       = $upstreamAttempts
+        UpstreamFoundOnRerun   = $upstreamFoundOnRerun
     }
 }
 
@@ -2543,6 +2582,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
     $appStatusCache = [hashtable]::Synchronized(@{})
 
     $reviewed = 0
+    $upstreamRescued = 0
     $reviewFailed = [System.Collections.Generic.List[object]]::new()
 
     if ($ReviewPoolSize -le 1) {
@@ -2567,6 +2607,10 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
                 Add-Member -InputObject $vm -NotePropertyName Decommissioned         -NotePropertyValue $rev.Decommissioned         -Force
                 Add-Member -InputObject $vm -NotePropertyName UpstreamLifecycleStatus -NotePropertyValue $rev.UpstreamLifecycleStatus -Force
                 Add-Member -InputObject $vm -NotePropertyName UpstreamAppCag         -NotePropertyValue $rev.UpstreamAppCag         -Force
+                if ($rev.UpstreamFoundOnRerun) {
+                    Write-Log "   [upstream found on attempt $($rev.UpstreamAttempts)]" -Color Green
+                    $upstreamRescued++
+                }
             }
             catch {
                 $reviewFailed.Add([PSCustomObject]@{ VMName = $vm.VMName; ProjectName = $vm.ProjectName; Error = $_.Exception.Message })
@@ -2598,6 +2642,15 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
                     (New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry($fn, $cmd.Definition))
                 )
             }
+        }
+
+        # Script-level config the injected helpers read. Runspace workers do not see
+        # the script's variables, so without this the log re-fetch and upstream
+        # rerun settings silently evaluate to empty (i.e. no retries) in parallel mode.
+        foreach ($vn in @('MaxLogResults','LogFetchRetries','LogFetchRetryDelayMs','UpstreamRerunRetries','UpstreamRerunDelayMs')) {
+            $iss.Variables.Add(
+                (New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry($vn, (Get-Variable -Name $vn -ValueOnly), ''))
+            )
         }
 
         $reviewPool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $ReviewPoolSize, $iss, $Host)
@@ -2724,6 +2777,10 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
                 Add-Member -InputObject $vm -NotePropertyName Decommissioned         -NotePropertyValue $rev.Decommissioned         -Force
                 Add-Member -InputObject $vm -NotePropertyName UpstreamLifecycleStatus -NotePropertyValue $rev.UpstreamLifecycleStatus -Force
                 Add-Member -InputObject $vm -NotePropertyName UpstreamAppCag         -NotePropertyValue $rev.UpstreamAppCag         -Force
+                if ($rev.UpstreamFoundOnRerun) {
+                    Write-Log " [$($reviewed + 1)/$reviewTotal] $($vm.VMName) | upstream found on attempt $($rev.UpstreamAttempts)" -Color Green
+                    $upstreamRescued++
+                }
 
                 if ($ReviewDebug -and $out.DebugText) {
                     $out.DebugText | Add-Content -Path $ReviewDebugPath -Encoding UTF8
@@ -2745,6 +2802,9 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
     }
 
     Write-Log " Review complete: $reviewed VMs" -Color Green
+    if ($UpstreamRerunRetries -gt 0) {
+        Write-Log " Upstream found on rerun: $upstreamRescued VM(s)" -Color $(if ($upstreamRescued -gt 0) { 'Yellow' } else { 'Gray' })
+    }
     if ($reviewFailed.Count -gt 0) {
         Write-Log " Review failures: $($reviewFailed.Count) - see $failedCsvPath" -Color Yellow
         try { Invoke-CleanResultsInPlace -Rows $reviewFailed; $reviewFailed | Export-Csv -Path $failedCsvPath -NoTypeInformation -Encoding UTF8 } catch { }
