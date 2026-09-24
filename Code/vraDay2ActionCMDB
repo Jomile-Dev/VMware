@@ -38,7 +38,6 @@ $returnAppVmsUri  = "<module-namespace>/returnApplicationsVms"
 $UpstreamClassFields = @('UpstreamCICMSClass', 'UpstreamCIType')
 
 $phasedOutEnabled = $true
-$RunReview        = $true
 
 # Project placement check: compare the VM's upstream app against the CAG catalogue
 # of the VM's OWN project. A VM whose upstream app belongs to a different project's
@@ -49,37 +48,19 @@ $RunReview        = $true
 # the review starts. Set to $false to skip the check and the fetches entirely.
 $CheckProjectPlacement = $true
 
-# Replay: skip the slow deployment fetch + main runspace phase and load a prior
-# snapshot CSV straight into $results, then run the review against it.
-$ReplayFromCsv    = $false
-$ReplayCsvPath    = Join-Path $resultsDir "results_snapshot.csv"
-
-
-# Review only the first N VMs (0 = all). Handy for troubleshooting.
-$ReviewLimit      = 0
-
-# Review only one specific VM (by exact name; blank = ignored). Overrides $ReviewLimit.
-# Both Phase 1 and the review are narrowed to just this VM, so runs are fast.
-# NOTE: the deployment fetch runs first and only sees VMs inside deployments it
-# fetched. If $MaxDeployments caps the fetch before the target VM's deployment,
-# nothing matches - keep $MaxDeployments = 0 when using $ReviewOnlyVM. Turn on
-# $ReviewDebug = $true and read $ReviewDebugPath to see the raw responses for
-# that VM.
-$ReviewOnlyVM     = ""
-
-# Fetch only the first N deployments that contain eligible VMs (0 = all).
-# Handy for troubleshooting - empty/deleted deployments don't count toward N.
-$MaxDeployments   = 0
+# Phase 1 (NSX tag fetch) parallelism and per-VM wall clock.
+$poolSize          = 30
+$jobTimeoutSeconds = 120
 
 # Review-phase parallelism. The review makes real CMDB calls through vRO, so keep
-# this well below the Phase 1 pool size. 1 = sequential (original behaviour).
+# this well below the Phase 1 pool size. 1 = one VM at a time.
 # Raise gradually and watch $failedCsvPath for throttling/timeouts.
 $ReviewPoolSize       = 6
 $ReviewJobTimeoutSec  = 300
 
 # Project placement CAG fetch parallelism. One CAG call per project in the estate
 # (two when $phasedOutEnabled is $true), done once on the main thread before the
-# review starts. 1 = sequential; raise for large estates.
+# review starts. 1 = one project at a time; raise for large estates.
 $PlacementPoolSize    = 6
 # Per-project wall clock. Covers the CAG call's retries (up to 3 attempts with
 # 2s gaps, and twice that when $phasedOutEnabled is $true). A project whose job
@@ -109,10 +90,6 @@ $UpstreamRerunDelayMs = 3000
 # Save a partial CSV every N reviewed VMs, so a long run that dies part-way still
 # leaves usable output. Failed VMs are listed separately for a targeted re-run.
 $IncrementalSaveEvery = 50
-
-# Write raw + parsed vRO responses per reviewed VM to a file for troubleshooting.
-$ReviewDebug      = $false
-$ReviewDebugPath  = Join-Path $resultsDir "review_debug.txt"
 
 # Partial output (rewritten every $IncrementalSaveEvery VMs) and the failed-VM list
 $partialCsvPath   = Join-Path $resultsDir "CMDBRelations_PARTIAL.csv"
@@ -162,7 +139,6 @@ $exportColumns = @(
 # NSX Manager Configuration (fallback for VMs with empty AppApplication)
 $NSXManager    = "nsx-manager.company.com"
 $NSXAuthMode   = "vIDM"
-$NSXvIDMDomain = "COMPANY"
 $NSXCredPath   = "C:\Scripts\Creds\nsx_cred.xml"
 
 function Write-Log {
@@ -175,10 +151,14 @@ function Write-Log {
 # scriptblock form throws "There is no Runspace available to run scripts in this
 # thread" when the request runs on a background thread, which surfaces as
 # "The underlying connection was closed: An unexpected error occurred on a send."
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-[System.Net.ServicePointManager]::Expect100Continue = $false
-if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
-    Add-Type @"
+# One definition, used by the main thread and injected into every runspace pool.
+# ServicePointManager settings are process-wide; each worker still calls this so
+# the policy is guaranteed in force regardless of what ran before it.
+function Enable-TrustAllCerts {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    [System.Net.ServicePointManager]::Expect100Continue = $false
+    if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
+        Add-Type @"
 using System.Net;
 using System.Security.Cryptography.X509Certificates;
 public class TrustAllCertsPolicy : ICertificatePolicy {
@@ -187,9 +167,36 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
         WebRequest request, int certificateProblem) { return true; }
 }
 "@
+    }
+    [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+    [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $null
 }
-[System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
-[System.Net.ServicePointManager]::ServerCertificateValidationCallback = $null
+Enable-TrustAllCerts
+
+# ---------------------------------------------------------------------------
+# Run log + output housekeeping. Only the LATEST run is kept in $resultsDir:
+#   - older run logs are removed here, before this run's log starts
+#   - older report CSVs are removed only after this run's report is saved, so a
+#     failed run never leaves you with no report at all
+#   - the failed-VM list is per run, so the previous one is removed here
+# Only files this script creates are touched (CMDBRelations_yyyyMMdd_HHmmss.csv/.log
+# and CMDBRelations_FAILED.csv).
+# ---------------------------------------------------------------------------
+$runStamp       = Get-Date -Format 'yyyyMMdd_HHmmss'
+$runLogPath     = Join-Path $resultsDir "CMDBRelations_$runStamp.log"
+$runOutputRegex = '^CMDBRelations_\d{8}_\d{6}\.(csv|log)$'
+if (-not (Test-Path $resultsDir)) { New-Item -ItemType Directory -Path $resultsDir -Force | Out-Null }
+
+Get-ChildItem -Path $resultsDir -File -Filter 'CMDBRelations_*.log' -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -match $runOutputRegex } |
+    ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+if (Test-Path $failedCsvPath) { Remove-Item -LiteralPath $failedCsvPath -Force -ErrorAction SilentlyContinue }
+
+# A transcript left open by an interrupted previous run (e.g. Ctrl+C in ISE)
+# would make Start-Transcript fail, so close any that is still running.
+try { Stop-Transcript -ErrorAction Stop | Out-Null } catch { $null = $_ }
+try { Start-Transcript -Path $runLogPath -Force | Out-Null }
+catch { Write-Host "Could not start run log: $($_.Exception.Message)" -ForegroundColor Yellow }
 
 # Authenticate to VMware Aria
 Write-Log "=== AUTHENTICATION ===" -Color Cyan
@@ -804,7 +811,6 @@ function Invoke-VroActionWithLogs {
     return [PSCustomObject]@{ Value = $value; LogText = $logText; LogEndpoint = $usedEndpoint; ExecId = $execId; LogAttempts = $logAttempts }
 }
 
-# Build the review fields for one VM result object
 # Resolve an application / sub-application: its own status AND its own upstreams.
 # Second hop of the chain. The VM's upstream gives us the Sub-App name only;
 # returnApplicationVms takes applicationName, so run it and read both the CI status
@@ -819,6 +825,7 @@ function Get-AppDecommStatus {
     $statuses = @()
     $ownUpstreams = @()
     $classes = @()
+    $lookupError = $null
     try {
         $res = Invoke-VroActionWithLogs -VraServer $VraServer -AuthToken $AuthToken `
             -ActionUri $ReturnAppVmsUri -Parameters @{ applicationName = $AppName }
@@ -837,7 +844,10 @@ function Get-AppDecommStatus {
             }
         }
     }
-    catch { }
+    catch {
+        $lookupError = $_.Exception.Message
+        Write-Log "   WARNING: returnApplicationVms failed for '$AppName': $lookupError" -Color Yellow
+    }
 
     $statuses = @($statuses | Where-Object { $_ } | Select-Object -Unique)
     $disposed = @($statuses | Where-Object { $_ -match 'dispos|retire|decommission|phased' })
@@ -859,7 +869,8 @@ function Get-AppDecommStatus {
         Classes      = $classes
         PrimaryClass = $primaryClass
     }
-    if ($Cache) { $Cache[$key] = $result }
+    # A failed lookup is not cached, so the next VM sharing this app tries again
+    if ($Cache -and -not $lookupError) { $Cache[$key] = $result }
     return $result
 }
 
@@ -867,7 +878,7 @@ function Get-AppDecommStatus {
 function Invoke-CmdbReview {
     param(
         $Vm, $Catalog, $VraServer, $AuthToken, $GetVmAppsUri, $ReturnAppVmsUri,
-        $PhasedOut, $ClassFields, $DebugPath,
+        $ClassFields,
         $AppStatusCache, $AppToProject, $AppClass
     )
 
@@ -983,7 +994,6 @@ function Invoke-CmdbReview {
     # Keyed on vmName + projectName (one call per VM).
     $upstreamCIs = @()
     $ciStatuses  = @()
-    $returnRaws  = @()
     $upstreamAttempts = 0
     $maxUpstreamAttempts = 1 + [Math]::Max(0, [int]$UpstreamRerunRetries)
     for ($uAttempt = 1; $uAttempt -le $maxUpstreamAttempts; $uAttempt++) {
@@ -997,20 +1007,6 @@ function Invoke-CmdbReview {
                 vmName      = $Vm.VMName
                 projectName = $Vm.ProjectName
             }
-            $logTextStr = if ($runRes.LogText) { [string]$runRes.LogText } else { '' }
-            $returnRaws += [ordered]@{
-                vmName            = $Vm.VMName
-                upstreamAttempt   = $uAttempt
-                execId            = $runRes.ExecId
-                logEndpoint       = $runRes.LogEndpoint
-                logAttempts       = $runRes.LogAttempts
-                logChars          = $logTextStr.Length
-                hasRelMarker      = ($logTextStr -match 'retrieveCIRelationshipInfoByKey')
-                hasCiInfoMarker   = ($logTextStr -match 'retrieveCiInfoByKey')
-                hasUpstreamCIs    = ($logTextStr -match 'upstreamCIs')
-                log               = $logTextStr
-                value             = $runRes.Value
-            }
             # Upstream CIs: from the log's retrieveCIRelationshipInfoByKey block
             # (falls back to the return value if it ever carries the JSON)
             $attemptUpstreams += @(Get-UpstreamCIsFromLog -LogText $runRes.LogText)
@@ -1023,7 +1019,6 @@ function Invoke-CmdbReview {
         }
         catch {
             $runError = $_.Exception.Message
-            $returnRaws += [ordered]@{ vmName = $Vm.VMName; upstreamAttempt = $uAttempt; error = $runError }
         }
         $attemptUpstreams = @($attemptUpstreams | Where-Object { $_ })
 
@@ -1043,6 +1038,9 @@ function Invoke-CmdbReview {
     $upstreamCIs = @($upstreamCIs | Where-Object { $_ })
     $ciStatuses  = @($ciStatuses  | Select-Object -Unique | Where-Object { $_ })
     $upstreamFoundOnRerun = ($upstreamAttempts -gt 1 -and $hasAppUpstream)
+    if ($runError -and -not $hasAppUpstream) {
+        Write-Log "   WARNING: getVmApplications failed for $($Vm.VMName) after $upstreamAttempts attempt(s): $runError" -Color Yellow
+    }
 
     $upstreamToApp = "N/A"; $multiUpstream = "No multiple upstream"; $noUpstream = "N/A"; $decomm = "No"
     $upstreamTo = ""; $multiUpstreamCI = ""
@@ -1069,8 +1067,6 @@ function Invoke-CmdbReview {
     })
     # Upstream to an Application is the correct end state; upstream to another
     # Sub-Application does not satisfy the rule and needs review.
-    $toApplication    = @($appUpstreams | Where-Object { (Get-AppTier (Get-FirstFieldValue -Object $_ -Fields $ClassFields)) -eq 'Application' })
-    $toSubApplication = @($appUpstreams | Where-Object { (Get-AppTier (Get-FirstFieldValue -Object $_ -Fields $ClassFields)) -eq 'SubApplication' })
 
     if ($appUpstreams.Count -gt 0) {
         # ---- FIRST HOP: what the VM is linked to ----
@@ -1207,7 +1203,7 @@ function Invoke-CmdbReview {
         #   - N/A         : no 2nd hop at all (VM's upstream is top of chain)
         #   - Unknown     : 2nd hop exists but its ConfigAdmin field was empty
         #   - One 2nd hop : ConfigAdmin(s) joined by "; "
-        #   - Multi hops  : "AppA: AdminX, AdminY | AppB: Unknown"
+        #   - Multi hops  : "AppA: AdminX, AdminY; AppB: Unknown"
         if ($secondHopCagMap.Count -eq 0) {
             $upstreamAppCag = "N/A"
         }
@@ -1224,7 +1220,7 @@ function Invoke-CmdbReview {
                 if ($cags.Count -eq 0) { $parts += "${k}: Unknown" }
                 else                   { $parts += "${k}: $($cags -join ', ')" }
             }
-            $upstreamAppCag = ($parts -join " | ")
+            $upstreamAppCag = ($parts -join "; ")
         }
     }
     elseif ($tags.Count -eq 0) {
@@ -1409,7 +1405,7 @@ function Invoke-CmdbReview {
                     $tagDecommHits += "$ciKey : $($tagApp.Disposed -join ', ')"
                 }
             }
-            catch { }
+            catch { Write-Log "   WARNING: decomm check failed for tag '$t' on $($Vm.VMName): $($_.Exception.Message)" -Color Yellow }
         }
 
         # and check whether the tag's app was previously phased out
@@ -1461,7 +1457,7 @@ function Invoke-CmdbReview {
                     $nsxTagDetail += "$t ($($tagStat.Disposed -join ', '))"
                 }
             }
-            catch { }
+            catch { Write-Log "   WARNING: NSX tag decomm check failed for '$t' on $($Vm.VMName): $($_.Exception.Message)" -Color Yellow }
         }
     }
     $nsxTagDetail = @($nsxTagDetail | Select-Object -Unique)
@@ -1480,31 +1476,6 @@ function Invoke-CmdbReview {
     }
     else {
         $decommCompare = "Both good"
-    }
-
-    # --- Debug dump: raw + parsed data per VM for troubleshooting ---
-    if ($DebugPath) {
-        $dbg = [ordered]@{
-            VMName           = $Vm.VMName
-            ProjectName      = $Vm.ProjectName
-            Tags             = $tags
-            CagApps          = @($Catalog.Apps).Count
-            CagSubApps       = @($Catalog.SubApps).Count
-            UpstreamCount    = $upstreamCIs.Count
-            AppUpstreamCount = $appUpstreams.Count
-            AppUpstreams     = @($appUpstreams | ForEach-Object { "$($_.UpstreamCIName) [$(Get-FirstFieldValue -Object $_ -Fields $ClassFields)] status=$($_.UpstreamCIStatus)" })
-            OtherUpstreams   = @($otherUpstreams | ForEach-Object { "$($_.UpstreamCIName) [$(Get-FirstFieldValue -Object $_ -Fields $ClassFields)]" })
-            UpstreamCIs      = @($upstreamCIs | ForEach-Object {
-                @($_.PSObject.Properties | ForEach-Object { "$($_.Name) = $($_.Value)" })
-            })
-            ClassFieldsRead  = @($upstreamCIs | ForEach-Object { Get-FirstFieldValue -Object $_ -Fields $ClassFields })
-            UpstreamStatuses = @($upstreamCIs | ForEach-Object { $_.UpstreamCIStatus })
-            CiStatuses       = $ciStatuses
-            UpstreamAttempts = $upstreamAttempts
-            RawReturnAppVms  = $returnRaws
-        }
-        "==================== $($Vm.VMName) ====================" | Add-Content -Path $DebugPath -Encoding UTF8
-        ($dbg | ConvertTo-Json -Depth 12) | Add-Content -Path $DebugPath -Encoding UTF8
     }
 
     return [PSCustomObject]@{
@@ -1528,21 +1499,6 @@ function Invoke-CmdbReview {
     }
 }
 
-if ($ReplayFromCsv) {
-    Write-Log "`n=== REPLAY MODE: loading $ReplayCsvPath ===" -Color Cyan
-    if (-not (Test-Path -LiteralPath $ReplayCsvPath)) {
-        Write-Log "Replay CSV not found: $ReplayCsvPath" -Color Red
-        return
-    }
-    $results = [System.Collections.Generic.List[object]]::new()
-    Import-Csv -LiteralPath $ReplayCsvPath | ForEach-Object { $results.Add($_) }
-    $vmQueue      = @($results)
-    $successCount = @($results).Count
-    $failCount    = 0
-    $stopwatch    = [System.Diagnostics.Stopwatch]::StartNew()
-    Write-Log "Loaded $($results.Count) rows from replay CSV" -Color Green
-}
-else {
 
 # Fetch all deployments with resources in one pass (size=1000, same as working export script)
 Write-Log "`n=== FETCHING DEPLOYMENTS ===" -Color Cyan
@@ -1593,7 +1549,6 @@ do {
 
     $deployments = if ($response.content) { $response.content } else { $response }
 
-    $capReached = $false
     foreach ($dep in $deployments) {
         # Skip deleted/failed deployments
         if ($dep.status -and $dep.status -in @("DELETE_SUCCESSFUL", "FAILED", "DELETE_INPROGRESS")) {
@@ -1629,22 +1584,11 @@ do {
             $addedForThisDep++
         }
 
-        # Cap counts only deployments that actually contributed VMs
-        if ($addedForThisDep -gt 0) {
-            $deploymentsWithVMs++
-            if ($MaxDeployments -gt 0 -and $deploymentsWithVMs -ge $MaxDeployments) {
-                $capReached = $true
-                break
-            }
-        }
+        if ($addedForThisDep -gt 0) { $deploymentsWithVMs++ }
     }
 
     $totalProcessed += $deployments.Count
     $page++
-    if ($capReached) {
-        Write-Log " Reached $MaxDeployments deployments with VMs - stopping fetch" -Color Yellow
-        break
-    }
     $hasMore = if ($response.totalPages) {
         $page -lt $response.totalPages
     } elseif ($response.totalElements) {
@@ -1657,38 +1601,13 @@ do {
 Write-Log "Scanned: $totalProcessed deployments ($deploymentsWithVMs with VMs, skipped $skippedCount deleted/failed)" -Color Cyan
 Write-Log "VMs to process: $($vmQueue.Count)" -Color Cyan
 
-if ($ReviewOnlyVM) {
-    $matched = @($vmQueue | Where-Object { $_.VMName -eq $ReviewOnlyVM })
-    if ($matched.Count -eq 0) {
-        Write-Log "ReviewOnlyVM '$ReviewOnlyVM' not found in the $($vmQueue.Count) fetched VMs - if the VM exists, $MaxDeployments may be capping the fetch before its deployment" -Color Red
-    }
-    else {
-        $vmQueue.Clear()
-        foreach ($m in $matched) { $vmQueue.Add($m) }
-        Write-Log "ReviewOnlyVM: Phase 1 narrowed to '$ReviewOnlyVM' ($($vmQueue.Count) row(s))" -Color Yellow
-    }
-}
-
 # Scriptblock that runs in each runspace
 $scriptBlock = {
     param($VraServer, $AuthToken, $ShowVmDetailsUri, $VMName, $ProjectId, $ProjectName, $DeploymentName)
 
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     # Compiled policy, not a scriptblock: runspace threads have no default runspace,
     # so a { $true } callback throws and the request fails with "connection was closed".
-    if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
-        Add-Type @"
-using System.Net;
-using System.Security.Cryptography.X509Certificates;
-public class TrustAllCertsPolicy : ICertificatePolicy {
-    public bool CheckValidationResult(
-        ServicePoint srvPoint, X509Certificate certificate,
-        WebRequest request, int certificateProblem) { return true; }
-}
-"@
-    }
-    [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
-    [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $null
+    Enable-TrustAllCerts
 
     $headers = @{
         "Authorization" = "Bearer $AuthToken"
@@ -1752,7 +1671,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
         $appApplication = ($appApplications | Select-Object -Unique) -join "; "
 
         # CompareResult / MatchedApps are filled by the review phase. "Not checked"
-        # stays only if the review doesn't run ($RunReview = $false) or fails.
+        # stays only if the review fails for that VM.
         return [PSCustomObject]@{
             DeploymentName = $DeploymentName
             VMName = $VMName
@@ -1782,13 +1701,16 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
     }
 }
 
-# Process with single runspace pool and timeout per job
-$poolSize = 30
-$jobTimeoutSeconds = 120
+# Process with single runspace pool and timeout per job ($poolSize / $jobTimeoutSeconds in config)
 Write-Log "`n=== PROCESSING $($vmQueue.Count) VMs ($poolSize parallel threads, ${jobTimeoutSeconds}s timeout) ===" -Color Cyan
 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
-$runspacePool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $poolSize)
+# Phase 1 workers need the cert helper; nothing else is injected
+$phase1Iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+$phase1Iss.Commands.Add(
+    (New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry('Enable-TrustAllCerts', (Get-Command Enable-TrustAllCerts).Definition))
+)
+$runspacePool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $poolSize, $phase1Iss, $Host)
 $runspacePool.Open()
 
 $results = [System.Collections.Generic.List[object]]::new()
@@ -1858,11 +1780,10 @@ foreach ($job in $jobs) {
 
 if ($runspacePool) { $runspacePool.Close(); $runspacePool.Dispose() }
 $stopwatch.Stop()
-}
 
 # NSX Fallback - fill in missing AppApplication from NSX VM tags
 $missingAppVMs = @($results | Where-Object { -not $_.AppApplication })
-if (-not $ReplayFromCsv -and $missingAppVMs.Count -gt 0) {
+if ($missingAppVMs.Count -gt 0) {
     Write-Log "`n=== NSX FALLBACK: $($missingAppVMs.Count) VMs with empty AppApplication ===" -Color Cyan
 
     # NSX Auth functions (from working NSX firewall script)
@@ -1870,8 +1791,7 @@ if (-not $ReplayFromCsv -and $missingAppVMs.Count -gt 0) {
         param(
             [string]$Server,
             [PSCredential]$Credential,
-            [string]$AuthMode = "Local",
-            [string]$VIDMDomain = ""
+            [string]$AuthMode = "Local"
         )
 
         $headers = @{
@@ -1947,19 +1867,7 @@ if (-not $ReplayFromCsv -and $missingAppVMs.Count -gt 0) {
     }
 
     # Switch SSL mode for NSX (NSX requires TrustAllCertsPolicy, not ServerCertificateValidationCallback)
-    [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $null
-    if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
-        Add-Type @"
-using System.Net;
-using System.Security.Cryptography.X509Certificates;
-public class TrustAllCertsPolicy : ICertificatePolicy {
-    public bool CheckValidationResult(
-        ServicePoint srvPoint, X509Certificate certificate,
-        WebRequest request, int certificateProblem) { return true; }
-}
-"@
-    }
-    [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+    Enable-TrustAllCerts
 
     # Import NSX credentials
     $script:NSXFallbackSession = $null
@@ -1975,7 +1883,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
     }
 
     try {
-        $nsxHeaders = Connect-NSXManagerFallback -Server $NSXManager -Credential $nsxCred -AuthMode $NSXAuthMode -VIDMDomain $NSXvIDMDomain
+        $nsxHeaders = Connect-NSXManagerFallback -Server $NSXManager -Credential $nsxCred -AuthMode $NSXAuthMode
         $nsxFilled = 0
 
         foreach ($vm in $missingAppVMs) {
@@ -2047,493 +1955,344 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
 # UpstreamToApp, MultipleUpstream, NoUpstreamRelationship, ProjectPlacement,
 # Decommissioned. Runs sequentially or in a runspace pool per $ReviewPoolSize.
 # ---------------------------------------------------------------------------
-if ($RunReview) {
-    Write-Log "`n=== CMDB RELATIONSHIP REVIEW ($($results.Count) VMs) ===" -Color Cyan
+Write-Log "`n=== CMDB RELATIONSHIP REVIEW ($($results.Count) VMs) ===" -Color Cyan
 
-    # Ensure the COMPILED cert policy is in force for the review phase.
-    # Do NOT revert to a { $true } scriptblock here - the action-log fetch fails with
-    # "The underlying connection was closed" when the callback can't find a runspace.
-    if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
-        Add-Type @"
-using System.Net;
-using System.Security.Cryptography.X509Certificates;
-public class TrustAllCertsPolicy : ICertificatePolicy {
-    public bool CheckValidationResult(
-        ServicePoint srvPoint, X509Certificate certificate,
-        WebRequest request, int certificateProblem) { return true; }
+# Ensure the COMPILED cert policy is in force for the review phase.
+# Do NOT revert to a { $true } scriptblock here - the action-log fetch fails with
+# "The underlying connection was closed" when the callback can't find a runspace.
+Enable-TrustAllCerts
+
+$reviewSet   = $results
+$reviewTotal = @($reviewSet).Count
+
+# --- Project name -> id map (main thread) -----------------------------
+# Fetched here once for the placement-index block further down.
+$allProjects = @{}
+try {
+    $allProjResp = Invoke-RestMethod -Uri "https://$vraServer/iaas/api/projects?`$top=1000" -Method Get -Headers @{
+        "Authorization" = "Bearer $authToken"
+        "Content-Type"  = "application/json"
+    } -TimeoutSec 60
+    foreach ($p in @($allProjResp.content)) { if ($p.id -and $p.name) { $allProjects[$p.name] = $p.id } }
+    Write-Log " Loaded $($allProjects.Count) project(s) for name->id resolution" -Color Gray
 }
-"@
-    }
-    [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
-    [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $null
+catch {
+    Write-Log " Could not load project list: $($_.Exception.Message)" -Color Yellow
+}
 
-    if ($ReviewDebug -and (Test-Path $ReviewDebugPath)) { Remove-Item $ReviewDebugPath -Force }
-
-    $reviewSet = if ($ReviewOnlyVM) {
-        @($results | Where-Object { $_.VMName -eq $ReviewOnlyVM })
+# --- Pre-build the CAG catalogue per unique project (main thread) ---
+# Far fewer projects than VMs, and it keeps the per-project cache out of the
+# runspaces (each runspace would otherwise have its own empty cache and refetch).
+# ProjectId is required: the external-values endpoint is keyed on it.
+$projectMap = @{}
+foreach ($r in $reviewSet) {
+    if ($r.ProjectName -and $r.ProjectId -and -not $projectMap.ContainsKey($r.ProjectName)) {
+        $projectMap[$r.ProjectName] = $r.ProjectId
     }
-    elseif ($ReviewLimit -gt 0) {
-        @($results | Select-Object -First $ReviewLimit)
+}
+Write-Log " Pre-loading CAG catalogue for $($projectMap.Count) project(s)..." -Color Gray
+$cagByProject = @{}
+foreach ($pn in $projectMap.Keys) {
+    $cagByProject[$pn] = Get-CagForProject -ProjectName $pn -ProjectId $projectMap[$pn] -VraServer $vraServer -AuthToken $authToken -CagUri $getCagAppsUri -PhasedOut $phasedOutEnabled
+    $c = $cagByProject[$pn]
+    Write-Log ("   {0}: {1} app(s), {2} sub-app(s), {3} phased-out" -f $pn, @($c.Apps).Count, @($c.SubApps).Count, (@($c.PhasedOutApps).Count + @($c.PhasedOutSubApps).Count)) -Color DarkGray
+}
+Write-Log " CAG catalogue ready" -Color Gray
+
+# --- App -> owning project index (for the Project Placement column) -----
+# To say "move the VM to project X" we need a catalogue for EVERY project, not
+# just the ones in the review set, so any project's CAG list is fetched here once.
+# $appToProject stays $null when the check is off, which makes the review report
+# "Not checked" rather than guessing. $appClass follows the same lifecycle so
+# the tag-classification fallback also stays inert when placement is off.
+$appToProject = $null
+$appClass     = $null
+if ($CheckProjectPlacement) {
+    # $allProjects was fetched above.
+    # If that fetch failed, the placement check has no project list to work with.
+    if ($allProjects.Count -gt 0) {
+        $toFetch = @($allProjects.Keys | Where-Object { -not $cagByProject.ContainsKey($_) })
+        Write-Log " Project placement: indexing $($allProjects.Count) project(s) ($($toFetch.Count) new CAG fetch(es), pool size $PlacementPoolSize)..." -Color Gray
+
+        if ($toFetch.Count -gt 0) {
+            # Worker: fetch one project's CAG. Runs in a runspace so must set up
+            # its own cert policy. Emits the empty-CAG warning for every project
+            # whose catalogue comes back empty.
+            $placementBlock = {
+                param($ProjectName, $ProjectId, $VraServer, $AuthToken, $CagUri, $PhasedOut)
+                Enable-TrustAllCerts
+
+                try {
+                    $cat = Get-CagForProject -ProjectName $ProjectName -ProjectId $ProjectId `
+                        -VraServer $VraServer -AuthToken $AuthToken -CagUri $CagUri -PhasedOut $PhasedOut
+                    return [PSCustomObject]@{ ProjectName = $ProjectName; Catalog = $cat; Error = $null }
+                }
+                catch {
+                    return [PSCustomObject]@{ ProjectName = $ProjectName; Catalog = $null; Error = $_.Exception.Message }
+                }
+            }
+
+            # InitialSessionState: inject the helpers Get-CagForProject depends on.
+            # Write-Log is included so the empty-CAG WARNING can surface from
+            # inside the runspace instead of throwing CommandNotFound.
+            $placementFns = @(
+                'Write-Log','Enable-TrustAllCerts','Normalize-AppName','Get-CagCatalog',
+                'Get-CagViaExternalValues','Get-CagForProject'
+            )
+            $placementIss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+            foreach ($fn in $placementFns) {
+                $cmd = Get-Command $fn -ErrorAction SilentlyContinue
+                if ($cmd) {
+                    $placementIss.Commands.Add(
+                        (New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry($fn, $cmd.Definition))
+                    )
+                }
+            }
+
+            $placementPool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $PlacementPoolSize, $placementIss, $Host)
+            $placementPool.Open()
+
+            $placementJobs = [System.Collections.Generic.List[object]]::new()
+            foreach ($pn in $toFetch) {
+                $ps = [PowerShell]::Create().AddScript($placementBlock)
+                $ps.AddArgument($pn)                | Out-Null
+                $ps.AddArgument($allProjects[$pn])  | Out-Null
+                $ps.AddArgument($vraServer)         | Out-Null
+                $ps.AddArgument($authToken)         | Out-Null
+                $ps.AddArgument($getCagAppsUri)     | Out-Null
+                $ps.AddArgument($phasedOutEnabled)  | Out-Null
+                $ps.RunspacePool = $placementPool
+                $placementJobs.Add(@{ PowerShell = $ps; Handle = $ps.BeginInvoke(); ProjectName = $pn })
+            }
+
+            $done = 0; $errCount = 0
+            foreach ($job in $placementJobs) {
+                $out = $null
+                try {
+                    if ($job.Handle.AsyncWaitHandle.WaitOne($PlacementJobTimeoutSec * 1000)) {
+                        $out = @($job.PowerShell.EndInvoke($job.Handle))[0]
+                    }
+                    else {
+                        $job.PowerShell.Stop()
+                        Write-Log "   $($job.ProjectName) : CAG fetch timeout after ${PlacementJobTimeoutSec}s" -Color Yellow
+                        $errCount++
+                    }
+                }
+                catch {
+                    Write-Log "   $($job.ProjectName) : CAG fetch failed - $($_.Exception.Message)" -Color Yellow
+                    $errCount++
+                }
+                finally { $job.PowerShell.Dispose() }
+
+                if ($out -and $out.Catalog) {
+                    $cagByProject[$out.ProjectName] = $out.Catalog
+                }
+                elseif ($out -and $out.Error) {
+                    Write-Log "   $($out.ProjectName) : CAG fetch failed - $($out.Error)" -Color Yellow
+                    $errCount++
+                }
+
+                $done++
+                if ($done % 20 -eq 0) { Write-Log "   $done / $($toFetch.Count) placement CAGs fetched" -Color DarkGray }
+            }
+
+            $placementPool.Close(); $placementPool.Dispose()
+            Write-Log " Placement CAG fetch complete ($($toFetch.Count) project(s), $errCount error(s))" -Color Gray
+        }
+
+        # Normalised app name -> list of projects whose CAG contains it.
+        # A name can map to several projects; the review reports them all rather
+        # than picking one.
+        $appToProject = @{}
+        # Parallel index: normalised app name -> class ('Application' | 'SubApplication').
+        # Used as a fallback for the tag classification when a tag isn't in the VM's
+        # OWN project CAG - a Sub-App living in another project should still be
+        # classified as Sub-App rather than reported as "Not found in CAG".
+        # Sub-App wins when a name appears as both across projects, matching the
+        # local per-VM classification preference.
+        $appClass = @{}
+        foreach ($pn in $cagByProject.Keys) {
+            $c = $cagByProject[$pn]
+            foreach ($a in (@($c.Apps) + @($c.SubApps))) {
+                if (-not $a) { continue }
+                $k = Normalize-AppName $a
+                if (-not $k) { continue }
+                if ($appToProject.ContainsKey($k)) {
+                    if ($appToProject[$k] -notcontains $pn) { $appToProject[$k] = @($appToProject[$k]) + $pn }
+                }
+                else { $appToProject[$k] = @($pn) }
+            }
+            # Sub-Apps first so an App entry can't overwrite a Sub-App
+            foreach ($a in @($c.SubApps)) {
+                if (-not $a) { continue }
+                $k = Normalize-AppName $a
+                if ($k) { $appClass[$k] = 'SubApplication' }
+            }
+            foreach ($a in @($c.Apps)) {
+                if (-not $a) { continue }
+                $k = Normalize-AppName $a
+                if ($k -and -not $appClass.ContainsKey($k)) { $appClass[$k] = 'Application' }
+            }
+        }
+        Write-Log " Project placement index: $($appToProject.Count) distinct app/sub-app name(s)" -Color Gray
     }
     else {
-        $results
+        Write-Log " Project placement check skipped - no project list available" -Color Yellow
     }
-    $reviewTotal = @($reviewSet).Count
-    if ($ReviewOnlyVM) {
-        if ($reviewTotal -eq 0) {
-            Write-Log " ReviewOnlyVM '$ReviewOnlyVM' not found in $($results.Count) row(s) - nothing to review" -Color Red
-        }
-        else {
-            Write-Log " (review narrowed to '$ReviewOnlyVM' - $reviewTotal row(s))" -Color Yellow
-        }
-    }
-    elseif ($ReviewLimit -gt 0) { Write-Log " (limited to first $reviewTotal VMs)" -Color Yellow }
+}
 
-    # --- Project name -> id map (main thread) -----------------------------
-    # Fetched here so both the CAG preload below and the placement-index block
-    # further down share one call. Also lets us backfill ProjectId on rows loaded
-    # from a replay CSV, which doesn't carry ProjectId (it's not in $exportColumns)
-    # and so leaves the CAG preload seeing zero projects.
-    $allProjects = @{}
+# Shared across runspaces: app-name -> decommission status. Many VMs share the
+# same upstream app, so this avoids re-running returnApplicationVms per VM.
+$appStatusCache = [hashtable]::Synchronized(@{})
+
+$reviewed = 0
+$upstreamRescued = 0
+
+# Review fields copied from Invoke-CmdbReview's result onto each VM row.
+# Adding a column = return it from Invoke-CmdbReview, list it here, and add
+# it to $exportColumns.
+$reviewFields = @(
+    'Action',
+    'NSXMatchCMDB',
+    'CompareResult',
+    'MatchedApps',
+    'DecommCompare',
+    'UpstreamToApp',
+    'UpstreamTo',
+    'MultipleUpstream',
+    'MultipleUpstreamCI',
+    'NoUpstreamRelationship',
+    'ProjectPlacementCI',
+    'ProjectPlacementResult',
+    'Decommissioned',
+    'UpstreamLifecycleStatus',
+    'UpstreamAppCag'
+)
+$reviewFailed = [System.Collections.Generic.List[object]]::new()
+
+# ---------- Review (runspace pool; $ReviewPoolSize = 1 runs one VM at a time) ----------
+Write-Log " Running review with $ReviewPoolSize parallel worker(s)..." -Color Cyan
+
+# Inject the helper functions this phase needs into every runspace
+$fnNames = @(
+    'Write-Log','Enable-TrustAllCerts','Normalize-AppName','Get-CagCatalog',
+    'Get-FirstFieldValue','Get-AppTier','Get-TagClassPriority','Get-BestStatusLabel','Format-CiClass','Get-VroJson','Get-UpstreamCIs','Get-CiStatuses','Get-CiClasses',
+    'Get-JsonBlockFromText','Get-UpstreamCIsFromLog','Get-CiStatusesFromLog','Get-CiClassesFromLog',
+    'Invoke-VroActionWithLogs','Get-AppDecommStatus','Invoke-CmdbReview'
+)
+$iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+foreach ($fn in $fnNames) {
+    $cmd = Get-Command $fn -ErrorAction SilentlyContinue
+    if ($cmd) {
+        $iss.Commands.Add(
+            (New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry($fn, $cmd.Definition))
+        )
+    }
+}
+
+# Script-level config the injected helpers read. Runspace workers do not see
+# the script's variables, so without this the log re-fetch and upstream
+# rerun settings silently evaluate to empty (i.e. no retries) in parallel mode.
+foreach ($vn in @('MaxLogResults','LogFetchRetries','LogFetchRetryDelayMs','UpstreamRerunRetries','UpstreamRerunDelayMs')) {
+    $iss.Variables.Add(
+        (New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry($vn, (Get-Variable -Name $vn -ValueOnly), ''))
+    )
+}
+
+$reviewPool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $ReviewPoolSize, $iss, $Host)
+$reviewPool.Open()
+
+# Worker: runs one VM's review and returns its fields (or the error).
+$reviewBlock = {
+    param($Vm, $Catalog, $VraServer, $AuthToken, $GetVmAppsUri, $ReturnAppVmsUri,
+          $ClassFields,
+          $AppStatusCache, $AppToProject, $AppClass)
+
+    Enable-TrustAllCerts
+
     try {
-        $allProjResp = Invoke-RestMethod -Uri "https://$vraServer/iaas/api/projects?`$top=1000" -Method Get -Headers @{
-            "Authorization" = "Bearer $authToken"
-            "Content-Type"  = "application/json"
-        } -TimeoutSec 60
-        foreach ($p in @($allProjResp.content)) { if ($p.id -and $p.name) { $allProjects[$p.name] = $p.id } }
-        Write-Log " Loaded $($allProjects.Count) project(s) for name->id resolution" -Color Gray
+        $rev = Invoke-CmdbReview -Vm $Vm -Catalog $Catalog -VraServer $VraServer -AuthToken $AuthToken `
+            -GetVmAppsUri $GetVmAppsUri -ReturnAppVmsUri $ReturnAppVmsUri `
+            -ClassFields $ClassFields `
+            -AppStatusCache $AppStatusCache -AppToProject $AppToProject -AppClass $AppClass
+
+        return [PSCustomObject]@{ VMName = $Vm.VMName; Review = $rev;  Error = $null }
     }
     catch {
-        Write-Log " Could not load project list: $($_.Exception.Message)" -Color Yellow
+        return [PSCustomObject]@{ VMName = $Vm.VMName; Review = $null; Error = $_.Exception.Message }
     }
-
-    # Backfill ProjectId on rows that lack one (replay mode). Import-Csv rows are
-    # plain PSCustomObjects with only the exported columns, so Add-Member covers
-    # the case where the property doesn't yet exist.
-    if ($allProjects.Count -gt 0) {
-        $backfilled = 0
-        foreach ($r in $reviewSet) {
-            if ($r.ProjectName -and -not $r.ProjectId -and $allProjects.ContainsKey($r.ProjectName)) {
-                if ($r.PSObject.Properties.Name -contains 'ProjectId') {
-                    $r.ProjectId = $allProjects[$r.ProjectName]
-                }
-                else {
-                    Add-Member -InputObject $r -NotePropertyName ProjectId -NotePropertyValue $allProjects[$r.ProjectName] -Force
-                }
-                $backfilled++
-            }
-        }
-        if ($backfilled -gt 0) { Write-Log " Backfilled ProjectId for $backfilled row(s)" -Color Gray }
-    }
-
-    # --- Pre-build the CAG catalogue per unique project (main thread) ---
-    # Far fewer projects than VMs, and it keeps the per-project cache out of the
-    # runspaces (each runspace would otherwise have its own empty cache and refetch).
-    # ProjectId is required: the external-values endpoint is keyed on it.
-    $projectMap = @{}
-    foreach ($r in $reviewSet) {
-        if ($r.ProjectName -and $r.ProjectId -and -not $projectMap.ContainsKey($r.ProjectName)) {
-            $projectMap[$r.ProjectName] = $r.ProjectId
-        }
-    }
-    Write-Log " Pre-loading CAG catalogue for $($projectMap.Count) project(s)..." -Color Gray
-    $cagByProject = @{}
-    foreach ($pn in $projectMap.Keys) {
-        $cagByProject[$pn] = Get-CagForProject -ProjectName $pn -ProjectId $projectMap[$pn] -VraServer $vraServer -AuthToken $authToken -CagUri $getCagAppsUri -PhasedOut $phasedOutEnabled
-        $c = $cagByProject[$pn]
-        Write-Log ("   {0}: {1} app(s), {2} sub-app(s), {3} phased-out" -f $pn, @($c.Apps).Count, @($c.SubApps).Count, (@($c.PhasedOutApps).Count + @($c.PhasedOutSubApps).Count)) -Color DarkGray
-    }
-    Write-Log " CAG catalogue ready" -Color Gray
-
-    # --- App -> owning project index (for the Project Placement column) -----
-    # To say "move the VM to project X" we need a catalogue for EVERY project, not
-    # just the ones in the review set, so any project's CAG list is fetched here once.
-    # $appToProject stays $null when the check is off, which makes the review report
-    # "Not checked" rather than guessing. $appClass follows the same lifecycle so
-    # the tag-classification fallback also stays inert when placement is off.
-    # $ReviewOnlyVM also skips placement: for a single-VM debug run the estate-wide
-    # scan is wasted work - the target VM's own project CAG is already loaded
-    # (from the reviewSet-driven preload above), and the upstream / status / decomm
-    # columns don't depend on placement. Trade-off: Project Placement CI/Result
-    # read "Not checked", and NSX Tag Category loses the global-CAG fallback for
-    # tags that live in another project's CAG. Acceptable for debug.
-    $appToProject = $null
-    $appClass     = $null
-    if ($CheckProjectPlacement -and $ReviewOnlyVM) {
-        Write-Log " Project placement skipped (ReviewOnlyVM='$ReviewOnlyVM' - single-VM debug mode)" -Color Yellow
-    }
-    elseif ($CheckProjectPlacement) {
-        # $allProjects was fetched above (shared with the CAG preload / replay backfill).
-        # If that fetch failed, the placement check has no project list to work with.
-        if ($allProjects.Count -gt 0) {
-            $toFetch = @($allProjects.Keys | Where-Object { -not $cagByProject.ContainsKey($_) })
-            Write-Log " Project placement: indexing $($allProjects.Count) project(s) ($($toFetch.Count) new CAG fetch(es), pool size $PlacementPoolSize)..." -Color Gray
-
-            if ($toFetch.Count -gt 0) {
-                # Worker: fetch one project's CAG. Runs in a runspace so must set up
-                # its own cert policy. Emits the empty-CAG warning for every project
-                # whose catalogue comes back empty.
-                $placementBlock = {
-                    param($ProjectName, $ProjectId, $VraServer, $AuthToken, $CagUri, $PhasedOut)
-                    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-                    [System.Net.ServicePointManager]::Expect100Continue = $false
-                    if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
-                        Add-Type @"
-using System.Net;
-using System.Security.Cryptography.X509Certificates;
-public class TrustAllCertsPolicy : ICertificatePolicy {
-    public bool CheckValidationResult(
-        ServicePoint srvPoint, X509Certificate certificate,
-        WebRequest request, int certificateProblem) { return true; }
 }
-"@
-                    }
-                    [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
-                    [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $null
 
-                    try {
-                        $cat = Get-CagForProject -ProjectName $ProjectName -ProjectId $ProjectId `
-                            -VraServer $VraServer -AuthToken $AuthToken -CagUri $CagUri -PhasedOut $PhasedOut
-                        return [PSCustomObject]@{ ProjectName = $ProjectName; Catalog = $cat; Error = $null }
-                    }
-                    catch {
-                        return [PSCustomObject]@{ ProjectName = $ProjectName; Catalog = $null; Error = $_.Exception.Message }
-                    }
-                }
+# Queue every VM
+$reviewJobs = [System.Collections.Generic.List[object]]::new()
+foreach ($vm in $reviewSet) {
+    $cat = if ($vm.ProjectName -and $cagByProject.ContainsKey($vm.ProjectName)) { $cagByProject[$vm.ProjectName] } else { [PSCustomObject]@{ Apps = @(); SubApps = @() } }
+    $ps = [PowerShell]::Create().AddScript($reviewBlock)
+    $ps.AddArgument($vm)                         | Out-Null
+    $ps.AddArgument($cat)                        | Out-Null
+    $ps.AddArgument($vraServer)                  | Out-Null
+    $ps.AddArgument($authToken)                  | Out-Null
+    $ps.AddArgument($getVmAppsUri)               | Out-Null
+    $ps.AddArgument($returnAppVmsUri)            | Out-Null
+    $ps.AddArgument($UpstreamClassFields)        | Out-Null
+    $ps.AddArgument($appStatusCache)             | Out-Null
+    $ps.AddArgument($appToProject)               | Out-Null
+    $ps.AddArgument($appClass)                   | Out-Null
+    $ps.RunspacePool = $reviewPool
+    $reviewJobs.Add(@{ PowerShell = $ps; Handle = $ps.BeginInvoke(); VMName = $vm.VMName; Vm = $vm })
+}
 
-                # InitialSessionState: inject the helpers Get-CagForProject depends on.
-                # Write-Log is included so the empty-CAG WARNING can surface from
-                # inside the runspace instead of throwing CommandNotFound.
-                $placementFns = @(
-                    'Write-Log','Normalize-AppName','Get-CagCatalog',
-                    'Get-CagViaExternalValues','Get-CagForProject'
-                )
-                $placementIss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
-                foreach ($fn in $placementFns) {
-                    $cmd = Get-Command $fn -ErrorAction SilentlyContinue
-                    if ($cmd) {
-                        $placementIss.Commands.Add(
-                            (New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry($fn, $cmd.Definition))
-                        )
-                    }
-                }
-
-                $placementPool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $PlacementPoolSize, $placementIss, $Host)
-                $placementPool.Open()
-
-                $placementJobs = [System.Collections.Generic.List[object]]::new()
-                foreach ($pn in $toFetch) {
-                    $ps = [PowerShell]::Create().AddScript($placementBlock)
-                    $ps.AddArgument($pn)                | Out-Null
-                    $ps.AddArgument($allProjects[$pn])  | Out-Null
-                    $ps.AddArgument($vraServer)         | Out-Null
-                    $ps.AddArgument($authToken)         | Out-Null
-                    $ps.AddArgument($getCagAppsUri)     | Out-Null
-                    $ps.AddArgument($phasedOutEnabled)  | Out-Null
-                    $ps.RunspacePool = $placementPool
-                    $placementJobs.Add(@{ PowerShell = $ps; Handle = $ps.BeginInvoke(); ProjectName = $pn })
-                }
-
-                $done = 0; $errCount = 0
-                foreach ($job in $placementJobs) {
-                    $out = $null
-                    try {
-                        if ($job.Handle.AsyncWaitHandle.WaitOne($PlacementJobTimeoutSec * 1000)) {
-                            $out = @($job.PowerShell.EndInvoke($job.Handle))[0]
-                        }
-                        else {
-                            $job.PowerShell.Stop()
-                            Write-Log "   $($job.ProjectName) : CAG fetch timeout after ${PlacementJobTimeoutSec}s" -Color Yellow
-                            $errCount++
-                        }
-                    }
-                    catch {
-                        Write-Log "   $($job.ProjectName) : CAG fetch failed - $($_.Exception.Message)" -Color Yellow
-                        $errCount++
-                    }
-                    finally { $job.PowerShell.Dispose() }
-
-                    if ($out -and $out.Catalog) {
-                        $cagByProject[$out.ProjectName] = $out.Catalog
-                    }
-                    elseif ($out -and $out.Error) {
-                        Write-Log "   $($out.ProjectName) : CAG fetch failed - $($out.Error)" -Color Yellow
-                        $errCount++
-                    }
-
-                    $done++
-                    if ($done % 20 -eq 0) { Write-Log "   $done / $($toFetch.Count) placement CAGs fetched" -Color DarkGray }
-                }
-
-                $placementPool.Close(); $placementPool.Dispose()
-                Write-Log " Placement CAG fetch complete ($($toFetch.Count) project(s), $errCount error(s))" -Color Gray
-            }
-
-            # Normalised app name -> list of projects whose CAG contains it.
-            # A name can map to several projects; the review reports them all rather
-            # than picking one.
-            $appToProject = @{}
-            # Parallel index: normalised app name -> class ('Application' | 'SubApplication').
-            # Used as a fallback for the tag classification when a tag isn't in the VM's
-            # OWN project CAG - a Sub-App living in another project should still be
-            # classified as Sub-App rather than reported as "Not found in CAG".
-            # Sub-App wins when a name appears as both across projects, matching the
-            # local per-VM classification preference.
-            $appClass = @{}
-            foreach ($pn in $cagByProject.Keys) {
-                $c = $cagByProject[$pn]
-                foreach ($a in (@($c.Apps) + @($c.SubApps))) {
-                    if (-not $a) { continue }
-                    $k = Normalize-AppName $a
-                    if (-not $k) { continue }
-                    if ($appToProject.ContainsKey($k)) {
-                        if ($appToProject[$k] -notcontains $pn) { $appToProject[$k] = @($appToProject[$k]) + $pn }
-                    }
-                    else { $appToProject[$k] = @($pn) }
-                }
-                # Sub-Apps first so an App entry can't overwrite a Sub-App
-                foreach ($a in @($c.SubApps)) {
-                    if (-not $a) { continue }
-                    $k = Normalize-AppName $a
-                    if ($k) { $appClass[$k] = 'SubApplication' }
-                }
-                foreach ($a in @($c.Apps)) {
-                    if (-not $a) { continue }
-                    $k = Normalize-AppName $a
-                    if ($k -and -not $appClass.ContainsKey($k)) { $appClass[$k] = 'Application' }
-                }
-            }
-            Write-Log " Project placement index: $($appToProject.Count) distinct app/sub-app name(s)" -Color Gray
+# Collect in order; write debug + partial CSV serially here
+foreach ($job in $reviewJobs) {
+    $out = $null
+    try {
+        if ($job.Handle.AsyncWaitHandle.WaitOne($ReviewJobTimeoutSec * 1000)) {
+            $out = @($job.PowerShell.EndInvoke($job.Handle))[0]
         }
         else {
-            Write-Log " Project placement check skipped - no project list available" -Color Yellow
+            $job.PowerShell.Stop()
+            $reviewFailed.Add([PSCustomObject]@{ VMName = $job.VMName; ProjectName = $job.Vm.ProjectName; Error = "timeout after ${ReviewJobTimeoutSec}s" })
+            Write-Log " [$($reviewed + 1)/$reviewTotal] $($job.VMName) | TIMEOUT" -Color Red
         }
     }
+    catch {
+        $reviewFailed.Add([PSCustomObject]@{ VMName = $job.VMName; ProjectName = $job.Vm.ProjectName; Error = $_.Exception.Message })
+    }
+    finally { $job.PowerShell.Dispose() }
 
-    # Shared across runspaces: app-name -> decommission status. Many VMs share the
-    # same upstream app, so this avoids re-running returnApplicationVms per VM.
-    $appStatusCache = [hashtable]::Synchronized(@{})
-
-    $reviewed = 0
-    $upstreamRescued = 0
-    $reviewFailed = [System.Collections.Generic.List[object]]::new()
-
-    if ($ReviewPoolSize -le 1) {
-        # ---------- Sequential (original behaviour) ----------
-        foreach ($vm in $reviewSet) {
-            Write-Log " [$($reviewed + 1)/$reviewTotal] $($vm.VMName)..." -Color DarkGray
-            $cat = if ($vm.ProjectName -and $cagByProject.ContainsKey($vm.ProjectName)) { $cagByProject[$vm.ProjectName] } else { [PSCustomObject]@{ Apps = @(); SubApps = @() } }
-            try {
-                $rev = Invoke-CmdbReview -Vm $vm -Catalog $cat -VraServer $vraServer -AuthToken $authToken -GetVmAppsUri $getVmAppsUri -ReturnAppVmsUri $returnAppVmsUri -PhasedOut $phasedOutEnabled -ClassFields $UpstreamClassFields -DebugPath $(if ($ReviewDebug) { $ReviewDebugPath } else { $null }) -AppStatusCache $appStatusCache -AppToProject $appToProject -AppClass $appClass
-                Add-Member -InputObject $vm -NotePropertyName Action                 -NotePropertyValue $rev.Action                 -Force
-                Add-Member -InputObject $vm -NotePropertyName NSXMatchCMDB           -NotePropertyValue $rev.NSXMatchCMDB           -Force
-                Add-Member -InputObject $vm -NotePropertyName CompareResult          -NotePropertyValue $rev.CompareResult          -Force
-                Add-Member -InputObject $vm -NotePropertyName MatchedApps            -NotePropertyValue $rev.MatchedApps            -Force
-                Add-Member -InputObject $vm -NotePropertyName DecommCompare          -NotePropertyValue $rev.DecommCompare          -Force
-                Add-Member -InputObject $vm -NotePropertyName UpstreamToApp          -NotePropertyValue $rev.UpstreamToApp          -Force
-                Add-Member -InputObject $vm -NotePropertyName UpstreamTo             -NotePropertyValue $rev.UpstreamTo             -Force
-                Add-Member -InputObject $vm -NotePropertyName MultipleUpstream       -NotePropertyValue $rev.MultipleUpstream       -Force
-                Add-Member -InputObject $vm -NotePropertyName MultipleUpstreamCI     -NotePropertyValue $rev.MultipleUpstreamCI     -Force
-                Add-Member -InputObject $vm -NotePropertyName NoUpstreamRelationship -NotePropertyValue $rev.NoUpstreamRelationship -Force
-                Add-Member -InputObject $vm -NotePropertyName ProjectPlacementCI     -NotePropertyValue $rev.ProjectPlacementCI     -Force
-                Add-Member -InputObject $vm -NotePropertyName ProjectPlacementResult -NotePropertyValue $rev.ProjectPlacementResult -Force
-                Add-Member -InputObject $vm -NotePropertyName Decommissioned         -NotePropertyValue $rev.Decommissioned         -Force
-                Add-Member -InputObject $vm -NotePropertyName UpstreamLifecycleStatus -NotePropertyValue $rev.UpstreamLifecycleStatus -Force
-                Add-Member -InputObject $vm -NotePropertyName UpstreamAppCag         -NotePropertyValue $rev.UpstreamAppCag         -Force
-                if ($rev.UpstreamFoundOnRerun) {
-                    Write-Log "   [upstream found on attempt $($rev.UpstreamAttempts)]" -Color Green
-                    $upstreamRescued++
-                }
-            }
-            catch {
-                $reviewFailed.Add([PSCustomObject]@{ VMName = $vm.VMName; ProjectName = $vm.ProjectName; Error = $_.Exception.Message })
-                Write-Log "   FAILED: $($_.Exception.Message)" -Color Red
-            }
-            $reviewed++
-            if ($reviewed % $IncrementalSaveEvery -eq 0) {
-                Write-Log " Reviewed $reviewed / $reviewTotal (saving partial)" -Color Gray
-                try { Invoke-CleanResultsInPlace -Rows $results; $results | Select-Object $exportColumns | Export-Csv -Path $partialCsvPath -NoTypeInformation -Encoding UTF8 } catch { }
-            }
+    if ($out -and $out.Review) {
+        $vm = $job.Vm; $rev = $out.Review
+        foreach ($fld in $reviewFields) {
+            Add-Member -InputObject $vm -NotePropertyName $fld -NotePropertyValue $rev.$fld -Force
+        }
+        if ($rev.UpstreamFoundOnRerun) {
+            Write-Log " [$($reviewed + 1)/$reviewTotal] $($vm.VMName) | upstream found on attempt $($rev.UpstreamAttempts)" -Color Green
+            $upstreamRescued++
         }
     }
-    else {
-        # ---------- Parallel (runspace pool) ----------
-        Write-Log " Running review with $ReviewPoolSize parallel workers..." -Color Cyan
+    elseif ($out -and $out.Error) {
+        $reviewFailed.Add([PSCustomObject]@{ VMName = $out.VMName; ProjectName = $job.Vm.ProjectName; Error = $out.Error })
+        Write-Log " [$($reviewed + 1)/$reviewTotal] $($out.VMName) | FAILED: $($out.Error)" -Color Red
+    }
 
-        # Inject the helper functions this phase needs into every runspace
-        $fnNames = @(
-            'Normalize-AppName','Get-CagCatalog',
-            'Get-FirstFieldValue','Get-AppTier','Get-TagClassPriority','Get-BestStatusLabel','Format-CiClass','Get-VroJson','Get-UpstreamCIs','Get-CiStatuses','Get-CiClasses',
-            'Get-JsonBlockFromText','Get-UpstreamCIsFromLog','Get-CiStatusesFromLog','Get-CiClassesFromLog',
-            'Invoke-VroActionWithLogs','Get-AppDecommStatus','Invoke-CmdbReview'
-        )
-        $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
-        foreach ($fn in $fnNames) {
-            $cmd = Get-Command $fn -ErrorAction SilentlyContinue
-            if ($cmd) {
-                $iss.Commands.Add(
-                    (New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry($fn, $cmd.Definition))
-                )
-            }
-        }
-
-        # Script-level config the injected helpers read. Runspace workers do not see
-        # the script's variables, so without this the log re-fetch and upstream
-        # rerun settings silently evaluate to empty (i.e. no retries) in parallel mode.
-        foreach ($vn in @('MaxLogResults','LogFetchRetries','LogFetchRetryDelayMs','UpstreamRerunRetries','UpstreamRerunDelayMs')) {
-            $iss.Variables.Add(
-                (New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry($vn, (Get-Variable -Name $vn -ValueOnly), ''))
-            )
-        }
-
-        $reviewPool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $ReviewPoolSize, $iss, $Host)
-        $reviewPool.Open()
-
-        # Worker: runs one VM's review and returns the fields + debug text.
-        # Debug is RETURNED (not written) so the collector can write it serially -
-        # concurrent writes to one file would interleave and corrupt it.
-        $reviewBlock = {
-            param($Vm, $Catalog, $VraServer, $AuthToken, $GetVmAppsUri, $ReturnAppVmsUri,
-                  $PhasedOut, $ClassFields, $WantDebug,
-                  $AppStatusCache, $AppToProject, $AppClass)
-
-            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            [System.Net.ServicePointManager]::Expect100Continue = $false
-            if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
-                Add-Type @"
-using System.Net;
-using System.Security.Cryptography.X509Certificates;
-public class TrustAllCertsPolicy : ICertificatePolicy {
-    public bool CheckValidationResult(
-        ServicePoint srvPoint, X509Certificate certificate,
-        WebRequest request, int certificateProblem) { return true; }
+    $reviewed++
+    if ($reviewed % $IncrementalSaveEvery -eq 0) {
+        Write-Log " Reviewed $reviewed / $reviewTotal (saving partial)" -Color Gray
+        try { Invoke-CleanResultsInPlace -Rows $results; $results | Select-Object $exportColumns | Export-Csv -Path $partialCsvPath -NoTypeInformation -Encoding UTF8 }
+        catch { Write-Log " WARNING: partial save failed: $($_.Exception.Message)" -Color Yellow }
+    }
 }
-"@
-            }
-            [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
-            [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $null
 
-            $tmpDebug = $null
-            if ($WantDebug) { $tmpDebug = [System.IO.Path]::GetTempFileName() }
+$reviewPool.Close(); $reviewPool.Dispose()
 
-            try {
-                $rev = Invoke-CmdbReview -Vm $Vm -Catalog $Catalog -VraServer $VraServer -AuthToken $AuthToken `
-                    -GetVmAppsUri $GetVmAppsUri -ReturnAppVmsUri $ReturnAppVmsUri -PhasedOut $PhasedOut `
-                    -ClassFields $ClassFields -DebugPath $tmpDebug `
-                    -AppStatusCache $AppStatusCache -AppToProject $AppToProject -AppClass $AppClass
-
-                $dbgText = ""
-                if ($tmpDebug -and (Test-Path $tmpDebug)) {
-                    $dbgText = Get-Content -Path $tmpDebug -Raw -ErrorAction SilentlyContinue
-                    Remove-Item $tmpDebug -Force -ErrorAction SilentlyContinue
-                }
-
-                return [PSCustomObject]@{
-                    VMName    = $Vm.VMName
-                    Review    = $rev
-                    DebugText = $dbgText
-                    Error     = $null
-                }
-            }
-            catch {
-                if ($tmpDebug -and (Test-Path $tmpDebug)) { Remove-Item $tmpDebug -Force -ErrorAction SilentlyContinue }
-                return [PSCustomObject]@{
-                    VMName    = $Vm.VMName
-                    Review    = $null
-                    DebugText = ""
-                    Error     = $_.Exception.Message
-                }
-            }
-        }
-
-        # Queue every VM
-        $reviewJobs = [System.Collections.Generic.List[object]]::new()
-        foreach ($vm in $reviewSet) {
-            $cat = if ($vm.ProjectName -and $cagByProject.ContainsKey($vm.ProjectName)) { $cagByProject[$vm.ProjectName] } else { [PSCustomObject]@{ Apps = @(); SubApps = @() } }
-            $ps = [PowerShell]::Create().AddScript($reviewBlock)
-            $ps.AddArgument($vm)                         | Out-Null
-            $ps.AddArgument($cat)                        | Out-Null
-            $ps.AddArgument($vraServer)                  | Out-Null
-            $ps.AddArgument($authToken)                  | Out-Null
-            $ps.AddArgument($getVmAppsUri)               | Out-Null
-            $ps.AddArgument($returnAppVmsUri)            | Out-Null
-            $ps.AddArgument($phasedOutEnabled)           | Out-Null
-            $ps.AddArgument($UpstreamClassFields)        | Out-Null
-            $ps.AddArgument([bool]$ReviewDebug)          | Out-Null
-            $ps.AddArgument($appStatusCache)             | Out-Null
-            $ps.AddArgument($appToProject)               | Out-Null
-            $ps.AddArgument($appClass)                   | Out-Null
-            $ps.RunspacePool = $reviewPool
-            $reviewJobs.Add(@{ PowerShell = $ps; Handle = $ps.BeginInvoke(); VMName = $vm.VMName; Vm = $vm })
-        }
-
-        # Collect in order; write debug + partial CSV serially here
-        foreach ($job in $reviewJobs) {
-            $out = $null
-            try {
-                if ($job.Handle.AsyncWaitHandle.WaitOne($ReviewJobTimeoutSec * 1000)) {
-                    $out = @($job.PowerShell.EndInvoke($job.Handle))[0]
-                }
-                else {
-                    $job.PowerShell.Stop()
-                    $reviewFailed.Add([PSCustomObject]@{ VMName = $job.VMName; ProjectName = $job.Vm.ProjectName; Error = "timeout after ${ReviewJobTimeoutSec}s" })
-                    Write-Log " [$($reviewed + 1)/$reviewTotal] $($job.VMName) | TIMEOUT" -Color Red
-                }
-            }
-            catch {
-                $reviewFailed.Add([PSCustomObject]@{ VMName = $job.VMName; ProjectName = $job.Vm.ProjectName; Error = $_.Exception.Message })
-            }
-            finally { $job.PowerShell.Dispose() }
-
-            if ($out -and $out.Review) {
-                $vm = $job.Vm; $rev = $out.Review
-                Add-Member -InputObject $vm -NotePropertyName Action                 -NotePropertyValue $rev.Action                 -Force
-                Add-Member -InputObject $vm -NotePropertyName NSXMatchCMDB           -NotePropertyValue $rev.NSXMatchCMDB           -Force
-                Add-Member -InputObject $vm -NotePropertyName CompareResult          -NotePropertyValue $rev.CompareResult          -Force
-                Add-Member -InputObject $vm -NotePropertyName MatchedApps            -NotePropertyValue $rev.MatchedApps            -Force
-                Add-Member -InputObject $vm -NotePropertyName DecommCompare          -NotePropertyValue $rev.DecommCompare          -Force
-                Add-Member -InputObject $vm -NotePropertyName UpstreamToApp          -NotePropertyValue $rev.UpstreamToApp          -Force
-                Add-Member -InputObject $vm -NotePropertyName UpstreamTo             -NotePropertyValue $rev.UpstreamTo             -Force
-                Add-Member -InputObject $vm -NotePropertyName MultipleUpstream       -NotePropertyValue $rev.MultipleUpstream       -Force
-                Add-Member -InputObject $vm -NotePropertyName MultipleUpstreamCI     -NotePropertyValue $rev.MultipleUpstreamCI     -Force
-                Add-Member -InputObject $vm -NotePropertyName NoUpstreamRelationship -NotePropertyValue $rev.NoUpstreamRelationship -Force
-                Add-Member -InputObject $vm -NotePropertyName ProjectPlacementCI     -NotePropertyValue $rev.ProjectPlacementCI     -Force
-                Add-Member -InputObject $vm -NotePropertyName ProjectPlacementResult -NotePropertyValue $rev.ProjectPlacementResult -Force
-                Add-Member -InputObject $vm -NotePropertyName Decommissioned         -NotePropertyValue $rev.Decommissioned         -Force
-                Add-Member -InputObject $vm -NotePropertyName UpstreamLifecycleStatus -NotePropertyValue $rev.UpstreamLifecycleStatus -Force
-                Add-Member -InputObject $vm -NotePropertyName UpstreamAppCag         -NotePropertyValue $rev.UpstreamAppCag         -Force
-                if ($rev.UpstreamFoundOnRerun) {
-                    Write-Log " [$($reviewed + 1)/$reviewTotal] $($vm.VMName) | upstream found on attempt $($rev.UpstreamAttempts)" -Color Green
-                    $upstreamRescued++
-                }
-
-                if ($ReviewDebug -and $out.DebugText) {
-                    $out.DebugText | Add-Content -Path $ReviewDebugPath -Encoding UTF8
-                }
-            }
-            elseif ($out -and $out.Error) {
-                $reviewFailed.Add([PSCustomObject]@{ VMName = $out.VMName; ProjectName = $job.Vm.ProjectName; Error = $out.Error })
-                Write-Log " [$($reviewed + 1)/$reviewTotal] $($out.VMName) | FAILED: $($out.Error)" -Color Red
-            }
-
-            $reviewed++
-            if ($reviewed % $IncrementalSaveEvery -eq 0) {
-                Write-Log " Reviewed $reviewed / $reviewTotal (saving partial)" -Color Gray
-                try { Invoke-CleanResultsInPlace -Rows $results; $results | Select-Object $exportColumns | Export-Csv -Path $partialCsvPath -NoTypeInformation -Encoding UTF8 } catch { }
-            }
-        }
-
-        $reviewPool.Close(); $reviewPool.Dispose()
-    }
-
-    Write-Log " Review complete: $reviewed VMs" -Color Green
-    if ($UpstreamRerunRetries -gt 0) {
-        Write-Log " Upstream found on rerun: $upstreamRescued VM(s)" -Color $(if ($upstreamRescued -gt 0) { 'Yellow' } else { 'Gray' })
-    }
-    if ($reviewFailed.Count -gt 0) {
-        Write-Log " Review failures: $($reviewFailed.Count) - see $failedCsvPath" -Color Yellow
-        try { Invoke-CleanResultsInPlace -Rows $reviewFailed; $reviewFailed | Export-Csv -Path $failedCsvPath -NoTypeInformation -Encoding UTF8 } catch { }
-    }
+Write-Log " Review complete: $reviewed VMs" -Color Green
+if ($UpstreamRerunRetries -gt 0) {
+    Write-Log " Upstream found on rerun: $upstreamRescued VM(s)" -Color $(if ($upstreamRescued -gt 0) { 'Yellow' } else { 'Gray' })
+}
+if ($reviewFailed.Count -gt 0) {
+    Write-Log " Review failures: $($reviewFailed.Count) - see $failedCsvPath" -Color Yellow
+    try { Invoke-CleanResultsInPlace -Rows $reviewFailed; $reviewFailed | Export-Csv -Path $failedCsvPath -NoTypeInformation -Encoding UTF8 }
+    catch { Write-Log " WARNING: could not write failed-VM list: $($_.Exception.Message)" -Color Yellow }
 }
 
 # Summary
@@ -2547,7 +2306,7 @@ Write-Log "Mismatches: $(($results | Where-Object { $_.CompareResult -eq 'Mismat
 Write-Log "No VM Upstream CI: $(($results | Where-Object { $_.CompareResult -eq 'Missing Data' }).Count)" -Color Gray
 Write-Log "No NSX Tag: $(($results | Where-Object { $_.CompareResult -eq 'No Tag' }).Count)" -Color Gray
 $notChecked = @($results | Where-Object { $_.CompareResult -eq 'Not checked' -or -not $_.CompareResult }).Count
-if ($notChecked -gt 0) { Write-Log "Not checked (review not run or failed): $notChecked" -Color Yellow }
+if ($notChecked -gt 0) { Write-Log "Not checked (review failed): $notChecked" -Color Yellow }
 Write-Log "Time elapsed: $($stopwatch.Elapsed.ToString('hh\:mm\:ss'))" -Color White
 
 # Export results (CompareResult kept internal for console/summary; CSV uses NSXMatchCMDB).
@@ -2555,17 +2314,34 @@ Write-Log "Time elapsed: $($stopwatch.Elapsed.ToString('hh\:mm\:ss'))" -Color Wh
 # only PARTIAL.csv behind as the "output" - the console will say plainly whether
 # the timestamped file landed. On success PARTIAL is removed so the folder holds
 # just the definitive output.
-$resultsPath = "$resultsDir\CMDBRelations_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+$resultsPath = Join-Path $resultsDir "CMDBRelations_$runStamp.csv"
+# Two attempts, 5s apart - covers transient problems such as the file being
+# briefly locked by AV or a sync client.
 $finalExportOK = $false
-try {
-    Invoke-CleanResultsInPlace -Rows $results
-    $results | Select-Object $exportColumns | Export-Csv -Path $resultsPath -NoTypeInformation -Encoding UTF8
-    $finalExportOK = $true
-    Write-Log "`nResults saved: $resultsPath" -Color Green
+for ($exportAttempt = 1; $exportAttempt -le 2 -and -not $finalExportOK; $exportAttempt++) {
+    try {
+        Invoke-CleanResultsInPlace -Rows $results
+        $results | Select-Object $exportColumns | Export-Csv -Path $resultsPath -NoTypeInformation -Encoding UTF8
+        $finalExportOK = $true
+        Write-Log "`nResults saved: $resultsPath" -Color Green
+    }
+    catch {
+        Write-Log "`nFinal export attempt $exportAttempt FAILED: $($_.Exception.Message)" -Color Red
+        if ($exportAttempt -lt 2) { Start-Sleep -Seconds 5 }
+    }
 }
-catch {
-    Write-Log "`nFinal export FAILED: $($_.Exception.Message)" -Color Red
+if (-not $finalExportOK) {
     Write-Log "PARTIAL.csv (last incremental save) may still be at $partialCsvPath" -Color Yellow
+}
+
+# Keep only the latest report: remove previous runs' CSVs now that this one exists
+if ($finalExportOK) {
+    $oldReports = @(Get-ChildItem -Path $resultsDir -File -Filter 'CMDBRelations_*.csv' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match $runOutputRegex -and $_.FullName -ne (Get-Item -LiteralPath $resultsPath).FullName })
+    foreach ($old in $oldReports) {
+        try   { Remove-Item -LiteralPath $old.FullName -Force; Write-Log "Removed previous report: $($old.Name)" -Color Gray }
+        catch { Write-Log "Could not remove previous report $($old.Name): $($_.Exception.Message)" -Color Yellow }
+    }
 }
 
 if ($finalExportOK -and (Test-Path $partialCsvPath)) {
@@ -2573,11 +2349,14 @@ if ($finalExportOK -and (Test-Path $partialCsvPath)) {
         Remove-Item -Path $partialCsvPath -Force
         Write-Log "Removed superseded partial: $partialCsvPath" -Color Gray
     }
-    catch { }
+    catch { Write-Log "Could not remove partial CSV: $($_.Exception.Message)" -Color Yellow }
 }
 
-# Email report
-if ($SendEmail) {
+# Email report - only ever sent with the final export attached
+if ($SendEmail -and -not $finalExportOK) {
+    Write-Log "`nEmail NOT sent - the final export failed, so there is no report to attach" -Color Red
+}
+elseif ($SendEmail) {
     Write-Log "`n=== SENDING EMAIL ===" -Color Cyan
 
     $matchCount = @($results | Where-Object { $_.CompareResult -eq 'Match' }).Count
@@ -2585,6 +2364,8 @@ if ($SendEmail) {
     $mismatchCount = @($results | Where-Object { $_.CompareResult -eq 'Mismatch' }).Count
     $missingCount = @($results | Where-Object { $_.CompareResult -eq 'Missing Data' }).Count
     $noTagCount = @($results | Where-Object { $_.CompareResult -eq 'No Tag' }).Count
+    $notCheckedCount = @($results | Where-Object { $_.CompareResult -eq 'Not checked' -or -not $_.CompareResult }).Count
+    $reviewFailCount = @($reviewFailed).Count
     $totalVMs = @($results).Count
     $generatedAt = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
 
@@ -2618,9 +2399,18 @@ if ($SendEmail) {
     $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd;'>No NSX Tag</td>"
     $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd; text-align:right; color:gray; font-weight:bold;'>$noTagCount</td>"
     $emailBody += "</tr>"
+    $emailBody += "<tr style='background:#fff8e1;'>"
+    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd;'>Not checked</td>"
+    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd; text-align:right; color:#b26a00; font-weight:bold;'>$notCheckedCount</td>"
+    $emailBody += "</tr>"
     $emailBody += "<tr style='background:#e3f2fd;'>"
     $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd; font-weight:bold;'>Total VMs</td>"
     $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd; text-align:right; font-weight:bold;'>$totalVMs</td>"
+    $emailBody += "</tr>"
+    # Below the total: a pointer to CMDBRelations_FAILED.csv, not part of the count
+    $emailBody += "<tr style='background:#fbe9e7;'>"
+    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd;'>Review failures</td>"
+    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd; text-align:right; color:#c62828; font-weight:bold;'>$reviewFailCount</td>"
     $emailBody += "</tr>"
     $emailBody += "</table>"
     $emailBody += "</body></html>"
@@ -2643,15 +2433,11 @@ if ($SendEmail) {
         }
         Send-MailMessage @emailParams
         Write-Log "Email sent to $EmailTo" -Color Green
-
-        # Clean up CSV after sending
-        if (Test-Path $resultsPath) {
-            Remove-Item -Path $resultsPath -Force
-            Write-Log "CSV cleaned up" -Color Gray
-        }
     }
     catch {
         Write-Log "Failed to send email: $($_.Exception.Message)" -Color Red
-        Write-Log "CSV retained: $resultsPath" -Color Yellow
     }
 }
+
+Write-Log "`nRun log: $runLogPath" -Color Gray
+try { Stop-Transcript | Out-Null } catch { $null = $_ }
