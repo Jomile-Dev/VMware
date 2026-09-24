@@ -96,7 +96,11 @@ $ReviewJobTimeoutSec  = 180
 # (two when $phasedOutEnabled is $true), done once on the main thread before the
 # review starts. 1 = sequential; raise for large estates.
 $PlacementPoolSize    = 6
-$PlacementJobTimeoutSec = 60
+# Per-project wall clock. Covers the CAG call's retries (up to 3 attempts with
+# 2s gaps, and twice that when $phasedOutEnabled is $true). A project whose job
+# hits this limit drops out of the placement index, so keep it comfortably above
+# a normal fetch time.
+$PlacementJobTimeoutSec = 180
 
 # vRO action log fetch: the debug-level endpoint caps its response, which can
 # chop off the retrieveCIRelationshipInfoByKey block on VMs whose action produced
@@ -300,7 +304,17 @@ $cagCache = @{}
 # action in some environments, which silently produced an empty catalogue and made
 # every tag report "Not found in CAG".
 function Get-CagViaExternalValues {
-    param($VraServer, $AuthToken, $ProjectId, $ProjectName, $CagUri, $PhasedOut)
+    # Retries when the call errors OR comes back with no data: the form-service
+    # backend is intermittently flaky (same behaviour as the vRA day-2 form that
+    # fills in after being reopened), and before this a single failed call was
+    # swallowed and treated as "project has no apps" - making every tag in that
+    # project report "Not found in CAG" with nothing in the log.
+    # $FailureInfo (optional hashtable, filled in by reference) tells the caller
+    # whether the result is a genuine empty list or a failed fetch, so a failure
+    # isn't cached. Defaults are in the signature (not script-level config) so
+    # they also apply inside the placement runspaces, which don't see globals.
+    param($VraServer, $AuthToken, $ProjectId, $ProjectName, $CagUri, $PhasedOut,
+          [int]$Retries = 2, [int]$RetryDelayMs = 2000, [hashtable]$FailureInfo)
 
     if (-not $ProjectId) { return @() }
     $headers = @{ Authorization = "Bearer $AuthToken"; "Content-Type" = "application/json" }
@@ -320,13 +334,32 @@ function Get-CagViaExternalValues {
     }
     $body = "[" + ($req | ConvertTo-Json -Depth 6 -Compress) + "]"
 
-    try {
-        $resp = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body -TimeoutSec 60
-        foreach ($r in @($resp)) {
-            if ($r.data) { return @($r.data) }
+    $lastError = $null
+    $attempts  = 1 + [Math]::Max(0, $Retries)
+    for ($i = 1; $i -le $attempts; $i++) {
+        try {
+            $resp = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body -TimeoutSec 60
+            foreach ($r in @($resp)) {
+                if ($r.data) {
+                    if ($FailureInfo) { $FailureInfo.Failed = $false; $FailureInfo.Error = $null; $FailureInfo.Attempts = $i }
+                    return @($r.data)
+                }
+            }
+            # HTTP 200 with no data: may be a genuinely empty CAG, or backend flakiness
+            $lastError = $null
         }
+        catch {
+            $lastError = $_.Exception.Message
+        }
+        if ($i -lt $attempts) { Start-Sleep -Milliseconds $RetryDelayMs }
     }
-    catch { }
+
+    # Out of attempts. Failed = every attempt threw (an error, not an empty list).
+    if ($FailureInfo) {
+        $FailureInfo.Failed   = [bool]$lastError
+        $FailureInfo.Error    = $lastError
+        $FailureInfo.Attempts = $attempts
+    }
     return @()
 }
 
@@ -336,7 +369,8 @@ function Get-CagForProject {
     if ($cagCache -and $cagCache.ContainsKey($ProjectName)) { return $cagCache[$ProjectName] }
 
     # Full catalogue (external-values first, actions REST as fallback)
-    $raw = Get-CagViaExternalValues -VraServer $VraServer -AuthToken $AuthToken -ProjectId $ProjectId -ProjectName $ProjectName -CagUri $CagUri -PhasedOut $PhasedOut
+    $fetchInfo = @{ Failed = $false; Error = $null; Attempts = 0 }
+    $raw = Get-CagViaExternalValues -VraServer $VraServer -AuthToken $AuthToken -ProjectId $ProjectId -ProjectName $ProjectName -CagUri $CagUri -PhasedOut $PhasedOut -FailureInfo $fetchInfo
     if (-not $raw -or @($raw).Count -eq 0) {
         try {
             $raw = Get-VroObjectArray -Response (Invoke-VroActionRest -VraServer $VraServer -AuthToken $AuthToken -ActionUri $CagUri -Parameters @{
@@ -378,8 +412,21 @@ function Get-CagForProject {
     # Do not fail silently - an empty catalogue makes every tag look "Not found in CAG".
     # -Quiet suppresses this: the placement bulk scan legitimately hits many empty
     # projects and the warning would flood the console.
-    if (-not $Quiet -and @($result.Apps).Count -eq 0 -and @($result.SubApps).Count -eq 0) {
-        Write-Log "  WARNING: CAG catalogue is EMPTY for project '$ProjectName' - every tag will report 'Not found in CAG'" -Color Yellow
+    $isEmpty = (@($result.Apps).Count -eq 0 -and @($result.SubApps).Count -eq 0)
+
+    # A FAILED fetch (every attempt errored) is reported in red with the real error,
+    # separately from a genuinely empty catalogue, and is NOT cached - so a later
+    # lookup for the same project gets another go instead of reusing the failure.
+    if ($isEmpty -and $fetchInfo.Failed) {
+        Write-Log "  ERROR: CAG fetch FAILED for project '$ProjectName' after $($fetchInfo.Attempts) attempt(s): $($fetchInfo.Error) - tags in this project will report 'Not found in CAG'" -Color Red
+        return $result
+    }
+
+    # Do not fail silently - an empty catalogue makes every tag look "Not found in CAG".
+    # -Quiet suppresses this: the placement bulk scan legitimately hits many empty
+    # projects and the warning would flood the console.
+    if (-not $Quiet -and $isEmpty) {
+        Write-Log "  WARNING: CAG catalogue is EMPTY for project '$ProjectName' after $($fetchInfo.Attempts) attempt(s) - every tag will report 'Not found in CAG'" -Color Yellow
     }
 
     if ($cagCache) { $cagCache[$ProjectName] = $result }
