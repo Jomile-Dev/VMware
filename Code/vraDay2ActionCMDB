@@ -139,6 +139,7 @@ $exportColumns = @(
 # NSX Manager Configuration (fallback for VMs with empty AppApplication)
 $NSXManager    = "nsx-manager.company.com"
 $NSXAuthMode   = "vIDM"
+$NSXvIDMDomain = "COMPANY"
 $NSXCredPath   = "C:\Scripts\Creds\nsx_cred.xml"
 
 function Write-Log {
@@ -1791,7 +1792,8 @@ if ($missingAppVMs.Count -gt 0) {
         param(
             [string]$Server,
             [PSCredential]$Credential,
-            [string]$AuthMode = "Local"
+            [string]$AuthMode = "Local",
+            [string]$VIDMDomain = ""
         )
 
         $headers = @{
@@ -1867,7 +1869,19 @@ if ($missingAppVMs.Count -gt 0) {
     }
 
     # Switch SSL mode for NSX (NSX requires TrustAllCertsPolicy, not ServerCertificateValidationCallback)
-    Enable-TrustAllCerts
+    [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $null
+    if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
+        Add-Type @"
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+public class TrustAllCertsPolicy : ICertificatePolicy {
+    public bool CheckValidationResult(
+        ServicePoint srvPoint, X509Certificate certificate,
+        WebRequest request, int certificateProblem) { return true; }
+}
+"@
+    }
+    [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
 
     # Import NSX credentials
     $script:NSXFallbackSession = $null
@@ -1883,7 +1897,7 @@ if ($missingAppVMs.Count -gt 0) {
     }
 
     try {
-        $nsxHeaders = Connect-NSXManagerFallback -Server $NSXManager -Credential $nsxCred -AuthMode $NSXAuthMode
+        $nsxHeaders = Connect-NSXManagerFallback -Server $NSXManager -Credential $nsxCred -AuthMode $NSXAuthMode -VIDMDomain $NSXvIDMDomain
         $nsxFilled = 0
 
         foreach ($vm in $missingAppVMs) {
