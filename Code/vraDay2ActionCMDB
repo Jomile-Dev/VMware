@@ -164,6 +164,7 @@ $exportColumns = @(
     @{ Name = 'Multiple Upstream CI';          Expression = { $_.MultipleUpstreamCI } }
 
     @{ Name = 'Upstream To';                   Expression = { $_.UpstreamTo } }
+    @{ Name = 'Upstream App CAG';              Expression = { $_.UpstreamAppCag } }
 
     @{ Name = 'Project Placement CI';          Expression = { $_.ProjectPlacementCI } }
     @{ Name = 'Project Placement Result';      Expression = { $_.ProjectPlacementResult } }
@@ -171,7 +172,6 @@ $exportColumns = @(
     @{ Name = 'NSX vs CMDB Decomm';            Expression = { $_.DecommCompare } }
 
     @{ Name = 'Upstream Lifecycle Status';     Expression = { $_.UpstreamLifecycleStatus } }
-    @{ Name = 'Upstream App CAG';              Expression = { $_.UpstreamAppCag } }
 )
 
 # Per-action REST timeout (seconds) so a bad/blocked endpoint fails fast
@@ -1010,6 +1010,68 @@ function Get-AppDecommStatus {
 }
 
 
+function Get-InfraPortalCiRefetch {
+    # Re-runs the CI portion (requestId=2) of the Phase 1 form-service call
+    # when the review detects a contradiction: Phase 2's log parse found
+    # upstream data, but InfraPortal CMDB CI came back empty from Phase 1.
+    # If the backend has data for the upstream, it also has data for the CI -
+    # so an empty CI in that scenario points at intermittent backend flakiness
+    # rather than a genuine "no CI" result.
+    #
+    # Skips requestId=1 (tags/OS/layer): those already succeeded in Phase 1,
+    # no point re-fetching. Returns the CI string, or empty on any failure -
+    # never throws (would kill the whole review for that VM otherwise).
+    param(
+        [string]$VraServer,
+        [string]$AuthToken,
+        [string]$GetVmAppsUri,
+        [string]$VMName,
+        [string]$ProjectId,
+        [string]$ProjectName,
+        [int]$TimeoutSec = 60
+    )
+
+    if (-not $ProjectId) { return "" }
+
+    try {
+        $headers = @{
+            "Authorization" = "Bearer $AuthToken"
+            "Content-Type"  = "application/json"
+        }
+        $uri = "https://$VraServer/form-service/api/forms/renderer/external-values?projectId=$ProjectId"
+
+        $bodyArray = @(
+            @{
+                uri = $GetVmAppsUri
+                dataSource = "scriptAction"
+                parameters = @(
+                    @{ name = "vmName";      value = $VMName },
+                    @{ name = "projectName"; value = $ProjectName }
+                )
+                useResultsFromRequestId = -1
+                fieldType  = @{ dataType = "string" }
+                isMultiple = $true
+                requestId  = 2
+            }
+        )
+        $body = "[" + (($bodyArray | ForEach-Object { $_ | ConvertTo-Json -Depth 5 -Compress }) -join ",") + "]"
+
+        $response = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body -TimeoutSec $TimeoutSec
+
+        $ci = ""
+        foreach ($result in $response) {
+            if ($result.requestId -eq 2 -and $result.data -is [array]) {
+                $ci = ($result.data | Where-Object { $_ -and $_ -notmatch "^---" }) -join "; "
+            }
+        }
+        return $ci
+    }
+    catch {
+        return ""
+    }
+}
+
+
 function Invoke-CmdbReview {
     param(
         $Vm, $Catalog, $VraServer, $AuthToken, $GetVmAppsUri, $ReturnAppVmsUri,
@@ -1230,6 +1292,71 @@ function Invoke-CmdbReview {
         }
         $multiUpstreamCI = ($firstHopNames -join "; ")
 
+        # Fix 2: contradiction rescue. When Phase 2's log parse found upstream
+        # apps but Phase 1's InfraPortal CMDB CI came back empty, the underlying
+        # action clearly HAS data for this VM (both endpoints hit the same
+        # backend). Empty CI in that case is Phase 1 flakiness, not a real "no
+        # CI" result - retry just the CI portion. If the retry lands data,
+        # backfill $Vm.CMDBCI so the CSV shows it, then re-derive CompareResult /
+        # MatchedApps / $nsxMatch so the match verdict matches the rescued data
+        # (otherwise the row would show a CI value AND a "CMDB data missing"
+        # verdict, which is confusing). One extra API call per affected VM.
+        if ($multiUpstreamCI -and (-not $Vm.CMDBCI) -and $Vm.ProjectId) {
+            $rescuedCI = Get-InfraPortalCiRefetch -VraServer $VraServer -AuthToken $AuthToken `
+                -GetVmAppsUri $GetVmAppsUri -VMName $Vm.VMName `
+                -ProjectId $Vm.ProjectId -ProjectName $Vm.ProjectName
+            if ($rescuedCI) {
+                $Vm.CMDBCI = $rescuedCI
+
+                # Re-run the same tag-vs-CI comparison Phase 1 does, so the
+                # verdict columns catch up with the rescued data. Kept in step
+                # with the Phase 1 logic (see the scriptblock in Phase 1) -
+                # both sides must use the same normalisation.
+                $rescueTags = @()
+                if ($Vm.AppApplication) { $rescueTags = $Vm.AppApplication -split '\|' }
+                $rescueMatchable = @($rescueTags | Where-Object { $_ -and ($_ -notmatch '^(?i)non[_\s\-]?nsx$') } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+
+                $rescueMatch = "Missing Data"
+                $rescueMatchedApps = @()
+                if ($rescueMatchable.Count -gt 0) {
+                    $rescueCiList = $rescuedCI -split ';\s*'
+                    foreach ($rt in $rescueMatchable) {
+                        $rtNorm = ($rt.ToLower().Trim() -replace '[^a-z0-9]+', '')
+                        foreach ($rc in $rescueCiList) {
+                            $rcNorm = ($rc.ToLower().Trim() -replace '[^a-z0-9]+', '')
+                            if ($rtNorm -and $rcNorm -and $rtNorm -eq $rcNorm) {
+                                $rescueMatchedApps += $rt
+                                break
+                            }
+                        }
+                    }
+                    if ($rescueMatchedApps.Count -gt 0) {
+                        $rescueMatch = if ($rescueMatchable.Count -gt 1) { "Match - Multiple Tags" } else { "Match" }
+                    }
+                    else {
+                        $rescueMatch = "Mismatch"
+                    }
+                }
+
+                $Vm.CompareResult = $rescueMatch
+                $Vm.MatchedApps   = ($rescueMatchedApps | Select-Object -Unique) -join "; "
+
+                # NSXMatchCMDB was set at the top of this function from the
+                # original CompareResult. Recompute with the same switch so the
+                # column reflects the rescued verdict.
+                $nsxMatch = switch ($Vm.CompareResult) {
+                    "Match"                 { "NSX tag matches CMDB" }
+                    "Match - Multiple Tags" {
+                        if ($Vm.MatchedApps) { "NSX tag matches CMDB (multiple tags: $($Vm.MatchedApps))" }
+                        else                 { "NSX tag matches CMDB (multiple tags)" }
+                    }
+                    "Mismatch"              { "No match - review CMDB or NSX tag" }
+                    "Missing Data"          { "CMDB data missing - review" }
+                    default                 { [string]$Vm.CompareResult }
+                }
+            }
+        }
+
         # ---- SECOND HOP: does the VM's upstream itself have an upstream? ----
         # Ideal chain is VM > Sub-App > App. A Sub-App with no upstream App needs
         # review; an Application at the first hop is already top of the chain, so
@@ -1275,24 +1402,21 @@ function Invoke-CmdbReview {
                         $lifecycleHits += "App above ${uName}: $($ou.UpstreamCIName) [$(Format-CiClass $ouClassRaw)] - $($ou.UpstreamCIStatus)"
                     }
 
-                    # Track which project CAG(s) own the 2nd-hop app for the
-                    # "Upstream App CAG" column. Ordered dictionary so multiple
-                    # 2nd-hop apps render in a stable order. Empty entry means
-                    # the app was seen but is in no CAG - rendered as "Unknown".
-                    # Skipped when AppToProject is null (placement scan disabled
-                    # or ReviewOnlyVM mode) - handled after the loop.
-                    if ($ou.UpstreamCIName -and $AppToProject) {
-                        $ouKey = Normalize-AppName $ou.UpstreamCIName
-                        if ($ouKey) {
-                            if (-not $secondHopCagMap.Contains($ou.UpstreamCIName)) {
-                                $secondHopCagMap[$ou.UpstreamCIName] = @()
-                            }
-                            $ouProjects = @($AppToProject[$ouKey]) | Where-Object { $_ } | Select-Object -Unique
-                            foreach ($p in $ouProjects) {
-                                if ($secondHopCagMap[$ou.UpstreamCIName] -notcontains $p) {
-                                    $secondHopCagMap[$ou.UpstreamCIName] += $p
-                                }
-                            }
+                    # Track ConfigAdmin from each 2nd-hop entry for the Upstream
+                    # App CAG column. Comes straight from the log record; no
+                    # separate lookup, no reliance on the placement index, so
+                    # this column works even when project placement is skipped.
+                    # Ordered dict lets us handle the rare case of multiple
+                    # distinct 2nd-hop apps under one VM (each with its own admin).
+                    if ($ou.UpstreamCIName) {
+                        if (-not $secondHopCagMap.Contains($ou.UpstreamCIName)) {
+                            $secondHopCagMap[$ou.UpstreamCIName] = @()
+                        }
+                        $ouAdmin = $ou.UpstreamConfigAdmin
+                        if ($ouAdmin -is [array]) { $ouAdmin = ($ouAdmin | Select-Object -First 1) }
+                        if ($ouAdmin) { $ouAdmin = [string]$ouAdmin }
+                        if ($ouAdmin -and $ouAdmin.Trim() -and ($secondHopCagMap[$ou.UpstreamCIName] -notcontains $ouAdmin.Trim())) {
+                            $secondHopCagMap[$ou.UpstreamCIName] += $ouAdmin.Trim()
                         }
                     }
                 }
@@ -1346,20 +1470,14 @@ function Invoke-CmdbReview {
             $lifecycleStatus = "OK"
         }
 
-        # Upstream App CAG: project CAG owning each 2nd-hop app.
-        #   - Not checked : placement scan skipped ($AppToProject null - typical
-        #                   under ReviewOnlyVM or when the scan is disabled)
+        # Upstream App CAG: ConfigAdmin(s) owning each 2nd-hop app.
+        # Source is UpstreamConfigAdmin on each 2nd-hop log entry - a direct
+        # field read, no external index lookup, no placement-scan dependency.
         #   - N/A         : no 2nd hop at all (VM's upstream is top of chain)
-        #   - Unknown     : 2nd hop exists but the app isn't in any project CAG
-        #   - One 2nd hop : CAG name(s) joined by "; "
-        #   - Multi hops  : "AppA: Proj1, Proj2 | AppB: Unknown" (different
-        #                   separator between apps vs between CAGs so a multi-
-        #                   CAG single-hop cell isn't ambiguous with a multi-
-        #                   hop one)
-        if ($null -eq $AppToProject) {
-            $upstreamAppCag = "Not checked"
-        }
-        elseif ($secondHopCagMap.Count -eq 0) {
+        #   - Unknown     : 2nd hop exists but its ConfigAdmin field was empty
+        #   - One 2nd hop : ConfigAdmin(s) joined by "; "
+        #   - Multi hops  : "AppA: AdminX, AdminY | AppB: Unknown"
+        if ($secondHopCagMap.Count -eq 0) {
             $upstreamAppCag = "N/A"
         }
         elseif ($secondHopCagMap.Count -eq 1) {
