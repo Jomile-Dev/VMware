@@ -108,16 +108,6 @@ $MaxLogResults        = 2000
 $LogFetchRetries      = 2
 $LogFetchRetryDelayMs = 1500
 
-# Phase 1 form-service call for InfraPortal CMDB CI: getVmApplications sometimes
-# returns HTTP 200 with an empty CI list even when data exists on the backend
-# (same intermittency you see in the vRA GUI when reopening the day-2 form
-# repopulates the field). When the call succeeds but the CI list comes back
-# empty AND the VM has NSX tags, retry the whole call. Set $Phase1EmptyCIRetries
-# = 0 to disable. Retry only fires when tags are present, so VMs that legitimately
-# have no CMDB CI aren't penalised.
-$Phase1EmptyCIRetries      = 2
-$Phase1EmptyCIRetryDelayMs = 1500
-
 # Save a partial CSV every N reviewed VMs, so a long run that dies part-way still
 # leaves usable output. Failed VMs are listed separately for a targeted re-run.
 $IncrementalSaveEvery = 50
@@ -157,11 +147,11 @@ $exportColumns = @(
 
     @{ Name = 'Infra OS';                      Expression = { $_.InfraOS } }
     @{ Name = 'App Layer';                     Expression = { $_.AppLayer } }
-    @{ Name = 'InfraPortal CMDB CI';           Expression = { $_.CMDBCI } }
+    # NSX tag compared against the VM Upstream CI (relationship log), not InfraPortal.
     @{ Name = 'NSX Match CMDB';                Expression = { $_.NSXMatchCMDB } }
 
     @{ Name = 'VM Upstream Result';            Expression = { $_.MultipleUpstream } }
-    @{ Name = 'Multiple Upstream CI';          Expression = { $_.MultipleUpstreamCI } }
+    @{ Name = 'VM Upstream CI';                Expression = { $_.MultipleUpstreamCI } }
 
     @{ Name = 'Upstream To';                   Expression = { $_.UpstreamTo } }
     @{ Name = 'Upstream App CAG';              Expression = { $_.UpstreamAppCag } }
@@ -1010,68 +1000,6 @@ function Get-AppDecommStatus {
 }
 
 
-function Get-InfraPortalCiRefetch {
-    # Re-runs the CI portion (requestId=2) of the Phase 1 form-service call
-    # when the review detects a contradiction: Phase 2's log parse found
-    # upstream data, but InfraPortal CMDB CI came back empty from Phase 1.
-    # If the backend has data for the upstream, it also has data for the CI -
-    # so an empty CI in that scenario points at intermittent backend flakiness
-    # rather than a genuine "no CI" result.
-    #
-    # Skips requestId=1 (tags/OS/layer): those already succeeded in Phase 1,
-    # no point re-fetching. Returns the CI string, or empty on any failure -
-    # never throws (would kill the whole review for that VM otherwise).
-    param(
-        [string]$VraServer,
-        [string]$AuthToken,
-        [string]$GetVmAppsUri,
-        [string]$VMName,
-        [string]$ProjectId,
-        [string]$ProjectName,
-        [int]$TimeoutSec = 60
-    )
-
-    if (-not $ProjectId) { return "" }
-
-    try {
-        $headers = @{
-            "Authorization" = "Bearer $AuthToken"
-            "Content-Type"  = "application/json"
-        }
-        $uri = "https://$VraServer/form-service/api/forms/renderer/external-values?projectId=$ProjectId"
-
-        $bodyArray = @(
-            @{
-                uri = $GetVmAppsUri
-                dataSource = "scriptAction"
-                parameters = @(
-                    @{ name = "vmName";      value = $VMName },
-                    @{ name = "projectName"; value = $ProjectName }
-                )
-                useResultsFromRequestId = -1
-                fieldType  = @{ dataType = "string" }
-                isMultiple = $true
-                requestId  = 2
-            }
-        )
-        $body = "[" + (($bodyArray | ForEach-Object { $_ | ConvertTo-Json -Depth 5 -Compress }) -join ",") + "]"
-
-        $response = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body -TimeoutSec $TimeoutSec
-
-        $ci = ""
-        foreach ($result in $response) {
-            if ($result.requestId -eq 2 -and $result.data -is [array]) {
-                $ci = ($result.data | Where-Object { $_ -and $_ -notmatch "^---" }) -join "; "
-            }
-        }
-        return $ci
-    }
-    catch {
-        return ""
-    }
-}
-
-
 function Invoke-CmdbReview {
     param(
         $Vm, $Catalog, $VraServer, $AuthToken, $GetVmAppsUri, $ReturnAppVmsUri,
@@ -1080,17 +1008,8 @@ function Invoke-CmdbReview {
         $AppStatusCache, $AppToProject, $AppClass
     )
 
-    $nsxMatch = switch ($Vm.CompareResult) {
-        "Match"                 { "NSX tag matches CMDB" }
-        "Match - Multiple Tags" {
-            # List which tags actually matched, rather than just saying "multiple"
-            if ($Vm.MatchedApps) { "NSX tag matches CMDB (multiple tags: $($Vm.MatchedApps))" }
-            else                 { "NSX tag matches CMDB (multiple tags)" }
-        }
-        "Mismatch"              { "No match - review CMDB or NSX tag" }
-        "Missing Data"          { "CMDB data missing - review" }
-        default                 { [string]$Vm.CompareResult }
-    }
+    # NSX Match CMDB is computed further down, once the VM's upstream CIs have
+    # been read from the relationship log (see "NSX tag vs VM Upstream CI").
 
     # NON_NSX is a marker, not an application - exclude it from every review check
     $tags = if ($Vm.AppApplication) {
@@ -1292,71 +1211,6 @@ function Invoke-CmdbReview {
         }
         $multiUpstreamCI = ($firstHopNames -join "; ")
 
-        # Fix 2: contradiction rescue. When Phase 2's log parse found upstream
-        # apps but Phase 1's InfraPortal CMDB CI came back empty, the underlying
-        # action clearly HAS data for this VM (both endpoints hit the same
-        # backend). Empty CI in that case is Phase 1 flakiness, not a real "no
-        # CI" result - retry just the CI portion. If the retry lands data,
-        # backfill $Vm.CMDBCI so the CSV shows it, then re-derive CompareResult /
-        # MatchedApps / $nsxMatch so the match verdict matches the rescued data
-        # (otherwise the row would show a CI value AND a "CMDB data missing"
-        # verdict, which is confusing). One extra API call per affected VM.
-        if ($multiUpstreamCI -and (-not $Vm.CMDBCI) -and $Vm.ProjectId) {
-            $rescuedCI = Get-InfraPortalCiRefetch -VraServer $VraServer -AuthToken $AuthToken `
-                -GetVmAppsUri $GetVmAppsUri -VMName $Vm.VMName `
-                -ProjectId $Vm.ProjectId -ProjectName $Vm.ProjectName
-            if ($rescuedCI) {
-                $Vm.CMDBCI = $rescuedCI
-
-                # Re-run the same tag-vs-CI comparison Phase 1 does, so the
-                # verdict columns catch up with the rescued data. Kept in step
-                # with the Phase 1 logic (see the scriptblock in Phase 1) -
-                # both sides must use the same normalisation.
-                $rescueTags = @()
-                if ($Vm.AppApplication) { $rescueTags = $Vm.AppApplication -split '\|' }
-                $rescueMatchable = @($rescueTags | Where-Object { $_ -and ($_ -notmatch '^(?i)non[_\s\-]?nsx$') } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-
-                $rescueMatch = "Missing Data"
-                $rescueMatchedApps = @()
-                if ($rescueMatchable.Count -gt 0) {
-                    $rescueCiList = $rescuedCI -split ';\s*'
-                    foreach ($rt in $rescueMatchable) {
-                        $rtNorm = ($rt.ToLower().Trim() -replace '[^a-z0-9]+', '')
-                        foreach ($rc in $rescueCiList) {
-                            $rcNorm = ($rc.ToLower().Trim() -replace '[^a-z0-9]+', '')
-                            if ($rtNorm -and $rcNorm -and $rtNorm -eq $rcNorm) {
-                                $rescueMatchedApps += $rt
-                                break
-                            }
-                        }
-                    }
-                    if ($rescueMatchedApps.Count -gt 0) {
-                        $rescueMatch = if ($rescueMatchable.Count -gt 1) { "Match - Multiple Tags" } else { "Match" }
-                    }
-                    else {
-                        $rescueMatch = "Mismatch"
-                    }
-                }
-
-                $Vm.CompareResult = $rescueMatch
-                $Vm.MatchedApps   = ($rescueMatchedApps | Select-Object -Unique) -join "; "
-
-                # NSXMatchCMDB was set at the top of this function from the
-                # original CompareResult. Recompute with the same switch so the
-                # column reflects the rescued verdict.
-                $nsxMatch = switch ($Vm.CompareResult) {
-                    "Match"                 { "NSX tag matches CMDB" }
-                    "Match - Multiple Tags" {
-                        if ($Vm.MatchedApps) { "NSX tag matches CMDB (multiple tags: $($Vm.MatchedApps))" }
-                        else                 { "NSX tag matches CMDB (multiple tags)" }
-                    }
-                    "Mismatch"              { "No match - review CMDB or NSX tag" }
-                    "Missing Data"          { "CMDB data missing - review" }
-                    default                 { [string]$Vm.CompareResult }
-                }
-            }
-        }
-
         # ---- SECOND HOP: does the VM's upstream itself have an upstream? ----
         # Ideal chain is VM > Sub-App > App. A Sub-App with no upstream App needs
         # review; an Application at the first hop is already top of the chain, so
@@ -1509,6 +1363,46 @@ function Invoke-CmdbReview {
         else {
             $noUpstream    = "No - no upstream relationship, add"
             $multiUpstream = "No upstream"
+        }
+    }
+
+    # --- NSX tag vs VM Upstream CI -----------------------------------------
+    # Compares the NSX tag(s) against the app/sub-app CIs directly upstream of
+    # the VM (the same list shown in the "VM Upstream CI" column), read from
+    # the relationship log. Replaces the old comparison against the Phase 1
+    # InfraPortal value. Normalisation strips everything except a-z0-9, so
+    # underscores/spaces/dashes/punctuation differences don't cause a mismatch.
+    $compareResult = ""
+    $matchedTags   = @()
+    $upstreamNames = @($appUpstreams | ForEach-Object { $_.UpstreamCIName } | Where-Object { $_ })
+
+    if ($tags.Count -eq 0) {
+        $compareResult = "No Tag"
+        $nsxMatch      = "No NSX tag - review"
+    }
+    elseif ($upstreamNames.Count -eq 0) {
+        $compareResult = "Missing Data"
+        $nsxMatch      = "No VM upstream CI - review"
+    }
+    else {
+        $normUpstreams = @($upstreamNames | ForEach-Object { ([string]$_).ToLower().Trim() -replace '[^a-z0-9]+', '' } | Where-Object { $_ })
+        foreach ($t in $tags) {
+            $nt = ([string]$t).ToLower().Trim() -replace '[^a-z0-9]+', ''
+            if ($nt -and ($normUpstreams -contains $nt)) { $matchedTags += $t }
+        }
+        $matchedTags = @($matchedTags | Select-Object -Unique)
+
+        if ($matchedTags.Count -eq 0) {
+            $compareResult = "Mismatch"
+            $nsxMatch      = "No match - review CMDB or NSX tag"
+        }
+        elseif ($tags.Count -gt 1) {
+            $compareResult = "Match - Multiple Tags"
+            $nsxMatch      = "NSX tag matches VM upstream CI (multiple tags: $($matchedTags -join '; '))"
+        }
+        else {
+            $compareResult = "Match"
+            $nsxMatch      = "NSX tag matches VM upstream CI"
         }
     }
 
@@ -1739,6 +1633,8 @@ function Invoke-CmdbReview {
     return [PSCustomObject]@{
         Action                 = $action
         NSXMatchCMDB           = $nsxMatch
+        CompareResult          = $compareResult
+        MatchedApps            = ($matchedTags -join "; ")
         DecommCompare          = $decommCompare
         UpstreamToApp          = $upstreamToApp
         UpstreamTo             = $upstreamTo
@@ -1896,7 +1792,7 @@ if ($ReviewOnlyVM) {
 
 # Scriptblock that runs in each runspace
 $scriptBlock = {
-    param($VraServer, $AuthToken, $ShowVmDetailsUri, $GetVmAppsUri, $VMName, $ProjectId, $ProjectName, $DeploymentName, $MaxAttempts, $RetryDelayMs)
+    param($VraServer, $AuthToken, $ShowVmDetailsUri, $VMName, $ProjectId, $ProjectName, $DeploymentName)
 
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     # Compiled policy, not a scriptblock: runspace threads have no default runspace,
@@ -1922,6 +1818,10 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
 
     $uri = "https://$VraServer/form-service/api/forms/renderer/external-values?projectId=$ProjectId"
 
+    # Phase 1 fetches the NSX tags (app-application, infra-os, app-layer) only.
+    # The NSX-vs-CMDB comparison is done in the review phase against the VM's
+    # upstream CIs from the relationship log ("VM Upstream CI" column), so the
+    # old getVmApplications value (InfraPortal CMDB CI) is no longer fetched here.
     $bodyArray = @(
         @{
             uri = $ShowVmDetailsUri
@@ -1937,121 +1837,44 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
             )
             isMultiple = $true
             requestId = 1
-        },
-        @{
-            uri = $GetVmAppsUri
-            dataSource = "scriptAction"
-            parameters = @(
-                @{ name = "vmName"; value = $VMName },
-                @{ name = "projectName"; value = $ProjectName }
-            )
-            useResultsFromRequestId = -1
-            fieldType = @{ dataType = "string" }
-            isMultiple = $true
-            requestId = 2
         }
     )
 
     $body = "[" + (($bodyArray | ForEach-Object { $_ | ConvertTo-Json -Depth 5 -Compress }) -join ",") + "]"
 
     try {
-        # Retry loop for the intermittent "empty CI list on a VM that has data"
-        # backend behaviour. Only retries when: the HTTP call succeeded, the VM
-        # has NSX tags AND the CI list came back empty. VMs that legitimately
-        # have no CMDB CI (no tags either) exit on the first attempt.
         $appApplications = [System.Collections.ArrayList]::new()
         $infraOs = ""
         $appLayer = ""
-        $vmApplications = ""
-        $attempt = 0
-        $totalAttempts = [Math]::Max(1, [int]$MaxAttempts)
 
-        while ($attempt -lt $totalAttempts) {
-            $attempt++
+        # 60s per-call timeout so a hung form-service endpoint fails this VM's
+        # job fast, freeing the runspace for the next job, instead of waiting
+        # out the wall-clock $jobTimeoutSeconds (120s) that governs the whole
+        # runspace slot.
+        $response = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body -TimeoutSec 60
 
-            # Reset per-attempt state so a previous empty attempt doesn't leak
-            # into the next parse.
-            $appApplications.Clear()
-            $infraOs = ""
-            $appLayer = ""
-            $vmApplications = ""
-
-            # 60s per-call timeout so a hung form-service endpoint fails this VM's
-            # job fast, freeing the runspace for the next job, instead of waiting
-            # out the wall-clock $jobTimeoutSeconds (120s) that governs the whole
-            # runspace slot.
-            $response = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body -TimeoutSec 60
-
-            foreach ($result in $response) {
-                switch ($result.requestId) {
-                    1 {
-                        if ($result.data -is [array]) {
-                            foreach ($item in $result.data) {
-                                if ($item.scope -and $item.tag) {
-                                    if ($item.scope -eq "app-application") {
-                                        [void]$appApplications.Add($item.tag)
-                                    }
-                                    elseif ($item.scope -eq "infra-os") {
-                                        $infraOs = $item.tag
-                                    }
-                                    elseif ($item.scope -eq "app-layer") {
-                                        $appLayer = $item.tag
-                                    }
-                                }
-                            }
+        foreach ($result in $response) {
+            if ($result.requestId -eq 1 -and $result.data -is [array]) {
+                foreach ($item in $result.data) {
+                    if ($item.scope -and $item.tag) {
+                        if ($item.scope -eq "app-application") {
+                            [void]$appApplications.Add($item.tag)
                         }
-                    }
-                    2 {
-                        if ($result.data -is [array]) {
-                            $vmApplications = ($result.data | Where-Object { $_ -and $_ -notmatch "^---" }) -join "; "
+                        elseif ($item.scope -eq "infra-os") {
+                            $infraOs = $item.tag
+                        }
+                        elseif ($item.scope -eq "app-layer") {
+                            $appLayer = $item.tag
                         }
                     }
                 }
             }
-
-            # Break out if CI populated, or no tags to correlate against (nothing
-            # to retry for), or attempts exhausted.
-            if ($vmApplications) { break }
-            if ($appApplications.Count -eq 0) { break }
-            if ($attempt -ge $totalAttempts) { break }
-
-            Start-Sleep -Milliseconds $RetryDelayMs
         }
 
         $appApplication = ($appApplications | Select-Object -Unique) -join "; "
 
-        # Compare each tag against each CMDB CI entry.
-        # NON_NSX is a marker meaning the VM isn't NSX-managed - it is not an
-        # application name and must never be looked up in CMDB.
-        $matchableTags = @($appApplications | Where-Object { $_ -and ($_ -notmatch '^(?i)non[_\s\-]?nsx$') })
-
-        $match = "Missing Data"
-        $matchedApps = @()
-        if ($matchableTags.Count -gt 0 -and $vmApplications) {
-            $ciList = $vmApplications -split ";\s*"
-            foreach ($tag in $matchableTags) {
-                $normTag = ($tag.ToLower().Trim() -replace '[^a-z0-9]+', '')
-                foreach ($ci in $ciList) {
-                    $normCI = ($ci.ToLower().Trim() -replace '[^a-z0-9]+', '')
-                    if ($normTag -and $normCI -and $normTag -eq $normCI) {
-                        $matchedApps += $tag
-                        break
-                    }
-                }
-            }
-            if ($matchedApps.Count -gt 0) {
-                if ($matchableTags.Count -gt 1) {
-                    $match = "Match - Multiple Tags"
-                } else {
-                    $match = "Match"
-                }
-            } else {
-                $match = "Mismatch"
-            }
-        }
-
-        $matchedAppsStr = ($matchedApps | Select-Object -Unique) -join "; "
-
+        # CompareResult / MatchedApps are filled by the review phase. "Not checked"
+        # stays only if the review doesn't run ($RunReview = $false) or fails.
         return [PSCustomObject]@{
             DeploymentName = $DeploymentName
             VMName = $VMName
@@ -2060,11 +1883,9 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
             AppApplication = $appApplication
             InfraOS = $infraOs
             AppLayer = $appLayer
-            CMDBCI = $vmApplications
-            CompareResult = $match
-            MatchedApps = $matchedAppsStr
+            CompareResult = "Not checked"
+            MatchedApps = ""
             Status = "Success"
-            CiFetchAttempts = $attempt
         }
     }
     catch {
@@ -2076,11 +1897,9 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
             AppApplication = ""
             InfraOS = ""
             AppLayer = ""
-            CMDBCI = ""
             CompareResult = ""
             MatchedApps = ""
             Status = "Failed: $($_.Exception.Message)"
-            CiFetchAttempts = $attempt
         }
     }
 }
@@ -2106,13 +1925,10 @@ foreach ($vm in $vmQueue) {
     $ps.AddArgument($vraServer) | Out-Null
     $ps.AddArgument($authToken) | Out-Null
     $ps.AddArgument($showVmDetailsUri) | Out-Null
-    $ps.AddArgument($getVmAppsUri) | Out-Null
     $ps.AddArgument($vm.VMName) | Out-Null
     $ps.AddArgument($vm.ProjectId) | Out-Null
     $ps.AddArgument($vm.ProjectName) | Out-Null
     $ps.AddArgument($vm.DeploymentName) | Out-Null
-    $ps.AddArgument(1 + $Phase1EmptyCIRetries) | Out-Null
-    $ps.AddArgument($Phase1EmptyCIRetryDelayMs) | Out-Null
     $ps.RunspacePool = $runspacePool
 
     $jobs.Add(@{
@@ -2131,26 +1947,9 @@ foreach ($job in $jobs) {
             foreach ($r in $result) {
                 if ($r.Status -eq "Success") {
                     $successCount++
-                    $matchColor = switch ($r.CompareResult) {
-                        "Match" { "Green" }
-                        "Mismatch" { "Red" }
-                        default { "Gray" }
-                    }
-                    # Show a note when a retry actually rescued the CI fetch, so
-                    # the frequency of the intermittency is visible in the run log.
-                    $retryNote = ""
-                    if ($r.CiFetchAttempts -and $r.CiFetchAttempts -gt 1) {
-                        $retryNote = " [CI rescued on attempt $($r.CiFetchAttempts)]"
-                    }
-                    # Show what was returned for Missing Data so you can see what's empty
-                    if ($r.CompareResult -eq "Missing Data") {
-                        $tagVal = if ($r.AppApplication) { $r.AppApplication } else { "(empty)" }
-                        $appVal = if ($r.CMDBCI) { $r.CMDBCI } else { "(empty)" }
-                        Write-Log "[$completed/$($vmQueue.Count)] $($r.VMName) | Tag: $tagVal | CMDB CI: $appVal | Missing Data$retryNote" -Color Gray
-                    }
-                    else {
-                        Write-Log "[$completed/$($vmQueue.Count)] $($r.VMName) | $($r.AppApplication) | $($r.CompareResult)$retryNote" -Color $matchColor
-                    }
+                    # Phase 1 now only reads tags; the match verdict comes from the review.
+                    $tagVal = if ($r.AppApplication) { $r.AppApplication } else { "(no tag)" }
+                    Write-Log "[$completed/$($vmQueue.Count)] $($r.VMName) | Tag: $tagVal" -Color Gray
                 }
                 else {
                     $failCount++
@@ -2165,7 +1964,6 @@ foreach ($job in $jobs) {
                     AppApplication = [string]$r.AppApplication
                     InfraOS = [string]$r.InfraOS
                     AppLayer = [string]$r.AppLayer
-                    CMDBCI = [string]$r.CMDBCI
                     CompareResult = [string]$r.CompareResult
                     MatchedApps = [string]$r.MatchedApps
                 })
@@ -2338,31 +2136,8 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
                             $nsxFilled++
                             Write-Log " $($vm.VMName) | NSX Tags: $($vm.AppApplication)" -Color Green
 
-                            # Re-run comparison with multiple tags
-                            $matchedApps = @()
-                            if ($vm.CMDBCI) {
-                                $ciList = $vm.CMDBCI -split ";\s*"
-                                foreach ($tag in $nsxAppTags) {
-                                    $normTag = ($tag.ToLower().Trim() -replace '[^a-z0-9]+', '')
-                                    foreach ($ci in $ciList) {
-                                        $normCI = ($ci.ToLower().Trim() -replace '[^a-z0-9]+', '')
-                                        if ($normTag -and $normCI -and $normTag -eq $normCI) {
-                                            $matchedApps += $tag
-                                            break
-                                        }
-                                    }
-                                }
-                            }
-
-                            if ($matchedApps.Count -gt 0) {
-                                if ($nsxAppTags.Count -gt 1) {
-                                    $vm.CompareResult = "Match - Multiple Tags"
-                                } else {
-                                    $vm.CompareResult = "Match"
-                                }
-                            } else {
-                                $vm.CompareResult = "Mismatch"
-                            }
+                            # The NSX tag vs VM Upstream CI comparison runs in the
+                            # review phase, which picks up these filled-in tags.
                         }
                         else {
                             Write-Log " $($vm.VMName) | No app-application tag in NSX" -Color Gray
@@ -2732,6 +2507,8 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
                 $rev = Invoke-CmdbReview -Vm $vm -Catalog $cat -VraServer $vraServer -AuthToken $authToken -GetVmAppsUri $getVmAppsUri -ReturnAppVmsUri $returnAppVmsUri -PhasedOut $phasedOutEnabled -ClassFields $UpstreamClassFields -DebugPath $(if ($ReviewDebug) { $ReviewDebugPath } else { $null }) -UseWorkflowLogs $UseWorkflowLogs -WorkflowId $UpstreamWorkflowId -WfInputVmName $UpstreamWfInputVmName -WfInputProjectName $UpstreamWfInputProjectName -WorkflowWaitSec $WorkflowWaitSec -AppStatusCache $appStatusCache -AppToProject $appToProject -AppClass $appClass
                 Add-Member -InputObject $vm -NotePropertyName Action                 -NotePropertyValue $rev.Action                 -Force
                 Add-Member -InputObject $vm -NotePropertyName NSXMatchCMDB           -NotePropertyValue $rev.NSXMatchCMDB           -Force
+                Add-Member -InputObject $vm -NotePropertyName CompareResult          -NotePropertyValue $rev.CompareResult          -Force
+                Add-Member -InputObject $vm -NotePropertyName MatchedApps            -NotePropertyValue $rev.MatchedApps            -Force
                 Add-Member -InputObject $vm -NotePropertyName DecommCompare          -NotePropertyValue $rev.DecommCompare          -Force
                 Add-Member -InputObject $vm -NotePropertyName UpstreamToApp          -NotePropertyValue $rev.UpstreamToApp          -Force
                 Add-Member -InputObject $vm -NotePropertyName UpstreamTo             -NotePropertyValue $rev.UpstreamTo             -Force
@@ -2887,6 +2664,8 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
                 $vm = $job.Vm; $rev = $out.Review
                 Add-Member -InputObject $vm -NotePropertyName Action                 -NotePropertyValue $rev.Action                 -Force
                 Add-Member -InputObject $vm -NotePropertyName NSXMatchCMDB           -NotePropertyValue $rev.NSXMatchCMDB           -Force
+                Add-Member -InputObject $vm -NotePropertyName CompareResult          -NotePropertyValue $rev.CompareResult          -Force
+                Add-Member -InputObject $vm -NotePropertyName MatchedApps            -NotePropertyValue $rev.MatchedApps            -Force
                 Add-Member -InputObject $vm -NotePropertyName DecommCompare          -NotePropertyValue $rev.DecommCompare          -Force
                 Add-Member -InputObject $vm -NotePropertyName UpstreamToApp          -NotePropertyValue $rev.UpstreamToApp          -Force
                 Add-Member -InputObject $vm -NotePropertyName UpstreamTo             -NotePropertyValue $rev.UpstreamTo             -Force
@@ -2933,7 +2712,10 @@ Write-Log "Failed: $failCount" -Color Red
 Write-Log "Matches: $(($results | Where-Object { $_.CompareResult -eq 'Match' }).Count)" -Color Green
 Write-Log "Match (Multi): $(($results | Where-Object { $_.CompareResult -eq 'Match - Multiple Tags' }).Count)" -Color Green
 Write-Log "Mismatches: $(($results | Where-Object { $_.CompareResult -eq 'Mismatch' }).Count)" -Color Red
-Write-Log "Missing Data: $(($results | Where-Object { $_.CompareResult -eq 'Missing Data' }).Count)" -Color Gray
+Write-Log "No VM Upstream CI: $(($results | Where-Object { $_.CompareResult -eq 'Missing Data' }).Count)" -Color Gray
+Write-Log "No NSX Tag: $(($results | Where-Object { $_.CompareResult -eq 'No Tag' }).Count)" -Color Gray
+$notChecked = @($results | Where-Object { $_.CompareResult -eq 'Not checked' -or -not $_.CompareResult }).Count
+if ($notChecked -gt 0) { Write-Log "Not checked (review not run or failed): $notChecked" -Color Yellow }
 Write-Log "Time elapsed: $($stopwatch.Elapsed.ToString('hh\:mm\:ss'))" -Color White
 
 # Export results (CompareResult kept internal for console/summary; CSV uses NSXMatchCMDB).
@@ -2970,6 +2752,7 @@ if ($SendEmail) {
     $matchMultiCount = @($results | Where-Object { $_.CompareResult -eq 'Match - Multiple Tags' }).Count
     $mismatchCount = @($results | Where-Object { $_.CompareResult -eq 'Mismatch' }).Count
     $missingCount = @($results | Where-Object { $_.CompareResult -eq 'Missing Data' }).Count
+    $noTagCount = @($results | Where-Object { $_.CompareResult -eq 'No Tag' }).Count
     $totalVMs = @($results).Count
     $generatedAt = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
 
@@ -2996,8 +2779,12 @@ if ($SendEmail) {
     $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd; text-align:right; color:red; font-weight:bold;'>$mismatchCount</td>"
     $emailBody += "</tr>"
     $emailBody += "<tr style='background:#f5f5f5;'>"
-    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd;'>Missing Data</td>"
+    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd;'>No VM Upstream CI</td>"
     $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd; text-align:right; color:gray; font-weight:bold;'>$missingCount</td>"
+    $emailBody += "</tr>"
+    $emailBody += "<tr style='background:#f5f5f5;'>"
+    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd;'>No NSX Tag</td>"
+    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd; text-align:right; color:gray; font-weight:bold;'>$noTagCount</td>"
     $emailBody += "</tr>"
     $emailBody += "<tr style='background:#e3f2fd;'>"
     $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd; font-weight:bold;'>Total VMs</td>"
