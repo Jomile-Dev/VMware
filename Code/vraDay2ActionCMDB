@@ -17,8 +17,9 @@ $UseSSL = $true
 # vRO action URIs - each is the full "<module>/<actionName>" string.
 # Format: dotted module namespace + a single forward slash + the action name.
 # Do NOT include https:// or /vco/api/... - the code builds that part itself.
-# The review-phase actions (getCag, returnAppVms) are called via the vRO Action
-# REST API (/vco/api/actions), not the form external-values endpoint.
+# showVmDetails (Phase 1) and getCagApplications go through the form-service
+# external-values endpoint; getVmApplications and returnApplicationsVms run via
+# the vRO Action REST API (/vco/api/actions) so their debug logs can be read.
 $showVmDetailsUri = "<module-namespace>/showVmDetails"
 $getVmAppsUri     = "<module-namespace>/getVmApplications"
 $getCagAppsUri    = "<module-namespace>/getCagApplications"
@@ -30,22 +31,10 @@ $returnAppVmsUri  = "<module-namespace>/returnApplicationsVms"
 # the getVmApplications LOG. On 8.x an action run's log IS retrievable over REST,
 # but at a different path than the execution resource:
 #   GET /vco/api/actions/{executionId}/logs   (NOT /actions/{module}/{name}/executions/{id}/logs)
-# Invoke-VroActionWithLogs now hits that correct path first, so no workflow or
-# action edit is required. Leave $UseWorkflowLogs = $false to use it.
-#
-# WORKFLOW FALLBACK (only if the action-log path is blocked in your build):
-# set $UseWorkflowLogs = $true and point $UpstreamWorkflowId at a thin wrapper
-# workflow that calls getVmApplications with vmName + projectName.
-$UseWorkflowLogs      = $false
-$UpstreamWorkflowId   = "<workflow-id-guid>"     # only used when $UseWorkflowLogs = $true
-# Workflow input parameter names -> mapped from the VM row at runtime.
-$UpstreamWfInputVmName      = "vmName"
-$UpstreamWfInputProjectName = "projectName"
-# Max seconds to wait for a workflow run to leave "running" before giving up.
-$WorkflowWaitSec      = 60
+# Invoke-VroActionWithLogs hits that path, so no workflow or action edit is required.
 
 # Field(s) on the upstream object that hold "Application" / "SubApplication".
-# UpstreamCIType is the current candidate; UpstreamCICMSClass is kept as a fallback.
+# Read in order: UpstreamCICMSClass first, UpstreamCIType as the fallback.
 $UpstreamClassFields = @('UpstreamCICMSClass', 'UpstreamCIType')
 
 $phasedOutEnabled = $true
@@ -63,12 +52,8 @@ $CheckProjectPlacement = $true
 # Replay: skip the slow deployment fetch + main runspace phase and load a prior
 # snapshot CSV straight into $results, then run the review against it.
 $ReplayFromCsv    = $false
-$ReplayCsvPath    = "C:\Logs\results_snapshot.csv"
+$ReplayCsvPath    = Join-Path $resultsDir "results_snapshot.csv"
 
-# Probe: before the full review, run ONE getVmApplications call and dump the raw
-# response, so you can confirm the /vco/api/actions endpoint works and see the shape.
-$ProbeVroActions  = $false
-$ProbeVMName      = ""            # blank = first VM in $results
 
 # Review only the first N VMs (0 = all). Handy for troubleshooting.
 $ReviewLimit      = 0
@@ -127,11 +112,11 @@ $IncrementalSaveEvery = 50
 
 # Write raw + parsed vRO responses per reviewed VM to a file for troubleshooting.
 $ReviewDebug      = $false
-$ReviewDebugPath  = "C:\Logs\review_debug.txt"
+$ReviewDebugPath  = Join-Path $resultsDir "review_debug.txt"
 
 # Partial output (rewritten every $IncrementalSaveEvery VMs) and the failed-VM list
-$partialCsvPath   = "C:\Logs\CMDBRelations_PARTIAL.csv"
-$failedCsvPath    = "C:\Logs\CMDBRelations_FAILED.csv"
+$partialCsvPath   = Join-Path $resultsDir "CMDBRelations_PARTIAL.csv"
+$failedCsvPath    = Join-Path $resultsDir "CMDBRelations_FAILED.csv"
 
 # CSV column definition - defined early so the incremental partial saves during
 # the review phase can use the same layout as the final export.
@@ -141,13 +126,9 @@ $failedCsvPath    = "C:\Logs\CMDBRelations_FAILED.csv"
 # Application - convert to sub-app, Not found in CAG, or No tag. Everything to the
 # right of NSX Tag Category is supporting evidence.
 #
-# Two review fields are split into two columns each at export time, so the CSV
-# is filterable on the verdict alone instead of "<CI>: <verdict>" in one cell:
-#   MultipleUpstream  "<Result>: <CI details>"   -> Result + CI   (note: reversed)
-#   UpstreamToApp     "<From> > <To>"            -> From   + To
-# The underlying properties are unchanged - only the export layout differs.
-# If a value doesn't match the expected shape, the first column keeps the raw
-# value and the second is blank, so nothing is silently dropped.
+# Verdict and evidence are separate review fields (e.g. VM Upstream Result vs
+# VM Upstream CI), so each column maps straight to one property - nothing is
+# split or parsed at export time. Header names can differ from the property names.
 $exportColumns = @(
     @{ Name = 'Deployment Name';               Expression = { $_.DeploymentName } }
     @{ Name = 'VM Name';                       Expression = { $_.VMName } }
@@ -160,7 +141,7 @@ $exportColumns = @(
 
     @{ Name = 'Infra OS';                      Expression = { $_.InfraOS } }
     @{ Name = 'App Layer';                     Expression = { $_.AppLayer } }
-    # NSX tag compared against the VM Upstream CI (relationship log), not InfraPortal.
+    # NSX tag compared against the VM Upstream CI (relationship log).
     @{ Name = 'NSX Match CMDB';                Expression = { $_.NSXMatchCMDB } }
 
     @{ Name = 'VM Upstream Result';            Expression = { $_.MultipleUpstream } }
@@ -177,9 +158,6 @@ $exportColumns = @(
     @{ Name = 'Upstream Lifecycle Status';     Expression = { $_.UpstreamLifecycleStatus } }
 )
 
-# Per-action REST timeout (seconds) so a bad/blocked endpoint fails fast
-# instead of hanging the whole review.
-$VroTimeoutSec    = 30
 
 # NSX Manager Configuration (fallback for VMs with empty AppApplication)
 $NSXManager    = "nsx-manager.company.com"
@@ -236,55 +214,6 @@ function Normalize-AppName {
     param($Name)
     if (-not $Name) { return "" }
     return ($Name.ToLower().Trim() -replace '[^a-z0-9]+', '')
-}
-
-# ---------------------------------------------------------------------------
-# vRO Action REST API helper
-# Runs a vRO action synchronously and returns its output normalised:
-#   - string return  -> [string]
-#   - array return   -> [string[]]
-#   - anything else  -> raw .value object
-# CONFIRM this against your environment: endpoint path, auth scheme, and the
-# request/response envelope. Swap in your own helper if it differs.
-# ---------------------------------------------------------------------------
-function Invoke-VroActionRest {
-    param(
-        [string]$VraServer,
-        [string]$AuthToken,
-        [string]$ActionUri,      # "module/actionName"
-        [hashtable]$Parameters,
-        [switch]$Raw,
-        [int]$TimeoutSec = $(if ($VroTimeoutSec) { $VroTimeoutSec } else { 30 })
-    )
-
-    $lastSlash  = $ActionUri.LastIndexOf('/')
-    $module     = $ActionUri.Substring(0, $lastSlash)
-    $actionName = $ActionUri.Substring($lastSlash + 1)
-
-    $paramList = foreach ($k in $Parameters.Keys) {
-        $val = $Parameters[$k]
-        if ($val -is [bool]) {
-            @{ name = $k; type = "boolean"; value = @{ boolean = @{ value = $val } } }
-        }
-        else {
-            @{ name = $k; type = "string"; value = @{ string = @{ value = [string]$val } } }
-        }
-    }
-
-    $body = @{ parameters = @($paramList) } | ConvertTo-Json -Depth 6
-    $uri  = "https://$VraServer/vco/api/actions/$module/$actionName/executions"
-    $headers = @{
-        "Authorization" = "Bearer $AuthToken"
-        "Content-Type"  = "application/json"
-        "Accept"        = "application/json"
-    }
-
-    $resp = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body -TimeoutSec $TimeoutSec
-    if ($Raw) { return $resp }
-    $v = $resp.value
-    if ($null -ne $v.string) { return $v.string.value }
-    elseif ($null -ne $v.array) { return @($v.array.elements | ForEach-Object { $_.string.value }) }
-    else { return $v }
 }
 
 # Parse the flat getCagApplications string array into App / Sub-App buckets.
@@ -377,18 +306,10 @@ function Get-CagForProject {
     if (-not $ProjectName) { return [PSCustomObject]@{ Apps = @(); SubApps = @(); PhasedOutApps = @(); PhasedOutSubApps = @() } }
     if ($cagCache -and $cagCache.ContainsKey($ProjectName)) { return $cagCache[$ProjectName] }
 
-    # Full catalogue (external-values first, actions REST as fallback)
+    # Full catalogue - form-service external-values only (the /vco/api/actions
+    # route does not return the CAG for this action)
     $fetchInfo = @{ Failed = $false; Error = $null; Attempts = 0 }
     $raw = Get-CagViaExternalValues -VraServer $VraServer -AuthToken $AuthToken -ProjectId $ProjectId -ProjectName $ProjectName -CagUri $CagUri -PhasedOut $PhasedOut -FailureInfo $fetchInfo
-    if (-not $raw -or @($raw).Count -eq 0) {
-        try {
-            $raw = Get-VroObjectArray -Response (Invoke-VroActionRest -VraServer $VraServer -AuthToken $AuthToken -ActionUri $CagUri -Parameters @{
-                projectName      = $ProjectName
-                phasedOutEnabled = $PhasedOut
-            })
-        }
-        catch { $raw = @() }
-    }
     $cat = Get-CagCatalog -RawArray $raw
 
     # Live-only catalogue: the difference against the full list IS the phased-out set
@@ -440,38 +361,6 @@ function Get-CagForProject {
 
     if ($cagCache) { $cagCache[$ProjectName] = $result }
     return $result
-}
-
-# Defensively pull an array of objects out of a vRO action REST response.
-# Handles a native array in .value.array.elements (either .properties key/value
-# pairs or a JSON string per element), a single JSON-string return, or an
-# already-native array/object. Confirm the actual envelope against your logs.
-function Get-VroObjectArray {
-    param($Response)
-    if ($null -eq $Response) { return @() }
-
-    $v = $Response.value
-    if ($v -and $v.array -and $v.array.elements) {
-        $out = foreach ($el in $v.array.elements) {
-            if ($el.properties) {
-                $o = @{}
-                foreach ($p in $el.properties) { $o[$p.key] = $p.value.string.value }
-                [PSCustomObject]$o
-            }
-            elseif ($el.string -and $el.string.value) {
-                try { $el.string.value | ConvertFrom-Json -ErrorAction Stop } catch { $el.string.value }
-            }
-            else { $el }
-        }
-        return @($out)
-    }
-    if ($v -and $v.string -and $v.string.value) {
-        try { return @($v.string.value | ConvertFrom-Json -ErrorAction Stop) } catch { return @() }
-    }
-    if ($Response -is [string]) {
-        try { return @($Response | ConvertFrom-Json -ErrorAction Stop) } catch { return @() }
-    }
-    return @($Response)
 }
 
 # First non-empty value across a set of candidate field names
@@ -805,87 +694,6 @@ function Get-CiClassesFromLog {
     return @(Get-CiClasses -Obj $obj)
 }
 
-# Run a WORKFLOW via REST and fetch that run's logs. On vRO/Aria 8.x a workflow
-# execution exposes its log at /executions/{execId}/syslogs (and /logs), where the
-# wrapped action's System.log output - including retrieveCIRelationshipInfoByKey -
-# appears. Poll state until the run leaves "running", then read the log.
-# Returns the same shape as Invoke-VroActionWithLogs: Value/LogText/LogEndpoint/ExecId.
-function Invoke-VroWorkflowWithLogs {
-    param(
-        $VraServer, $AuthToken, $WorkflowId, [hashtable]$Parameters,
-        [int]$WaitSec = 60, [int]$TimeoutSec = 60
-    )
-
-    $headers = @{
-        "Authorization" = "Bearer $AuthToken"
-        "Content-Type"  = "application/json"
-        "Accept"        = "application/json"
-    }
-
-    # Workflow execution body: parameters use the same typed envelope as actions.
-    $paramList = foreach ($k in $Parameters.Keys) {
-        $val = $Parameters[$k]
-        if ($val -is [bool]) { @{ name = $k; type = "boolean"; value = @{ boolean = @{ value = $val } } } }
-        else                 { @{ name = $k; type = "string";  value = @{ string  = @{ value = [string]$val } } } }
-    }
-    $body = @{ parameters = @($paramList) } | ConvertTo-Json -Depth 6
-
-    $base   = "https://$VraServer/vco/api/workflows/$WorkflowId"
-    $execId = $null
-
-    try {
-        $resp = Invoke-WebRequest -Uri "$base/executions" -Method Post -Headers $headers -Body $body -TimeoutSec $TimeoutSec -UseBasicParsing
-        if ($resp.Headers.Location) { $execId = ([string]$resp.Headers.Location).TrimEnd('/').Split('/')[-1] }
-        if (-not $execId -and $resp.Content) {
-            try { $p = $resp.Content | ConvertFrom-Json; if ($p.id) { $execId = $p.id } } catch { }
-        }
-    }
-    catch {
-        return [PSCustomObject]@{ Value = $null; LogText = ""; LogEndpoint = "wf-run-failed: $($_.Exception.Message)"; ExecId = $null }
-    }
-
-    if (-not $execId) {
-        return [PSCustomObject]@{ Value = $null; LogText = ""; LogEndpoint = "wf-no-execId"; ExecId = $null }
-    }
-
-    # Poll state until it leaves "running" (or we hit the wait cap)
-    $waited = 0
-    do {
-        Start-Sleep -Milliseconds 1000
-        $waited++
-        $state = "unknown"
-        try {
-            $st = Invoke-RestMethod -Uri "$base/executions/$execId/state" -Method Get -Headers $headers -TimeoutSec 30
-            if ($st.value) { $state = [string]$st.value } elseif ($st.'state') { $state = [string]$st.'state' }
-        } catch { }
-    } while ($state -eq "running" -and $waited -lt $WaitSec)
-
-    # Read the run log (syslogs carries the detailed System.log lines; /logs is the fallback)
-    $logText = ""; $usedEndpoint = "none"
-    $candidates = @(
-        "$base/executions/$execId/syslogs?maxResult=10000",
-        "$base/executions/$execId/logs?maxResult=10000"
-    )
-    foreach ($cand in $candidates) {
-        try {
-            $logResp = Invoke-RestMethod -Uri $cand -Method Get -Headers $headers -TimeoutSec 30
-            $lines = @()
-            foreach ($e in @($logResp.logs)) {
-                $m = $null
-                if     ($e.entry.'long-message')  { $m = $e.entry.'long-message' }
-                elseif ($e.entry.'short-message') { $m = $e.entry.'short-message' }
-                elseif ($e.message)               { $m = $e.message }
-                if ($m) { $lines += $m }
-            }
-            if (-not $lines -and $logResp -is [string]) { $lines = @($logResp) }
-            if ($lines) { $logText = ($lines -join "`n"); $usedEndpoint = $cand; break }
-        }
-        catch { continue }
-    }
-
-    return [PSCustomObject]@{ Value = $null; LogText = $logText; LogEndpoint = $usedEndpoint; ExecId = $execId }
-}
-
 # Run an action (same module/name URI as everywhere else) and fetch that run's
 # logs - the same data the GUI Logs tab shows. Also returns the action's value.
 function Invoke-VroActionWithLogs {
@@ -1060,7 +868,6 @@ function Invoke-CmdbReview {
     param(
         $Vm, $Catalog, $VraServer, $AuthToken, $GetVmAppsUri, $ReturnAppVmsUri,
         $PhasedOut, $ClassFields, $DebugPath,
-        $UseWorkflowLogs, $WorkflowId, $WfInputVmName, $WfInputProjectName, $WorkflowWaitSec,
         $AppStatusCache, $AppToProject, $AppClass
     )
 
@@ -1173,8 +980,7 @@ function Invoke-CmdbReview {
     #   GET /vco/api/actions/{execId}/logs?conditions=severity=debug&...
     # The block is logged at DEBUG level, so the severity=debug condition is required -
     # without it the endpoint returns only the few info-level factory lines.
-    # Keyed on vmName + projectName (one call per VM). The workflow-log path remains
-    # available via $UseWorkflowLogs but is not needed.
+    # Keyed on vmName + projectName (one call per VM).
     $upstreamCIs = @()
     $ciStatuses  = @()
     $returnRaws  = @()
@@ -1186,27 +992,15 @@ function Invoke-CmdbReview {
         $attemptStatuses  = @()
         $runError = $null
         try {
-            if ($UseWorkflowLogs -and $WorkflowId -and $WorkflowId -notmatch '^<') {
-                # Optional: run a wrapper workflow and read its run log
-                $wfInputs = @{}
-                $wfInputs[$WfInputVmName]      = $Vm.VMName
-                $wfInputs[$WfInputProjectName] = $Vm.ProjectName
-                $runRes = Invoke-VroWorkflowWithLogs -VraServer $VraServer -AuthToken $AuthToken -WorkflowId $WorkflowId -Parameters $wfInputs -WaitSec $WorkflowWaitSec
-                $runMode = "workflow"
-            }
-            else {
-                # Default: action execution + debug-level action log (confirmed working)
-                $runRes = Invoke-VroActionWithLogs -VraServer $VraServer -AuthToken $AuthToken -ActionUri $GetVmAppsUri -Parameters @{
-                    vmName      = $Vm.VMName
-                    projectName = $Vm.ProjectName
-                }
-                $runMode = "action"
+            # Action execution + debug-level action log
+            $runRes = Invoke-VroActionWithLogs -VraServer $VraServer -AuthToken $AuthToken -ActionUri $GetVmAppsUri -Parameters @{
+                vmName      = $Vm.VMName
+                projectName = $Vm.ProjectName
             }
             $logTextStr = if ($runRes.LogText) { [string]$runRes.LogText } else { '' }
             $returnRaws += [ordered]@{
                 vmName            = $Vm.VMName
                 upstreamAttempt   = $uAttempt
-                runMode           = $runMode
                 execId            = $runRes.ExecId
                 logEndpoint       = $runRes.LogEndpoint
                 logAttempts       = $runRes.LogAttempts
@@ -1452,8 +1246,7 @@ function Invoke-CmdbReview {
     # --- NSX tag vs VM Upstream CI -----------------------------------------
     # Compares the NSX tag(s) against the app/sub-app CIs directly upstream of
     # the VM (the same list shown in the "VM Upstream CI" column), read from
-    # the relationship log. Replaces the old comparison against the Phase 1
-    # InfraPortal value. Normalisation strips everything except a-z0-9, so
+    # the relationship log. Normalisation strips everything except a-z0-9, so
     # underscores/spaces/dashes/punctuation differences don't cause a mismatch.
     $compareResult = ""
     $matchedTags   = @()
@@ -1906,8 +1699,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
 
     # Phase 1 fetches the NSX tags (app-application, infra-os, app-layer) only.
     # The NSX-vs-CMDB comparison is done in the review phase against the VM's
-    # upstream CIs from the relationship log ("VM Upstream CI" column), so the
-    # old getVmApplications value (InfraPortal CMDB CI) is no longer fetched here.
+    # upstream CIs from the relationship log ("VM Upstream CI" column).
     $bodyArray = @(
         @{
             uri = $ShowVmDetailsUri
@@ -2275,65 +2067,6 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
     [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
     [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $null
 
-    # Probe: confirm the /vco/api/actions endpoint responds and see the raw shape
-    if ($ProbeVroActions) {
-        $probeVm = if ($ProbeVMName) { $results | Where-Object { $_.VMName -eq $ProbeVMName } | Select-Object -First 1 }
-                   else { $results | Select-Object -First 1 }
-        if ($probeVm) {
-            Write-Log " ===== PROBE: $($probeVm.VMName) | project $($probeVm.ProjectName) | tags '$($probeVm.AppApplication)' =====" -Color Yellow
-
-            # 1) getCagApplications - does the catalogue return anything, and how does it parse?
-            Write-Log "`n --- getCagApplications (raw) ---" -Color Yellow
-            try {
-                $cagRaw = Invoke-VroActionRest -VraServer $vraServer -AuthToken $authToken -ActionUri $getCagAppsUri -Parameters @{
-                    projectName      = $probeVm.ProjectName
-                    phasedOutEnabled = $phasedOutEnabled
-                }
-                Write-Log ($cagRaw | ConvertTo-Json -Depth 8) -Color Gray
-                $cagCat = Get-CagCatalog -RawArray $cagRaw
-                Write-Log " Parsed CAG -> Apps: $($cagCat.Apps.Count), SubApps: $($cagCat.SubApps.Count)" -Color Cyan
-                Write-Log ("  Apps sample:    " + (($cagCat.Apps    | Select-Object -First 5) -join ' | ')) -Color Gray
-                Write-Log ("  SubApps sample: " + (($cagCat.SubApps | Select-Object -First 5) -join ' | ')) -Color Gray
-            }
-            catch { Write-Log " getCagApplications failed: $($_.Exception.Message)" -Color Red }
-
-            # 2) getVmApplications - raw shape AND the real property names on each object
-            Write-Log "`n --- getVmApplications (raw) ---" -Color Yellow
-            try {
-                $vmRaw = Invoke-VroActionRest -VraServer $vraServer -AuthToken $authToken -ActionUri $getVmAppsUri -Raw -Parameters @{
-                    projectName = $probeVm.ProjectName
-                    vmName      = $probeVm.VMName
-                }
-                Write-Log ($vmRaw | ConvertTo-Json -Depth 10) -Color Gray
-                $objs = @(Get-VroObjectArray -Response $vmRaw)
-                Write-Log " Parsed objects: $($objs.Count)" -Color Cyan
-                if ($objs.Count -gt 0) {
-                    Write-Log ("  Property names on object[0]: " + (($objs[0].PSObject.Properties.Name) -join ', ')) -Color Green
-                    Write-Log ($objs[0] | ConvertTo-Json -Depth 6) -Color Gray
-                }
-            }
-            catch { Write-Log " getVmApplications failed: $($_.Exception.Message)" -Color Red }
-
-            # 3) returnApplicationVms - raw shape for the first tag
-            $firstTag = ($probeVm.AppApplication -split ";\s*" | Where-Object { $_ } | Select-Object -First 1)
-            if ($firstTag) {
-                Write-Log "`n --- returnApplicationVms (raw) for tag '$firstTag' ---" -Color Yellow
-                try {
-                    $rRaw = Invoke-VroActionRest -VraServer $vraServer -AuthToken $authToken -ActionUri $returnAppVmsUri -Raw -Parameters @{
-                        applicationName  = ($firstTag -replace '_', ' ')
-                        projectName      = $probeVm.ProjectName
-                        vmName           = $probeVm.VMName
-                        phasedOutEnabled = $phasedOutEnabled
-                    }
-                    Write-Log ($rRaw | ConvertTo-Json -Depth 10) -Color Gray
-                }
-                catch { Write-Log " returnApplicationVms failed: $($_.Exception.Message)" -Color Red }
-            }
-        }
-        Write-Log "`n Probe done - set `$ProbeVroActions = `$false to run the full review." -Color Yellow
-        return
-    }
-
     if ($ReviewDebug -and (Test-Path $ReviewDebugPath)) { Remove-Item $ReviewDebugPath -Force }
 
     $reviewSet = if ($ReviewOnlyVM) {
@@ -2472,8 +2205,8 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
                 # Write-Log is included so the empty-CAG WARNING can surface from
                 # inside the runspace instead of throwing CommandNotFound.
                 $placementFns = @(
-                    'Write-Log','Normalize-AppName','Invoke-VroActionRest','Get-CagCatalog',
-                    'Get-VroObjectArray','Get-CagViaExternalValues','Get-CagForProject'
+                    'Write-Log','Normalize-AppName','Get-CagCatalog',
+                    'Get-CagViaExternalValues','Get-CagForProject'
                 )
                 $placementIss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
                 foreach ($fn in $placementFns) {
@@ -2591,7 +2324,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
             Write-Log " [$($reviewed + 1)/$reviewTotal] $($vm.VMName)..." -Color DarkGray
             $cat = if ($vm.ProjectName -and $cagByProject.ContainsKey($vm.ProjectName)) { $cagByProject[$vm.ProjectName] } else { [PSCustomObject]@{ Apps = @(); SubApps = @() } }
             try {
-                $rev = Invoke-CmdbReview -Vm $vm -Catalog $cat -VraServer $vraServer -AuthToken $authToken -GetVmAppsUri $getVmAppsUri -ReturnAppVmsUri $returnAppVmsUri -PhasedOut $phasedOutEnabled -ClassFields $UpstreamClassFields -DebugPath $(if ($ReviewDebug) { $ReviewDebugPath } else { $null }) -UseWorkflowLogs $UseWorkflowLogs -WorkflowId $UpstreamWorkflowId -WfInputVmName $UpstreamWfInputVmName -WfInputProjectName $UpstreamWfInputProjectName -WorkflowWaitSec $WorkflowWaitSec -AppStatusCache $appStatusCache -AppToProject $appToProject -AppClass $appClass
+                $rev = Invoke-CmdbReview -Vm $vm -Catalog $cat -VraServer $vraServer -AuthToken $authToken -GetVmAppsUri $getVmAppsUri -ReturnAppVmsUri $returnAppVmsUri -PhasedOut $phasedOutEnabled -ClassFields $UpstreamClassFields -DebugPath $(if ($ReviewDebug) { $ReviewDebugPath } else { $null }) -AppStatusCache $appStatusCache -AppToProject $appToProject -AppClass $appClass
                 Add-Member -InputObject $vm -NotePropertyName Action                 -NotePropertyValue $rev.Action                 -Force
                 Add-Member -InputObject $vm -NotePropertyName NSXMatchCMDB           -NotePropertyValue $rev.NSXMatchCMDB           -Force
                 Add-Member -InputObject $vm -NotePropertyName CompareResult          -NotePropertyValue $rev.CompareResult          -Force
@@ -2629,10 +2362,10 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
 
         # Inject the helper functions this phase needs into every runspace
         $fnNames = @(
-            'Normalize-AppName','Invoke-VroActionRest','Get-CagCatalog','Get-VroObjectArray',
+            'Normalize-AppName','Get-CagCatalog',
             'Get-FirstFieldValue','Get-AppTier','Get-TagClassPriority','Get-BestStatusLabel','Format-CiClass','Get-VroJson','Get-UpstreamCIs','Get-CiStatuses','Get-CiClasses',
             'Get-JsonBlockFromText','Get-UpstreamCIsFromLog','Get-CiStatusesFromLog','Get-CiClassesFromLog',
-            'Invoke-VroWorkflowWithLogs','Invoke-VroActionWithLogs','Get-AppDecommStatus','Invoke-CmdbReview'
+            'Invoke-VroActionWithLogs','Get-AppDecommStatus','Invoke-CmdbReview'
         )
         $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
         foreach ($fn in $fnNames) {
@@ -2662,7 +2395,6 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
         $reviewBlock = {
             param($Vm, $Catalog, $VraServer, $AuthToken, $GetVmAppsUri, $ReturnAppVmsUri,
                   $PhasedOut, $ClassFields, $WantDebug,
-                  $UseWorkflowLogs, $WorkflowId, $WfInputVmName, $WfInputProjectName, $WorkflowWaitSec,
                   $AppStatusCache, $AppToProject, $AppClass)
 
             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -2688,8 +2420,6 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
                 $rev = Invoke-CmdbReview -Vm $Vm -Catalog $Catalog -VraServer $VraServer -AuthToken $AuthToken `
                     -GetVmAppsUri $GetVmAppsUri -ReturnAppVmsUri $ReturnAppVmsUri -PhasedOut $PhasedOut `
                     -ClassFields $ClassFields -DebugPath $tmpDebug `
-                    -UseWorkflowLogs $UseWorkflowLogs -WorkflowId $WorkflowId `
-                    -WfInputVmName $WfInputVmName -WfInputProjectName $WfInputProjectName -WorkflowWaitSec $WorkflowWaitSec `
                     -AppStatusCache $AppStatusCache -AppToProject $AppToProject -AppClass $AppClass
 
                 $dbgText = ""
@@ -2730,11 +2460,6 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
             $ps.AddArgument($phasedOutEnabled)           | Out-Null
             $ps.AddArgument($UpstreamClassFields)        | Out-Null
             $ps.AddArgument([bool]$ReviewDebug)          | Out-Null
-            $ps.AddArgument($UseWorkflowLogs)            | Out-Null
-            $ps.AddArgument($UpstreamWorkflowId)         | Out-Null
-            $ps.AddArgument($UpstreamWfInputVmName)      | Out-Null
-            $ps.AddArgument($UpstreamWfInputProjectName) | Out-Null
-            $ps.AddArgument($WorkflowWaitSec)            | Out-Null
             $ps.AddArgument($appStatusCache)             | Out-Null
             $ps.AddArgument($appToProject)               | Out-Null
             $ps.AddArgument($appClass)                   | Out-Null
