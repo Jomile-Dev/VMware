@@ -1093,10 +1093,12 @@ function Invoke-CmdbReview {
         $hopTo      = @()
         $anySecondHop = $false
         $anySubAppMissingApp = $false
-        # Lifecycle: apps that came back with UpstreamCIStatus "Planned/On order".
-        # Checked at both hops. Distinct from Decomm (dispos|retire|decommission|phased) -
-        # this is "not yet live" rather than "no longer live".
+        # Lifecycle: every app/sub-app at either hop whose UpstreamCIStatus is NOT
+        # In Use - Production / Test / Pilot (i.e. Planned/On order, In Use - Phasing out,
+        # Disposed/Retired, an unrecognised wording, or empty -> "Unknown").
+        # Statuses go through Get-BestStatusLabel so wording variants map to the six labels.
         $lifecycleHits = @()
+        $lifecycleGood = @('In Use - Production', 'In Use - Test', 'In Use - Pilot')
         # 2nd-hop app name -> list of project CAG names owning it. Ordered so the
         # display string keeps the order 2nd hops were seen in. Only populated
         # when $AppToProject is available (placement scan wasn't skipped).
@@ -1109,8 +1111,9 @@ function Invoke-CmdbReview {
             if (-not $uName) { continue }
 
             # 1st hop lifecycle: direct upstream's own status
-            if ($u.UpstreamCIStatus -match '(?i)planned/on\s*order') {
-                $lifecycleHits += "VM upstream: $uName [$(Format-CiClass $uClassRaw)] - $($u.UpstreamCIStatus)"
+            $uStatus = if ($u.UpstreamCIStatus) { Get-BestStatusLabel @([string]$u.UpstreamCIStatus) } else { 'Unknown' }
+            if ($uStatus -notin $lifecycleGood) {
+                $lifecycleHits += "VM upstream: $uName [$(Format-CiClass $uClassRaw)] - $uStatus"
             }
 
             $info = Get-AppDecommStatus -AppName $uName -VraServer $VraServer `
@@ -1125,9 +1128,13 @@ function Invoke-CmdbReview {
                     if     ($ouClass -eq 'Application')    { $ownApps += $ou.UpstreamCIName }
                     elseif ($ouClass -eq 'SubApplication') { $ownSubs += $ou.UpstreamCIName }
 
-                    # 2nd hop lifecycle: status of the upstream's own upstream
-                    if ($ou.UpstreamCIStatus -match '(?i)planned/on\s*order') {
-                        $lifecycleHits += "App above ${uName}: $($ou.UpstreamCIName) [$(Format-CiClass $ouClassRaw)] - $($ou.UpstreamCIStatus)"
+                    # 2nd hop lifecycle: status of the upstream's own app/sub-app upstream
+                    # (non-app CIs such as agents or running software are ignored, as in Upstream To)
+                    if ($ouClass -in @('Application','SubApplication') -and $ou.UpstreamCIName) {
+                        $ouStatus = if ($ou.UpstreamCIStatus) { Get-BestStatusLabel @([string]$ou.UpstreamCIStatus) } else { 'Unknown' }
+                        if ($ouStatus -notin $lifecycleGood) {
+                            $lifecycleHits += "App above ${uName}: $($ou.UpstreamCIName) [$(Format-CiClass $ouClassRaw)] - $ouStatus"
+                        }
                     }
 
                     # Track ConfigAdmin from each 2nd-hop entry for the Upstream
@@ -1188,14 +1195,14 @@ function Invoke-CmdbReview {
         elseif ($anySubAppMissingApp)   { $noUpstream = "No - Sub-App has no upstream App, add relationship" }
         else                            { $noUpstream = "N/A - VM upstream is an Application (top of chain)" }
 
-        # Upstream Lifecycle Status: Planned/On order at either hop.
-        # "OK" when there ARE app upstreams but none are Planned/On order at either hop.
+        # Upstream Lifecycle Status: lists only the hops that are not In Use -
+        # Production / Test / Pilot. "Good" when every app at both hops is in use.
         # "N/A" stays only for the no-upstream case (handled by the default init above).
         if ($lifecycleHits.Count -gt 0) {
             $lifecycleStatus = ($lifecycleHits | Select-Object -Unique) -join "; "
         }
         else {
-            $lifecycleStatus = "OK"
+            $lifecycleStatus = "Good"
         }
 
         # Upstream App CAG: ConfigAdmin(s) owning each 2nd-hop app.
