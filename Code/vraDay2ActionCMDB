@@ -2380,59 +2380,47 @@ if ($SendEmail -and -not $finalExportOK) {
 elseif ($SendEmail) {
     Write-Log "`n=== SENDING EMAIL ===" -Color Cyan
 
-    $matchCount = @($results | Where-Object { $_.CompareResult -eq 'Match' }).Count
-    $matchMultiCount = @($results | Where-Object { $_.CompareResult -eq 'Match - Multiple Tags' }).Count
-    $mismatchCount = @($results | Where-Object { $_.CompareResult -eq 'Mismatch' }).Count
-    $missingCount = @($results | Where-Object { $_.CompareResult -eq 'Missing Data' }).Count
-    $noTagCount = @($results | Where-Object { $_.CompareResult -eq 'No Tag' }).Count
-    $notCheckedCount = @($results | Where-Object { $_.CompareResult -eq 'Not checked' -or -not $_.CompareResult }).Count
-    $reviewFailCount = @($reviewFailed).Count
-    $totalVMs = @($results).Count
+    $totalVMs    = @($results).Count
     $generatedAt = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+
+    # Column guide shown in the email body: CSV header -> description.
+    $columnGuide = @(
+        @('Deployment Name',           'Deployment name in vRA'),
+        @('VM Name',                   'The Cloud.vSphere.Machine resource that is tied to that deployment'),
+        @('Project Name',              'The vRA Project (CAG) it sits under'),
+        @('NSX Tag',                   'The VM application tag from NSX'),
+        @('NSX Tag Category',          'it searches the NSX tag name in CMDB to see the status of the app and whether it is a Sub-App or App'),
+        @('Infra OS',                  'OS Tag'),
+        @('App Layer',                 'App Layer Tag'),
+        @('NSX Match CMDB',            'It does a check of the NSX tag against the CMDB to see if the name matches'),
+        @('VM Upstream Result',        'Check how many app/sub-app upstream is linked against the VM'),
+        @('VM Upstream CI',            'The name of the CI with what class (Sub-App or App..etc)'),
+        @('Upstream To',               'What each upstream CI is linked to (2nd hop. meaning VM > Sub-App > XXX)'),
+        @('Upstream App CAG',          'The CAG of the 2nd hop upstream CI'),
+        @('Project Placement CI',      'what was checked for project placement'),
+        @('Project Placement Result',  'whether the vm is in the right vra project'),
+        @('NSX vs CMDB Decomm',        'whether the tagged app and/or app upstream app is decomm/disposed'),
+        @('Upstream Lifecycle Status', 'CI status of every app at both hops')
+    )
 
     $emailBody = "<html>"
     $emailBody += "<body style='font-family: Segoe UI, Arial, sans-serif; color: #333;'>"
     $emailBody += "<h2 style='color: #2c3e50;'>CMDB Relations Comparison Report</h2>"
     $emailBody += "<p>Generated: $generatedAt</p>"
-    $emailBody += "<h3 style='color: #2c3e50;'>Summary</h3>"
+    $emailBody += "<p>The full report is attached ($totalVMs VMs).</p>"
     $emailBody += "<table style='border-collapse:collapse; margin-bottom:20px;'>"
     $emailBody += "<tr style='background:#2c3e50; color:white;'>"
-    $emailBody += "<th style='padding:8px 16px; border:1px solid #ddd; text-align:left;'>Category</th>"
-    $emailBody += "<th style='padding:8px 16px; border:1px solid #ddd; text-align:right;'>Count</th>"
+    $emailBody += "<th style='padding:8px 16px; border:1px solid #ddd; text-align:left;'>Column</th>"
+    $emailBody += "<th style='padding:8px 16px; border:1px solid #ddd; text-align:left;'>Description</th>"
     $emailBody += "</tr>"
-    $emailBody += "<tr style='background:#e8f5e9;'>"
-    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd;'>Match</td>"
-    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd; text-align:right; color:green; font-weight:bold;'>$matchCount</td>"
-    $emailBody += "</tr>"
-    $emailBody += "<tr style='background:#e8f5e9;'>"
-    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd;'>Match - Multiple Tags</td>"
-    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd; text-align:right; color:green; font-weight:bold;'>$matchMultiCount</td>"
-    $emailBody += "</tr>"
-    $emailBody += "<tr style='background:#ffebee;'>"
-    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd;'>Mismatch</td>"
-    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd; text-align:right; color:red; font-weight:bold;'>$mismatchCount</td>"
-    $emailBody += "</tr>"
-    $emailBody += "<tr style='background:#f5f5f5;'>"
-    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd;'>No VM Upstream CI</td>"
-    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd; text-align:right; color:gray; font-weight:bold;'>$missingCount</td>"
-    $emailBody += "</tr>"
-    $emailBody += "<tr style='background:#f5f5f5;'>"
-    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd;'>No NSX Tag</td>"
-    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd; text-align:right; color:gray; font-weight:bold;'>$noTagCount</td>"
-    $emailBody += "</tr>"
-    $emailBody += "<tr style='background:#fff8e1;'>"
-    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd;'>Not checked</td>"
-    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd; text-align:right; color:#b26a00; font-weight:bold;'>$notCheckedCount</td>"
-    $emailBody += "</tr>"
-    $emailBody += "<tr style='background:#e3f2fd;'>"
-    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd; font-weight:bold;'>Total VMs</td>"
-    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd; text-align:right; font-weight:bold;'>$totalVMs</td>"
-    $emailBody += "</tr>"
-    # Below the total: a pointer to CMDBRelations_FAILED.csv, not part of the count
-    $emailBody += "<tr style='background:#fbe9e7;'>"
-    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd;'>Review failures</td>"
-    $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd; text-align:right; color:#c62828; font-weight:bold;'>$reviewFailCount</td>"
-    $emailBody += "</tr>"
+    foreach ($col in $columnGuide) {
+        $colName = [System.Net.WebUtility]::HtmlEncode($col[0])
+        $colDesc = [System.Net.WebUtility]::HtmlEncode($col[1])
+        $emailBody += "<tr>"
+        $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd; font-weight:bold; white-space:nowrap;'>$colName</td>"
+        $emailBody += "<td style='padding:6px 16px; border:1px solid #ddd;'>$colDesc</td>"
+        $emailBody += "</tr>"
+    }
     $emailBody += "</table>"
     $emailBody += "</body></html>"
 
