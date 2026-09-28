@@ -823,31 +823,39 @@ function Get-AppDecommStatus {
     $key = ($AppName.ToLower().Trim())
     if ($Cache -and $Cache.ContainsKey($key)) { return $Cache[$key] }
 
-    $statuses = @()
-    $ownUpstreams = @()
-    $classes = @()
-    $lookupError = $null
-    try {
-        $res = Invoke-VroActionWithLogs -VraServer $VraServer -AuthToken $AuthToken `
-            -ActionUri $ReturnAppVmsUri -Parameters @{ applicationName = $AppName }
+    # An empty status is re-run (fresh execution) up to $UpstreamRerunRetries times:
+    # the same intermittent empty result seen with getVmApplications would otherwise
+    # be cached and blank the status for every VM sharing this app.
+    $maxLookupAttempts = 1 + [Math]::Max(0, [int]$UpstreamRerunRetries)
+    for ($lookupAttempt = 1; $lookupAttempt -le $maxLookupAttempts; $lookupAttempt++) {
+        $statuses = @()
+        $ownUpstreams = @()
+        $classes = @()
+        $lookupError = $null
+        try {
+            $res = Invoke-VroActionWithLogs -VraServer $VraServer -AuthToken $AuthToken `
+                -ActionUri $ReturnAppVmsUri -Parameters @{ applicationName = $AppName }
 
-        if ($res.LogText) {
-            $statuses     += @(Get-CiStatusesFromLog -LogText $res.LogText)
-            $ownUpstreams += @(Get-UpstreamCIsFromLog -LogText $res.LogText)
-            $classes      += @(Get-CiClassesFromLog  -LogText $res.LogText)
-        }
-        if (-not $statuses -and $res.Value) {
-            $obj = Get-VroJson -Response $res.Value
-            if ($obj) {
-                $statuses     += @(Get-CiStatuses  -Obj $obj)
-                $ownUpstreams += @(Get-UpstreamCIs -Obj $obj)
-                $classes      += @(Get-CiClasses   -Obj $obj)
+            if ($res.LogText) {
+                $statuses     += @(Get-CiStatusesFromLog -LogText $res.LogText)
+                $ownUpstreams += @(Get-UpstreamCIsFromLog -LogText $res.LogText)
+                $classes      += @(Get-CiClassesFromLog  -LogText $res.LogText)
+            }
+            if (-not $statuses -and $res.Value) {
+                $obj = Get-VroJson -Response $res.Value
+                if ($obj) {
+                    $statuses     += @(Get-CiStatuses  -Obj $obj)
+                    $ownUpstreams += @(Get-UpstreamCIs -Obj $obj)
+                    $classes      += @(Get-CiClasses   -Obj $obj)
+                }
             }
         }
-    }
-    catch {
-        $lookupError = $_.Exception.Message
-        Write-Log "   WARNING: returnApplicationVms failed for '$AppName': $lookupError" -Color Yellow
+        catch {
+            $lookupError = $_.Exception.Message
+            Write-Log "   WARNING: returnApplicationVms failed for '$AppName': $lookupError" -Color Yellow
+        }
+        if ($lookupError -or @($statuses | Where-Object { $_ }).Count -gt 0 -or $lookupAttempt -ge $maxLookupAttempts) { break }
+        Start-Sleep -Milliseconds ([Math]::Max(0, [int]$UpstreamRerunDelayMs))
     }
 
     $statuses = @($statuses | Where-Object { $_ } | Select-Object -Unique)
@@ -890,100 +898,6 @@ function Invoke-CmdbReview {
     $tags = if ($Vm.AppApplication) {
         @($Vm.AppApplication -split ";\s*" | Where-Object { $_ -and ($_ -notmatch '^(?i)non[_\s\-]?nsx$') })
     } else { @() }
-
-    # --- App vs Sub-App per tag (from getCagApplications catalogue) ---
-    # Classifies each tag against the project's CAG catalogue AND always attaches
-    # the CI's current lifecycle status. When a VM carries several tags one is
-    # chosen as primary via Get-TagClassPriority (live > phasing > planned > disposed,
-    # sub-app > app within each state).
-    # Value shapes:
-    #   Sub-Application (In Use - Production)                    live in CAG, live in CMDB
-    #   Sub-Application (Disposed/Retired)                       not in CAG; CI says disposed
-    #   Application - convert to sub-app (In Use - Phasing out)  live-in-CAG App being retired
-    #   In Use - Phasing out                                     status found; class unknown
-    #   Not found in CAG                                         nothing found anywhere
-    # Get-AppDecommStatus is cached, so a tag shared across many VMs costs one call.
-    $tagClasses = @{}
-    $primaryTag = $null; $primaryClass = $null; $primaryPriority = -1
-    foreach ($tag in $tags) {
-        $normTag = ($tag.ToLower().Trim() -replace '[^a-z0-9]+', '')
-        $isApp = $Catalog.Apps    | Where-Object { (($_.ToLower().Trim()) -replace '[^a-z0-9]+', '') -eq $normTag }
-        $isSub = $Catalog.SubApps | Where-Object { (($_.ToLower().Trim()) -replace '[^a-z0-9]+', '') -eq $normTag }
-
-        # Base class from CAG (local first, then global fallback)
-        $baseClass = ''
-        if     ($isSub) { $baseClass = 'Sub-Application' }
-        elseif ($isApp) { $baseClass = 'Application - convert to sub-app' }
-        elseif ($AppClass -and $AppClass[$normTag]) {
-            $globalCls = $AppClass[$normTag]
-            if     ($globalCls -eq 'SubApplication') { $baseClass = 'Sub-Application' }
-            elseif ($globalCls -eq 'Application')    { $baseClass = 'Application - convert to sub-app' }
-        }
-
-        # CI record: always looked up. Provides the status label; also provides a
-        # class-of-last-resort when CAG had nothing. If the lookup fails or returns
-        # nothing, a placeholder is emitted so the exported cell always carries a
-        # status - bare "Sub-Application" / "Application" never appears.
-        $statusLabel = ''
-        $ciClassLabel = ''
-        $ciKey = ($tag -replace '_', ' ').Trim()
-        if ($ciKey) {
-            $lookupErrored = $false
-            $tagInfo = $null
-            try {
-                $tagInfo = Get-AppDecommStatus -AppName $ciKey -VraServer $VraServer `
-                    -AuthToken $AuthToken -ReturnAppVmsUri $ReturnAppVmsUri -Cache $AppStatusCache
-            }
-            catch { $lookupErrored = $true }
-
-            if ($lookupErrored) {
-                $statusLabel = 'Status lookup failed'
-            }
-            elseif ($tagInfo) {
-                $statusLabel = Get-BestStatusLabel $tagInfo.Statuses
-                if (-not $statusLabel) { $statusLabel = 'Status not read' }
-                if (-not $baseClass) {
-                    if     ($tagInfo.PrimaryClass -eq 'SubApplication') { $ciClassLabel = 'Sub-Application' }
-                    elseif ($tagInfo.PrimaryClass -eq 'Application')    { $ciClassLabel = 'Application' }
-                }
-            }
-            else {
-                $statusLabel = 'Status not read'
-            }
-        }
-        else {
-            $statusLabel = 'Status not read'
-        }
-
-        # Compose. baseClass (from CAG) wins over ciClassLabel (fallback) when both exist.
-        $classForLabel = if ($baseClass) { $baseClass } else { $ciClassLabel }
-
-        if     ($classForLabel -and $statusLabel) { $cls = "$classForLabel ($statusLabel)" }
-        elseif ($classForLabel)                   { $cls = $classForLabel }
-        elseif ($statusLabel)                     { $cls = $statusLabel }
-        else                                      { $cls = 'Not found in CAG' }
-
-        $tagClasses[$tag] = $cls
-
-        # Priority-based primary tag pick.
-        $p = Get-TagClassPriority $cls
-        if ($p -gt $primaryPriority) {
-            $primaryTag      = $tag
-            $primaryClass    = $cls
-            $primaryPriority = $p
-        }
-    }
-
-    # --- Action -------------------------------------------------------------
-    # The classification of the NSX tag from the project's CAG catalogue:
-    #   Sub-Application
-    #   Application - convert to sub-app
-    #   Not found in CAG
-    #   No tag
-    # A property of the tag, not a verdict on the VM. Every column to its right
-    # is supporting evidence (upstream, project placement, decomm, etc.).
-    if (-not $primaryTag) { $action = "No tag" }
-    else                  { $action = $primaryClass }
 
     # --- Upstream relationship from getVmApplications LOGS ---
     # The upstream data (retrieveCIRelationshipInfoByKey.upstreamCIs) is written to
@@ -1066,6 +980,134 @@ function Invoke-CmdbReview {
     $otherUpstreams = @($upstreamCIs | Where-Object {
         -not ((Get-AppTier (Get-FirstFieldValue -Object $_ -Fields $ClassFields)) -in @('Application','SubApplication'))
     })
+
+    # --- App vs Sub-App per tag (from getCagApplications catalogue) ---
+    # Classifies each tag against the project's CAG catalogue AND always attaches
+    # the CI's current lifecycle status. When a VM carries several tags one is
+    # chosen as primary via Get-TagClassPriority (live > phasing > planned > disposed,
+    # sub-app > app within each state).
+    # Value shapes:
+    #   Sub-Application (In Use - Production)                    live in CAG, live in CMDB
+    #   Sub-Application (Disposed/Retired)                       not in CAG; CI says disposed
+    #   Application - convert to sub-app (In Use - Phasing out)  live-in-CAG App being retired
+    #   In Use - Phasing out                                     status found; class unknown
+    #   Status not read                                          not in any CAG, no CMDB status
+    # When the class IS known, the status is taken from the first source that has it:
+    # name lookup (re-run if empty) -> lookup by the CAG's spelling -> the VM's own
+    # relationship record. This block runs after the relationship fetch so the last
+    # source is available. Get-AppDecommStatus is cached per app name.
+    $tagClasses = @{}
+    $primaryTag = $null; $primaryClass = $null; $primaryPriority = -1
+    foreach ($tag in $tags) {
+        $normTag = ($tag.ToLower().Trim() -replace '[^a-z0-9]+', '')
+        $isApp = $Catalog.Apps    | Where-Object { (($_.ToLower().Trim()) -replace '[^a-z0-9]+', '') -eq $normTag }
+        $isSub = $Catalog.SubApps | Where-Object { (($_.ToLower().Trim()) -replace '[^a-z0-9]+', '') -eq $normTag }
+
+        # Base class from CAG (local first, then global fallback)
+        $baseClass = ''
+        if     ($isSub) { $baseClass = 'Sub-Application' }
+        elseif ($isApp) { $baseClass = 'Application - convert to sub-app' }
+        elseif ($AppClass -and $AppClass[$normTag]) {
+            $globalCls = $AppClass[$normTag]
+            if     ($globalCls -eq 'SubApplication') { $baseClass = 'Sub-Application' }
+            elseif ($globalCls -eq 'Application')    { $baseClass = 'Application - convert to sub-app' }
+        }
+
+        # CI record: always looked up. Provides the status label; also provides a
+        # class-of-last-resort when CAG had nothing. If the lookup fails or returns
+        # nothing, a placeholder is emitted so the exported cell always carries a
+        # status - bare "Sub-Application" / "Application" never appears.
+        $statusLabel = ''
+        $ciClassLabel = ''
+        $ciKey = ($tag -replace '_', ' ').Trim()
+        if ($ciKey) {
+            $lookupErrored = $false
+            $tagInfo = $null
+            try {
+                $tagInfo = Get-AppDecommStatus -AppName $ciKey -VraServer $VraServer `
+                    -AuthToken $AuthToken -ReturnAppVmsUri $ReturnAppVmsUri -Cache $AppStatusCache
+            }
+            catch { $lookupErrored = $true }
+
+            if ($lookupErrored) {
+                $statusLabel = 'Status lookup failed'
+            }
+            elseif ($tagInfo) {
+                $statusLabel = Get-BestStatusLabel $tagInfo.Statuses
+                if (-not $statusLabel) { $statusLabel = 'Status not read' }
+                if (-not $baseClass) {
+                    if     ($tagInfo.PrimaryClass -eq 'SubApplication') { $ciClassLabel = 'Sub-Application' }
+                    elseif ($tagInfo.PrimaryClass -eq 'Application')    { $ciClassLabel = 'Application' }
+                }
+            }
+            else {
+                $statusLabel = 'Status not read'
+            }
+        }
+        else {
+            $statusLabel = 'Status not read'
+        }
+
+        # The class is known but no status came back: try the other sources.
+        $noStatus = @('Status not read', 'Status lookup failed')
+        if (($statusLabel -in $noStatus) -and $baseClass) {
+            # 1) The name exactly as the CAG spells it (the tag may differ in
+            #    punctuation or spacing, which the name lookup does not forgive)
+            $cagName = @(@($isSub) + @($isApp) | Where-Object { $_ }) | Select-Object -First 1
+            if ($cagName -and ($cagName.Trim().ToLower() -ne $ciKey.ToLower())) {
+                try {
+                    $cagInfo  = Get-AppDecommStatus -AppName $cagName.Trim() -VraServer $VraServer `
+                        -AuthToken $AuthToken -ReturnAppVmsUri $ReturnAppVmsUri -Cache $AppStatusCache
+                    $cagLabel = if ($cagInfo) { Get-BestStatusLabel $cagInfo.Statuses } else { '' }
+                    if ($cagLabel) { $statusLabel = $cagLabel }
+                }
+                catch { Write-Log "   WARNING: status lookup by CAG name failed for '$cagName': $($_.Exception.Message)" -Color Yellow }
+            }
+        }
+        if (($statusLabel -in $noStatus) -and ($baseClass -or $ciClassLabel)) {
+            # 2) The status on the VM's own relationship record for this CI
+            $relMatch = @($upstreamCIs | Where-Object {
+                $_.UpstreamCIStatus -and ((([string]$_.UpstreamCIName).ToLower().Trim() -replace '[^a-z0-9]+', '') -eq $normTag)
+            }) | Select-Object -First 1
+            if ($relMatch) {
+                $relLabel = Get-BestStatusLabel @([string]$relMatch.UpstreamCIStatus)
+                if ($relLabel) { $statusLabel = $relLabel }
+            }
+        }
+        if (($statusLabel -in $noStatus) -and ($baseClass -or $ciClassLabel)) {
+            Write-Log "   WARNING: no CMDB status found for tag '$tag' on $($Vm.VMName) (name lookup, CAG name and relationship record all empty)" -Color Yellow
+        }
+
+        # Compose. baseClass (from CAG) wins over ciClassLabel (fallback) when both exist.
+        $classForLabel = if ($baseClass) { $baseClass } else { $ciClassLabel }
+
+        if     ($classForLabel -and $statusLabel) { $cls = "$classForLabel ($statusLabel)" }
+        elseif ($classForLabel)                   { $cls = $classForLabel }
+        elseif ($statusLabel)                     { $cls = $statusLabel }
+        else                                      { $cls = 'Not found in CAG' }
+
+        $tagClasses[$tag] = $cls
+
+        # Priority-based primary tag pick.
+        $p = Get-TagClassPriority $cls
+        if ($p -gt $primaryPriority) {
+            $primaryTag      = $tag
+            $primaryClass    = $cls
+            $primaryPriority = $p
+        }
+    }
+
+    # --- Action -------------------------------------------------------------
+    # The classification of the NSX tag from the project's CAG catalogue:
+    #   Sub-Application (<status>)
+    #   Application - convert to sub-app (<status>)
+    #   <status> / Status not read    (class unknown)
+    #   No tag
+    # A property of the tag, not a verdict on the VM. Every column to its right
+    # is supporting evidence (upstream, project placement, decomm, etc.).
+    if (-not $primaryTag) { $action = "No tag" }
+    else                  { $action = $primaryClass }
+
     # Upstream to an Application is the correct end state; upstream to another
     # Sub-Application does not satisfy the rule and needs review.
 
