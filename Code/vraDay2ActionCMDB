@@ -8,6 +8,9 @@ $resultsDir = "C:\Logs"
 # Email Configuration
 $SendEmail = $true
 $EmailTo = "admin@company.com"
+# Optional CC. Leave empty for none; one address as a string, several as an array,
+# e.g. @("team@company.com", "manager@company.com").
+$EmailCc = @()
 $EmailFrom = "vmware-reports@company.com"
 $EmailSubject = "CMDB Relations Comparison Report - $(Get-Date -Format 'yyyy-MM-dd')"
 $SMTPServer = "mail.company.com"
@@ -2482,8 +2485,10 @@ elseif ($SendEmail) {
             UseSsl = $UseSSL
             Attachments = $resultsPath
         }
+        $ccList = @($EmailCc | Where-Object { $_ -and $_.Trim() } | ForEach-Object { $_.Trim() })
+        if ($ccList.Count -gt 0) { $emailParams.Cc = $ccList }
         Send-MailMessage @emailParams
-        Write-Log "Email sent to $EmailTo" -Color Green
+        Write-Log "Email sent to $EmailTo$(if ($ccList.Count -gt 0) { " (CC: $($ccList -join ', '))" })" -Color Green
     }
     catch {
         Write-Log "Failed to send email: $($_.Exception.Message)" -Color Red
