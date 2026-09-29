@@ -1136,11 +1136,11 @@ function Invoke-CmdbReview {
         $anySecondHop = $false
         $anySubAppMissingApp = $false
         # Lifecycle: every app/sub-app at either hop whose UpstreamCIStatus is NOT
-        # In Use - Production / Test / Pilot (i.e. Planned/On order, In Use - Phasing out,
-        # Disposed/Retired, an unrecognised wording, or empty -> "Unknown").
+        # In Use - Production (i.e. In Use - Test, In Use - Pilot, In Use - Phasing out,
+        # Planned/On order, Disposed/Retired, an unrecognised wording, or empty -> "Unknown").
         # Statuses go through Get-BestStatusLabel so wording variants map to the six labels.
         $lifecycleHits = @()
-        $lifecycleGood = @('In Use - Production', 'In Use - Test', 'In Use - Pilot')
+        $lifecycleGood = @('In Use - Production')
         # 2nd-hop app name -> list of project CAG names owning it. Ordered so the
         # display string keeps the order 2nd hops were seen in. Only populated
         # when $AppToProject is available (placement scan wasn't skipped).
@@ -1238,7 +1238,7 @@ function Invoke-CmdbReview {
         else                            { $noUpstream = "N/A - VM upstream is an Application (top of chain)" }
 
         # Upstream Lifecycle Status: lists only the hops that are not In Use -
-        # Production / Test / Pilot. "Good" when every app at both hops is in use.
+        # Production. "Good" when every app at both hops is In Use - Production.
         # "N/A" stays only for the no-upstream case (handled by the default init above).
         if ($lifecycleHits.Count -gt 0) {
             $lifecycleStatus = ($lifecycleHits | Select-Object -Unique) -join "; "
