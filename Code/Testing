@@ -1,5 +1,6 @@
-# Show the lines around the failure for full context
-grep -i -B 5 -A 2 "Rdm device is not supported" /var/log/hostd.log | tail -n 40
+# Where the old VM lives
+Get-VM -Name <old-vm> | Get-Datastore | Select-Object Name, Type | Format-Table -AutoSize
 
-# List VMFS datastores this host can use for the pointer file
-esxcli storage filesystem list | grep -i vmfs
+# If the RDM is currently attached to the old VM, this shows the pointer's datastore
+Get-VM -Name <old-vm> | Get-HardDisk -DiskType RawPhysical, RawVirtual |
+    Select-Object Name, ScsiCanonicalName, Filename | Format-Table -AutoSize
