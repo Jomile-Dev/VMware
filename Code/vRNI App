@@ -9,9 +9,9 @@
       vRNI App Name  : <APP_CI>                 (spaces replaced with "_")
       NSX Tag        : ST-<APP_CI>-<Zone>
       NSX SG         : SG-<APP CI>-<Zone>
-      Zones          : FrontEnd, Internal, Protected, Management
+      Zones / Tiers  : FrontEnd, Management, Internal, Protected  (tier name = zone name)
 
-    Tier membership : Custom VM Search, VMs where Security Group = 'SG-<APP CI>-<Zone>'
+    Tier filter     : Security Group = 'SG-<APP CI>-<Zone>'   (same format vRNI returns for existing tiers)
 
     Credential file (create once, same Windows account that runs the script):
       Get-Credential | Export-Clixml -Path "C:\Scripts\Creds\<cred-file>.xml"
@@ -31,8 +31,7 @@ $CredFile        = 'C:\Scripts\Creds\<cred-file>.xml'
 $ApplicationCI   = '<APP CI>'
 $InputCSV        = ''                                       # e.g. 'C:\Scripts\Input\vrniApps.csv' - overrides $ApplicationCI when set
 
-$Zones           = @('FrontEnd', 'Internal', 'Protected', 'Management')
-$TierNameFormat  = '{0}-{1}'                                # {0} = <APP_CI>, {1} = Zone
+$Zones           = @('FrontEnd', 'Management', 'Internal', 'Protected')   # Tier names
 
 # List mode
 $IncludeTiers    = $true
@@ -251,7 +250,6 @@ function Get-vRNIApplications {
             if ($tierList.Count -eq 0) {
                 $results.Add([pscustomobject]@{
                     ApplicationName = $app.name
-                    EntityId        = $app.entity_id
                     TierName        = 'N/A'
                     TierFilter      = 'N/A'
                 })
@@ -260,7 +258,6 @@ function Get-vRNIApplications {
                 $filters = @($t.group_membership_criteria | ForEach-Object { $_.search_membership_criteria.filter } | Where-Object { $_ })
                 $results.Add([pscustomobject]@{
                     ApplicationName = $app.name
-                    EntityId        = $app.entity_id
                     TierName        = $t.name
                     TierFilter      = ($filters -join ' OR ')
                 })
@@ -268,7 +265,6 @@ function Get-vRNIApplications {
         } else {
             $results.Add([pscustomobject]@{
                 ApplicationName = $app.name
-                EntityId        = $app.entity_id
             })
         }
     }
@@ -292,7 +288,7 @@ function New-vRNIApplication {
     # ---------- Build plan ----------
     $Plan = foreach ($z in $Zones) {
         [pscustomobject]@{
-            TierName      = $TierNameFormat -f $AppName, $z
+            TierName      = $z
             SecurityGroup = "SG-$AppCI-$z"
             NSXTag        = "ST-$AppName-$z"
         }
@@ -304,7 +300,7 @@ function New-vRNIApplication {
     Write-Host "CI          : $AppCI"
     foreach ($t in $Plan) {
         Write-Host "  Tier $($t.TierName)"
-        Write-Host "       VMs where Security Group = '$($t.SecurityGroup)'"
+        Write-Host "       Security Group = '$($t.SecurityGroup)'"
     }
     Write-Host '------------------------------------------------------------'
 
@@ -359,7 +355,7 @@ function New-vRNIApplication {
                     membership_type = 'SearchMembershipCriteria'
                     search_membership_criteria = @{
                         entity_type = 'BaseVirtualMachine'
-                        filter      = "security_groups.name = '$($t.SecurityGroup)'"
+                        filter      = "Security Group = '$($t.SecurityGroup)'"
                     }
                 }
             )
