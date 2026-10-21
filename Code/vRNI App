@@ -69,19 +69,39 @@ if (Test-Path $CredFile) {
 
 # ============================== FUNCTIONS ==============================
 
+function Get-ErrorBody {
+    # PS 5.1 - pull the response body out of a failed Invoke-RestMethod call
+    param($ErrorRecord)
+    $text = ''
+    if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
+        $text = $ErrorRecord.ErrorDetails.Message
+    } elseif ($ErrorRecord.Exception.Response) {
+        try {
+            $stream = $ErrorRecord.Exception.Response.GetResponseStream()
+            if ($stream.CanSeek) { $stream.Position = 0 }
+            $reader = New-Object System.IO.StreamReader($stream)
+            $text   = $reader.ReadToEnd()
+            $reader.Close()
+        } catch { $text = '' }
+    }
+    $status = ''
+    if ($ErrorRecord.Exception.Response) { $status = [int]$ErrorRecord.Exception.Response.StatusCode }
+    return "HTTP $status - $($ErrorRecord.Exception.Message) | Body: $text"
+}
+
 function Connect-vRNIvIDM {
     # 1. Get vIDM appliance + OAuth client-id from vRNI
     try {
         $client = Invoke-RestMethod -Method Get -Uri "$BaseUri/auth/vidm/client-id" -UseBasicParsing
     } catch {
-        throw "Failed to get vIDM client-id from vRNI: $($_.Exception.Message)"
+        throw "STEP 1 (vRNI client-id) failed: $(Get-ErrorBody $_)"
     }
 
     $vidmHost = if ($vIDMServer) { $vIDMServer } else { $client.vidm_appliance }
     if (-not $client.client_id -or -not $vidmHost) {
         throw 'vIDM client-id / appliance not returned - check vIDM is configured and enabled in vRNI.'
     }
-    Write-Host "vIDM appliance : $vidmHost"
+    Write-Host "STEP 1 OK - vIDM appliance : $vidmHost"
 
     # 2. Get vIDM access token (password grant)
     $form = @{
@@ -97,11 +117,12 @@ function Connect-vRNIvIDM {
                         -Body $form -ContentType 'application/x-www-form-urlencoded' -UseBasicParsing
     } catch {
         $form.password = $null
-        throw "vIDM token request failed for user '$($Cred.UserName)': $($_.Exception.Message)"
+        throw "STEP 2 (vIDM token, user '$($Cred.UserName)', host '$vidmHost') failed: $(Get-ErrorBody $_)"
     }
     $form.password = $null
 
     if (-not $vidmToken.access_token) { throw 'vIDM did not return an access_token.' }
+    Write-Host 'STEP 2 OK - vIDM access token received'
 
     # 3. Swap vIDM token for vRNI token
     $body = @{ vidm_token = $vidmToken.access_token } | ConvertTo-Json
@@ -109,7 +130,7 @@ function Connect-vRNIvIDM {
         $ni = Invoke-RestMethod -Method Post -Uri "$BaseUri/auth/token/vidm" -Body $body `
                 -ContentType 'application/json' -UseBasicParsing
     } catch {
-        throw "vRNI vIDM token exchange failed: $($_.Exception.Message)"
+        throw "STEP 3 (vRNI token exchange) failed: $(Get-ErrorBody $_)"
     }
 
     return @{ Authorization = "NetworkInsight $($ni.token)" }
