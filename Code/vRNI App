@@ -104,24 +104,49 @@ function Connect-vRNIvIDM {
     Write-Host "STEP 1 OK - vIDM appliance : $vidmHost"
 
     # 2. Get vIDM access token (password grant)
-    $form = @{
-        grant_type = 'password'
-        username   = $Cred.UserName
-        password   = $Cred.GetNetworkCredential().Password
-        client_id  = $client.client_id
-    }
-    if ($vIDMDomain) { $form.domain = $vIDMDomain }
+    #    Same idea as the NSX script - try bare username first, then other formats
+    $rawUser   = $Cred.UserName
+    $bareUser  = $rawUser
+    $credDomain = ''
+    if ($rawUser -match '^(.+)\\(.+)$') { $credDomain = $Matches[1]; $bareUser = $Matches[2] }
+    elseif ($rawUser -match '^(.+)@(.+)$') { $bareUser = $Matches[1]; $credDomain = $Matches[2] }
 
-    try {
-        $vidmToken = Invoke-RestMethod -Method Post -Uri "https://$vidmHost/SAAS/auth/oauthtoken" `
-                        -Body $form -ContentType 'application/x-www-form-urlencoded' -UseBasicParsing
-    } catch {
-        $form.password = $null
-        throw "STEP 2 (vIDM token, user '$($Cred.UserName)', host '$vidmHost') failed: $(Get-ErrorBody $_)"
-    }
-    $form.password = $null
+    $domainToUse = if ($vIDMDomain) { $vIDMDomain } else { $credDomain }
 
-    if (-not $vidmToken.access_token) { throw 'vIDM did not return an access_token.' }
+    $Attempts = New-Object System.Collections.Generic.List[object]
+    if ($domainToUse) { $Attempts.Add(@{ User = $bareUser; Domain = $domainToUse }) }
+    $Attempts.Add(@{ User = $bareUser; Domain = '' })
+    if ($rawUser -ne $bareUser) { $Attempts.Add(@{ User = $rawUser; Domain = '' }) }
+
+    $vidmToken = $null
+    $lastError = ''
+    foreach ($a in $Attempts) {
+        $form = @{
+            grant_type = 'password'
+            username   = $a.User
+            password   = $Cred.GetNetworkCredential().Password
+            client_id  = $client.client_id
+        }
+        if ($a.Domain) { $form.domain = $a.Domain }
+
+        $label = if ($a.Domain) { "user '$($a.User)' domain '$($a.Domain)'" } else { "user '$($a.User)' (no domain)" }
+        Write-Host "STEP 2 try - $label"
+
+        try {
+            $vidmToken = Invoke-RestMethod -Method Post -Uri "https://$vidmHost/SAAS/auth/oauthtoken" `
+                            -Body $form -ContentType 'application/x-www-form-urlencoded' -UseBasicParsing
+            $form.password = $null
+            if ($vidmToken.access_token) { Write-Host "STEP 2 OK - $label" -ForegroundColor Green; break }
+        } catch {
+            $form.password = $null
+            $lastError = Get-ErrorBody $_
+            Write-Host "         failed: $lastError" -ForegroundColor Yellow
+        }
+    }
+
+    if (-not $vidmToken -or -not $vidmToken.access_token) {
+        throw "STEP 2 (vIDM token, host '$vidmHost') failed for all username formats. Last error: $lastError"
+    }
     Write-Host 'STEP 2 OK - vIDM access token received'
 
     # 3. Swap vIDM token for vRNI token
