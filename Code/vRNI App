@@ -37,6 +37,10 @@ $TierNameFormat  = '{0}-{1}'                                # {0} = <APP_CI>, {1
 # List mode
 $IncludeTiers    = $true
 
+# API throttling (HTTP 429 handling)
+$RequestDelayMs  = 250                                      # Pause before every vRNI API call
+$MaxRetries      = 6                                        # Retries on 429 / 503 before giving up
+
 # Output - falls back to C:\Temp if running unsaved (e.g. pasted into ISE)
 $OutputFolder    = if ($PSScriptRoot) { $PSScriptRoot } else { 'C:\Temp' }
 if (-not (Test-Path $OutputFolder)) { New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null }
@@ -89,6 +93,46 @@ function Get-ErrorBody {
     return "HTTP $status - $($ErrorRecord.Exception.Message) | Body: $text"
 }
 
+function Invoke-vRNIRequest {
+    # Invoke-RestMethod with a small delay between calls and retry on 429 / 503
+    param(
+        [string]$Method = 'Get',
+        [string]$Uri,
+        $Headers,
+        $Body,
+        [string]$ContentType = 'application/json',
+        [switch]$UseBasicParsing
+    )
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        if ($RequestDelayMs -gt 0) { Start-Sleep -Milliseconds $RequestDelayMs }
+
+        $p = @{ Method = $Method; Uri = $Uri; Headers = $Headers; ContentType = $ContentType; UseBasicParsing = $true }
+        if ($null -ne $Body) { $p.Body = $Body }
+
+        try {
+            return Invoke-RestMethod @p
+        } catch {
+            $status = 0
+            if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
+
+            if (($status -eq 429 -or $status -eq 503) -and $attempt -le $MaxRetries) {
+                [int]$wait = 0
+                $retryAfter = $null
+                try { $retryAfter = $_.Exception.Response.Headers['Retry-After'] } catch { $retryAfter = $null }
+                if (-not ($retryAfter -and [int]::TryParse($retryAfter, [ref]$wait) -and $wait -gt 0)) {
+                    $wait = [int][math]::Min(60, [math]::Pow(2, $attempt))
+                }
+                Write-Host "         HTTP $status - waiting $wait sec (retry $attempt of $MaxRetries)" -ForegroundColor Yellow
+                Start-Sleep -Seconds $wait
+                continue
+            }
+            throw
+        }
+    }
+}
+
 function Connect-vRNIvIDM {
     # 1. Get vIDM appliance + OAuth client-id from vRNI
     try {
@@ -113,10 +157,12 @@ function Connect-vRNIvIDM {
 
     $domainToUse = if ($vIDMDomain) { $vIDMDomain } else { $credDomain }
 
+    # Order: username exactly as saved (UPN worked in testing) -> bare + domain -> bare
     $Attempts = New-Object System.Collections.Generic.List[object]
-    if ($domainToUse) { $Attempts.Add(@{ User = $bareUser; Domain = $domainToUse }) }
-    $Attempts.Add(@{ User = $bareUser; Domain = '' })
-    if ($rawUser -ne $bareUser) { $Attempts.Add(@{ User = $rawUser; Domain = '' }) }
+    $Attempts.Add(@{ User = $rawUser; Domain = '' })
+    if ($domainToUse -and $rawUser -ne $bareUser) { $Attempts.Add(@{ User = $bareUser; Domain = $domainToUse }) }
+    elseif ($domainToUse) { $Attempts[0].Domain = $domainToUse }
+    if ($rawUser -ne $bareUser) { $Attempts.Add(@{ User = $bareUser; Domain = '' }) }
 
     $vidmToken = $null
     $lastError = ''
@@ -164,7 +210,7 @@ function Connect-vRNIvIDM {
 function Disconnect-vRNI {
     param($Headers)
     try {
-        Invoke-RestMethod -Method Delete -Uri "$BaseUri/auth/token" -Headers $Headers -UseBasicParsing | Out-Null
+        Invoke-vRNIRequest -Method Delete -Uri "$BaseUri/auth/token" -Headers $Headers -UseBasicParsing | Out-Null
         Write-Host 'vRNI token deleted.'
     } catch {
         Write-Host "WARNING: token delete failed: $($_.Exception.Message)" -ForegroundColor Yellow
@@ -181,7 +227,7 @@ function Get-vRNIApplications {
         $uri = "$BaseUri/groups/applications?size=100"
         if ($cursor) { $uri += "&cursor=$([uri]::EscapeDataString($cursor))" }
 
-        $page = Invoke-RestMethod -Method Get -Uri $uri -Headers $Headers -UseBasicParsing
+        $page = Invoke-vRNIRequest -Method Get -Uri $uri -Headers $Headers -UseBasicParsing
         foreach ($r in @($page.results)) { if ($r.entity_id) { $ids.Add($r.entity_id) } }
 
         $cursor = $page.cursor
@@ -196,10 +242,10 @@ function Get-vRNIApplications {
         $i++
         Write-Progress -Activity 'Reading vRNI applications' -Status "$i / $($ids.Count)" -PercentComplete (($i / [math]::Max($ids.Count, 1)) * 100)
 
-        $app = Invoke-RestMethod -Method Get -Uri "$BaseUri/groups/applications/$id" -Headers $Headers -UseBasicParsing
+        $app = Invoke-vRNIRequest -Method Get -Uri "$BaseUri/groups/applications/$id" -Headers $Headers -UseBasicParsing
 
         if ($WithTiers) {
-            $tiers = Invoke-RestMethod -Method Get -Uri "$BaseUri/groups/applications/$id/tiers" -Headers $Headers -UseBasicParsing
+            $tiers = Invoke-vRNIRequest -Method Get -Uri "$BaseUri/groups/applications/$id/tiers" -Headers $Headers -UseBasicParsing
             $tierList = @($tiers.results)
 
             if ($tierList.Count -eq 0) {
@@ -295,7 +341,7 @@ function New-vRNIApplication {
     # ---------- Create app ----------
     $appBody = @{ name = $AppName } | ConvertTo-Json
     try {
-        $app = Invoke-RestMethod -Method Post -Uri "$BaseUri/groups/applications" -Headers $Headers `
+        $app = Invoke-vRNIRequest -Method Post -Uri "$BaseUri/groups/applications" -Headers $Headers `
                  -Body $appBody -ContentType 'application/json' -UseBasicParsing
         Write-Host "CREATED: $AppName ($($app.entity_id))" -ForegroundColor Green
     } catch {
@@ -320,7 +366,7 @@ function New-vRNIApplication {
         } | ConvertTo-Json -Depth 10
 
         try {
-            Invoke-RestMethod -Method Post -Uri "$BaseUri/groups/applications/$($app.entity_id)/tiers" -Headers $Headers `
+            Invoke-vRNIRequest -Method Post -Uri "$BaseUri/groups/applications/$($app.entity_id)/tiers" -Headers $Headers `
                 -Body $tierBody -ContentType 'application/json' -UseBasicParsing | Out-Null
             Write-Host "         Tier $($t.TierName) -> '$($t.SecurityGroup)'" -ForegroundColor Green
             $res = 'Created'
