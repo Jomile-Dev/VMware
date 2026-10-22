@@ -6,6 +6,12 @@ $vraServer = "vra.yourdomain.com"
 
 # vRA / Aria Automation credential file (Export-Clixml, created by the task's run-as account on this server)
 $vraCredPath = "<vra-cred-path>"
+
+# Authentication retry: if the login fails, wait $AuthRetryDelayMin minutes and
+# try again, up to $AuthRetries more times. After that the run stops (no report,
+# no email). 3 retries x 5 min = first attempt + 3 retries, up to ~15 min waiting.
+$AuthRetries       = 3
+$AuthRetryDelayMin = 5
 $resultsDir = "<results-dir>"
 
 # Email Configuration
@@ -229,15 +235,27 @@ $authBody = @{
     password = $credential.GetNetworkCredential().Password
 } | ConvertTo-Json
 
-try {
-    $authResponse = Invoke-RestMethod -Uri "https://$vraServer/csp/gateway/am/api/login" `
-        -Method Post -Headers @{"Content-Type"="application/json"} -Body $authBody -TimeoutSec 60 -ErrorAction Stop
+$authToken     = $null
+$authLastError = $null
+$authAttempts  = 1 + [Math]::Max(0, [int]$AuthRetries)
+for ($authAttempt = 1; $authAttempt -le $authAttempts; $authAttempt++) {
+    try {
+        $authResponse = Invoke-RestMethod -Uri "https://$vraServer/csp/gateway/am/api/login" `
+            -Method Post -Headers @{"Content-Type"="application/json"} -Body $authBody -TimeoutSec 60 -ErrorAction Stop
+        $authToken = $authResponse.cspAuthToken
+        if ($authToken) { break }
+        $authLastError = "no token returned"
+    }
+    catch {
+        $authLastError = $_.Exception.Message
+    }
+    Write-Log "Authentication attempt $authAttempt of $authAttempts failed: $authLastError" -Color Yellow
+    if ($authAttempt -lt $authAttempts) {
+        Write-Log "Waiting $AuthRetryDelayMin minute(s) before retrying..." -Color Yellow
+        Start-Sleep -Seconds ([int]$AuthRetryDelayMin * 60)
+    }
 }
-catch {
-    Stop-RunFailed "Authentication failed - $($_.Exception.Message)"
-}
-$authToken = $authResponse.cspAuthToken
-if (-not $authToken) { Stop-RunFailed "Authentication returned no token" }
+if (-not $authToken) { Stop-RunFailed "Authentication failed after $authAttempts attempt(s) - $authLastError" }
 Write-Log "Authentication successful!" -Color Green
 
 # Normalise application name for comparison.
