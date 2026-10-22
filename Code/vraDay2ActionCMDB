@@ -3,7 +3,10 @@
 # Uses runspace pooling for parallel execution (ISE compatible)
 
 $vraServer = "vra.yourdomain.com"
-$resultsDir = "C:\Logs"
+
+# vRA / Aria Automation credential file (Export-Clixml, created by the task's run-as account on this server)
+$vraCredPath = "<vra-cred-path>"
+$resultsDir = "<results-dir>"
 
 # Email Configuration
 $SendEmail = $true
@@ -143,11 +146,21 @@ $exportColumns = @(
 $NSXManager    = "nsx-manager.company.com"
 $NSXAuthMode   = "vIDM"
 $NSXvIDMDomain = "COMPANY"
-$NSXCredPath   = "C:\Scripts\Creds\nsx_cred.xml"
+$NSXCredPath   = "<nsx-cred-path>"
 
 function Write-Log {
     param($Message, $Color = "White")
     Write-Host $Message -ForegroundColor $Color
+}
+
+# Failed run: log the reason and stop. No report CSV is written and no email is
+# sent. Exit code 1 so Task Scheduler's Last Run Result shows the failure.
+function Stop-RunFailed {
+    param([string]$Reason)
+    Write-Log "`nRUN FAILED: $Reason" -Color Red
+    Write-Log "No report written and no email sent." -Color Red
+    try { Stop-Transcript | Out-Null } catch { $null = $_ }
+    exit 1
 }
 
 # Configure TLS 1.2 and bypass SSL for vRA
@@ -204,15 +217,27 @@ catch { Write-Host "Could not start run log: $($_.Exception.Message)" -Foregroun
 
 # Authenticate to VMware Aria
 Write-Log "=== AUTHENTICATION ===" -Color Cyan
-$credential = Get-Credential -Message "Enter VMware Aria Automation credentials"
+try {
+    $credential = Import-Clixml -Path $vraCredPath -ErrorAction Stop
+}
+catch {
+    Stop-RunFailed "Could not load vRA credential from $vraCredPath - $($_.Exception.Message)"
+}
+
 $authBody = @{
     username = $credential.UserName
     password = $credential.GetNetworkCredential().Password
 } | ConvertTo-Json
 
-$authResponse = Invoke-RestMethod -Uri "https://$vraServer/csp/gateway/am/api/login" `
-    -Method Post -Headers @{"Content-Type"="application/json"} -Body $authBody
+try {
+    $authResponse = Invoke-RestMethod -Uri "https://$vraServer/csp/gateway/am/api/login" `
+        -Method Post -Headers @{"Content-Type"="application/json"} -Body $authBody -TimeoutSec 60 -ErrorAction Stop
+}
+catch {
+    Stop-RunFailed "Authentication failed - $($_.Exception.Message)"
+}
 $authToken = $authResponse.cspAuthToken
+if (-not $authToken) { Stop-RunFailed "Authentication returned no token" }
 Write-Log "Authentication successful!" -Color Green
 
 # Normalise application name for comparison.
@@ -1581,6 +1606,7 @@ $totalProcessed = 0
 $deploymentsWithVMs = 0
 $skippedCount = 0
 $maxRetries = 3
+$fetchAborted = $false
 
 do {
     $uri = "https://$vraServer/deployment/api/deployments?page=$page&size=$size&expand=resources"
@@ -1595,7 +1621,10 @@ do {
         catch {
             Write-Log "  Page $($page + 1) attempt $attempt failed: $($_.Exception.Message)" -Color Yellow
             if ($attempt -lt $maxRetries) { Start-Sleep -Seconds ($attempt * 3) }
-            else { Write-Log "  Giving up on page $($page + 1) after $maxRetries attempts - stopping fetch" -Color Red }
+            else {
+                Write-Log "  Giving up on page $($page + 1) after $maxRetries attempts - stopping fetch" -Color Red
+                $fetchAborted = $true
+            }
         }
     }
     if (-not $response) { break }   # don't reprocess a stale $response from a prior page
@@ -1653,6 +1682,10 @@ do {
 
 Write-Log "Scanned: $totalProcessed deployments ($deploymentsWithVMs with VMs, skipped $skippedCount deleted/failed)" -Color Cyan
 Write-Log "VMs to process: $($vmQueue.Count)" -Color Cyan
+
+# A deployment page that could not be fetched means the VM list is incomplete
+if ($fetchAborted) { Stop-RunFailed "Deployment fetch failed part-way (page $($page + 1)) - VM list incomplete" }
+if ($vmQueue.Count -eq 0) { Stop-RunFailed "No VMs returned from vRA deployments" }
 
 # Scriptblock that runs in each runspace
 $scriptBlock = {
@@ -2374,6 +2407,9 @@ Write-Log "No NSX Tag: $(($results | Where-Object { $_.CompareResult -eq 'No Tag
 $notChecked = @($results | Where-Object { $_.CompareResult -eq 'Not checked' -or -not $_.CompareResult }).Count
 if ($notChecked -gt 0) { Write-Log "Not checked (review failed): $notChecked" -Color Yellow }
 Write-Log "Time elapsed: $($stopwatch.Elapsed.ToString('hh\:mm\:ss'))" -Color White
+
+# No rows collected = failed run: no report, no email
+if (@($results).Count -eq 0) { Stop-RunFailed "No results collected" }
 
 # Export results (CompareResult kept internal for console/summary; CSV uses NSXMatchCMDB).
 # The cleanup and export are wrapped so a failure in either doesn't silently leave
