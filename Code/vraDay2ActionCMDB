@@ -4,9 +4,6 @@
 
 $vraServer = "vra.yourdomain.com"
 
-# vRA / Aria Automation credential file (Export-Clixml, created by the task's run-as account on this server)
-$vraCredPath = "<vra-cred-path>"
-
 # Authentication retry: if the login fails, wait $AuthRetryDelayMin minutes and
 # try again, up to $AuthRetries more times. After that the run stops (no report,
 # no email). 3 retries x 5 min = first attempt + 3 retries, up to ~15 min waiting.
@@ -224,10 +221,10 @@ catch { Write-Host "Could not start run log: $($_.Exception.Message)" -Foregroun
 # Authenticate to VMware Aria
 Write-Log "=== AUTHENTICATION ===" -Color Cyan
 try {
-    $credential = Import-Clixml -Path $vraCredPath -ErrorAction Stop
+    $credential = Import-Clixml -Path "<vra-cred-path>" -ErrorAction Stop
 }
 catch {
-    Stop-RunFailed "Could not load vRA credential from $vraCredPath - $($_.Exception.Message)"
+    Stop-RunFailed "Could not load vRA credential - $($_.Exception.Message)"
 }
 
 $authBody = @{
