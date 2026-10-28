@@ -15,7 +15,7 @@
 #   <vm-name-03>,
 #
 # Name     - required
-# Action   - optional - PowerOn | PowerOff - blank or missing uses $DefaultAction
+# Action   - required column - PowerOn | PowerOff - blank = do nothing for that VM
 #
 # Every VM is searched for across ALL vCenters in $vCenterServers
 # If the same VM name exists more than once, it is skipped as Ambiguous
@@ -41,8 +41,7 @@ $CsvPath           = Join-Path $MainDirectory $FileName
 $OutputFolder      = Join-Path $MainDirectory 'Reports'   # Reports saved here (created if missing)
 
 $NameColumn        = 'Name'                         # CSV column with VM name
-$ActionColumn      = 'Action'                       # CSV column with per-row action (optional)
-$DefaultAction     = 'PowerOff'                     # PowerOn | PowerOff (graceful guest OS shutdown)
+$ActionColumn      = 'Action'                       # CSV column with action - PowerOn | PowerOff (graceful)
 
 $DryRun            = $true                          # Set to $false to actually make changes
 
@@ -120,11 +119,6 @@ $validActions = @('PowerOn', 'PowerOff')
 $timestamp    = Get-Date -Format 'yyyyMMdd-HHmmss'
 $runMode      = if ($DryRun) { 'DryRun' } else { 'Live' }
 
-# Validate default action
-if ($validActions -notcontains $DefaultAction) {
-    throw "Invalid `$DefaultAction '$DefaultAction'. Use: $($validActions -join ', ')"
-}
-
 # Validate main directory and CSV file exist, create report folder
 if (-not (Test-Path -Path $MainDirectory)) { throw "Main directory not found: $MainDirectory" }
 if (-not (Test-Path -Path $CsvPath)) { throw "CSV not found: $CsvPath" }
@@ -141,7 +135,9 @@ $columns = $rows[0].PSObject.Properties.Name
 if ($columns -notcontains $NameColumn) {
     throw "CSV is missing required column '$NameColumn'. Found: $($columns -join ', ')"
 }
-$hasActionColumn = $columns -contains $ActionColumn
+if ($columns -notcontains $ActionColumn) {
+    throw "CSV is missing required column '$ActionColumn'. Found: $($columns -join ', ')"
+}
 
 Write-Host "`nMode: $runMode" -ForegroundColor $(if ($DryRun) { 'Yellow' } else { 'Red' })
 Write-Host "CSV:  $CsvPath ($($rows.Count) row(s))`n"
@@ -200,11 +196,8 @@ try {
         $name = ([string]$row.$NameColumn).Trim()
         if ([string]::IsNullOrWhiteSpace($name)) { continue }
 
-        # Use per-row action if set, otherwise default
-        $action = $DefaultAction
-        if ($hasActionColumn -and -not [string]::IsNullOrWhiteSpace([string]$row.$ActionColumn)) {
-            $action = ([string]$row.$ActionColumn).Trim()
-        }
+        # Read action for this row - blank = do nothing
+        $action = ([string]$row.$ActionColumn).Trim()
 
         # Create report row - VM, Server and TargetState are not exported
         $item = [pscustomobject][ordered]@{
@@ -225,6 +218,13 @@ try {
             TargetState       = ''
         }
         $results.Add($item)
+
+        # Blank action - do nothing, just report it
+        if ([string]::IsNullOrWhiteSpace($action)) {
+            $item.Result  = 'NoAction'
+            $item.Message = 'Action blank - nothing done'
+            continue
+        }
 
         # Validate action (not case sensitive)
         $match = $validActions | Where-Object { $_ -eq $action }
