@@ -1,47 +1,62 @@
 # VMware PowerCLI Script to get VMs on vSAN storage with actual storage usage
+# Loops through multiple vCenter Servers
 # Optimized for performance
 
-# Connect to vCenter (replace with your vCenter details)
-$vCenterServer = "<vcenter-fqdn>"
-$Credential = Get-Credential
-Connect-VIServer -Server $vCenterServer -Credential $Credential
+# vCenter Servers to process (replace with your vCenter details)
+$vCenterServers = @(
+    "<vcenter-fqdn-01>",
+    "<vcenter-fqdn-02>",
+    "<vcenter-fqdn-03>"
+)
 
-# Pre-cache datastore information for performance
-Write-Host "Caching datastore information..." -ForegroundColor Green
-$allDatastores = Get-Datastore
-$datastoreInfo = @{}
+# Set to $true to be prompted for a separate credential for each vCenter
+$UsePerVCenterCredential = $false
 
-foreach ($ds in $allDatastores) {
-    $datastoreInfo[$ds.Name] = @{
-        Type        = $ds.Type
-        Name        = $ds.Name
-        IsExternal  = $false
-        StorageType = "Unknown"
-    }
+if (-not $UsePerVCenterCredential) {
+    $Credential = Get-Credential -Message "Credential for all vCenter Servers"
+}
 
-    if ($ds.Type -eq "vsan") {
-        $datastoreInfo[$ds.Name].StorageType = "vSAN"
-    }
-    elseif ($ds.Type -eq "VMFS") {
-        # Check if shared across multiple hosts (external storage indicator)
-        if ($ds.ExtensionData.Summary.MultipleHostAccess) {
-            $datastoreInfo[$ds.Name].IsExternal = $true
-            $datastoreInfo[$ds.Name].StorageType = "SAN"
+# Function to build the datastore cache for the connected vCenter
+function Get-DatastoreInfoCache {
+    param($Server)
+
+    $cache = @{}
+    $datastores = Get-Datastore -Server $Server
+
+    foreach ($ds in $datastores) {
+        $cache[$ds.Name] = @{
+            Type        = $ds.Type
+            Name        = $ds.Name
+            IsExternal  = $false
+            StorageType = "Unknown"
         }
-        # Also check by naming convention (faster than LUN inspection)
-        if ($ds.Name -match "(SAN|FC|iSCSI|PURE|NETAPP|EMC|DELL|HP|3PAR|COMPELLENT|EQUALLOGIC)") {
-            $datastoreInfo[$ds.Name].IsExternal = $true
-            $datastoreInfo[$ds.Name].StorageType = "SAN"
+
+        if ($ds.Type -eq "vsan") {
+            $cache[$ds.Name].StorageType = "vSAN"
+        }
+        elseif ($ds.Type -eq "VMFS") {
+            # Check if shared across multiple hosts (external storage indicator)
+            if ($ds.ExtensionData.Summary.MultipleHostAccess) {
+                $cache[$ds.Name].IsExternal = $true
+                $cache[$ds.Name].StorageType = "SAN"
+            }
+            # Also check by naming convention (faster than LUN inspection)
+            if ($ds.Name -match "(SAN|FC|iSCSI|PURE|NETAPP|EMC|DELL|HP|3PAR|COMPELLENT|EQUALLOGIC)") {
+                $cache[$ds.Name].IsExternal = $true
+                $cache[$ds.Name].StorageType = "SAN"
+            }
+        }
+        elseif ($ds.Type -eq "NFS" -or $ds.Type -eq "NFS41") {
+            $cache[$ds.Name].StorageType = "NFS"
         }
     }
-    elseif ($ds.Type -eq "NFS" -or $ds.Type -eq "NFS41") {
-        $datastoreInfo[$ds.Name].StorageType = "NFS"
-    }
+
+    return $cache
 }
 
 # Function to get VM storage breakdown quickly
 function Get-VMStorageBreakdown {
-    param($VM)
+    param($VM, $DatastoreInfo)
 
     $storageBreakdown = @{
         SAN     = @{ Used = 0; Provisioned = 0; Datastores = @() }
@@ -87,7 +102,7 @@ function Get-VMStorageBreakdown {
             $datastoreUsage[$datastoreName].Provisioned += $diskProvisionedGB
 
             # Get datastore info from cache
-            $dsInfo = $datastoreInfo[$datastoreName]
+            $dsInfo = $DatastoreInfo[$datastoreName]
             if ($dsInfo) {
                 $datastoreUsage[$datastoreName].Type = $dsInfo.StorageType
             }
@@ -153,71 +168,110 @@ function Get-VMStorageBreakdown {
     return $storageBreakdown
 }
 
-# Get all VMs at once for performance
-Write-Host "Retrieving all VMs..." -ForegroundColor Green
-$allVMs = Get-VM
-
-# Filter and process VMs with vSAN storage
-Write-Host "Processing VMs for vSAN storage and calculating actual usage..." -ForegroundColor Green
 $vmResults = @()
-$processedCount = 0
+$failedVCenters = @()
+$vcIndex = 0
 
-foreach ($vm in $allVMs) {
-    $processedCount++
-    Write-Progress -Activity "Processing VMs" -Status "Processing $($vm.Name) ($processedCount of $($allVMs.Count))" -PercentComplete (($processedCount / $allVMs.Count) * 100)
+foreach ($vCenterServer in $vCenterServers) {
+    $vcIndex++
+    Write-Host "`n===== [$vcIndex/$($vCenterServers.Count)] $vCenterServer =====" -ForegroundColor Cyan
 
-    $storageBreakdown = Get-VMStorageBreakdown -VM $vm
+    # Connect to this vCenter
+    try {
+        if ($UsePerVCenterCredential) {
+            $vcCredential = Get-Credential -Message "Credential for $vCenterServer"
+        }
+        else {
+            $vcCredential = $Credential
+        }
+        $viServer = Connect-VIServer -Server $vCenterServer -Credential $vcCredential -ErrorAction Stop
+    }
+    catch {
+        Write-Warning "Failed to connect to $vCenterServer : $($_.Exception.Message)"
+        $failedVCenters += $vCenterServer
+        continue
+    }
 
-    # Only include VMs that have vSAN storage
-    if ($storageBreakdown.HasVSAN) {
-        $vmResults += [PSCustomObject]@{
-            VMName               = $vm.Name
-            PowerState           = $vm.PowerState
-            CPUs                 = $vm.NumCpu
-            CPUCoresPerSocket    = $vm.CoresPerSocket
-            CPUHotAddEnabled     = $vm.ExtensionData.Config.CpuHotAddEnabled
-            MemoryGB             = [math]::Round($vm.MemoryGB, 2)
-            MemoryMB             = $vm.MemoryMB
-            MemoryHotAddEnabled  = $vm.ExtensionData.Config.MemoryHotAddEnabled
+    try {
+        # Pre-cache datastore information for this vCenter
+        Write-Host "Caching datastore information..." -ForegroundColor Green
+        $datastoreInfo = Get-DatastoreInfoCache -Server $viServer
 
-            # vSAN Storage
-            vSAN_UsedGB          = $storageBreakdown.vSAN.Used
-            vSAN_ProvisionedGB   = $storageBreakdown.vSAN.Provisioned
-            vSAN_Datastores      = ($storageBreakdown.vSAN.Datastores -join ", ")
+        # Get all VMs at once for performance
+        Write-Host "Retrieving all VMs..." -ForegroundColor Green
+        $allVMs = @(Get-VM -Server $viServer)
 
-            # SAN Storage (external)
-            SAN_UsedGB           = $storageBreakdown.SAN.Used
-            SAN_ProvisionedGB    = $storageBreakdown.SAN.Provisioned
-            SAN_Datastores       = ($storageBreakdown.SAN.Datastores -join ", ")
+        # Filter and process VMs with vSAN storage
+        Write-Host "Processing VMs for vSAN storage and calculating actual usage..." -ForegroundColor Green
+        $processedCount = 0
 
-            # NFS Storage
-            NFS_UsedGB           = $storageBreakdown.NFS.Used
-            NFS_ProvisionedGB    = $storageBreakdown.NFS.Provisioned
-            NFS_Datastores       = ($storageBreakdown.NFS.Datastores -join ", ")
+        foreach ($vm in $allVMs) {
+            $processedCount++
+            Write-Progress -Activity "Processing VMs on $vCenterServer" -Status "Processing $($vm.Name) ($processedCount of $($allVMs.Count))" -PercentComplete (($processedCount / $allVMs.Count) * 100)
 
-            # Totals
-            Total_UsedGB         = [math]::Round(($storageBreakdown.SAN.Used + $storageBreakdown.vSAN.Used + $storageBreakdown.NFS.Used), 2)
-            Total_ProvisionedGB  = [math]::Round(($storageBreakdown.SAN.Provisioned + $storageBreakdown.vSAN.Provisioned + $storageBreakdown.NFS.Provisioned), 2)
+            $storageBreakdown = Get-VMStorageBreakdown -VM $vm -DatastoreInfo $datastoreInfo
 
-            # Metadata
-            Host                 = $vm.VMHost.Name
-            Cluster              = (Get-Cluster -VM $vm).Name
+            # Only include VMs that have vSAN storage
+            if ($storageBreakdown.HasVSAN) {
+                $vmResults += [PSCustomObject]@{
+                    vCenter              = $vCenterServer
+                    VMName               = $vm.Name
+                    PowerState           = $vm.PowerState
+                    CPUs                 = $vm.NumCpu
+                    CPUCoresPerSocket    = $vm.CoresPerSocket
+                    CPUHotAddEnabled     = $vm.ExtensionData.Config.CpuHotAddEnabled
+                    MemoryGB             = [math]::Round($vm.MemoryGB, 2)
+                    MemoryMB             = $vm.MemoryMB
+                    MemoryHotAddEnabled  = $vm.ExtensionData.Config.MemoryHotAddEnabled
+
+                    # vSAN Storage
+                    vSAN_UsedGB          = $storageBreakdown.vSAN.Used
+                    vSAN_ProvisionedGB   = $storageBreakdown.vSAN.Provisioned
+                    vSAN_Datastores      = ($storageBreakdown.vSAN.Datastores -join ", ")
+
+                    # SAN Storage (external)
+                    SAN_UsedGB           = $storageBreakdown.SAN.Used
+                    SAN_ProvisionedGB    = $storageBreakdown.SAN.Provisioned
+                    SAN_Datastores       = ($storageBreakdown.SAN.Datastores -join ", ")
+
+                    # NFS Storage
+                    NFS_UsedGB           = $storageBreakdown.NFS.Used
+                    NFS_ProvisionedGB    = $storageBreakdown.NFS.Provisioned
+                    NFS_Datastores       = ($storageBreakdown.NFS.Datastores -join ", ")
+
+                    # Totals
+                    Total_UsedGB         = [math]::Round(($storageBreakdown.SAN.Used + $storageBreakdown.vSAN.Used + $storageBreakdown.NFS.Used), 2)
+                    Total_ProvisionedGB  = [math]::Round(($storageBreakdown.SAN.Provisioned + $storageBreakdown.vSAN.Provisioned + $storageBreakdown.NFS.Provisioned), 2)
+
+                    # Metadata
+                    Host                 = $vm.VMHost.Name
+                    Cluster              = (Get-Cluster -VM $vm -Server $viServer).Name
+                }
+
+                Write-Host "vSAN VM Found: $($vm.Name) - vSAN: $($storageBreakdown.vSAN.Used)/$($storageBreakdown.vSAN.Provisioned)GB, SAN: $($storageBreakdown.SAN.Used)/$($storageBreakdown.SAN.Provisioned)GB" -ForegroundColor Yellow
+            }
         }
 
-        Write-Host "vSAN VM Found: $($vm.Name) - vSAN: $($storageBreakdown.vSAN.Used)/$($storageBreakdown.vSAN.Provisioned)GB, SAN: $($storageBreakdown.SAN.Used)/$($storageBreakdown.SAN.Provisioned)GB" -ForegroundColor Yellow
+        Write-Progress -Completed -Activity "Processing VMs on $vCenterServer"
+    }
+    catch {
+        Write-Warning "Error processing $vCenterServer : $($_.Exception.Message)"
+        $failedVCenters += $vCenterServer
+    }
+    finally {
+        # Disconnect from this vCenter before moving to the next
+        Disconnect-VIServer -Server $viServer -Confirm:$false -ErrorAction SilentlyContinue
     }
 }
 
-Write-Progress -Completed -Activity "Processing VMs"
-
 # Display results
 Write-Host "`nVMs with vSAN storage (showing actual used/provisioned space):" -ForegroundColor Yellow
-$vmResults | Format-Table VMName, PowerState, CPUs, MemoryGB, vSAN_UsedGB, vSAN_ProvisionedGB, SAN_UsedGB, SAN_ProvisionedGB, Total_UsedGB, Total_ProvisionedGB -AutoSize
+$vmResults | Format-Table vCenter, VMName, PowerState, CPUs, MemoryGB, vSAN_UsedGB, vSAN_ProvisionedGB, SAN_UsedGB, SAN_ProvisionedGB, Total_UsedGB, Total_ProvisionedGB -AutoSize
 
 # Detailed per-VM breakdown
 Write-Host "`nDetailed Storage Usage:" -ForegroundColor Yellow
 foreach ($vm in $vmResults) {
-    Write-Host "`n--- $($vm.VMName) ---" -ForegroundColor Cyan
+    Write-Host "`n--- $($vm.VMName) ($($vm.vCenter)) ---" -ForegroundColor Cyan
 
     if ($vm.vSAN_ProvisionedGB -gt 0) {
         Write-Host "  vSAN Storage: $($vm.vSAN_UsedGB) GB used / $($vm.vSAN_ProvisionedGB) GB provisioned ($($vm.vSAN_Datastores))" -ForegroundColor Magenta
@@ -232,13 +286,22 @@ foreach ($vm in $vmResults) {
     Write-Host "  Total: $($vm.Total_UsedGB) GB used / $($vm.Total_ProvisionedGB) GB provisioned" -ForegroundColor White
 }
 
-# Export to CSV
+# Export to CSV (all vCenters combined)
 $exportPath = "C:\temp\vSAN_VMs_Storage_Detailed_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
 $vmResults | Export-Csv -Path $exportPath -NoTypeInformation
 Write-Host "`nResults exported to: $exportPath" -ForegroundColor Green
 
-# Summary calculations
-Write-Host "`nEnvironment Storage Summary:" -ForegroundColor Cyan
+# Per-vCenter summary
+Write-Host "`nPer-vCenter Summary:" -ForegroundColor Cyan
+$vmResults | Group-Object -Property vCenter | ForEach-Object {
+    $vcUsed        = ($_.Group | Measure-Object -Property vSAN_UsedGB -Sum).Sum
+    $vcProvisioned = ($_.Group | Measure-Object -Property vSAN_ProvisionedGB -Sum).Sum
+    Write-Host "  $($_.Name): $($_.Count) VMs, vSAN $([math]::Round($vcUsed, 2)) GB used / $([math]::Round($vcProvisioned, 2)) GB provisioned"
+}
+
+# Overall summary
+Write-Host "`nEnvironment Storage Summary (all vCenters):" -ForegroundColor Cyan
+Write-Host "vCenters processed: $($vCenterServers.Count - $failedVCenters.Count) of $($vCenterServers.Count)"
 Write-Host "Total VMs with vSAN storage: $($vmResults.Count)"
 Write-Host "Total CPU cores: $(($vmResults | Measure-Object -Property CPUs -Sum).Sum)"
 Write-Host "Total Memory GB: $(($vmResults | Measure-Object -Property MemoryGB -Sum).Sum)"
@@ -264,5 +327,7 @@ if ($grandTotalProvisioned -gt 0) {
     Write-Host "  Overall Storage Utilization: $utilizationPercent%" -ForegroundColor Cyan
 }
 
-# Disconnect from vCenter
-Disconnect-VIServer -Confirm:$false
+if ($failedVCenters.Count -gt 0) {
+    Write-Host "`nvCenters that failed:" -ForegroundColor Red
+    $failedVCenters | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
+}
