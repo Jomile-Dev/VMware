@@ -49,8 +49,9 @@ $CheckTags           = $true                                     # look up the S
 $NsxCrossCheck       = $true                                     # report whether the expected SGs (NSX) and tags (vRNI inventory) exist
 $ShowProgress        = $true                                     # progress bar plus a status line for each step / app
 $FastNameLookup      = $true                                     # try to get app names from the list / bulk summary calls before one call per app
-$RequestDelayMs      = 300                                       # pause after every API call (avoids HTTP 429)
+$RequestDelayMs      = 200                                       # pause after every API call (avoids HTTP 429)
 $MaxRetries          = 5                                         # retries on HTTP 429, backing off each time
+$Threads             = 4                                         # parallel tier reads (1 = one at a time) - lower it if you see 429 lines
 
 # Output
 $OutputDir           = '.\Reports'                               # CSV reports are written here
@@ -65,6 +66,7 @@ $script:QuitNow    = $false
 $script:NsxSession  = $null
 $script:NsxXsrf     = $null
 $script:NsxGroupTable = $null
+$script:TierCache  = $null
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 if ($SkipCertCheck -and -not ('TrustAllCertsPolicy' -as [type])) {
@@ -253,21 +255,105 @@ function Get-SgStatus {
     Test-VrniEntity -EntityType 'BaseSecurityGroup' -Name $Name
 }
 
-# Read every tier of an app: name, id, the Security Group filters, and a count of any non-search criteria
+# Turn one tier detail (as vRNI returns it) into: name, id, the Security Group filters, count of non-search criteria
+function ConvertTo-TierInfo {
+    param($Detail, [string]$Id)
+    $filters = @(); $other = 0
+    foreach ($c in @($Detail.group_membership_criteria)) {
+        if ($c.membership_type -eq 'SearchMembershipCriteria' -and $c.search_membership_criteria.filter) {
+            $filters += [string]$c.search_membership_criteria.filter
+        } else { $other++ }
+    }
+    [pscustomobject]@{ Name = $Detail.name; Id = $Id; Filters = $filters; OtherCriteria = $other }
+}
+
+# Read every tier of an app one call at a time (used when the parallel read is off or failed for that app)
 function Get-AppTiers {
     param([string]$AppId)
     $out = @()
     foreach ($ref in (Get-Paged -Path "/groups/applications/$AppId/tiers")) {
-        $t = Invoke-Vrni -Path "/groups/tiers/$($ref.entity_id)"
-        $filters = @(); $other = 0
-        foreach ($c in @($t.group_membership_criteria)) {
-            if ($c.membership_type -eq 'SearchMembershipCriteria' -and $c.search_membership_criteria.filter) {
-                $filters += [string]$c.search_membership_criteria.filter
-            } else { $other++ }
-        }
-        $out += [pscustomobject]@{ Name = $t.name; Id = $ref.entity_id; Filters = $filters; OtherCriteria = $other }
+        $out += ConvertTo-TierInfo -Detail (Invoke-Vrni -Path "/groups/tiers/$($ref.entity_id)") -Id $ref.entity_id
     }
     $out
+}
+
+# Read the tiers of all apps up front with $Threads parallel workers and keep them in $script:TierCache
+#   - the worker only does read-only GETs (tier list, then each tier), with its own 429 back-off
+#   - anything that fails here is simply read again one at a time later
+function Initialize-TierCache {
+    param($Apps)
+    $script:TierCache = @{}
+    $total = @($Apps).Count
+    if ($Threads -le 1 -or $total -lt 2) { return }
+
+    $worker = {
+        param($Base, $Token, $AppId, $Delay, $Retries)
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        function Get-One {
+            param($Path)
+            $hdr = @{ Authorization = "NetworkInsight $Token"; Accept = 'application/json' }
+            for ($t = 0; $t -le $Retries; $t++) {
+                try {
+                    $r = Invoke-RestMethod -Method GET -Uri "$Base$Path" -Headers $hdr -ContentType 'application/json' -UseBasicParsing
+                    if ($Delay) { Start-Sleep -Milliseconds $Delay }
+                    return $r
+                } catch {
+                    $code = 0; $resp = $_.Exception.Response
+                    if ($resp) { $code = [int]$resp.StatusCode }
+                    if ($code -eq 429 -and $t -lt $Retries) { Start-Sleep -Seconds ([math]::Pow(2, $t) * 2); continue }
+                    throw
+                }
+            }
+        }
+        try {
+            $refs = @(); $cursor = $null
+            do {
+                $uri = "/groups/applications/$AppId/tiers?size=100"
+                if ($cursor) { $uri += "&cursor=$cursor" }
+                $r = Get-One $uri
+                if ($r.results) { $refs += @($r.results) }
+                $cursor = $r.cursor
+            } while ($cursor -and $r.results -and @($r.results).Count -gt 0)
+            $items = @()
+            foreach ($ref in $refs) { $items += [pscustomobject]@{ Id = $ref.entity_id; Detail = (Get-One "/groups/tiers/$($ref.entity_id)") } }
+            [pscustomobject]@{ AppId = $AppId; Items = $items; Error = $null }
+        } catch {
+            [pscustomobject]@{ AppId = $AppId; Items = @(); Error = "$_" }
+        }
+    }
+
+    Show-Step "Reading the tiers of $total apps with $Threads parallel reads..." 'Cyan'
+    $sw   = [Diagnostics.Stopwatch]::StartNew()
+    $pool = [runspacefactory]::CreateRunspacePool(1, $Threads)
+    $pool.Open()
+    $jobs = New-Object System.Collections.Generic.List[object]
+    foreach ($a in $Apps) {
+        $ps = [powershell]::Create()
+        $ps.RunspacePool = $pool
+        [void]$ps.AddScript($worker.ToString()).AddArgument($script:Base).AddArgument($script:Token).AddArgument($a.Id).AddArgument($RequestDelayMs).AddArgument($MaxRetries)
+        $jobs.Add([pscustomobject]@{ Ps = $ps; Handle = $ps.BeginInvoke() })
+    }
+
+    $lastShown = 0
+    do {
+        $done = @($jobs | Where-Object { $_.Handle.IsCompleted }).Count
+        if ($ShowProgress) { Write-Progress -Activity 'Reading tiers' -Status "$done / $total" -PercentComplete (($done / [math]::Max($total, 1)) * 100) }
+        if ($done - $lastShown -ge 25) { $lastShown = $done; Show-Step "  tiers read: $done / $total" }
+        if ($done -lt $total) { Start-Sleep -Milliseconds 300 }
+    } while ($done -lt $total)
+    Write-Progress -Activity 'Reading tiers' -Completed
+
+    $failed = 0
+    foreach ($j in $jobs) {
+        $res = @($j.Ps.EndInvoke($j.Handle)) | Select-Object -First 1
+        $j.Ps.Dispose()
+        if ($res -and -not $res.Error) {
+            $script:TierCache[$res.AppId] = @($res.Items | ForEach-Object { ConvertTo-TierInfo -Detail $_.Detail -Id $_.Id })
+        } else { $failed++ }
+    }
+    $pool.Close(); $pool.Dispose()
+    $color = if ($failed -gt 0) { 'Yellow' } else { 'Green' }
+    Show-Step "Tiers read for $($script:TierCache.Count) of $total apps in $([math]::Round($sw.Elapsed.TotalSeconds)) s (failed: $failed - those are read again one at a time)" $color
 }
 
 # Request body for a tier - VMs where Security Group = '<SG name>'
@@ -397,7 +483,8 @@ function Invoke-ListMode {
     param($Apps)
     $rows = New-Object System.Collections.Generic.List[object]
     foreach ($app in $Apps) {
-        $tiers = Get-AppTiers -AppId $app.Id
+        if ($script:TierCache -and $script:TierCache.ContainsKey($app.Id)) { $tiers = @($script:TierCache[$app.Id]) }
+        else { $tiers = Get-AppTiers -AppId $app.Id }
         if (@($tiers).Count -eq 0) {
             $rows.Add([pscustomobject]@{ Application = $app.Name; Tier = ''; Filter = '' })
         }
@@ -417,7 +504,8 @@ function Update-App {
     param($App)
     $out    = New-Object System.Collections.Generic.List[object]
     $name   = $App.Name
-    $tiers  = @(Get-AppTiers -AppId $App.Id)
+    if ($script:TierCache -and $script:TierCache.ContainsKey($App.Id)) { $tiers = @($script:TierCache[$App.Id]) }
+    else { $tiers = @(Get-AppTiers -AppId $App.Id) }
 
     # 1. FrontEnd tier - by name first, otherwise the tier with a single SG-<base>-FrontEnd filter
     $fe = @($tiers | Where-Object { $_.Name -ceq 'FrontEnd' })
@@ -617,6 +705,7 @@ try {
 
     # List mode - export every app and tier to CSV
     if ($Mode -eq 'List') {
+        Initialize-TierCache -Apps $apps
         $file = Join-Path $OutputDir "vrni_apps_$stamp.csv"
         Invoke-ListMode -Apps $apps | Export-Csv -Path $file -NoTypeInformation -Encoding UTF8
         Write-Host "Saved: $file"
@@ -634,6 +723,8 @@ try {
                 Show-Step "NSX groups loaded: $($script:NsxGroupTable.Count)" 'Green'
             } catch { Show-Step "NSX group load failed ($_) - using one vRNI search per SG instead" 'Yellow' }
         }
+
+        Initialize-TierCache -Apps $apps
 
         $n = $apps.Count; $i = 0
         $swCheck = [Diagnostics.Stopwatch]::StartNew()
