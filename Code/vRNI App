@@ -20,15 +20,14 @@
 #>
 
 #region CONFIG ---------------------------------------------------------------
-# vRNI connection
+# vRNI connection - you are prompted for the vIDM login (full UPN) when the script starts
 $VrniServer          = '<vrni-fqdn>'                             # vRNI (Aria Operations for Networks) FQDN
 $VidmServer          = ''                                        # blank = ask vRNI which vIDM appliance to use
 $VidmDomain          = ''                                        # optional - only tried if the plain UPN login fails
-$CredentialPath      = '<path-to-cred.xml>'                      # Export-Clixml PSCredential (full UPN username)
 
 # NSX connection - Create mode, and the SG check in Update / Create
 $NsxServer           = '<nsx-manager-fqdn>'                      # NSX Manager FQDN
-$NsxCredentialPath   = ''                                        # Export-Clixml PSCredential for NSX - blank = reuse $CredentialPath
+$NsxSeparateLogin    = $false                                    # $true = prompt for a separate NSX login, $false = reuse the vRNI login
 
 # What to run
 $Mode                = 'Update'                                  # 'List', 'Update' or 'Create'
@@ -254,11 +253,12 @@ function New-TierBody {
     }
 }
 
-# NSX Manager session login (same credential approach as the NSX audit scripts)
+# NSX Manager session login - reuses the vRNI login unless $NsxSeparateLogin is $true
 function Connect-Nsx {
     param([pscredential]$Credential)
     $c = $Credential
-    if ($NsxCredentialPath) { $c = Import-Clixml -Path $NsxCredentialPath }
+    if ($NsxSeparateLogin) { $c = Get-Credential -Message 'NSX Manager user' }
+    if (-not $c) { throw 'No NSX credential supplied.' }
     $form = @{ j_username = $c.UserName; j_password = $c.GetNetworkCredential().Password }
     try {
         $r = Invoke-WebRequest -Method POST -Uri "https://$NsxServer/api/session/create" -Body $form -ContentType 'application/x-www-form-urlencoded' -SessionVariable nsxSess -UseBasicParsing
@@ -506,7 +506,8 @@ function New-AppFromPolicy {
 #region main -----------------------------------------------------------------
 if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir | Out-Null }
 $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-$cred  = Import-Clixml -Path $CredentialPath
+$cred  = Get-Credential -Message 'vIDM user for vRNI (full UPN)'
+if (-not $cred) { throw 'No credential supplied.' }
 
 # Connect, read the application list, then run the chosen mode (token is deleted in finally)
 try {
