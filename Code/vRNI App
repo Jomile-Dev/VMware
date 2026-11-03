@@ -275,7 +275,7 @@ function New-TierBody {
 function Connect-Nsx {
     param([pscredential]$Credential)
     $c = $Credential
-    if ($NsxCredentialPath) { $c = Import-Clixml -Path $NsxCredentialPath }
+    if ($NsxCredentialPath) { $c = Import-Clixml -LiteralPath $NsxCredentialPath }
     if (-not $c) { throw 'No NSX credential supplied.' }
     $form = @{ j_username = $c.UserName; j_password = $c.GetNetworkCredential().Password }
     try {
@@ -528,8 +528,18 @@ $swTotal = [Diagnostics.Stopwatch]::StartNew()
 Show-Step "Mode: $Mode   DryRun: $DryRun" 'Cyan'
 
 # Saved credential (Export-Clixml) - falls back to a prompt if the file is not there
-if ($CredentialPath -and (Test-Path $CredentialPath)) { $cred = Import-Clixml -Path $CredentialPath; Show-Step 'Credential loaded from file' }
-else { $cred = Get-Credential -Message 'vIDM user for vRNI'; Show-Step 'Credential entered at the prompt' }
+if (-not $CredentialPath -or $CredentialPath -like '<*') {
+    Show-Step 'CredentialPath is not set in CONFIG - prompting instead' 'Yellow'
+    $cred = Get-Credential -Message 'vIDM user for vRNI'
+}
+elseif (-not (Test-Path -LiteralPath $CredentialPath)) {
+    Show-Step "Credential file not found: $CredentialPath (looked from $((Get-Location).Path)) - prompting instead" 'Yellow'
+    $cred = Get-Credential -Message 'vIDM user for vRNI'
+}
+else {
+    $cred = Import-Clixml -LiteralPath $CredentialPath
+    Show-Step 'Credential loaded from file' 'Green'
+}
 if (-not $cred) { throw 'No credential supplied.' }
 
 # Connect, read the application list, then run the chosen mode (token is deleted in finally)
