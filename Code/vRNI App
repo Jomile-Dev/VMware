@@ -44,6 +44,9 @@ $Zones               = @('FrontEnd', 'Management', 'Internal', 'Protected')   # 
 # Create mode - which DFW security policies count as applications
 $NsxPolicyCategories = @('Application')                          # DFW categories to read - blank array = all categories
 $NsxPolicyExclude    = ''                                        # regex of policy names to skip, e.g. '^(Default|Sample)'
+$RemoveOrphans       = $false                                    # Create - DELETE vRNI apps that have no DFW policy in NSX (asks Y/N/A/Q for each, separately from creates)
+$RemoveExclude       = ''                                        # regex of vRNI app names never to delete, e.g. '^(SDDC Manager|Other App)$'
+$RemoveMaxPercent    = 25                                        # safety - delete nothing if more than this % of all apps would go
 
 # Checks and API behaviour
 $CheckTags           = $true                                     # look up the ST- tags in vRNI (only for apps that will change) - $false = skip the tag check
@@ -62,7 +65,7 @@ $SkipCertCheck       = $true                                     # bypass self-s
 $ErrorActionPreference = 'Stop'
 $script:Base       = "https://$VrniServer/api/ni"
 $script:Token      = $null
-$script:ApproveAll = $false
+$script:ApproveAll = @{}
 $script:QuitNow    = $false
 $script:NsxSession  = $null
 $script:NsxXsrf     = $null
@@ -228,12 +231,12 @@ function Get-Paged {
     $all
 }
 
-# Y / N / A (yes to all) / Q (quit) prompt used before each app is changed
+# Y / N / A (yes to all) / Q (quit) prompt used before each app is changed - 'All' only covers the same kind ('change' or 'delete')
 function Get-UserConfirm {
-    param([string]$Prompt)
-    if ($script:ApproveAll) { return 'Y' }
+    param([string]$Prompt, [string]$Kind = 'change')
+    if ($script:ApproveAll[$Kind]) { return 'Y' }
     do { $a = (Read-Host "$Prompt [Y]es / [N]o / [A]ll / [Q]uit").Trim().ToUpper() } until ($a -in 'Y','N','A','Q')
-    if ($a -eq 'A') { $script:ApproveAll = $true; return 'Y' }
+    if ($a -eq 'A') { $script:ApproveAll[$Kind] = $true; return 'Y' }
     $a
 }
 
@@ -1010,6 +1013,45 @@ try {
             catch { $report.Add((New-Row $pn 'Error' '' '' '' '' 'Failed' "$_")); Write-Host "ERROR  : $pn - $_" -ForegroundColor Red }
         }
         Write-Progress -Activity 'Checking NSX policies' -Completed
+
+        # 4. The other direction - apps in vRNI with no DFW policy of the same name in NSX
+        #    report only, unless $RemoveOrphans is on - then they are deleted (with all their tiers) after a separate Y/N/A/Q
+        $policyNorm = @{}
+        foreach ($pn in $policyNames) { $policyNorm[(Get-NormName $pn)] = $true }
+        $orphans  = @($apps | Where-Object { -not $policyNorm.ContainsKey((Get-NormName $_.Name)) })
+        $toDelete = @()
+        if ($RemoveOrphans -and $orphans.Count -gt 0) {
+            $toDelete = @($orphans | Where-Object { -not ($RemoveExclude -and $_.Name -match $RemoveExclude) })
+            $pct = [math]::Round(100 * $toDelete.Count / [math]::Max($apps.Count, 1))
+            if ($policyNames.Count -eq 0) {
+                Show-Step 'No DFW policies were read from NSX - nothing will be deleted' 'Red'; $toDelete = @()
+            } elseif ($pct -gt $RemoveMaxPercent) {
+                Show-Step "$($toDelete.Count) of $($apps.Count) apps ($pct%) would be deleted - over the $RemoveMaxPercent% safety limit, so nothing is deleted. Check the policy list / categories, or raise `$RemoveMaxPercent" 'Red'
+                $toDelete = @()
+            }
+        }
+        $deleteIds = @{}
+        foreach ($d in $toDelete) { $deleteIds[$d.Id] = $true }
+
+        foreach ($o in $orphans) {
+            if ($script:QuitNow -or -not $deleteIds.ContainsKey($o.Id)) {
+                $why = 'No DFW policy in NSX with this name (ignoring _ / spaces / punctuation / case)'
+                if ($RemoveOrphans -and $RemoveExclude -and $o.Name -match $RemoveExclude) { $why += ' - excluded from delete by $RemoveExclude' }
+                $report.Add((New-Row $o.Name 'None' '' '' '' '' 'In vRNI only' $why)); continue
+            }
+            Write-Host "  DELETE app '$($o.Name)' and all its tiers (no DFW policy in NSX)" -ForegroundColor Red
+            if ($DryRun) { $report.Add((New-Row $o.Name 'Delete' '' '' '' '' 'DryRun' 'No DFW policy in NSX')); continue }
+            $answer = Get-UserConfirm -Prompt "DELETE '$($o.Name)' from vRNI?" -Kind 'delete'
+            if ($answer -eq 'N') { $report.Add((New-Row $o.Name 'None' '' '' '' '' 'In vRNI only' 'Delete declined')); continue }
+            if ($answer -eq 'Q') { $script:QuitNow = $true; $report.Add((New-Row $o.Name 'None' '' '' '' '' 'In vRNI only' 'Delete skipped - quit')); continue }
+            try {
+                Invoke-Vrni -Method DELETE -Path "/groups/applications/$($o.Id)" | Out-Null
+                $report.Add((New-Row $o.Name 'Delete' '' '' '' '' 'Applied' 'No DFW policy in NSX'))
+                Write-Host "DELETED: $($o.Name)" -ForegroundColor Green
+            } catch { $report.Add((New-Row $o.Name 'Delete' '' '' '' '' 'Failed' "$_")); Write-Host "FAILED : delete of $($o.Name) - $_" -ForegroundColor Red }
+        }
+        if ($orphans.Count -gt 0) { Show-Step "$($orphans.Count) vRNI apps have no matching DFW policy in NSX$(if ($toDelete.Count) { " - $($toDelete.Count) planned for delete" } else { " - listed as 'In vRNI only' in the CSV" })" 'Yellow' }
+
         $file = Join-Path $OutputDir "vrni_create_$stamp.csv"
         $report | Export-Csv -Path $file -NoTypeInformation -Encoding UTF8
         Write-Host ''
@@ -1018,7 +1060,7 @@ try {
         $nExist  = @($report | Where-Object { $_.Result -eq 'Already in vRNI' }).Count
         $nReview = @($report | Where-Object { $_.Action -eq 'Review' }).Count
         $nNew    = @($report | Where-Object { $_.Action -eq 'CreateApp' } | Select-Object -ExpandProperty Application -Unique).Count
-        Show-Step "Policies: $n   already in vRNI: $nExist   to create / created: $nNew   for review: $nReview" 'Cyan'
+        Show-Step "Policies: $n   already in vRNI: $nExist   to create / created: $nNew   for review: $nReview   in vRNI only: $($orphans.Count)   to delete: $($toDelete.Count)" 'Cyan'
     }
     else { throw "Unknown `$Mode '$Mode' - use 'List', 'Update' or 'Create'." }
 
