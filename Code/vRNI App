@@ -33,6 +33,7 @@ $NsxCredentialPath   = ''                                        # Export-Clixml
 # What to run
 $Mode                = 'Update'                                  # 'List', 'Update' or 'Create'
 $DryRun              = $true                                     # Update / Create - $true = show the plan only, no changes in vRNI
+$RenameApps          = $false                                    # Update - also rename each app to its SG-based name (spaces instead of _) - changes the name in vRNI
 
 # Update mode - CSV (column: ApplicationName, exact vRNI app names) OR blank = all apps
 $UpdateCSV           = ''                                        # e.g. 'C:\Scripts\Input\vrniUpdate.csv'
@@ -67,6 +68,8 @@ $script:NsxSession  = $null
 $script:NsxXsrf     = $null
 $script:NsxGroupTable = $null
 $script:TierCache  = $null
+$script:LookupCache = $null
+$script:AppNames   = $null
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 if ($SkipCertCheck -and -not ('TrustAllCertsPolicy' -as [type])) {
@@ -116,6 +119,8 @@ function Invoke-Api {
         if ($ContentType -eq 'application/json' -and $Body -isnot [string]) { $Body = $Body | ConvertTo-Json -Depth 10 }
         $p.Body = $Body
     }
+    # PowerShell 7 rejects a plain number in If-Match - skip its header check (Windows PowerShell 5.1 does not need this)
+    if ($Headers.ContainsKey('If-Match') -and $PSVersionTable.PSVersion.Major -ge 6) { $p.SkipHeaderValidation = $true }
     for ($try = 0; $try -le $MaxRetries; $try++) {
         try {
             $r = Invoke-RestMethod @p
@@ -139,9 +144,10 @@ function Invoke-Api {
 
 # vRNI call - adds the NetworkInsight token header to Invoke-Api
 function Invoke-Vrni {
-    param([string]$Method = 'GET', [string]$Path, $Body)
-    Invoke-Api -Method $Method -Uri "$script:Base$Path" -Body $Body `
-        -Headers @{ Authorization = "NetworkInsight $script:Token"; Accept = 'application/json' }
+    param([string]$Method = 'GET', [string]$Path, $Body, [hashtable]$Extra = @{})
+    $h = @{ Authorization = "NetworkInsight $script:Token"; Accept = 'application/json' }
+    foreach ($k in $Extra.Keys) { $h[$k] = $Extra[$k] }
+    Invoke-Api -Method $Method -Uri "$script:Base$Path" -Body $Body -Headers $h
 }
 
 # vIDM login, then exchange the vIDM token for a vRNI token
@@ -237,6 +243,8 @@ function New-Row {
 function Test-VrniEntity {
     param([string]$EntityType, [string]$Name)
     if (-not $NsxCrossCheck) { return 'NotChecked' }
+    $key = "$EntityType|$Name"
+    if ($script:LookupCache -and $script:LookupCache.ContainsKey($key)) { return $script:LookupCache[$key] }
     try {
         $r = Invoke-Vrni -Method POST -Path '/search' -Body @{
             entity_type = $EntityType
@@ -258,13 +266,14 @@ function Get-SgStatus {
 # Turn one tier detail (as vRNI returns it) into: name, id, the Security Group filters, count of non-search criteria
 function ConvertTo-TierInfo {
     param($Detail, [string]$Id)
-    $filters = @(); $other = 0
+    $filters = @(); $other = 0; $crit = @()
     foreach ($c in @($Detail.group_membership_criteria)) {
         if ($c.membership_type -eq 'SearchMembershipCriteria' -and $c.search_membership_criteria.filter) {
             $filters += [string]$c.search_membership_criteria.filter
+            $crit    += [pscustomobject]@{ EntityType = [string]$c.search_membership_criteria.entity_type; Filter = [string]$c.search_membership_criteria.filter }
         } else { $other++ }
     }
-    [pscustomobject]@{ Name = $Detail.name; Id = $Id; Filters = $filters; OtherCriteria = $other }
+    [pscustomobject]@{ Name = $Detail.name; Id = $Id; Filters = $filters; OtherCriteria = $other; Criteria = $crit }
 }
 
 # Read every tier of an app one call at a time (used when the parallel read is off or failed for that app)
@@ -277,8 +286,39 @@ function Get-AppTiers {
     $out
 }
 
-# Read the tiers of all apps up front with $Threads parallel workers and keep them in $script:TierCache
-#   - the worker only does read-only GETs (tier list, then each tier), with its own 429 back-off
+# Run a read-only worker script block once per argument set, $Threads at a time - returns one result per set
+#   - each worker call gets its own runspace from a small pool, so nothing is shared except the results
+function Invoke-Parallel {
+    param([scriptblock]$Worker, $ArgSets, [string]$Label)
+    $total = @($ArgSets).Count
+    $pool  = [runspacefactory]::CreateRunspacePool(1, $Threads)
+    $pool.Open()
+    $jobs = New-Object System.Collections.Generic.List[object]
+    foreach ($set in $ArgSets) {
+        $ps = [powershell]::Create()
+        $ps.RunspacePool = $pool
+        [void]$ps.AddScript($Worker.ToString())
+        foreach ($arg in $set) { [void]$ps.AddArgument($arg) }
+        $jobs.Add([pscustomobject]@{ Ps = $ps; Handle = $ps.BeginInvoke() })
+    }
+    $lastShown = 0
+    do {
+        $done = @($jobs | Where-Object { $_.Handle.IsCompleted }).Count
+        if ($ShowProgress) { Write-Progress -Activity $Label -Status "$done / $total" -PercentComplete (($done / [math]::Max($total, 1)) * 100) }
+        if ($done - $lastShown -ge 50) { $lastShown = $done; Show-Step "  $Label`: $done / $total" }
+        if ($done -lt $total) { Start-Sleep -Milliseconds 300 }
+    } while ($done -lt $total)
+    Write-Progress -Activity $Label -Completed
+    $results = foreach ($j in $jobs) {
+        @($j.Ps.EndInvoke($j.Handle)) | Select-Object -First 1
+        $j.Ps.Dispose()
+    }
+    $pool.Close(); $pool.Dispose()
+    @($results)
+}
+
+# Read the tiers of all apps up front ($Threads at a time) and keep them in $script:TierCache
+#   - read-only GETs (tier list, then each tier) with their own 429 back-off
 #   - anything that fails here is simply read again one at a time later
 function Initialize-TierCache {
     param($Apps)
@@ -289,12 +329,15 @@ function Initialize-TierCache {
     $worker = {
         param($Base, $Token, $AppId, $Delay, $Retries)
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $swApp = [Diagnostics.Stopwatch]::StartNew(); $calls = 0; $busy = 0.0
         function Get-One {
             param($Path)
             $hdr = @{ Authorization = "NetworkInsight $Token"; Accept = 'application/json' }
             for ($t = 0; $t -le $Retries; $t++) {
                 try {
+                    $one = [Diagnostics.Stopwatch]::StartNew()
                     $r = Invoke-RestMethod -Method GET -Uri "$Base$Path" -Headers $hdr -ContentType 'application/json' -UseBasicParsing
+                    $script:calls++; $script:busy += $one.Elapsed.TotalSeconds
                     if ($Delay) { Start-Sleep -Milliseconds $Delay }
                     return $r
                 } catch {
@@ -316,44 +359,92 @@ function Initialize-TierCache {
             } while ($cursor -and $r.results -and @($r.results).Count -gt 0)
             $items = @()
             foreach ($ref in $refs) { $items += [pscustomobject]@{ Id = $ref.entity_id; Detail = (Get-One "/groups/tiers/$($ref.entity_id)") } }
-            [pscustomobject]@{ AppId = $AppId; Items = $items; Error = $null }
+            [pscustomobject]@{ AppId = $AppId; Items = $items; Error = $null; Seconds = $swApp.Elapsed.TotalSeconds; Calls = $calls; Busy = $busy; Tiers = @($refs).Count }
         } catch {
-            [pscustomobject]@{ AppId = $AppId; Items = @(); Error = "$_" }
+            [pscustomobject]@{ AppId = $AppId; Items = @(); Error = "$_"; Seconds = $swApp.Elapsed.TotalSeconds; Calls = $calls; Busy = $busy; Tiers = 0 }
         }
     }
 
-    Show-Step "Reading the tiers of $total apps with $Threads parallel reads..." 'Cyan'
-    $sw   = [Diagnostics.Stopwatch]::StartNew()
-    $pool = [runspacefactory]::CreateRunspacePool(1, $Threads)
-    $pool.Open()
-    $jobs = New-Object System.Collections.Generic.List[object]
-    foreach ($a in $Apps) {
-        $ps = [powershell]::Create()
-        $ps.RunspacePool = $pool
-        [void]$ps.AddScript($worker.ToString()).AddArgument($script:Base).AddArgument($script:Token).AddArgument($a.Id).AddArgument($RequestDelayMs).AddArgument($MaxRetries)
-        $jobs.Add([pscustomobject]@{ Ps = $ps; Handle = $ps.BeginInvoke() })
-    }
-
-    $lastShown = 0
-    do {
-        $done = @($jobs | Where-Object { $_.Handle.IsCompleted }).Count
-        if ($ShowProgress) { Write-Progress -Activity 'Reading tiers' -Status "$done / $total" -PercentComplete (($done / [math]::Max($total, 1)) * 100) }
-        if ($done - $lastShown -ge 25) { $lastShown = $done; Show-Step "  tiers read: $done / $total" }
-        if ($done -lt $total) { Start-Sleep -Milliseconds 300 }
-    } while ($done -lt $total)
-    Write-Progress -Activity 'Reading tiers' -Completed
-
+    Show-Step "Reading the tiers of $total apps, $Threads at a time..." 'Cyan'
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $sets = foreach ($a in $Apps) { ,@($script:Base, $script:Token, $a.Id, $RequestDelayMs, $MaxRetries) }
     $failed = 0
-    foreach ($j in $jobs) {
-        $res = @($j.Ps.EndInvoke($j.Handle)) | Select-Object -First 1
-        $j.Ps.Dispose()
+    $stats = New-Object System.Collections.Generic.List[object]
+    $nameById = @{}; foreach ($a in $Apps) { $nameById[$a.Id] = $a.Name }
+    foreach ($res in (Invoke-Parallel -Worker $worker -ArgSets $sets -Label 'Reading tiers')) {
+        if ($res) { $stats.Add($res) }
         if ($res -and -not $res.Error) {
             $script:TierCache[$res.AppId] = @($res.Items | ForEach-Object { ConvertTo-TierInfo -Detail $_.Detail -Id $_.Id })
         } else { $failed++ }
     }
-    $pool.Close(); $pool.Dispose()
     $color = if ($failed -gt 0) { 'Yellow' } else { 'Green' }
     Show-Step "Tiers read for $($script:TierCache.Count) of $total apps in $([math]::Round($sw.Elapsed.TotalSeconds)) s (failed: $failed - those are read again one at a time)" $color
+
+    # Where the time went - helps tell a slow vRNI from too few readers
+    $calls = ($stats | Measure-Object -Property Calls -Sum).Sum
+    $busy  = ($stats | Measure-Object -Property Busy  -Sum).Sum
+    $tiersTotal = ($stats | Measure-Object -Property Tiers -Sum).Sum
+    if ($calls -gt 0) {
+        Show-Step ("  {0} calls for {1} tiers, {2:N2} s average per call (wall clock {3} s with {4} readers)" -f $calls, $tiersTotal, ($busy / $calls), [math]::Round($sw.Elapsed.TotalSeconds), $Threads)
+        $slow = $stats | Sort-Object Seconds -Descending | Select-Object -First 3
+        foreach ($x in $slow) { Show-Step ("  slowest: {0} - {1:N1} s, {2} tiers" -f $nameById[$x.AppId], $x.Seconds, $x.Tiers) }
+    }
+}
+
+# Look up every SG / tag name the check will need, $Threads at a time, so the per-app check makes no API calls
+#   - SG names only when the NSX group table was not loaded
+#   - tag names only for apps that are missing at least one zone tier (the same apps the tag lookup is done for)
+function Initialize-LookupCache {
+    param($Apps)
+    $script:LookupCache = @{}
+    if (-not $NsxCrossCheck -or $Threads -le 1 -or -not $script:TierCache) { return }
+
+    $wanted = New-Object System.Collections.Generic.HashSet[string]
+    foreach ($a in $Apps) {
+        $tiers = $script:TierCache[$a.Id]
+        if (-not $tiers) { continue }
+        $base = $null
+        foreach ($t in $tiers) { foreach ($f in $t.Filters) { if (-not $base -and $f -match "^Security Group = '(?<sg>SG-.+)-FrontEnd'$") { $base = $Matches['sg'] } } }
+        if (-not $base) { continue }
+        $tagBase = 'ST-' + ($base.Substring(3) -replace '\s+', '_')
+        $names   = @($tiers | ForEach-Object { $_.Name })
+        $needs   = @($Zones | Where-Object { $names -cnotcontains $_ }).Count -gt 0
+        foreach ($z in $Zones) {
+            if (-not $script:NsxGroupTable) { [void]$wanted.Add("BaseSecurityGroup|$base-$z") }
+            if ($CheckTags -and $needs)     { [void]$wanted.Add("SecurityTag|$tagBase-$z") }
+        }
+    }
+    if ($wanted.Count -eq 0) { return }
+
+    $worker = {
+        param($Base, $Token, $Type, $Name, $Delay, $Retries)
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $hdr  = @{ Authorization = "NetworkInsight $Token"; Accept = 'application/json' }
+        $body = @{ entity_type = $Type; filter = "name = '$Name'"; size = 1 } | ConvertTo-Json
+        $value = 'Error'
+        for ($t = 0; $t -le $Retries; $t++) {
+            try {
+                $r = Invoke-RestMethod -Method POST -Uri "$Base/search" -Headers $hdr -Body $body -ContentType 'application/json' -UseBasicParsing
+                if ($Delay) { Start-Sleep -Milliseconds $Delay }
+                $value = if ($r.results -and @($r.results).Count -gt 0) { 'Found' } else { 'Missing' }
+                break
+            } catch {
+                $code = 0; $resp = $_.Exception.Response
+                if ($resp) { $code = [int]$resp.StatusCode }
+                if ($code -eq 429 -and $t -lt $Retries) { Start-Sleep -Seconds ([math]::Pow(2, $t) * 2); continue }
+                break
+            }
+        }
+        [pscustomobject]@{ Key = "$Type|$Name"; Value = $value }
+    }
+
+    Show-Step "Looking up $($wanted.Count) SG / tag names, $Threads at a time..." 'Cyan'
+    $sw   = [Diagnostics.Stopwatch]::StartNew()
+    $sets = foreach ($k in $wanted) { $type, $name = $k.Split('|', 2); ,@($script:Base, $script:Token, $type, $name, $RequestDelayMs, $MaxRetries) }
+    foreach ($res in (Invoke-Parallel -Worker $worker -ArgSets $sets -Label 'Looking up names')) {
+        if ($res -and $res.Value -ne 'Error') { $script:LookupCache[$res.Key] = $res.Value }
+    }
+    Show-Step "Lookups done in $([math]::Round($sw.Elapsed.TotalSeconds)) s ($($script:LookupCache.Count) of $($wanted.Count) answered)" 'Green'
 }
 
 # Request body for a tier - VMs where Security Group = '<SG name>'
@@ -470,10 +561,10 @@ function Get-AppIndex {
     @($refs | ForEach-Object { [pscustomobject]@{ Id = $_.entity_id; Name = $names[$_.entity_id] } } | Sort-Object Name)
 }
 
-# Compare app / policy names ignoring case and underscore-versus-space differences
+# Compare app / policy names ignoring case, underscores, spaces and punctuation such as ( ) - so APP_NAME_X matches APP NAME (X)
 function Get-NormName {
     param([string]$Name)
-    (($Name -replace '[_\s]+', ' ').Trim()).ToLower()
+    (($Name -replace '[^A-Za-z0-9]+', ' ').Trim()).ToLower()
 }
 #endregion helpers -----------------------------------------------------------
 
@@ -493,6 +584,29 @@ function Invoke-ListMode {
         }
     }
     $rows
+}
+
+# Rename an app in vRNI through "Add Application With Tiers" (it also edits a saved app when the entity_id is sent)
+#   - If-Match carries the app's last modified time, so a change made by someone else in the meantime is refused
+#   - every existing tier is sent back with its id and criteria, so the tiers stay as they are
+function Rename-VrniApp {
+    param($App, [string]$NewName)
+    $d     = Invoke-Vrni -Path "/groups/applications/$($App.Id)"
+    $tiers = @(Get-AppTiers -AppId $App.Id)
+    foreach ($t in $tiers) {
+        if ($t.OtherCriteria -gt 0 -or @($t.Criteria).Count -eq 0) { throw "Tier '$($t.Name)' has criteria that cannot be re-sent safely - rename the app by hand" }
+    }
+    $tierBody = @(foreach ($t in $tiers) {
+        @{
+            name = $t.Name
+            entity_id = $t.Id
+            group_membership_criteria = @(foreach ($c in $t.Criteria) {
+                @{ membership_type = 'SearchMembershipCriteria'; search_membership_criteria = @{ entity_type = $c.EntityType; filter = $c.Filter } }
+            })
+        }
+    })
+    $body = @{ name = $NewName; entity_id = $App.Id; tiers = $tierBody }
+    Invoke-Vrni -Method POST -Path '/groups/applications/full/' -Body $body -Extra @{ 'If-Match' = [string]$d.last_modified_time } | Out-Null
 }
 
 # Update mode - brings one existing app in line with the four zone tiers
@@ -526,6 +640,18 @@ function Update-App {
     $base = $Matches['sg']
     $ci   = $base.Substring(3)
     $tagBase = 'ST-' + ($ci -replace '\s+', '_')
+
+    # App name - with $RenameApps the app gets the SG-based name (spaces); only differences in _ / space / punctuation / case are renamed
+    $renameTo = $null
+    if ($RenameApps -and $name -cne $ci) {
+        if ((Get-NormName $name) -ne (Get-NormName $ci)) {
+            $out.Add((New-Row $name 'Review' '' $existingText '' '' 'Review' "App name differs from the SG base by more than _ / spaces / punctuation - not renamed (SG base: $ci)")); return $out
+        }
+        if ($script:AppNames -and $script:AppNames.ContainsKey($ci.ToLower())) {
+            $out.Add((New-Row $name 'Review' '' $existingText '' '' 'Review' "An app named '$ci' already exists - not renamed")); return $out
+        }
+        $renameTo = $ci
+    }
 
     $unexpected = @($tiers | Where-Object { $Zones -notcontains $_.Name -and $_.Id -ne $feTier.Id })
     if ($unexpected.Count -gt 0) {
@@ -565,12 +691,13 @@ function Update-App {
         foreach ($p in $plan) { $p.Tag = Test-VrniEntity -EntityType 'SecurityTag' -Name "$tagBase-$($p.Tier)" }
     }
 
-    if ($plan.Count -eq 0) { Write-Host "OK     : $name - already has the 4 zone tiers"; return $out }
+    if ($plan.Count -eq 0 -and -not $renameTo) { Write-Host "OK     : $name - already has the 4 zone tiers"; return $out }
 
     Write-Host ''
     Write-Host '------------------------------------------------------------'
     Write-Host "Application : $name" -ForegroundColor Cyan
     Write-Host "SG base     : $base"
+    if ($renameTo) { Write-Host "  RENAME app  '$name' -> '$renameTo'" -ForegroundColor Magenta }
     foreach ($p in $plan) {
         if ($p.Action -eq 'Rename') { Write-Host "  RENAME tier '$($p.Old)' -> 'FrontEnd'   (filter kept: $($p.Filter))   NSX SG: $($p.Sg)  tag: $($p.Tag)" }
         else                        { Write-Host "  ADD    tier $($p.Tier) -> $($p.Filter)   NSX SG: $($p.Sg)  tag: $($p.Tag)" }
@@ -578,6 +705,7 @@ function Update-App {
     Write-Host '------------------------------------------------------------'
 
     if ($DryRun) {
+        if ($renameTo) { $out.Add((New-Row $name 'RenameApp' '' '' '' '' 'DryRun' "New name: $renameTo")) }
         foreach ($p in $plan) { $out.Add((New-Row $name $p.Action $p.Tier $p.Filter $p.Sg $p.Tag 'DryRun' $(if ($p.Old) { "Old name: $($p.Old)" } else { '' }))) }
         return $out
     }
@@ -601,6 +729,14 @@ function Update-App {
             $out.Add((New-Row $name 'Rename' 'FrontEnd' $p.Filter $p.Sg $p.Tag 'Applied' "Old name: $($p.Old)"))
             Write-Host "RENAMED: $name / $($p.Old) -> FrontEnd" -ForegroundColor Green
         } catch { $out.Add((New-Row $name 'Rename' 'FrontEnd' $p.Filter $p.Sg $p.Tag 'Failed' "Old name: $($p.Old) | $_")); Write-Host "FAILED : rename on $name - $_" -ForegroundColor Red }
+    }
+    # Rename the app last, once its tiers are in place
+    if ($renameTo) {
+        try {
+            Rename-VrniApp -App $App -NewName $renameTo
+            $out.Add((New-Row $name 'RenameApp' '' '' '' '' 'Applied' "New name: $renameTo"))
+            Write-Host "RENAMED: app '$name' -> '$renameTo'" -ForegroundColor Green
+        } catch { $out.Add((New-Row $name 'RenameApp' '' '' '' '' 'Failed' "New name: $renameTo | $_")); Write-Host "FAILED : app rename on $name - $_" -ForegroundColor Red }
     }
     $out
 }
@@ -696,6 +832,10 @@ try {
     $apps = @(Get-AppIndex)
     Show-Step "Found $($apps.Count) applications (took $([math]::Round($swNames.Elapsed.TotalSeconds)) s)" 'Green'
 
+    # Every existing app name (before any CSV filter) so a rename never collides with another app
+    $script:AppNames = @{}
+    foreach ($a in $apps) { $script:AppNames[$a.Name.ToLower()] = $true }
+
     # Update mode only - limit to the names in the CSV (exact vRNI names, spaces included)
     if ($UpdateCSV -and $Mode -eq 'Update') {
         $wanted = @(Import-Csv -Path $UpdateCSV | ForEach-Object { $_.ApplicationName.Trim() })
@@ -725,6 +865,7 @@ try {
         }
 
         Initialize-TierCache -Apps $apps
+        Initialize-LookupCache -Apps $apps
 
         $n = $apps.Count; $i = 0
         $swCheck = [Diagnostics.Stopwatch]::StartNew()
@@ -752,7 +893,7 @@ try {
         $report | Group-Object Result | Sort-Object Name | ForEach-Object { Write-Host ("  {0,-22} {1}" -f $_.Name, $_.Count) }
         $byApp   = @($report | Group-Object Application)
         $nReview = @($byApp | Where-Object { $_.Group.Action -contains 'Review' }).Count
-        $nChange = @($byApp | Where-Object { $_.Group.Action -notcontains 'Review' -and (@($_.Group.Action) -match '^(Add|Rename)$').Count -gt 0 }).Count
+        $nChange = @($byApp | Where-Object { $_.Group.Action -notcontains 'Review' -and (@($_.Group.Action) -match '^(Add|Rename|RenameApp)$').Count -gt 0 }).Count
         Show-Step "Apps checked: $($apps.Count)   need changes: $nChange   for review: $nReview   already compliant: $($apps.Count - $nChange - $nReview)" 'Cyan'
     }
     # Create mode - new vRNI apps from the NSX DFW policy list
