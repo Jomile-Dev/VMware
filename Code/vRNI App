@@ -459,19 +459,47 @@ function New-TierBody {
     }
 }
 
-# NSX Manager session login - reuses the vRNI login unless $NsxCredentialPath is set
+# NSX Manager session login (/api/session/create) - same approach as the NSX audit scripts
+#   - tries the bare username first (DOMAIN\user or user@domain stripped to user), then the name as saved
+#   - reuses the vRNI login unless $NsxCredentialPath is set
 function Connect-Nsx {
     param([pscredential]$Credential)
     $c = $Credential
     if ($NsxCredentialPath) { $c = Import-Clixml -LiteralPath $NsxCredentialPath }
     if (-not $c) { throw 'No NSX credential supplied.' }
-    $form = @{ j_username = $c.UserName; j_password = $c.GetNetworkCredential().Password }
-    try {
-        $r = Invoke-WebRequest -Method POST -Uri "https://$NsxServer/api/session/create" -Body $form -ContentType 'application/x-www-form-urlencoded' -SessionVariable nsxSess -UseBasicParsing
-    } catch { $form.j_password = $null; throw (Get-ErrorText $_) }
-    $form.j_password = $null
-    $script:NsxSession = $nsxSess
-    $script:NsxXsrf    = $r.Headers['X-XSRF-TOKEN']
+
+    $raw = $c.UserName
+    if     ($raw -match '^(.+)\\(.+)$') { $bare = $Matches[2] }
+    elseif ($raw -match '^([^@]+)@')     { $bare = $Matches[1] }
+    else                                 { $bare = $raw }
+    $tryNames = @($bare)
+    if ($raw -ne $bare) { $tryNames += $raw }
+
+    $pw = $c.GetNetworkCredential().Password
+    $lastErr = ''
+    $n = 0
+    foreach ($u in $tryNames) {
+        $n++
+        $fmt = if ($n -eq 1 -and $raw -ne $bare) { 'bare username' } else { 'username as saved' }
+        Show-Step "NSX login attempt $n of $($tryNames.Count) ($fmt)"
+        $body = "j_username=$([uri]::EscapeDataString($u))&j_password=$([uri]::EscapeDataString($pw))"
+        try {
+            $r = Invoke-WebRequest -Method POST -Uri "https://$NsxServer/api/session/create" -Body $body -ContentType 'application/x-www-form-urlencoded' -SessionVariable nsxSess -UseBasicParsing
+            $x = $r.Headers['X-XSRF-TOKEN']
+            if ($x -is [array]) { $x = $x[0] }
+            if (-not $x) { $lastErr = 'no X-XSRF-TOKEN returned'; Show-Step "  NSX login attempt $n - $lastErr" 'Yellow'; continue }
+            $script:NsxSession = $nsxSess
+            $script:NsxXsrf    = $x
+            $pw = $null; $body = $null
+            Show-Step 'NSX login OK' 'Green'
+            return
+        } catch {
+            $lastErr = Get-ErrorText $_
+            Show-Step "  NSX login attempt $n failed: $lastErr" 'Yellow'
+        }
+    }
+    $pw = $null; $body = $null
+    throw "NSX login failed ($lastErr) - check the username format NSX expects, or point `$NsxCredentialPath at a separate NSX credential file"
 }
 
 # NSX Manager call - session cookie plus XSRF token
@@ -855,13 +883,17 @@ try {
         $report = New-Object System.Collections.Generic.List[object]
         foreach ($m in $missing) { $report.Add((New-Row $m 'Review' '' '' '' '' 'Review' 'Name from CSV not found in vRNI')) }
         # Load every NSX group name once so the SG check needs no API call per app
+        #   login and read are reported separately, so a 403 shows whether it was the login or the permissions
         if ($NsxCrossCheck -and $NsxServer -and $NsxServer -notlike '<*') {
-            try {
-                Show-Step 'Loading NSX groups once for the SG check...'
-                Connect-Nsx -Credential $cred
-                $script:NsxGroupTable = Get-NsxGroupNames
-                Show-Step "NSX groups loaded: $($script:NsxGroupTable.Count)" 'Green'
-            } catch { Show-Step "NSX group load failed ($_) - using one vRNI search per SG instead" 'Yellow' }
+            $nsxOk = $true
+            try { Show-Step 'Loading NSX groups once for the SG check...'; Connect-Nsx -Credential $cred }
+            catch { $nsxOk = $false; Show-Step "$_ - using one vRNI search per SG instead" 'Yellow' }
+            if ($nsxOk) {
+                try {
+                    $script:NsxGroupTable = Get-NsxGroupNames
+                    Show-Step "NSX groups loaded: $($script:NsxGroupTable.Count)" 'Green'
+                } catch { Show-Step "NSX login worked but reading the groups failed ($_) - the account may not have read access to NSX groups; using one vRNI search per SG instead" 'Yellow' }
+            }
         }
 
         Initialize-TierCache -Apps $apps
