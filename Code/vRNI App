@@ -182,7 +182,7 @@ function Get-Paged {
     param([string]$Path)
     $all = @(); $cursor = $null
     do {
-        $sep = if ($Path -like '*?*') { '&' } else { '?' }
+        $sep = if ($Path.Contains('?')) { '&' } else { '?' }
         $uri = "$Path${sep}size=100"
         if ($cursor) { $uri += "&cursor=$cursor" }
         $r = Invoke-Vrni -Path $uri
@@ -286,7 +286,7 @@ function Get-NsxPaged {
     param([string]$Path)
     $all = @(); $cursor = $null
     do {
-        $sep = if ($Path -like '*?*') { '&' } else { '?' }
+        $sep = if ($Path.Contains('?')) { '&' } else { '?' }
         $uri = $Path
         if ($cursor) { $uri += "${sep}cursor=$cursor" }
         $r = Invoke-Nsx -Path $uri
@@ -568,9 +568,11 @@ try {
         $report = New-Object System.Collections.Generic.List[object]
         foreach ($pn in $policyNames) {
             if ($script:QuitNow) { break }
-            if ($known.ContainsKey((Get-NormName $pn))) {
-                Write-Host "EXISTS : $pn (vRNI: $($known[(Get-NormName $pn))])"
-                $report.Add((New-Row $pn 'None' '' '' '' '' 'Already in vRNI' "vRNI name: $($known[(Get-NormName $pn))]"))
+            $norm = Get-NormName $pn
+            if ($known.ContainsKey($norm)) {
+                $vrniName = $known[$norm]
+                Write-Host "EXISTS : $pn (vRNI: $vrniName)"
+                $report.Add((New-Row $pn 'None' '' '' '' '' 'Already in vRNI' "vRNI name: $vrniName"))
                 continue
             }
             try { foreach ($r in (New-AppFromPolicy -Name $pn -NsxGroups $nsxGroups)) { $report.Add($r) } }
