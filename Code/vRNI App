@@ -35,7 +35,7 @@ $Mode                = 'Update'                                  # 'List', 'Upda
 $DryRun              = $true                                     # Update / Create - $true = show the plan only, no changes in vRNI
 $RenameApps          = $false                                    # Update - also rename each app to its SG-based name (spaces instead of _) - changes the name in vRNI
 
-# Update mode - CSV (column: ApplicationName, exact vRNI app names) OR blank = all apps
+# Update mode - CSV (column ApplicationName or Application, exact vRNI app names) OR blank = all apps
 $UpdateCSV           = ''                                        # e.g. 'C:\Scripts\Input\vrniUpdate.csv'
 
 # Tiers
@@ -918,7 +918,17 @@ try {
 
     # Update mode only - limit to the names in the CSV (exact vRNI names, spaces included)
     if ($UpdateCSV -and $Mode -eq 'Update') {
-        $wanted = @(Import-Csv -Path $UpdateCSV | ForEach-Object { $_.ApplicationName.Trim() })
+        if (-not (Test-Path -LiteralPath $UpdateCSV)) { throw "Update CSV not found: $UpdateCSV" }
+        $rows = @(Import-Csv -LiteralPath $UpdateCSV)
+        # Column can be ApplicationName, or Application (so a filtered report can be fed straight back in)
+        $col = $null
+        if ($rows.Count -gt 0) {
+            $cols = @($rows[0].PSObject.Properties.Name)
+            foreach ($c in 'ApplicationName', 'Application') { if (-not $col -and $cols -contains $c) { $col = $c } }
+        }
+        if (-not $col) { throw "Update CSV needs a column named ApplicationName or Application: $UpdateCSV" }
+        $wanted = @($rows | ForEach-Object { [string]$_.$col } | Where-Object { $_ -and $_.Trim() } | ForEach-Object { $_.Trim() } | Select-Object -Unique)
+        Show-Step "Update CSV: $($wanted.Count) app names read from column '$col'"
         $missing = @($wanted | Where-Object { $apps.Name -cnotcontains $_ })
         $apps = @($apps | Where-Object { $wanted -ccontains $_.Name })
     }
@@ -978,7 +988,8 @@ try {
         $byApp   = @($report | Group-Object Application)
         $nReview = @($byApp | Where-Object { $_.Group.Action -contains 'Review' }).Count
         $nChange = @($byApp | Where-Object { $_.Group.Action -notcontains 'Review' -and (@($_.Group.Action) -match '^(Add|Rename|RenameApp)$').Count -gt 0 }).Count
-        Show-Step "Apps checked: $($apps.Count)   need changes: $nChange   for review: $nReview   already compliant: $($apps.Count - $nChange - $nReview)" 'Cyan'
+        $nOk     = @($byApp | Where-Object { $_.Group.Action -notcontains 'Review' -and (@($_.Group.Action) -match '^(Add|Rename|RenameApp)$').Count -eq 0 }).Count
+        Show-Step "Apps checked: $($apps.Count)   need changes: $nChange   for review: $nReview   already compliant: $nOk" 'Cyan'
     }
     # Create mode - new vRNI apps from the NSX DFW policy list
     elseif ($Mode -eq 'Create') {
