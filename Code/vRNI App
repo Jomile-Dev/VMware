@@ -1,429 +1,590 @@
+#Requires -Version 5.1
 <#
-    vrniApplications.ps1
-    List or create Applications in VMware Aria Operations for Networks (vRNI)
-    Auth : vIDM (vIDM access token -> vRNI token)
-    Run  : Windows PowerShell 5.1 / ISE (paste + F5)
+    vrniAppTierUpdate.ps1
+    List     - export vRNI applications and their tiers to CSV
+    Update   - bring existing vRNI applications in line with the four-zone tier layout
+    Create   - read the NSX distributed firewall security policy names (each policy = one application)
+               and create any that are missing in vRNI, with the four zone tiers
+    NSX security groups / tags are cross-checked and reported for every app.
 
-    Naming convention
-      Application CI : <APP CI>                 (spaces)
-      vRNI App Name  : <APP_CI>                 (spaces replaced with "_")
-      NSX Tag        : ST-<APP_CI>-<Zone>
-      NSX SG         : SG-<APP CI>-<Zone>
-      Zones / Tiers  : FrontEnd, Management, Internal, Protected  (tier name = zone name)
+    Tier layout (tier names are the zone names exactly):
+        FrontEnd, Management, Internal, Protected
+    Tier membership filter:
+        Security Group = 'SG-<APP CI>-<Zone>'
+    NSX tag expected per zone:
+        ST-<APP_CI>-<Zone>      (spaces in the CI replaced with underscores)
 
-    Tier filter     : Security Group = 'SG-<APP CI>-<Zone>'   (same format vRNI returns for existing tiers)
-
-    Credential file (create once, same Windows account that runs the script):
-      Get-Credential | Export-Clixml -Path "C:\Scripts\Creds\<cred-file>.xml"
+    Application names may contain spaces and are never changed on existing apps.
+    Update : the SG base is read from the app's existing FrontEnd filter, not built from the app name.
+    Create : the DFW policy name is the application name and the SG base is SG-<policy name>.
 #>
 
-# ============================== CONFIG ==============================
-$Mode            = 'List'                                   # 'List' or 'Create'
-$DryRun          = $true                                    # Create mode only - $true = show what would be created, no changes
-$ConfirmEach     = $true                                    # Create mode only - show plan and ask Y/N/A/Q before each app is created
+#region CONFIG ---------------------------------------------------------------
+# vRNI connection
+$VrniServer          = '<vrni-fqdn>'                             # vRNI (Aria Operations for Networks) FQDN
+$VidmServer          = ''                                        # blank = ask vRNI which vIDM appliance to use
+$VidmDomain          = ''                                        # optional - only tried if the plain UPN login fails
+$CredentialPath      = '<path-to-cred.xml>'                      # Export-Clixml PSCredential (full UPN username)
 
-$vRNIServer      = '<vrni-fqdn>'
-$vIDMServer      = ''                                       # Leave blank to use the vIDM appliance configured in vRNI
-$vIDMDomain      = ''                                       # Optional - vIDM directory domain
-$CredFile        = 'C:\Scripts\Creds\<cred-file>.xml'
+# NSX connection - Create mode, and the SG check in Update / Create
+$NsxServer           = '<nsx-manager-fqdn>'                      # NSX Manager FQDN
+$NsxCredentialPath   = ''                                        # Export-Clixml PSCredential for NSX - blank = reuse $CredentialPath
 
-# Create mode - single app OR CSV (column: ApplicationCI)
-$ApplicationCI   = '<APP CI>'
-$InputCSV        = ''                                       # e.g. 'C:\Scripts\Input\vrniApps.csv' - overrides $ApplicationCI when set
+# What to run
+$Mode                = 'Update'                                  # 'List', 'Update' or 'Create'
+$DryRun              = $true                                     # Update / Create - $true = show the plan only, no changes in vRNI
 
-$Zones           = @('FrontEnd', 'Management', 'Internal', 'Protected')   # Tier names
+# Update mode - CSV (column: ApplicationName, exact vRNI app names) OR blank = all apps
+$UpdateCSV           = ''                                        # e.g. 'C:\Scripts\Input\vrniUpdate.csv'
 
-# List mode
-$IncludeTiers    = $true
+# Tiers
+$Zones               = @('FrontEnd', 'Management', 'Internal', 'Protected')   # Tier names (exactly these)
 
-# API throttling (HTTP 429 handling)
-$RequestDelayMs  = 250                                      # Pause before every vRNI API call
-$MaxRetries      = 6                                        # Retries on 429 / 503 before giving up
+# Create mode - which DFW security policies count as applications
+$NsxPolicyCategories = @('Application')                          # DFW categories to read - blank array = all categories
+$NsxPolicyExclude    = ''                                        # regex of policy names to skip, e.g. '^(Default|Sample)'
 
-# Output - falls back to C:\Temp if running unsaved (e.g. pasted into ISE)
-$OutputFolder    = if ($PSScriptRoot) { $PSScriptRoot } else { 'C:\Temp' }
-if (-not (Test-Path $OutputFolder)) { New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null }
-$TimeStamp       = Get-Date -Format 'yyyy-MM-dd_HHmmss'
-$CSVPath         = Join-Path $OutputFolder "vRNI_Applications_$($Mode)_$TimeStamp.csv"
-# ====================================================================
+# Checks and API behaviour
+$NsxCrossCheck       = $true                                     # report whether the expected SGs (NSX) and tags (vRNI inventory) exist
+$RequestDelayMs      = 300                                       # pause after every API call (avoids HTTP 429)
+$MaxRetries          = 5                                         # retries on HTTP 429, backing off each time
 
-# ---------- SSL / TLS (PS 5.1) ----------
+# Output
+$OutputDir           = '.\Reports'                               # CSV reports are written here
+$SkipCertCheck       = $true                                     # bypass self-signed certificate errors
+#endregion CONFIG ------------------------------------------------------------
+
+$ErrorActionPreference = 'Stop'
+$script:Base       = "https://$VrniServer/api/ni"
+$script:Token      = $null
+$script:ApproveAll = $false
+$script:QuitNow    = $false
+$script:NsxSession  = $null
+$script:NsxXsrf     = $null
+
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-if (-not ('TrustAllCertsPolicy' -as [type])) {
+if ($SkipCertCheck -and -not ('TrustAllCertsPolicy' -as [type])) {
     Add-Type @"
 using System.Net;
 using System.Security.Cryptography.X509Certificates;
 public class TrustAllCertsPolicy : ICertificatePolicy {
-    public bool CheckValidationResult(ServicePoint sp, X509Certificate cert, WebRequest req, int problem) { return true; }
+    public bool CheckValidationResult(ServicePoint sp, X509Certificate c, WebRequest r, int p) { return true; }
 }
 "@
-}
-[Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
-
-$BaseUri = "https://$vRNIServer/api/ni"
-
-# ---------- Credential ----------
-if (Test-Path $CredFile) {
-    $Cred = Import-Clixml -Path $CredFile
-} else {
-    Write-Host "Credential file not found: $CredFile" -ForegroundColor Yellow
-    $Cred = Get-Credential -Message 'vIDM account for vRNI'
+    [Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
 }
 
-# ============================== FUNCTIONS ==============================
-
-function Get-ErrorBody {
-    # PS 5.1 - pull the response body out of a failed Invoke-RestMethod call
+#region helpers --------------------------------------------------------------
+# Pull the response body out of a failed call - Windows PowerShell 5.1 hides it by default
+function Get-ErrorText {
     param($ErrorRecord)
-    $text = ''
-    if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
-        $text = $ErrorRecord.ErrorDetails.Message
-    } elseif ($ErrorRecord.Exception.Response) {
-        try {
-            $stream = $ErrorRecord.Exception.Response.GetResponseStream()
-            if ($stream.CanSeek) { $stream.Position = 0 }
-            $reader = New-Object System.IO.StreamReader($stream)
-            $text   = $reader.ReadToEnd()
-            $reader.Close()
-        } catch { $text = '' }
-    }
-    $status = ''
-    if ($ErrorRecord.Exception.Response) { $status = [int]$ErrorRecord.Exception.Response.StatusCode }
-    return "HTTP $status - $($ErrorRecord.Exception.Message) | Body: $text"
+    $msg = $ErrorRecord.Exception.Message
+    try {
+        $resp = $ErrorRecord.Exception.Response
+        if ($resp) {
+            $sr   = New-Object System.IO.StreamReader($resp.GetResponseStream())
+            $body = $sr.ReadToEnd()
+            if ($body) { $msg = "$msg | $body" }
+        }
+    } catch {}
+    $msg
 }
 
-function Invoke-vRNIRequest {
-    # Invoke-RestMethod with a small delay between calls and retry on 429 / 503
+# Generic REST call - JSON body unless told otherwise, retries on HTTP 429 (Retry-After if given, else backoff)
+function Invoke-Api {
     param(
-        [string]$Method = 'Get',
-        [string]$Uri,
-        $Headers,
+        [string]$Method = 'GET',
+        [Parameter(Mandatory)][string]$Uri,
         $Body,
-        [string]$ContentType = 'application/json',
-        [switch]$UseBasicParsing
+        [hashtable]$Headers = @{},
+        [string]$ContentType = 'application/json'
     )
-    $attempt = 0
-    while ($true) {
-        $attempt++
-        if ($RequestDelayMs -gt 0) { Start-Sleep -Milliseconds $RequestDelayMs }
-
-        $p = @{ Method = $Method; Uri = $Uri; Headers = $Headers; ContentType = $ContentType; UseBasicParsing = $true }
-        if ($null -ne $Body) { $p.Body = $Body }
-
+    $p = @{ Method = $Method; Uri = $Uri; Headers = $Headers; ContentType = $ContentType; UseBasicParsing = $true }
+    if ($null -ne $Body) {
+        if ($ContentType -eq 'application/json' -and $Body -isnot [string]) { $Body = $Body | ConvertTo-Json -Depth 10 }
+        $p.Body = $Body
+    }
+    for ($try = 0; $try -le $MaxRetries; $try++) {
         try {
-            return Invoke-RestMethod @p
+            $r = Invoke-RestMethod @p
+            if ($RequestDelayMs) { Start-Sleep -Milliseconds $RequestDelayMs }
+            return $r
         } catch {
-            $status = 0
-            if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
-
-            if (($status -eq 429 -or $status -eq 503) -and $attempt -le $MaxRetries) {
-                [int]$wait = 0
-                $retryAfter = $null
-                try { $retryAfter = $_.Exception.Response.Headers['Retry-After'] } catch { $retryAfter = $null }
-                if (-not ($retryAfter -and [int]::TryParse($retryAfter, [ref]$wait) -and $wait -gt 0)) {
-                    $wait = [int][math]::Min(60, [math]::Pow(2, $attempt))
-                }
-                Write-Host "         HTTP $status - waiting $wait sec (retry $attempt of $MaxRetries)" -ForegroundColor Yellow
+            $code = 0
+            $resp = $_.Exception.Response
+            if ($resp) { $code = [int]$resp.StatusCode }
+            if ($code -eq 429 -and $try -lt $MaxRetries) {
+                $wait = [math]::Pow(2, $try) * 2
+                try { $ra = $resp.Headers['Retry-After']; if ($ra) { $wait = [int]$ra } } catch {}
+                Write-Host "429 from vRNI - waiting $wait s (retry $($try + 1)/$MaxRetries)" -ForegroundColor Yellow
                 Start-Sleep -Seconds $wait
                 continue
             }
-            throw
+            throw (Get-ErrorText $_)
         }
     }
 }
 
-function Connect-vRNIvIDM {
-    # 1. Get vIDM appliance + OAuth client-id from vRNI
-    try {
-        $client = Invoke-RestMethod -Method Get -Uri "$BaseUri/auth/vidm/client-id" -UseBasicParsing
-    } catch {
-        throw "STEP 1 (vRNI client-id) failed: $(Get-ErrorBody $_)"
-    }
+# vRNI call - adds the NetworkInsight token header to Invoke-Api
+function Invoke-Vrni {
+    param([string]$Method = 'GET', [string]$Path, $Body)
+    Invoke-Api -Method $Method -Uri "$script:Base$Path" -Body $Body `
+        -Headers @{ Authorization = "NetworkInsight $script:Token"; Accept = 'application/json' }
+}
 
-    $vidmHost = if ($vIDMServer) { $vIDMServer } else { $client.vidm_appliance }
-    if (-not $client.client_id -or -not $vidmHost) {
-        throw 'vIDM client-id / appliance not returned - check vIDM is configured and enabled in vRNI.'
-    }
-    Write-Host "STEP 1 OK - vIDM appliance : $vidmHost"
+# vIDM login, then exchange the vIDM token for a vRNI token
+function Connect-Vrni {
+    param([pscredential]$Credential)
+    # 1. Ask vRNI which vIDM appliance and OAuth client-id it uses
+    $client = Invoke-Api -Uri "$script:Base/auth/vidm/client-id"
+    $vidm   = if ($VidmServer) { $VidmServer } else { $client.vidm_appliance }
+    if (-not $client.client_id -or -not $vidm) { throw 'Could not get vIDM client-id/appliance from vRNI.' }
 
-    # 2. Get vIDM access token (password grant)
-    #    Same idea as the NSX script - try bare username first, then other formats
-    $rawUser   = $Cred.UserName
-    $bareUser  = $rawUser
-    $credDomain = ''
-    if ($rawUser -match '^(.+)\\(.+)$') { $credDomain = $Matches[1]; $bareUser = $Matches[2] }
-    elseif ($rawUser -match '^(.+)@(.+)$') { $bareUser = $Matches[1]; $credDomain = $Matches[2] }
-
-    $domainToUse = if ($vIDMDomain) { $vIDMDomain } else { $credDomain }
-
-    # Order: username exactly as saved (UPN worked in testing) -> bare + domain -> bare
-    $Attempts = New-Object System.Collections.Generic.List[object]
-    $Attempts.Add(@{ User = $rawUser; Domain = '' })
-    if ($domainToUse -and $rawUser -ne $bareUser) { $Attempts.Add(@{ User = $bareUser; Domain = $domainToUse }) }
-    elseif ($domainToUse) { $Attempts[0].Domain = $domainToUse }
-    if ($rawUser -ne $bareUser) { $Attempts.Add(@{ User = $bareUser; Domain = '' }) }
+    # 2. Get a user access token from vIDM (password grant) - plain UPN first, domain only as a fallback
+    #    (keeps failed logins down so the account is not locked out)
+    $attempts = @(@{ Domain = '' })
+    if ($VidmDomain) { $attempts += @{ Domain = $VidmDomain } }
 
     $vidmToken = $null
-    $lastError = ''
-    foreach ($a in $Attempts) {
+    foreach ($a in $attempts) {
         $form = @{
             grant_type = 'password'
-            username   = $a.User
-            password   = $Cred.GetNetworkCredential().Password
+            username   = $Credential.UserName
+            password   = $Credential.GetNetworkCredential().Password
             client_id  = $client.client_id
         }
         if ($a.Domain) { $form.domain = $a.Domain }
-
-        $label = if ($a.Domain) { "user '$($a.User)' domain '$($a.Domain)'" } else { "user '$($a.User)' (no domain)" }
-        Write-Host "STEP 2 try - $label"
-
         try {
-            $vidmToken = Invoke-RestMethod -Method Post -Uri "https://$vidmHost/SAAS/auth/oauthtoken" `
-                            -Body $form -ContentType 'application/x-www-form-urlencoded' -UseBasicParsing
+            $vidmToken = Invoke-Api -Method POST -Uri "https://$vidm/SAAS/auth/oauthtoken" `
+                -Body $form -ContentType 'application/x-www-form-urlencoded'
             $form.password = $null
-            if ($vidmToken.access_token) { Write-Host "STEP 2 OK - $label" -ForegroundColor Green; break }
+            if ($vidmToken.access_token) { break }
         } catch {
             $form.password = $null
-            $lastError = Get-ErrorBody $_
-            Write-Host "         failed: $lastError" -ForegroundColor Yellow
+            Write-Host "vIDM login attempt failed: $_" -ForegroundColor Yellow
         }
     }
+    if (-not $vidmToken -or -not $vidmToken.access_token) { throw 'vIDM did not return an access_token.' }
 
-    if (-not $vidmToken -or -not $vidmToken.access_token) {
-        throw "STEP 2 (vIDM token, host '$vidmHost') failed for all username formats. Last error: $lastError"
-    }
-    Write-Host 'STEP 2 OK - vIDM access token received'
-
-    # 3. Swap vIDM token for vRNI token
-    $body = @{ vidm_token = $vidmToken.access_token } | ConvertTo-Json
-    try {
-        $ni = Invoke-RestMethod -Method Post -Uri "$BaseUri/auth/token/vidm" -Body $body `
-                -ContentType 'application/json' -UseBasicParsing
-    } catch {
-        throw "STEP 3 (vRNI token exchange) failed: $(Get-ErrorBody $_)"
-    }
-
-    return @{ Authorization = "NetworkInsight $($ni.token)" }
+    # 3. Exchange the vIDM token for a vRNI token
+    $ni = Invoke-Api -Method POST -Uri "$script:Base/auth/token/vidm" -Body @{ vidm_token = $vidmToken.access_token }
+    if (-not $ni.token) { throw 'vRNI did not return a token.' }
+    $script:Token = $ni.token
 }
 
-function Disconnect-vRNI {
-    param($Headers)
-    try {
-        Invoke-vRNIRequest -Method Delete -Uri "$BaseUri/auth/token" -Headers $Headers -UseBasicParsing | Out-Null
-        Write-Host 'vRNI token deleted.'
-    } catch {
-        Write-Host "WARNING: token delete failed: $($_.Exception.Message)" -ForegroundColor Yellow
-    }
+# Delete the vRNI token at the end - each user is limited to 100 valid tokens
+function Disconnect-Vrni {
+    if ($script:Token) { try { Invoke-Vrni -Method DELETE -Path '/auth/token' | Out-Null } catch {} }
 }
 
-function Get-vRNIApplications {
-    param($Headers, [bool]$WithTiers)
-
-    $ids    = New-Object System.Collections.Generic.List[string]
-    $cursor = $null
-
+# Cursor-based paging for list calls (size=100 per page)
+function Get-Paged {
+    param([string]$Path)
+    $all = @(); $cursor = $null
     do {
-        $uri = "$BaseUri/groups/applications?size=100"
-        if ($cursor) { $uri += "&cursor=$([uri]::EscapeDataString($cursor))" }
-
-        $page = Invoke-vRNIRequest -Method Get -Uri $uri -Headers $Headers -UseBasicParsing
-        foreach ($r in @($page.results)) { if ($r.entity_id) { $ids.Add($r.entity_id) } }
-
-        $cursor = $page.cursor
-        if ($page.total_count -and $ids.Count -ge $page.total_count) { break }
-    } while ($cursor -and @($page.results).Count -gt 0)
-
-    Write-Host "Applications found: $($ids.Count)"
-
-    $results = New-Object System.Collections.Generic.List[object]
-    $i = 0
-    foreach ($id in $ids) {
-        $i++
-        Write-Progress -Activity 'Reading vRNI applications' -Status "$i / $($ids.Count)" -PercentComplete (($i / [math]::Max($ids.Count, 1)) * 100)
-
-        $app = Invoke-vRNIRequest -Method Get -Uri "$BaseUri/groups/applications/$id" -Headers $Headers -UseBasicParsing
-
-        if ($WithTiers) {
-            $tiers = Invoke-vRNIRequest -Method Get -Uri "$BaseUri/groups/applications/$id/tiers" -Headers $Headers -UseBasicParsing
-            $tierList = @($tiers.results)
-
-            if ($tierList.Count -eq 0) {
-                $results.Add([pscustomobject]@{
-                    ApplicationName = $app.name
-                    TierName        = 'N/A'
-                    TierFilter      = 'N/A'
-                })
-            }
-            foreach ($t in $tierList) {
-                $filters = @($t.group_membership_criteria | ForEach-Object { $_.search_membership_criteria.filter } | Where-Object { $_ })
-                $results.Add([pscustomobject]@{
-                    ApplicationName = $app.name
-                    TierName        = $t.name
-                    TierFilter      = ($filters -join ' OR ')
-                })
-            }
-        } else {
-            $results.Add([pscustomobject]@{
-                ApplicationName = $app.name
-            })
-        }
-    }
-    Write-Progress -Activity 'Reading vRNI applications' -Completed
-    return $results
+        $sep = if ($Path -like '*?*') { '&' } else { '?' }
+        $uri = "$Path${sep}size=100"
+        if ($cursor) { $uri += "&cursor=$cursor" }
+        $r = Invoke-Vrni -Path $uri
+        if ($r.results) { $all += @($r.results) }
+        $cursor = $r.cursor
+    } while ($cursor -and $r.results -and @($r.results).Count -gt 0)
+    $all
 }
 
-function New-vRNIApplication {
-    param($Headers, [string]$AppCI, $ExistingNames)
+# Y / N / A (yes to all) / Q (quit) prompt used before each app is changed
+function Get-UserConfirm {
+    param([string]$Prompt)
+    if ($script:ApproveAll) { return 'Y' }
+    do { $a = (Read-Host "$Prompt [Y]es / [N]o / [A]ll / [Q]uit").Trim().ToUpper() } until ($a -in 'Y','N','A','Q')
+    if ($a -eq 'A') { $script:ApproveAll = $true; return 'Y' }
+    $a
+}
 
-    $AppCI   = $AppCI.Trim()
-    $AppName = $AppCI -replace ' ', '_'
-    $out     = New-Object System.Collections.Generic.List[object]
+# One row of the output CSV (no entity IDs - names only)
+function New-Row {
+    param($App, $Action, $Tier, $Filter, $SgInNsx, $TagInNsx, $Result, $Note)
+    [pscustomobject]@{
+        Application = $App; Action = $Action; TierName = $Tier; Filter = $Filter
+        SgInNsx = $SgInNsx; TagInNsx = $TagInNsx; Result = $Result; Note = $Note
+    }
+}
 
-    if ($ExistingNames -contains $AppName) {
-        Write-Host "SKIP   : $AppName - already exists" -ForegroundColor Yellow
-        $out.Add([pscustomobject]@{ ApplicationCI = $AppCI; ApplicationName = $AppName; TierName = ''; SecurityGroup = ''; NSXTag = ''; Result = 'Skipped - already exists' })
+# Looks for an NSX object by name in vRNI's inventory - returns Found / Missing / Error / NotChecked
+# Informational only: SGs for the other zones may not exist in NSX yet
+function Test-VrniEntity {
+    param([string]$EntityType, [string]$Name)
+    if (-not $NsxCrossCheck) { return 'NotChecked' }
+    try {
+        $r = Invoke-Vrni -Method POST -Path '/search' -Body @{
+            entity_type = $EntityType
+            filter      = "name = '$Name'"
+            size        = 1
+        }
+        if ($r.results -and @($r.results).Count -gt 0) { 'Found' } else { 'Missing' }
+    } catch { 'Error' }
+}
+
+# Read every tier of an app: name, id, the Security Group filters, and a count of any non-search criteria
+function Get-AppTiers {
+    param([string]$AppId)
+    $out = @()
+    foreach ($ref in (Get-Paged -Path "/groups/applications/$AppId/tiers")) {
+        $t = Invoke-Vrni -Path "/groups/tiers/$($ref.entity_id)"
+        $filters = @(); $other = 0
+        foreach ($c in @($t.group_membership_criteria)) {
+            if ($c.membership_type -eq 'SearchMembershipCriteria' -and $c.search_membership_criteria.filter) {
+                $filters += [string]$c.search_membership_criteria.filter
+            } else { $other++ }
+        }
+        $out += [pscustomobject]@{ Name = $t.name; Id = $ref.entity_id; Filters = $filters; OtherCriteria = $other }
+    }
+    $out
+}
+
+# Request body for a tier - VMs where Security Group = '<SG name>'
+function New-TierBody {
+    param([string]$Name, [string]$Filter)
+    @{
+        name = $Name
+        group_membership_criteria = @(@{
+            membership_type            = 'SearchMembershipCriteria'
+            search_membership_criteria = @{ entity_type = 'BaseVirtualMachine'; filter = $Filter }
+        })
+    }
+}
+
+# NSX Manager session login (same credential approach as the NSX audit scripts)
+function Connect-Nsx {
+    param([pscredential]$Credential)
+    $c = $Credential
+    if ($NsxCredentialPath) { $c = Import-Clixml -Path $NsxCredentialPath }
+    $form = @{ j_username = $c.UserName; j_password = $c.GetNetworkCredential().Password }
+    try {
+        $r = Invoke-WebRequest -Method POST -Uri "https://$NsxServer/api/session/create" -Body $form -ContentType 'application/x-www-form-urlencoded' -SessionVariable nsxSess -UseBasicParsing
+    } catch { $form.j_password = $null; throw (Get-ErrorText $_) }
+    $form.j_password = $null
+    $script:NsxSession = $nsxSess
+    $script:NsxXsrf    = $r.Headers['X-XSRF-TOKEN']
+}
+
+# NSX Manager call - session cookie plus XSRF token
+function Invoke-Nsx {
+    param([string]$Path)
+    $p = @{
+        Method = 'GET'; Uri = "https://$NsxServer$Path"; WebSession = $script:NsxSession
+        Headers = @{ 'X-XSRF-TOKEN' = $script:NsxXsrf; Accept = 'application/json' }
+        ContentType = 'application/json'; UseBasicParsing = $true
+    }
+    try { $r = Invoke-RestMethod @p } catch { throw (Get-ErrorText $_) }
+    if ($RequestDelayMs) { Start-Sleep -Milliseconds $RequestDelayMs }
+    $r
+}
+
+# Cursor-based paging for NSX Policy list calls
+function Get-NsxPaged {
+    param([string]$Path)
+    $all = @(); $cursor = $null
+    do {
+        $sep = if ($Path -like '*?*') { '&' } else { '?' }
+        $uri = $Path
+        if ($cursor) { $uri += "${sep}cursor=$cursor" }
+        $r = Invoke-Nsx -Path $uri
+        if ($r.results) { $all += @($r.results) }
+        $cursor = $r.cursor
+    } while ($cursor)
+    $all
+}
+
+# DFW security policy names = the application list (default / system policies and excluded names dropped)
+function Get-NsxPolicyNames {
+    $pol = @(Get-NsxPaged -Path '/policy/api/v1/infra/domains/default/security-policies')
+    $names = foreach ($x in $pol) {
+        if ($x.is_default -or $x._system_owned) { continue }
+        if ($NsxPolicyCategories.Count -gt 0 -and $NsxPolicyCategories -notcontains $x.category) { continue }
+        if ($NsxPolicyExclude -and $x.display_name -match $NsxPolicyExclude) { continue }
+        $x.display_name
+    }
+    @($names | Where-Object { $_ } | Sort-Object -Unique)
+}
+
+# Every NSX group display name, case-insensitive lookup table (used to report which SGs exist)
+function Get-NsxGroupNames {
+    $t = New-Object System.Collections.Hashtable([StringComparer]::OrdinalIgnoreCase)
+    foreach ($g in (Get-NsxPaged -Path '/policy/api/v1/infra/domains/default/groups')) { $t[[string]$g.display_name] = $true }
+    $t
+}
+
+# Compare app / policy names ignoring case and underscore-versus-space differences
+function Get-NormName {
+    param([string]$Name)
+    (($Name -replace '[_\s]+', ' ').Trim()).ToLower()
+}
+#endregion helpers -----------------------------------------------------------
+
+#region modes ----------------------------------------------------------------
+# List mode - one row per tier (apps with no tiers still get a row)
+function Invoke-ListMode {
+    param($Apps)
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($app in $Apps) {
+        $tiers = Get-AppTiers -AppId $app.Id
+        if (@($tiers).Count -eq 0) {
+            $rows.Add([pscustomobject]@{ Application = $app.Name; Tier = ''; Filter = '' })
+        }
+        foreach ($t in $tiers) {
+            $rows.Add([pscustomobject]@{ Application = $app.Name; Tier = $t.Name; Filter = ($t.Filters -join ' ; ') })
+        }
+    }
+    $rows
+}
+
+# Update mode - brings one existing app in line with the four zone tiers
+#   1. find the FrontEnd tier and read the SG base from its filter
+#   2. flag anything unusual as Review and leave it alone
+#   3. plan: rename FrontEnd if needed, add the missing zone tiers
+#   4. show the plan, ask, then apply (adds first, rename last)
+function Update-App {
+    param($App)
+    $out    = New-Object System.Collections.Generic.List[object]
+    $name   = $App.Name
+    $tiers  = @(Get-AppTiers -AppId $App.Id)
+
+    # 1. FrontEnd tier - by name first, otherwise the tier with a single SG-<base>-FrontEnd filter
+    $fe = @($tiers | Where-Object { $_.Name -ceq 'FrontEnd' })
+    if ($fe.Count -eq 0) {
+        $fe = @($tiers | Where-Object { $_.Filters.Count -eq 1 -and $_.Filters[0] -match "^Security Group = '.+-FrontEnd'$" })
+    }
+    $existingText = ($tiers | ForEach-Object { "$($_.Name): " + ($_.Filters -join ',') }) -join ' | '
+
+    # 2. Anything that does not fit the pattern is listed for review, not guessed at
+    if ($fe.Count -ne 1)               { $out.Add((New-Row $name 'Review' '' $existingText '' '' 'Review' 'Could not identify a single FrontEnd tier')); return $out }
+    $feTier = $fe[0]
+    if ($feTier.Filters.Count -ne 1)   { $out.Add((New-Row $name 'Review' $feTier.Name $existingText '' '' 'Review' 'FrontEnd tier has none or more than one filter')); return $out }
+    if ($feTier.OtherCriteria -gt 0)   { $out.Add((New-Row $name 'Review' $feTier.Name $existingText '' '' 'Review' 'FrontEnd tier has extra non-search criteria')); return $out }
+    if ($feTier.Filters[0] -notmatch "^Security Group = '(?<sg>SG-.+)-FrontEnd'$") {
+        $out.Add((New-Row $name 'Review' $feTier.Name $existingText '' '' 'Review' 'FrontEnd filter is not Security Group = SG-<base>-FrontEnd')); return $out
+    }
+    # SG base comes from vRNI's own data:  SG-<APP CI>   (tag base:  ST-<APP_CI>)
+    $base = $Matches['sg']
+    $ci   = $base.Substring(3)
+    $tagBase = 'ST-' + ($ci -replace '\s+', '_')
+
+    $unexpected = @($tiers | Where-Object { $Zones -notcontains $_.Name -and $_.Id -ne $feTier.Id })
+    if ($unexpected.Count -gt 0) {
+        $out.Add((New-Row $name 'Review' ($unexpected.Name -join ',') $existingText '' '' 'Review' 'Tier name is not one of the zones')); return $out
+    }
+    foreach ($z in $Zones) {
+        $t = @($tiers | Where-Object { $_.Name -ceq $z -and $_.Id -ne $feTier.Id })
+        if ($t.Count -gt 0) {
+            $expected = "Security Group = '$base-$z'"
+            if (@($t[0].Filters).Count -ne 1 -or $t[0].Filters[0] -cne $expected) {
+                $out.Add((New-Row $name 'Review' $z ($t[0].Filters -join ',') '' '' 'Review' "Existing $z tier filter does not match $expected")); return $out
+            }
+        }
+    }
+
+    # 3. Build the plan (NSX lookups are for the report only)
+    $plan = New-Object System.Collections.Generic.List[object]
+    foreach ($z in $Zones) {
+        $expected = "Security Group = '$base-$z'"
+        $sgNsx  = Test-VrniEntity -EntityType 'BaseSecurityGroup' -Name "$base-$z"
+        $tagNsx = Test-VrniEntity -EntityType 'SecurityTag'        -Name "$tagBase-$z"
+        if ($z -eq 'FrontEnd') {
+            if ($feTier.Name -cne 'FrontEnd') {
+                $plan.Add([pscustomobject]@{ Action = 'Rename'; Tier = 'FrontEnd'; Old = $feTier.Name; TierId = $feTier.Id; Filter = $feTier.Filters[0]; Sg = $sgNsx; Tag = $tagNsx })
+            } else {
+                $out.Add((New-Row $name 'None' 'FrontEnd' $feTier.Filters[0] $sgNsx $tagNsx 'Already compliant' ''))
+            }
+        } elseif (@($tiers | Where-Object { $_.Name -ceq $z }).Count -eq 0) {
+            $plan.Add([pscustomobject]@{ Action = 'Add'; Tier = $z; Old = ''; TierId = ''; Filter = $expected; Sg = $sgNsx; Tag = $tagNsx })
+        } else {
+            $out.Add((New-Row $name 'None' $z $expected $sgNsx $tagNsx 'Already compliant' ''))
+        }
+    }
+
+    if ($plan.Count -eq 0) { Write-Host "OK     : $name - already has the 4 zone tiers"; return $out }
+
+    Write-Host ''
+    Write-Host '------------------------------------------------------------'
+    Write-Host "Application : $name" -ForegroundColor Cyan
+    Write-Host "SG base     : $base"
+    foreach ($p in $plan) {
+        if ($p.Action -eq 'Rename') { Write-Host "  RENAME tier '$($p.Old)' -> 'FrontEnd'   (filter kept: $($p.Filter))   NSX SG: $($p.Sg)  tag: $($p.Tag)" }
+        else                        { Write-Host "  ADD    tier $($p.Tier) -> $($p.Filter)   NSX SG: $($p.Sg)  tag: $($p.Tag)" }
+    }
+    Write-Host '------------------------------------------------------------'
+
+    if ($DryRun) {
+        foreach ($p in $plan) { $out.Add((New-Row $name $p.Action $p.Tier $p.Filter $p.Sg $p.Tag 'DryRun' $(if ($p.Old) { "Old name: $($p.Old)" } else { '' }))) }
         return $out
     }
 
-    # ---------- Build plan ----------
-    $Plan = foreach ($z in $Zones) {
+    $answer = Get-UserConfirm -Prompt "Update '$name'?"
+    if ($answer -eq 'N') { $out.Add((New-Row $name 'None' '' '' '' '' 'Skipped - declined' '')); return $out }
+    if ($answer -eq 'Q') { $script:QuitNow = $true; $out.Add((New-Row $name 'None' '' '' '' '' 'Skipped - quit' '')); return $out }
+
+    # 4. Apply - new tiers first, so a failed rename leaves the app no worse off
+    foreach ($p in ($plan | Where-Object { $_.Action -eq 'Add' })) {
+        try {
+            Invoke-Vrni -Method POST -Path "/groups/applications/$($App.Id)/tiers" -Body (New-TierBody -Name $p.Tier -Filter $p.Filter) | Out-Null
+            $out.Add((New-Row $name 'Add' $p.Tier $p.Filter $p.Sg $p.Tag 'Applied' ''))
+            Write-Host "ADDED  : $name / $($p.Tier)" -ForegroundColor Green
+        } catch { $out.Add((New-Row $name 'Add' $p.Tier $p.Filter $p.Sg $p.Tag 'Failed' "$_")); Write-Host "FAILED : $name / $($p.Tier) - $_" -ForegroundColor Red }
+    }
+    # Rename the existing tier to FrontEnd, keeping its filter
+    foreach ($p in ($plan | Where-Object { $_.Action -eq 'Rename' })) {
+        try {
+            Invoke-Vrni -Method PUT -Path "/groups/applications/$($App.Id)/tiers/$($p.TierId)" -Body (New-TierBody -Name 'FrontEnd' -Filter $p.Filter) | Out-Null
+            $out.Add((New-Row $name 'Rename' 'FrontEnd' $p.Filter $p.Sg $p.Tag 'Applied' "Old name: $($p.Old)"))
+            Write-Host "RENAMED: $name / $($p.Old) -> FrontEnd" -ForegroundColor Green
+        } catch { $out.Add((New-Row $name 'Rename' 'FrontEnd' $p.Filter $p.Sg $p.Tag 'Failed' "Old name: $($p.Old) | $_")); Write-Host "FAILED : rename on $name - $_" -ForegroundColor Red }
+    }
+    $out
+}
+
+# Create mode - builds one new vRNI app from a DFW policy name
+#   1. app name = policy name, SG base = SG-<policy name>, tag base = ST-<policy_name>
+#   2. plan the four zone tiers, each filtered on its zone SG (SG may not exist in NSX yet)
+#   3. show the plan, ask, then create the app and its tiers
+function New-AppFromPolicy {
+    param([string]$Name, $NsxGroups)
+    $out = New-Object System.Collections.Generic.List[object]
+
+    # 1. Names that would break the filter go to review
+    if ($Name -match "'") { $out.Add((New-Row $Name 'Review' '' '' '' '' 'Review' 'Policy name contains a single quote')); return $out }
+    $base    = "SG-$Name"
+    $tagBase = 'ST-' + ($Name -replace '\s+', '_')
+
+    # 2. Plan (NSX / tag lookups are for the report only)
+    $plan = foreach ($z in $Zones) {
+        $sg = 'NotChecked'
+        if ($NsxCrossCheck -and $NsxGroups) { $sg = if ($NsxGroups.ContainsKey("$base-$z")) { 'Found' } else { 'Missing' } }
         [pscustomobject]@{
-            TierName      = $z
-            SecurityGroup = "SG-$AppCI-$z"
-            NSXTag        = "ST-$AppName-$z"
+            Tier = $z; Filter = "Security Group = '$base-$z'"; Sg = $sg
+            Tag  = (Test-VrniEntity -EntityType 'SecurityTag' -Name "$tagBase-$z")
         }
     }
 
     Write-Host ''
     Write-Host '------------------------------------------------------------'
-    Write-Host "Application : $AppName" -ForegroundColor Cyan
-    Write-Host "CI          : $AppCI"
-    foreach ($t in $Plan) {
-        Write-Host "  Tier $($t.TierName)"
-        Write-Host "       Security Group = '$($t.SecurityGroup)'"
-    }
+    Write-Host "NEW Application : $Name" -ForegroundColor Cyan
+    foreach ($p in $plan) { Write-Host "  ADD tier $($p.Tier) -> $($p.Filter)   NSX SG: $($p.Sg)  tag: $($p.Tag)" }
     Write-Host '------------------------------------------------------------'
 
-    # ---------- DryRun ----------
     if ($DryRun) {
-        foreach ($t in $Plan) {
-            $out.Add([pscustomobject]@{ ApplicationCI = $AppCI; ApplicationName = $AppName; TierName = $t.TierName; SecurityGroup = $t.SecurityGroup; NSXTag = $t.NSXTag; Result = 'DryRun' })
-        }
+        foreach ($p in $plan) { $out.Add((New-Row $Name 'CreateApp' $p.Tier $p.Filter $p.Sg $p.Tag 'DryRun' '')) }
         return $out
     }
 
-    # ---------- Confirm ----------
-    if ($ConfirmEach -and -not $script:ConfirmAll) {
-        $answer = ''
-        while ($answer -notin @('Y', 'N', 'A', 'Q')) {
-            $answer = (Read-Host "Create '$AppName'? [Y]es / [N]o / [A]ll remaining / [Q]uit").Trim().ToUpper()
-        }
-        switch ($answer) {
-            'N' {
-                Write-Host "SKIP   : $AppName - declined" -ForegroundColor Yellow
-                $out.Add([pscustomobject]@{ ApplicationCI = $AppCI; ApplicationName = $AppName; TierName = ''; SecurityGroup = ''; NSXTag = ''; Result = 'Skipped - declined' })
-                return $out
-            }
-            'Q' {
-                Write-Host 'Quit selected - no further apps will be created.' -ForegroundColor Yellow
-                $script:QuitRequested = $true
-                $out.Add([pscustomobject]@{ ApplicationCI = $AppCI; ApplicationName = $AppName; TierName = ''; SecurityGroup = ''; NSXTag = ''; Result = 'Skipped - quit' })
-                return $out
-            }
-            'A' { $script:ConfirmAll = $true }
-        }
-    }
+    # 3. Confirm, create the app, then its tiers
+    $answer = Get-UserConfirm -Prompt "Create '$Name'?"
+    if ($answer -eq 'N') { $out.Add((New-Row $Name 'None' '' '' '' '' 'Skipped - declined' '')); return $out }
+    if ($answer -eq 'Q') { $script:QuitNow = $true; $out.Add((New-Row $Name 'None' '' '' '' '' 'Skipped - quit' '')); return $out }
 
-    # ---------- Create app ----------
-    $appBody = @{ name = $AppName } | ConvertTo-Json
     try {
-        $app = Invoke-vRNIRequest -Method Post -Uri "$BaseUri/groups/applications" -Headers $Headers `
-                 -Body $appBody -ContentType 'application/json' -UseBasicParsing
-        Write-Host "CREATED: $AppName ($($app.entity_id))" -ForegroundColor Green
+        $app = Invoke-Vrni -Method POST -Path '/groups/applications' -Body @{ name = $Name }
+        if (-not $app.entity_id) { throw 'vRNI did not return an entity_id for the new application.' }
     } catch {
-        Write-Host "FAILED : $AppName - $($_.Exception.Message)" -ForegroundColor Red
-        $out.Add([pscustomobject]@{ ApplicationCI = $AppCI; ApplicationName = $AppName; TierName = ''; SecurityGroup = ''; NSXTag = ''; Result = "Failed - $($_.Exception.Message)" })
+        $out.Add((New-Row $Name 'CreateApp' '' '' '' '' 'Failed' "$_")); Write-Host "FAILED : $Name - $_" -ForegroundColor Red
         return $out
     }
-
-    # ---------- Create tiers ----------
-    foreach ($t in $Plan) {
-        $tierBody = @{
-            name = $t.TierName
-            group_membership_criteria = @(
-                @{
-                    membership_type = 'SearchMembershipCriteria'
-                    search_membership_criteria = @{
-                        entity_type = 'BaseVirtualMachine'
-                        filter      = "Security Group = '$($t.SecurityGroup)'"
-                    }
-                }
-            )
-        } | ConvertTo-Json -Depth 10
-
+    Write-Host "CREATED: $Name" -ForegroundColor Green
+    foreach ($p in $plan) {
         try {
-            Invoke-vRNIRequest -Method Post -Uri "$BaseUri/groups/applications/$($app.entity_id)/tiers" -Headers $Headers `
-                -Body $tierBody -ContentType 'application/json' -UseBasicParsing | Out-Null
-            Write-Host "         Tier $($t.TierName) -> '$($t.SecurityGroup)'" -ForegroundColor Green
-            $res = 'Created'
+            Invoke-Vrni -Method POST -Path "/groups/applications/$($app.entity_id)/tiers" -Body (New-TierBody -Name $p.Tier -Filter $p.Filter) | Out-Null
+            $out.Add((New-Row $Name 'CreateApp' $p.Tier $p.Filter $p.Sg $p.Tag 'Applied' ''))
         } catch {
-            Write-Host "         Tier $($t.TierName) FAILED - $($_.Exception.Message)" -ForegroundColor Red
-            $res = "Failed - $($_.Exception.Message)"
+            $out.Add((New-Row $Name 'CreateApp' $p.Tier $p.Filter $p.Sg $p.Tag 'Failed' "App created, tier failed: $_"))
+            Write-Host "FAILED : $Name / $($p.Tier) - $_" -ForegroundColor Red
         }
-        $out.Add([pscustomobject]@{ ApplicationCI = $AppCI; ApplicationName = $AppName; TierName = $t.TierName; SecurityGroup = $t.SecurityGroup; NSXTag = $t.NSXTag; Result = $res })
     }
-    return $out
+    $out
 }
+#endregion modes -------------------------------------------------------------
 
-# ============================== MAIN ==============================
-$Headers = $null
+#region main -----------------------------------------------------------------
+if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir | Out-Null }
+$stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$cred  = Import-Clixml -Path $CredentialPath
+
+# Connect, read the application list, then run the chosen mode (token is deleted in finally)
 try {
-    $Headers = Connect-vRNIvIDM
-    Write-Host "Connected to $vRNIServer as $($Cred.UserName)" -ForegroundColor Green
+    Connect-Vrni -Credential $cred
 
-    switch ($Mode) {
-        'List' {
-            $Results = @(Get-vRNIApplications -Headers $Headers -WithTiers $IncludeTiers | Sort-Object ApplicationName)
-        }
-        'Create' {
-            if ($InputCSV) {
-                if (-not (Test-Path $InputCSV)) { throw "Input CSV not found: $InputCSV" }
-                $AppList = @(Import-Csv -Path $InputCSV | ForEach-Object { $_.ApplicationCI })
-            } else {
-                $AppList = @($ApplicationCI)
-            }
-            $AppList = @($AppList | Where-Object { $_ -and $_.Trim() } | Select-Object -Unique)
-            if ($AppList.Count -eq 0) { throw 'No ApplicationCI values to process.' }
+    # Application list gives IDs only - fetch each one for its name
+    Write-Host 'Reading application list...'
+    $appRefs = Get-Paged -Path '/groups/applications'
+    $apps = foreach ($ref in $appRefs) {
+        $d = Invoke-Vrni -Path "/groups/applications/$($ref.entity_id)"
+        [pscustomobject]@{ Id = $ref.entity_id; Name = $d.name }
+    }
+    $apps = @($apps | Sort-Object Name)
+    Write-Host "Found $($apps.Count) applications."
 
-            Write-Host "Apps to process: $($AppList.Count)  (DryRun = $DryRun)"
-            $Existing = @(Get-vRNIApplications -Headers $Headers -WithTiers $false | ForEach-Object { $_.ApplicationName })
-
-            $script:ConfirmAll    = $false
-            $script:QuitRequested = $false
-
-            $Results = New-Object System.Collections.Generic.List[object]
-            foreach ($ci in $AppList) {
-                if ($script:QuitRequested) {
-                    $Results.Add([pscustomobject]@{ ApplicationCI = $ci.Trim(); ApplicationName = ($ci.Trim() -replace ' ', '_'); TierName = ''; SecurityGroup = ''; NSXTag = ''; Result = 'Skipped - quit' })
-                    continue
-                }
-                foreach ($r in @(New-vRNIApplication -Headers $Headers -AppCI $ci -ExistingNames $Existing)) { $Results.Add($r) }
-            }
-        }
-        default { throw "Unknown Mode '$Mode' - use 'List' or 'Create'." }
+    # Update mode only - limit to the names in the CSV (exact vRNI names, spaces included)
+    if ($UpdateCSV -and $Mode -eq 'Update') {
+        $wanted = @(Import-Csv -Path $UpdateCSV | ForEach-Object { $_.ApplicationName.Trim() })
+        $missing = @($wanted | Where-Object { $apps.Name -cnotcontains $_ })
+        $apps = @($apps | Where-Object { $wanted -ccontains $_.Name })
     }
 
-    if (@($Results).Count -gt 0) {
-        $Results | Export-Csv -Path $CSVPath -NoTypeInformation -Encoding UTF8
-        Write-Host "Exported $(@($Results).Count) rows to $CSVPath" -ForegroundColor Green
-    } else {
-        Write-Host 'Nothing to export.' -ForegroundColor Yellow
+    # List mode - export every app and tier to CSV
+    if ($Mode -eq 'List') {
+        $file = Join-Path $OutputDir "vrni_apps_$stamp.csv"
+        Invoke-ListMode -Apps $apps | Export-Csv -Path $file -NoTypeInformation -Encoding UTF8
+        Write-Host "Saved: $file"
     }
-    $Results | Format-Table -AutoSize
-}
-catch {
-    Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
+    # Update mode - check each app against the four zone tiers, plan / apply, then export the report
+    elseif ($Mode -eq 'Update') {
+        $report = New-Object System.Collections.Generic.List[object]
+        foreach ($m in $missing) { $report.Add((New-Row $m 'Review' '' '' '' '' 'Review' 'Name from CSV not found in vRNI')) }
+        foreach ($app in $apps) {
+            if ($script:QuitNow) { break }
+            try { foreach ($r in (Update-App -App $app)) { $report.Add($r) } }
+            catch { $report.Add((New-Row $app.Name 'Error' '' '' '' '' 'Failed' "$_")); Write-Host "ERROR  : $($app.Name) - $_" -ForegroundColor Red }
+        }
+        $file = Join-Path $OutputDir "vrni_tier_update_$stamp.csv"
+        $report | Export-Csv -Path $file -NoTypeInformation -Encoding UTF8
+        Write-Host ''
+        Write-Host "Saved: $file"
+        $report | Group-Object Result | Sort-Object Name | ForEach-Object { Write-Host ("  {0,-22} {1}" -f $_.Name, $_.Count) }
+    }
+    # Create mode - new vRNI apps from the NSX DFW policy list
+    elseif ($Mode -eq 'Create') {
+        # 1. NSX - DFW policy names are the application list, group names are for the SG check
+        Connect-Nsx -Credential $cred
+        Write-Host 'Reading NSX DFW security policies...'
+        $policyNames = @(Get-NsxPolicyNames)
+        $nsxGroups   = $null
+        if ($NsxCrossCheck) { $nsxGroups = Get-NsxGroupNames }
+        Write-Host "Found $($policyNames.Count) policies in NSX."
+
+        # 2. Skip any policy vRNI already has (name match ignores case and _ versus space)
+        $known = @{}
+        foreach ($a in $apps) { $known[(Get-NormName $a.Name)] = $a.Name }
+
+        # 3. Plan / create the rest, then export the report
+        $report = New-Object System.Collections.Generic.List[object]
+        foreach ($pn in $policyNames) {
+            if ($script:QuitNow) { break }
+            if ($known.ContainsKey((Get-NormName $pn))) {
+                Write-Host "EXISTS : $pn (vRNI: $($known[(Get-NormName $pn))])"
+                $report.Add((New-Row $pn 'None' '' '' '' '' 'Already in vRNI' "vRNI name: $($known[(Get-NormName $pn))]"))
+                continue
+            }
+            try { foreach ($r in (New-AppFromPolicy -Name $pn -NsxGroups $nsxGroups)) { $report.Add($r) } }
+            catch { $report.Add((New-Row $pn 'Error' '' '' '' '' 'Failed' "$_")); Write-Host "ERROR  : $pn - $_" -ForegroundColor Red }
+        }
+        $file = Join-Path $OutputDir "vrni_create_$stamp.csv"
+        $report | Export-Csv -Path $file -NoTypeInformation -Encoding UTF8
+        Write-Host ''
+        Write-Host "Saved: $file"
+        $report | Group-Object Result | Sort-Object Name | ForEach-Object { Write-Host ("  {0,-22} {1}" -f $_.Name, $_.Count) }
+    }
+    else { throw "Unknown `$Mode '$Mode' - use 'List', 'Update' or 'Create'." }
 }
 finally {
-    if ($Headers) { Disconnect-vRNI -Headers $Headers }
+    Disconnect-Vrni
 }
+#endregion main --------------------------------------------------------------
