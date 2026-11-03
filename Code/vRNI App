@@ -70,8 +70,15 @@ $script:NsxGroupTable = $null
 $script:TierCache  = $null
 $script:LookupCache = $null
 $script:AppNames   = $null
+$script:TagSet     = $null
+$script:SgSet      = $null
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+# .NET Framework defaults that slow parallel calls in Windows PowerShell 5.1:
+#   only 2 connections per server, and every POST waits for a "100-continue" reply before sending its body
+[Net.ServicePointManager]::DefaultConnectionLimit = [math]::Max(16, $Threads * 2)
+[Net.ServicePointManager]::Expect100Continue      = $false
+[Net.ServicePointManager]::UseNagleAlgorithm      = $false
 if ($SkipCertCheck -and -not ('TrustAllCertsPolicy' -as [type])) {
     Add-Type @"
 using System.Net;
@@ -114,6 +121,7 @@ function Invoke-Api {
         [hashtable]$Headers = @{},
         [string]$ContentType = 'application/json'
     )
+    $ProgressPreference = 'SilentlyContinue'   # 5.1 draws a progress bar for every web call, which slows it down
     $p = @{ Method = $Method; Uri = $Uri; Headers = $Headers; ContentType = $ContentType; UseBasicParsing = $true }
     if ($null -ne $Body) {
         if ($ContentType -eq 'application/json' -and $Body -isnot [string]) { $Body = $Body | ConvertTo-Json -Depth 10 }
@@ -205,12 +213,12 @@ function Disconnect-Vrni {
 
 # Cursor-based paging for list calls (size=100 per page) - pass -Label to show each page as it is read
 function Get-Paged {
-    param([string]$Path, [string]$Label)
+    param([string]$Path, [string]$Label, [int]$Size = 100)
     $all = @(); $cursor = $null; $page = 0
     do {
         $page++
         $sep = if ($Path.Contains('?')) { '&' } else { '?' }
-        $uri = "$Path${sep}size=100"
+        $uri = "$Path${sep}size=$Size"
         if ($cursor) { $uri += "&cursor=$cursor" }
         $r = Invoke-Vrni -Path $uri
         if ($r.results) { $all += @($r.results) }
@@ -243,6 +251,8 @@ function New-Row {
 function Test-VrniEntity {
     param([string]$EntityType, [string]$Name)
     if (-not $NsxCrossCheck) { return 'NotChecked' }
+    if ($EntityType -eq 'SecurityTag' -and $script:TagSet) { if ($script:TagSet.Contains($Name)) { return 'Found' } else { return 'Missing' } }
+    if ($EntityType -eq 'BaseSecurityGroup' -and $script:SgSet) { if ($script:SgSet.Contains($Name)) { return 'Found' } else { return 'Missing' } }
     $key = "$EntityType|$Name"
     if ($script:LookupCache -and $script:LookupCache.ContainsKey($key)) { return $script:LookupCache[$key] }
     try {
@@ -289,7 +299,7 @@ function Get-AppTiers {
 # Run a read-only worker script block once per argument set, $Threads at a time - returns one result per set
 #   - each worker call gets its own runspace from a small pool, so nothing is shared except the results
 function Invoke-Parallel {
-    param([scriptblock]$Worker, $ArgSets, [string]$Label)
+    param([scriptblock]$Worker, $ArgSets, [string]$Label, $Shared)
     $total = @($ArgSets).Count
     $pool  = [runspacefactory]::CreateRunspacePool(1, $Threads)
     $pool.Open()
@@ -304,8 +314,10 @@ function Invoke-Parallel {
     $lastShown = 0
     do {
         $done = @($jobs | Where-Object { $_.Handle.IsCompleted }).Count
-        if ($ShowProgress) { Write-Progress -Activity $Label -Status "$done / $total" -PercentComplete (($done / [math]::Max($total, 1)) * 100) }
-        if ($done - $lastShown -ge 50) { $lastShown = $done; Show-Step "  $Label`: $done / $total" }
+        $extra = ''
+        if ($Shared) { $extra = "  (429 waits: $($Shared.Hit429), $([math]::Round($Shared.Wait)) s waited)" }
+        if ($ShowProgress) { Write-Progress -Activity $Label -Status "$done / $total$extra" -PercentComplete (($done / [math]::Max($total, 1)) * 100) }
+        if ($done - $lastShown -ge 25) { $lastShown = $done; Show-Step "  $Label`: $done / $total$extra" }
         if ($done -lt $total) { Start-Sleep -Milliseconds 300 }
     } while ($done -lt $total)
     Write-Progress -Activity $Label -Completed
@@ -327,8 +339,9 @@ function Initialize-TierCache {
     if ($Threads -le 1 -or $total -lt 2) { return }
 
     $worker = {
-        param($Base, $Token, $AppId, $Delay, $Retries)
+        param($Base, $Token, $AppId, $Delay, $Retries, $Shared)
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $ProgressPreference = 'SilentlyContinue'
         $swApp = [Diagnostics.Stopwatch]::StartNew(); $calls = 0; $busy = 0.0
         function Get-One {
             param($Path)
@@ -343,7 +356,7 @@ function Initialize-TierCache {
                 } catch {
                     $code = 0; $resp = $_.Exception.Response
                     if ($resp) { $code = [int]$resp.StatusCode }
-                    if ($code -eq 429 -and $t -lt $Retries) { Start-Sleep -Seconds ([math]::Pow(2, $t) * 2); continue }
+                    if ($code -eq 429 -and $t -lt $Retries) { $w = [math]::Min([math]::Pow(2, $t) * 2, 8); try { $ra = $resp.Headers['Retry-After']; if ($ra) { $w = [int]$ra } } catch {}; $Shared.Hit429++; $Shared.Wait += $w; Start-Sleep -Seconds $w; continue }
                     throw
                 }
             }
@@ -367,11 +380,12 @@ function Initialize-TierCache {
 
     Show-Step "Reading the tiers of $total apps, $Threads at a time..." 'Cyan'
     $sw = [Diagnostics.Stopwatch]::StartNew()
-    $sets = foreach ($a in $Apps) { ,@($script:Base, $script:Token, $a.Id, $RequestDelayMs, $MaxRetries) }
+    $shared = [hashtable]::Synchronized(@{ Hit429 = 0; Wait = 0.0 })
+    $sets = foreach ($a in $Apps) { ,@($script:Base, $script:Token, $a.Id, $RequestDelayMs, $MaxRetries, $shared) }
     $failed = 0
     $stats = New-Object System.Collections.Generic.List[object]
     $nameById = @{}; foreach ($a in $Apps) { $nameById[$a.Id] = $a.Name }
-    foreach ($res in (Invoke-Parallel -Worker $worker -ArgSets $sets -Label 'Reading tiers')) {
+    foreach ($res in (Invoke-Parallel -Worker $worker -ArgSets $sets -Label 'Reading tiers' -Shared $shared)) {
         if ($res) { $stats.Add($res) }
         if ($res -and -not $res.Error) {
             $script:TierCache[$res.AppId] = @($res.Items | ForEach-Object { ConvertTo-TierInfo -Detail $_.Detail -Id $_.Id })
@@ -379,6 +393,7 @@ function Initialize-TierCache {
     }
     $color = if ($failed -gt 0) { 'Yellow' } else { 'Green' }
     Show-Step "Tiers read for $($script:TierCache.Count) of $total apps in $([math]::Round($sw.Elapsed.TotalSeconds)) s (failed: $failed - those are read again one at a time)" $color
+    if ($shared.Hit429 -gt 0) { Show-Step "  vRNI throttled (429) $($shared.Hit429) times, $([math]::Round($shared.Wait)) s spent waiting across the readers - if this is high, lower `$Threads" 'Yellow' }
 
     # Where the time went - helps tell a slow vRNI from too few readers
     $calls = ($stats | Measure-Object -Property Calls -Sum).Sum
@@ -391,13 +406,43 @@ function Initialize-TierCache {
     }
 }
 
+# Every name of one vRNI entity type in a few calls: the list (1000 per page), then names in batches of 1000
+#   - returns a case-insensitive set, or $null if the list or names call is not usable on this vRNI
+function Get-VrniEntityNames {
+    param([string]$ListPath, [string]$Label)
+    try {
+        $refs = @(Get-Paged -Path $ListPath -Label $Label -Size 1000)
+        $set  = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        $need = New-Object System.Collections.Generic.List[string]
+        foreach ($r in $refs) { if ($r.entity_name) { [void]$set.Add([string]$r.entity_name) } elseif ($r.entity_id) { $need.Add([string]$r.entity_id) } }
+        for ($i = 0; $i -lt $need.Count; $i += 1000) {
+            $batch = @($need[$i..([math]::Min($i + 999, $need.Count - 1))] | ForEach-Object { @{ entity_id = $_ } })
+            $res = Invoke-Vrni -Method POST -Path '/entities/names' -Body @{ entities = $batch }
+            foreach ($x in @($res.results)) { $n = if ($x.entity_name) { $x.entity_name } elseif ($x.name) { $x.name } else { $null }; if ($n) { [void]$set.Add([string]$n) } }
+        }
+        if ($set.Count -eq 0) { Show-Step "  $Label`: no names returned - falling back to one search per name" 'Yellow'; return $null }
+        Show-Step "  $Label`: $($set.Count) names loaded in bulk" 'Green'
+        # A few real names, so the naming the script expects can be compared with what vRNI actually holds
+        $sample = @($set | Where-Object { $_ -like 'S[TG]-*' } | Select-Object -First 3)
+        if ($sample.Count -eq 0) { $sample = @($set | Select-Object -First 3) }
+        foreach ($x in $sample) { Show-Step "    example name in vRNI: $x" }
+        return ,$set
+    } catch { Show-Step "  $Label`: bulk load not usable ($_) - falling back to one search per name" 'Yellow'; return $null }
+}
+
 # Look up every SG / tag name the check will need, $Threads at a time, so the per-app check makes no API calls
 #   - SG names only when the NSX group table was not loaded
 #   - tag names only for apps that are missing at least one zone tier (the same apps the tag lookup is done for)
 function Initialize-LookupCache {
     param($Apps)
     $script:LookupCache = @{}
-    if (-not $NsxCrossCheck -or $Threads -le 1 -or -not $script:TierCache) { return }
+    if (-not $NsxCrossCheck) { return }
+
+    # Bulk first - a few calls for every tag / SG name, instead of one search per name
+    if ($CheckTags) { Show-Step 'Loading all security tag names from vRNI...'; $script:TagSet = Get-VrniEntityNames -ListPath '/entities/security-tags' -Label 'security tags' }
+    if (-not $script:NsxGroupTable) { Show-Step 'Loading all security group names from vRNI...'; $script:SgSet = Get-VrniEntityNames -ListPath '/entities/security-groups' -Label 'security groups' }
+
+    if ($Threads -le 1 -or -not $script:TierCache) { return }
 
     $wanted = New-Object System.Collections.Generic.HashSet[string]
     foreach ($a in $Apps) {
@@ -410,15 +455,16 @@ function Initialize-LookupCache {
         $names   = @($tiers | ForEach-Object { $_.Name })
         $needs   = @($Zones | Where-Object { $names -cnotcontains $_ }).Count -gt 0
         foreach ($z in $Zones) {
-            if (-not $script:NsxGroupTable) { [void]$wanted.Add("BaseSecurityGroup|$base-$z") }
-            if ($CheckTags -and $needs)     { [void]$wanted.Add("SecurityTag|$tagBase-$z") }
+            if (-not $script:NsxGroupTable -and -not $script:SgSet) { [void]$wanted.Add("BaseSecurityGroup|$base-$z") }
+            if ($CheckTags -and $needs -and -not $script:TagSet)  { [void]$wanted.Add("SecurityTag|$tagBase-$z") }
         }
     }
     if ($wanted.Count -eq 0) { return }
 
     $worker = {
-        param($Base, $Token, $Type, $Name, $Delay, $Retries)
+        param($Base, $Token, $Type, $Name, $Delay, $Retries, $Shared)
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $ProgressPreference = 'SilentlyContinue'
         $hdr  = @{ Authorization = "NetworkInsight $Token"; Accept = 'application/json' }
         $body = @{ entity_type = $Type; filter = "name = '$Name'"; size = 1 } | ConvertTo-Json
         $value = 'Error'
@@ -431,7 +477,7 @@ function Initialize-LookupCache {
             } catch {
                 $code = 0; $resp = $_.Exception.Response
                 if ($resp) { $code = [int]$resp.StatusCode }
-                if ($code -eq 429 -and $t -lt $Retries) { Start-Sleep -Seconds ([math]::Pow(2, $t) * 2); continue }
+                if ($code -eq 429 -and $t -lt $Retries) { $w = [math]::Min([math]::Pow(2, $t) * 2, 8); try { $ra = $resp.Headers['Retry-After']; if ($ra) { $w = [int]$ra } } catch {}; $Shared.Hit429++; $Shared.Wait += $w; Start-Sleep -Seconds $w; continue }
                 break
             }
         }
@@ -440,8 +486,9 @@ function Initialize-LookupCache {
 
     Show-Step "Looking up $($wanted.Count) SG / tag names, $Threads at a time..." 'Cyan'
     $sw   = [Diagnostics.Stopwatch]::StartNew()
-    $sets = foreach ($k in $wanted) { $type, $name = $k.Split('|', 2); ,@($script:Base, $script:Token, $type, $name, $RequestDelayMs, $MaxRetries) }
-    foreach ($res in (Invoke-Parallel -Worker $worker -ArgSets $sets -Label 'Looking up names')) {
+    $shared = [hashtable]::Synchronized(@{ Hit429 = 0; Wait = 0.0 })
+    $sets = foreach ($k in $wanted) { $type, $name = $k.Split('|', 2); ,@($script:Base, $script:Token, $type, $name, $RequestDelayMs, $MaxRetries, $shared) }
+    foreach ($res in (Invoke-Parallel -Worker $worker -ArgSets $sets -Label 'Looking up names' -Shared $shared)) {
         if ($res -and $res.Value -ne 'Error') { $script:LookupCache[$res.Key] = $res.Value }
     }
     Show-Step "Lookups done in $([math]::Round($sw.Elapsed.TotalSeconds)) s ($($script:LookupCache.Count) of $($wanted.Count) answered)" 'Green'
@@ -475,6 +522,7 @@ function Connect-Nsx {
     $tryNames = @($bare)
     if ($raw -ne $bare) { $tryNames += $raw }
 
+    $ProgressPreference = 'SilentlyContinue'
     $pw = $c.GetNetworkCredential().Password
     $lastErr = ''
     $n = 0
@@ -505,6 +553,7 @@ function Connect-Nsx {
 # NSX Manager call - session cookie plus XSRF token
 function Invoke-Nsx {
     param([string]$Path)
+    $ProgressPreference = 'SilentlyContinue'
     $p = @{
         Method = 'GET'; Uri = "https://$NsxServer$Path"; WebSession = $script:NsxSession
         Headers = @{ 'X-XSRF-TOKEN' = $script:NsxXsrf; Accept = 'application/json' }
@@ -887,12 +936,12 @@ try {
         if ($NsxCrossCheck -and $NsxServer -and $NsxServer -notlike '<*') {
             $nsxOk = $true
             try { Show-Step 'Loading NSX groups once for the SG check...'; Connect-Nsx -Credential $cred }
-            catch { $nsxOk = $false; Show-Step "$_ - using one vRNI search per SG instead" 'Yellow' }
+            catch { $nsxOk = $false; Show-Step "$_ - checking SGs through vRNI instead" 'Yellow' }
             if ($nsxOk) {
                 try {
                     $script:NsxGroupTable = Get-NsxGroupNames
                     Show-Step "NSX groups loaded: $($script:NsxGroupTable.Count)" 'Green'
-                } catch { Show-Step "NSX login worked but reading the groups failed ($_) - the account may not have read access to NSX groups; using one vRNI search per SG instead" 'Yellow' }
+                } catch { Show-Step "NSX login worked but reading the groups failed ($_) - the account may not have read access to NSX groups; checking SGs through vRNI instead" 'Yellow' }
             }
         }
 
