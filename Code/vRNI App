@@ -34,6 +34,7 @@ $NsxCredentialPath   = ''                                        # Export-Clixml
 $Mode                = 'Update'                                  # 'List', 'Update' or 'Create'
 $DryRun              = $true                                     # Update / Create - $true = show the plan only, no changes in vRNI
 $RenameApps          = $false                                    # Update - also rename each app to its SG-based name (spaces instead of _) - changes the name in vRNI
+$UseDfwNames         = $true                                     # app rename only - the new app name comes from the NSX DFW policy name (tiers still follow the FrontEnd SG)
 
 # Update mode - CSV (column ApplicationName or Application, exact vRNI app names) OR blank = all apps
 $UpdateCSV           = ''                                        # e.g. 'C:\Scripts\Input\vrniUpdate.csv'
@@ -77,6 +78,7 @@ $script:LookupCache = $null
 $script:AppNames   = $null
 $script:TagSet     = $null
 $script:SgSet      = $null
+$script:PolicyByNorm = $null
 # API limiter shared by the main script and every parallel reader - one slot every (1000 / $MaxCallsPerSecond) ms
 $script:Limiter    = [hashtable]::Synchronized(@{ Next = [DateTime]::UtcNow; IntervalMs = $(if ($MaxCallsPerSecond -gt 0) { 1000.0 / $MaxCallsPerSecond } else { 0 }) })
 
@@ -712,6 +714,17 @@ function Get-NormName {
     (($Name -replace '[^A-Za-z0-9]+', ' ').Trim()).ToLower()
 }
 
+# DFW policy for a vRNI app - matched on the app name first, then on its FrontEnd SG name (ignoring _ / spaces / punctuation / case)
+#   returns the policy name, $null when there is none, or '?' when more than one policy matches
+function Find-DfwPolicy {
+    param([string]$AppName, [string]$SgCi)
+    if (-not $script:PolicyByNorm) { return $null }
+    foreach ($k in @((Get-NormName $AppName), (Get-NormName $SgCi))) {
+        if ($k -and $script:PolicyByNorm.ContainsKey($k)) { return $script:PolicyByNorm[$k] }
+    }
+    $null
+}
+
 # vRNI only accepts letters, numbers, spaces, - and _ in an application name - anything else (such as brackets) is dropped
 #   'APP (ENV) NAME' -> 'APP ENV NAME'
 function Get-SafeAppName {
@@ -795,21 +808,31 @@ function Update-App {
     if ($feTier.Filters[0] -notmatch "^Security Group = '(?<sg>SG-.+)-FrontEnd'$") {
         $out.Add((New-Row $name 'Review' $feTier.Name $existingText '' '' 'Review' 'FrontEnd filter is not Security Group = SG-<base>-FrontEnd')); return $out
     }
-    # SG base comes from vRNI's own data:  SG-<APP CI>   (tag base:  ST-<APP_CI>)
     $base = $Matches['sg']
     $ci   = $base.Substring(3)
+
+    # Tiers always follow the FrontEnd SG:  SG-<APP CI>-<Zone>   (tag base:  ST-<APP_CI>)
     $tagBase = 'ST-' + ($ci -replace '\s+', '_')
 
-    # App name - with $RenameApps the app gets the SG-based name (spaces); only differences in _ / space / punctuation / case are renamed
+    # App name (only with $RenameApps) - nothing here changes the tiers
+    #   $UseDfwNames : new name = the NSX DFW policy name for this app (matched on app name, then FrontEnd SG name), cleaned for vRNI
+    #   otherwise    : new name = the FrontEnd SG name, cleaned for vRNI
+    #   when no safe new name can be worked out, only the rename is skipped - the tiers are still done
     $renameTo = $null
-    if ($RenameApps -and $name -cne (Get-SafeAppName $ci)) {
-        if ((Get-NormName $name) -ne (Get-NormName $ci)) {
-            $out.Add((New-Row $name 'Review' '' $existingText '' '' 'Review' "App name differs from the SG base by more than _ / spaces / punctuation - not renamed (SG base: $ci)")); return $out
+    if ($RenameApps) {
+        $target = $null; $skip = $null
+        if ($UseDfwNames) {
+            $policy = Find-DfwPolicy -AppName $name -SgCi $ci
+            if (-not $policy)       { $skip = 'No DFW policy in NSX matches this app - app not renamed' }
+            elseif ($policy -eq '?') { $skip = 'More than one DFW policy matches this app - app not renamed' }
+            else                    { $target = Get-SafeAppName $policy }
+        } else {
+            if ((Get-NormName $name) -ne (Get-NormName $ci)) { $skip = "App name differs from the SG base by more than _ / spaces / punctuation - app not renamed (SG base: $ci)" }
+            else { $target = Get-SafeAppName $ci }
         }
-        if ($script:AppNames -and $script:AppNames.ContainsKey((Get-SafeAppName $ci).ToLower())) {
-            $out.Add((New-Row $name 'Review' '' $existingText '' '' 'Review' "An app named '$(Get-SafeAppName $ci)' already exists - not renamed")); return $out
-        }
-        $renameTo = Get-SafeAppName $ci
+        if ($target -and $name -cne $target -and $script:AppNames -and $script:AppNames.ContainsKey($target.ToLower())) { $skip = "An app named '$target' already exists - app not renamed"; $target = $null }
+        if ($skip) { $out.Add((New-Row $name 'None' '' '' '' '' 'Rename skipped' $skip)); Show-Step "  $skip" 'Yellow' }
+        elseif ($target -and $name -cne $target) { $renameTo = $target }
     }
 
     $unexpected = @($tiers | Where-Object { $Zones -notcontains $_.Name -and $_.Id -ne $feTier.Id })
@@ -1025,13 +1048,31 @@ try {
     elseif ($Mode -eq 'Update') {
         $report = New-Object System.Collections.Generic.List[object]
         foreach ($m in $missing) { $report.Add((New-Row $m 'Review' '' '' '' '' 'Review' 'Name from CSV not found in vRNI')) }
-        # Load every NSX group name once so the SG check needs no API call per app
+        # NSX - DFW policy names (for the app rename, when $UseDfwNames) and every group name (for the SG check), read once
         #   login and read are reported separately, so a 403 shows whether it was the login or the permissions
-        if ($NsxCrossCheck -and $NsxServer -and $NsxServer -notlike '<*') {
+        $nsxSet = $NsxServer -and $NsxServer -notlike '<*'
+        $needPolicies = $RenameApps -and $UseDfwNames
+        if ($needPolicies -and -not $nsxSet) { throw "`$UseDfwNames needs `$NsxServer - set it, or set `$UseDfwNames = `$false" }
+        if ($nsxSet -and ($NsxCrossCheck -or $needPolicies)) {
             $nsxOk = $true
-            try { Show-Step 'Loading NSX groups once for the SG check...'; Connect-Nsx -Credential $cred }
-            catch { $nsxOk = $false; Show-Step "$_ - checking SGs through vRNI instead" 'Yellow' }
-            if ($nsxOk) {
+            try { Show-Step 'Logging in to NSX Manager...'; Connect-Nsx -Credential $cred }
+            catch {
+                $nsxOk = $false
+                if ($needPolicies) { throw "$_ - the app rename needs NSX for the DFW policy names (or set `$UseDfwNames = `$false)" }
+                Show-Step "$_ - checking SGs through vRNI instead" 'Yellow'
+            }
+            if ($nsxOk -and $needPolicies) {
+                Show-Step 'Reading DFW security policies (the new application names)...'
+                $pn = @(Get-NsxPolicyNames)
+                if ($pn.Count -eq 0) { throw 'No DFW policies were read from NSX - check $NsxPolicyCategories, or set $UseDfwNames = $false' }
+                $script:PolicyByNorm = @{}
+                foreach ($x in $pn) {
+                    $k = Get-NormName $x
+                    if ($script:PolicyByNorm.ContainsKey($k) -and $script:PolicyByNorm[$k] -ne $x) { $script:PolicyByNorm[$k] = '?' } else { $script:PolicyByNorm[$k] = $x }
+                }
+                Show-Step "DFW policies loaded: $($pn.Count)" 'Green'
+            }
+            if ($nsxOk -and $NsxCrossCheck) {
                 try {
                     $script:NsxGroupTable = Get-NsxGroupNames
                     Show-Step "NSX groups loaded: $($script:NsxGroupTable.Count)" 'Green'
