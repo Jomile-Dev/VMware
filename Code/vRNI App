@@ -104,10 +104,12 @@ function Show-Step {
     Write-Host ("[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $Text) -ForegroundColor $Color
 }
 
-# Pull the response body out of a failed call - Windows PowerShell 5.1 hides it by default
+# Pull vRNI's / NSX's error text out of a failed call - Windows PowerShell 5.1 hides it by default
 function Get-ErrorText {
     param($ErrorRecord)
     $msg = $ErrorRecord.Exception.Message
+    # Invoke-RestMethod has usually read the reply already - its text is then in ErrorDetails
+    if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) { return "$msg | $($ErrorRecord.ErrorDetails.Message)" }
     try {
         $resp = $ErrorRecord.Exception.Response
         if ($resp) {
@@ -749,7 +751,14 @@ function Rename-VrniApp {
         }
     })
     $body = @{ name = $NewName; entity_id = $App.Id; tiers = $tierBody }
-    Invoke-Vrni -Method POST -Path '/groups/applications/full/' -Body $body -Extra @{ 'If-Match' = [string]$d.last_modified_time } | Out-Null
+    try {
+        Invoke-Vrni -Method POST -Path '/groups/applications/full/' -Body $body -Extra @{ 'If-Match' = [string]$d.last_modified_time } | Out-Null
+    } catch {
+        # Keep the request that was refused (names and filters only - no credentials) so the cause can be checked
+        $f = Join-Path $OutputDir ("rename_failed_{0}.json" -f ($App.Id -replace '[^\w]', '_'))
+        try { @{ if_match = [string]$d.last_modified_time; body = $body } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $f -Encoding UTF8 } catch {}
+        throw "$_ (request saved to $f)"
+    }
 }
 
 # Update mode - brings one existing app in line with the four zone tiers
