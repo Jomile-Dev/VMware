@@ -711,6 +711,13 @@ function Get-NormName {
     param([string]$Name)
     (($Name -replace '[^A-Za-z0-9]+', ' ').Trim()).ToLower()
 }
+
+# vRNI only accepts letters, numbers, spaces, - and _ in an application name - anything else (such as brackets) is dropped
+#   'APP (ENV) NAME' -> 'APP ENV NAME'
+function Get-SafeAppName {
+    param([string]$Name)
+    (($Name -replace '[^A-Za-z0-9 _-]', ' ') -replace '\s+', ' ').Trim()
+}
 #endregion helpers -----------------------------------------------------------
 
 #region modes ----------------------------------------------------------------
@@ -795,14 +802,14 @@ function Update-App {
 
     # App name - with $RenameApps the app gets the SG-based name (spaces); only differences in _ / space / punctuation / case are renamed
     $renameTo = $null
-    if ($RenameApps -and $name -cne $ci) {
+    if ($RenameApps -and $name -cne (Get-SafeAppName $ci)) {
         if ((Get-NormName $name) -ne (Get-NormName $ci)) {
             $out.Add((New-Row $name 'Review' '' $existingText '' '' 'Review' "App name differs from the SG base by more than _ / spaces / punctuation - not renamed (SG base: $ci)")); return $out
         }
-        if ($script:AppNames -and $script:AppNames.ContainsKey($ci.ToLower())) {
-            $out.Add((New-Row $name 'Review' '' $existingText '' '' 'Review' "An app named '$ci' already exists - not renamed")); return $out
+        if ($script:AppNames -and $script:AppNames.ContainsKey((Get-SafeAppName $ci).ToLower())) {
+            $out.Add((New-Row $name 'Review' '' $existingText '' '' 'Review' "An app named '$(Get-SafeAppName $ci)' already exists - not renamed")); return $out
         }
-        $renameTo = $ci
+        $renameTo = Get-SafeAppName $ci
     }
 
     $unexpected = @($tiers | Where-Object { $Zones -notcontains $_.Name -and $_.Id -ne $feTier.Id })
@@ -918,7 +925,9 @@ function New-AppFromPolicy {
 
     Write-Host ''
     Write-Host '------------------------------------------------------------'
-    Write-Host "NEW Application : $Name" -ForegroundColor Cyan
+    $appName = Get-SafeAppName $Name
+    if ($appName -ceq $Name) { Write-Host "NEW Application : $appName" -ForegroundColor Cyan }
+    else { Write-Host "NEW Application : $appName   (policy: $Name - characters vRNI does not accept removed)" -ForegroundColor Cyan }
     foreach ($p in $plan) { Write-Host "  ADD tier $($p.Tier) -> $($p.Filter)   NSX SG: $($p.Sg)  tag: $($p.Tag)" }
     Write-Host '------------------------------------------------------------'
 
@@ -933,7 +942,7 @@ function New-AppFromPolicy {
     if ($answer -eq 'Q') { $script:QuitNow = $true; $out.Add((New-Row $Name 'None' '' '' '' '' 'Skipped - quit' '')); return $out }
 
     try {
-        $app = Invoke-Vrni -Method POST -Path '/groups/applications' -Body @{ name = $Name }
+        $app = Invoke-Vrni -Method POST -Path '/groups/applications' -Body @{ name = (Get-SafeAppName $Name) }
         if (-not $app.entity_id) { throw 'vRNI did not return an entity_id for the new application.' }
     } catch {
         $out.Add((New-Row $Name 'CreateApp' '' '' '' '' 'Failed' "$_")); Write-Host "FAILED : $Name - $_" -ForegroundColor Red
