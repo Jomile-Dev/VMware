@@ -5,6 +5,9 @@
     Update   - bring existing vRNI applications in line with the four-zone tier layout
     Create   - read the NSX distributed firewall security policy names (each policy = one application)
                and create any that are missing in vRNI, with the four zone tiers
+    Sync     - Create and Update in one run: update the apps that have a DFW policy, create the missing ones,
+               then report (or, with $RemoveOrphans, delete) vRNI apps that have no DFW policy
+    One or more NSX Managers can be listed in $NsxServers - policies and groups are read from all of them.
     NSX security groups / tags are cross-checked and reported for every app.
 
     Tier layout (tier names are the zone names exactly):
@@ -14,9 +17,9 @@
     NSX tag expected per zone:
         ST-<APP_CI>-<Zone>      (spaces in the CI replaced with underscores)
 
-    Application names may contain spaces and are never changed on existing apps.
-    Update : the SG base is read from the app's existing FrontEnd filter, not built from the app name.
-    Create : the DFW policy name is the application name and the SG base is SG-<policy name>.
+    Tiers  : for existing apps the SG base is read from the app's FrontEnd filter; new apps use SG-<policy name>.
+    Names  : new apps are named after their DFW policy; existing apps are only renamed with $RenameApps
+             (to the DFW policy name). vRNI only allows letters, numbers, spaces, - and _ - other characters are dropped.
 #>
 
 #region CONFIG ---------------------------------------------------------------
@@ -26,26 +29,26 @@ $VidmServer          = ''                                        # blank = ask v
 $VidmDomain          = ''                                        # optional - only tried if the plain UPN login fails
 $CredentialPath      = '<path-to-cred.xml>'                      # Export-Clixml PSCredential for vIDM / vRNI - if the file is missing you are prompted instead
 
-# NSX connection - Create mode, and the SG check in Update / Create
-$NsxServer           = '<nsx-manager-fqdn>'                      # NSX Manager FQDN
+# NSX connection - one or more NSX Managers (e.g. the management and the workload domain NSX)
+$NsxServers          = '<nsx-manager-fqdn>'                      # one or more, e.g. @('<nsx-mgmt-fqdn>', '<nsx-wld-fqdn>') - policies and groups are read from all of them
 $NsxCredentialPath   = ''                                        # Export-Clixml PSCredential for NSX - blank = reuse the vRNI login
 
 # What to run
-$Mode                = 'Update'                                  # 'List', 'Update' or 'Create'
+$Mode                = 'Update'                                  # 'List', 'Update', 'Create' or 'Sync' (Sync = create + update + orphan check in one run)
 $DryRun              = $true                                     # Update / Create - $true = show the plan only, no changes in vRNI
 $RenameApps          = $false                                    # Update - also rename each app to its SG-based name (spaces instead of _) - changes the name in vRNI
 $UseDfwNames         = $true                                     # app rename only - the new app name comes from the NSX DFW policy name (tiers still follow the FrontEnd SG)
 
-# Update mode - CSV (column ApplicationName or Application, exact vRNI app names) OR blank = all apps
+# Limit the run to some apps - CSV (column ApplicationName or Application) OR blank = all apps (Update / Create / Sync)
 $UpdateCSV           = ''                                        # e.g. 'C:\Scripts\Input\vrniUpdate.csv'
 
 # Tiers
 $Zones               = @('FrontEnd', 'Management', 'Internal', 'Protected')   # Tier names (exactly these)
 
-# Create mode - which DFW security policies count as applications
+# Create / Sync - which DFW security policies count as applications, and what to do with apps that have no policy
 $NsxPolicyCategories = @('Application')                          # DFW categories to read - blank array = all categories
 $NsxPolicyExclude    = ''                                        # regex of policy names to skip, e.g. '^(Default|Sample)'
-$RemoveOrphans       = $false                                    # Create - DELETE vRNI apps that have no DFW policy in NSX (asks Y/N/A/Q for each, separately from creates)
+$RemoveOrphans       = $false                                    # Create / Sync - DELETE vRNI apps that have no DFW policy in NSX (asks Y/N/A/Q for each, separately)
 $RemoveExclude       = ''                                        # regex of vRNI app names never to delete, e.g. '^(SDDC Manager|Other App)$'
 $RemoveMaxPercent    = 25                                        # safety - delete nothing if more than this % of all apps would go
 
@@ -70,8 +73,8 @@ $script:Base       = "https://$VrniServer/api/ni"
 $script:Token      = $null
 $script:ApproveAll = @{}
 $script:QuitNow    = $false
-$script:NsxSession  = $null
-$script:NsxXsrf     = $null
+$script:NsxSessions = @{}
+$script:NsxPolicies = @()
 $script:NsxGroupTable = $null
 $script:TierCache  = $null
 $script:LookupCache = $null
@@ -577,9 +580,9 @@ function New-TierBody {
 
 # NSX Manager session login (/api/session/create) - same approach as the NSX audit scripts
 #   - tries the bare username first (DOMAIN\user or user@domain stripped to user), then the name as saved
-#   - reuses the vRNI login unless $NsxCredentialPath is set
+#   - reuses the vRNI login unless $NsxCredentialPath is set; one session is kept per NSX Manager
 function Connect-Nsx {
-    param([pscredential]$Credential)
+    param([string]$Server, [pscredential]$Credential)
     $c = $Credential
     if ($NsxCredentialPath) { $c = Import-Clixml -LiteralPath $NsxCredentialPath }
     if (-not $c) { throw 'No NSX credential supplied.' }
@@ -598,17 +601,16 @@ function Connect-Nsx {
     foreach ($u in $tryNames) {
         $n++
         $fmt = if ($n -eq 1 -and $raw -ne $bare) { 'bare username' } else { 'username as saved' }
-        Show-Step "NSX login attempt $n of $($tryNames.Count) ($fmt)"
+        Show-Step "NSX login to $Server - attempt $n of $($tryNames.Count) ($fmt)"
         $body = "j_username=$([uri]::EscapeDataString($u))&j_password=$([uri]::EscapeDataString($pw))"
         try {
-            $r = Invoke-WebRequest -Method POST -Uri "https://$NsxServer/api/session/create" -Body $body -ContentType 'application/x-www-form-urlencoded' -SessionVariable nsxSess -UseBasicParsing -TimeoutSec $TimeoutSec
+            $r = Invoke-WebRequest -Method POST -Uri "https://$Server/api/session/create" -Body $body -ContentType 'application/x-www-form-urlencoded' -SessionVariable nsxSess -UseBasicParsing -TimeoutSec $TimeoutSec
             $x = $r.Headers['X-XSRF-TOKEN']
             if ($x -is [array]) { $x = $x[0] }
             if (-not $x) { $lastErr = 'no X-XSRF-TOKEN returned'; Show-Step "  NSX login attempt $n - $lastErr" 'Yellow'; continue }
-            $script:NsxSession = $nsxSess
-            $script:NsxXsrf    = $x
+            $script:NsxSessions[$Server] = @{ Session = $nsxSess; Xsrf = $x }
             $pw = $null; $body = $null
-            Show-Step 'NSX login OK' 'Green'
+            Show-Step "NSX login OK ($Server)" 'Green'
             return
         } catch {
             $lastErr = Get-ErrorText $_
@@ -616,16 +618,18 @@ function Connect-Nsx {
         }
     }
     $pw = $null; $body = $null
-    throw "NSX login failed ($lastErr) - check the username format NSX expects, or point `$NsxCredentialPath at a separate NSX credential file"
+    throw "NSX login to $Server failed ($lastErr) - check the username format NSX expects, or point `$NsxCredentialPath at a separate NSX credential file"
 }
 
-# NSX Manager call - session cookie plus XSRF token
+# NSX Manager call - that manager's session cookie plus XSRF token (read only)
 function Invoke-Nsx {
-    param([string]$Path)
+    param([string]$Server, [string]$Path)
     $ProgressPreference = 'SilentlyContinue'
+    $sess = $script:NsxSessions[$Server]
+    if (-not $sess) { throw "Not logged in to NSX Manager $Server" }
     $p = @{
-        Method = 'GET'; Uri = "https://$NsxServer$Path"; WebSession = $script:NsxSession
-        Headers = @{ 'X-XSRF-TOKEN' = $script:NsxXsrf; Accept = 'application/json' }
+        Method = 'GET'; Uri = "https://$Server$Path"; WebSession = $sess.Session
+        Headers = @{ 'X-XSRF-TOKEN' = $sess.Xsrf; Accept = 'application/json' }
         ContentType = 'application/json'; UseBasicParsing = $true; TimeoutSec = $TimeoutSec
     }
     Wait-ApiSlot $script:Limiter
@@ -636,22 +640,23 @@ function Invoke-Nsx {
 
 # Cursor-based paging for NSX Policy list calls
 function Get-NsxPaged {
-    param([string]$Path)
+    param([string]$Server, [string]$Path)
     $all = @(); $cursor = $null
     do {
         $sep = if ($Path.Contains('?')) { '&' } else { '?' }
         $uri = $Path
         if ($cursor) { $uri += "${sep}cursor=$cursor" }
-        $r = Invoke-Nsx -Path $uri
+        $r = Invoke-Nsx -Server $Server -Path $uri
         if ($r.results) { $all += @($r.results) }
         $cursor = $r.cursor
     } while ($cursor)
     $all
 }
 
-# DFW security policy names = the application list (default / system policies and excluded names dropped)
+# DFW security policy names on one NSX Manager = its application list (default / system policies and excluded names dropped)
 function Get-NsxPolicyNames {
-    $pol = @(Get-NsxPaged -Path '/policy/api/v1/infra/domains/default/security-policies')
+    param([string]$Server)
+    $pol = @(Get-NsxPaged -Server $Server -Path '/policy/api/v1/infra/domains/default/security-policies')
     $names = foreach ($x in $pol) {
         if ($x.is_default -or $x._system_owned) { continue }
         if ($NsxPolicyCategories.Count -gt 0 -and $NsxPolicyCategories -notcontains $x.category) { continue }
@@ -661,11 +666,61 @@ function Get-NsxPolicyNames {
     @($names | Where-Object { $_ } | Sort-Object -Unique)
 }
 
-# Every NSX group display name, case-insensitive lookup table (used to report which SGs exist)
+# Every group display name on one NSX Manager, case-insensitive lookup table (used to report which SGs exist)
 function Get-NsxGroupNames {
+    param([string]$Server)
     $t = New-Object System.Collections.Hashtable([StringComparer]::OrdinalIgnoreCase)
-    foreach ($g in (Get-NsxPaged -Path '/policy/api/v1/infra/domains/default/groups')) { $t[[string]$g.display_name] = $true }
+    foreach ($g in (Get-NsxPaged -Server $Server -Path '/policy/api/v1/infra/domains/default/groups')) { $t[[string]$g.display_name] = $true }
     $t
+}
+
+# Log in to every NSX Manager in $NsxServers and read what this run needs from all of them
+#   -NeedPolicies : DFW policy names (they drive creates, renames and deletes) - every manager must answer, or the run stops,
+#                   because a partial list would make apps look like they have no policy
+#   -NeedGroups   : group names for the SG check - if any manager fails, the SG check falls back to vRNI
+function Initialize-Nsx {
+    param([pscredential]$Credential, [switch]$NeedPolicies, [switch]$NeedGroups)
+    $servers = @($NsxServers | Where-Object { $_ -and $_ -notlike '<*' })
+    if ($servers.Count -eq 0) {
+        if ($NeedPolicies) { throw 'No NSX Manager set in $NsxServers - this needs the DFW policy names' }
+        return
+    }
+    if (-not $NeedPolicies -and -not $NeedGroups) { return }
+
+    $policySet = New-Object 'System.Collections.Generic.HashSet[string]'
+    $groups    = New-Object System.Collections.Hashtable([StringComparer]::OrdinalIgnoreCase)
+    $groupsOk  = [bool]$NeedGroups
+    foreach ($srv in $servers) {
+        try { Connect-Nsx -Server $srv -Credential $Credential }
+        catch {
+            if ($NeedPolicies) { throw "$_ - every NSX Manager must be read for the DFW policy list" }
+            Show-Step "$_ - checking SGs through vRNI instead" 'Yellow'; $groupsOk = $false; continue
+        }
+        if ($NeedPolicies) {
+            $pn = @(Get-NsxPolicyNames -Server $srv)
+            foreach ($x in $pn) { [void]$policySet.Add($x) }
+            Show-Step "  $srv`: $($pn.Count) DFW application policies" 'Green'
+        }
+        if ($groupsOk) {
+            try {
+                $g = Get-NsxGroupNames -Server $srv
+                foreach ($k in $g.Keys) { $groups[$k] = $true }
+                Show-Step "  $srv`: $($g.Count) groups" 'Green'
+            } catch { $groupsOk = $false; Show-Step "NSX login to $srv worked but reading the groups failed ($_) - checking SGs through vRNI instead" 'Yellow' }
+        }
+    }
+
+    if ($NeedPolicies) {
+        $script:NsxPolicies = @($policySet | Sort-Object)
+        if ($script:NsxPolicies.Count -eq 0) { throw 'No DFW policies were read from NSX - check $NsxPolicyCategories' }
+        $script:PolicyByNorm = @{}
+        foreach ($x in $script:NsxPolicies) {
+            $k = Get-NormName $x
+            if ($script:PolicyByNorm.ContainsKey($k) -and $script:PolicyByNorm[$k] -ne $x) { $script:PolicyByNorm[$k] = '?' } else { $script:PolicyByNorm[$k] = $x }
+        }
+        Show-Step "DFW policies loaded: $($script:NsxPolicies.Count) from $($servers.Count) NSX Manager(s)" 'Green'
+    }
+    if ($groupsOk) { $script:NsxGroupTable = $groups; Show-Step "NSX groups loaded: $($groups.Count) from $($servers.Count) NSX Manager(s)" 'Green' }
 }
 
 # Application names as fast as possible - ID list first, then fill in names from the cheapest source that has them
@@ -723,6 +778,22 @@ function Find-DfwPolicy {
         if ($k -and $script:PolicyByNorm.ContainsKey($k)) { return $script:PolicyByNorm[$k] }
     }
     $null
+}
+
+# FrontEnd SG name of an app without the SG- prefix (from the tier cache, or read live), or $null
+function Get-AppSgCi {
+    param($App)
+    $tiers = if ($script:TierCache -and $script:TierCache.ContainsKey($App.Id)) { $script:TierCache[$App.Id] } else { @(Get-AppTiers -AppId $App.Id) }
+    foreach ($t in @($tiers)) { foreach ($f in @($t.Filters)) { if ($f -match "^Security Group = '(?<sg>SG-.+)-FrontEnd'$") { return $Matches['sg'].Substring(3) } } }
+    $null
+}
+
+# Which DFW policy each vRNI app belongs to (app name first, then FrontEnd SG name) - AppId -> policy name, '?' or $null
+function Resolve-AppPolicies {
+    param($Apps)
+    $map = @{}
+    foreach ($a in $Apps) { $map[$a.Id] = Find-DfwPolicy -AppName $a.Name -SgCi (Get-AppSgCi -App $a) }
+    $map
 }
 
 # vRNI only accepts letters, numbers, spaces, - and _ in an application name - anything else (such as brackets) is dropped
@@ -1006,8 +1077,123 @@ else {
 }
 if (-not $cred) { throw 'No credential supplied.' }
 
+# Steps used by the modes ------------------------------------------------------
+
+# Update step - check each app against the four zone tiers, plan / apply (Update and Sync)
+function Invoke-UpdateStep {
+    param($Apps, $Report)
+    $n = @($Apps).Count; $i = 0
+    $swCheck = [Diagnostics.Stopwatch]::StartNew()
+    Show-Step "Checking $n applications against the four zone tiers" 'Cyan'
+    foreach ($app in $Apps) {
+        if ($script:QuitNow) { break }
+        $i++
+        $left = ''
+        if ($i -gt 1) { $left = ", about $([math]::Ceiling($swCheck.Elapsed.TotalSeconds / ($i - 1) * ($n - $i + 1) / 60)) min left" }
+        Show-Step "[$i/$n] $($app.Name)$left"
+        if ($ShowProgress) { Write-Progress -Activity 'Checking applications' -Status "$i / $n - $($app.Name)" -PercentComplete (($i / [math]::Max($n, 1)) * 100) }
+        try {
+            foreach ($r in (Update-App -App $app)) {
+                $Report.Add($r)
+                if ($r.Action -eq 'Review') { Show-Step "  REVIEW: $($r.Note)" 'Yellow' }
+            }
+        }
+        catch { $Report.Add((New-Row $app.Name 'Error' '' '' '' '' 'Failed' "$_")); Write-Host "ERROR  : $($app.Name) - $_" -ForegroundColor Red }
+    }
+    Write-Progress -Activity 'Checking applications' -Completed
+}
+
+# Create step - a new vRNI app for every DFW policy that no vRNI app belongs to (Create and Sync)
+function Invoke-CreateStep {
+    param([string[]]$Policies, $AppPolicy, $AllApps, $Report, [switch]$QuietExisting)
+    $owned = @{}
+    foreach ($a in $AllApps) { $pol = $AppPolicy[$a.Id]; if ($pol -and $pol -ne '?') { $owned[$pol] = $a.Name } }
+    $n = @($Policies).Count; $i = 0
+    foreach ($pn in $Policies) {
+        if ($script:QuitNow) { break }
+        $i++
+        if ($ShowProgress) { Write-Progress -Activity 'Checking NSX policies' -Status "$i / $n - $pn" -PercentComplete (($i / [math]::Max($n, 1)) * 100) }
+        if ($owned.ContainsKey($pn)) {
+            if (-not $QuietExisting) {
+                Write-Host "EXISTS : $pn (vRNI: $($owned[$pn]))"
+                $Report.Add((New-Row $pn 'None' '' '' '' '' 'Already in vRNI' "vRNI name: $($owned[$pn])"))
+            }
+            continue
+        }
+        try { foreach ($r in (New-AppFromPolicy -Name $pn -NsxGroups $script:NsxGroupTable)) { $Report.Add($r) } }
+        catch { $Report.Add((New-Row $pn 'Error' '' '' '' '' 'Failed' "$_")); Write-Host "ERROR  : $pn - $_" -ForegroundColor Red }
+    }
+    Write-Progress -Activity 'Checking NSX policies' -Completed
+}
+
+# Orphan step - vRNI apps that no DFW policy belongs to (Create and Sync)
+#   report only, unless $RemoveOrphans is on - then they are deleted (with all their tiers) after a separate Y/N/A/Q
+#   returns @(orphan count, planned delete count)
+function Invoke-OrphanStep {
+    param($Apps, $AppPolicy, [int]$AllAppCount, $Report)
+    foreach ($a in @($Apps | Where-Object { $AppPolicy[$_.Id] -eq '?' })) {
+        $Report.Add((New-Row $a.Name 'Review' '' '' '' '' 'Review' 'More than one DFW policy matches this app - not created, updated or deleted'))
+    }
+    $orphans  = @($Apps | Where-Object { -not $AppPolicy[$_.Id] })
+    $toDelete = @()
+    if ($RemoveOrphans -and $orphans.Count -gt 0) {
+        $toDelete = @($orphans | Where-Object { -not ($RemoveExclude -and $_.Name -match $RemoveExclude) })
+        $pct = [math]::Round(100 * $toDelete.Count / [math]::Max($AllAppCount, 1))
+        if ($script:NsxPolicies.Count -eq 0) {
+            Show-Step 'No DFW policies were read from NSX - nothing will be deleted' 'Red'; $toDelete = @()
+        } elseif ($pct -gt $RemoveMaxPercent) {
+            Show-Step "$($toDelete.Count) of $AllAppCount apps ($pct%) would be deleted - over the $RemoveMaxPercent% safety limit, so nothing is deleted. Check `$NsxServers / the policy categories, or raise `$RemoveMaxPercent" 'Red'
+            $toDelete = @()
+        }
+    }
+    $deleteIds = @{}
+    foreach ($d in $toDelete) { $deleteIds[$d.Id] = $true }
+
+    foreach ($o in $orphans) {
+        if ($script:QuitNow -or -not $deleteIds.ContainsKey($o.Id)) {
+            $why = 'No DFW policy in NSX matches this app (by app name or FrontEnd SG name)'
+            if ($RemoveOrphans -and $RemoveExclude -and $o.Name -match $RemoveExclude) { $why += ' - excluded from delete by $RemoveExclude' }
+            $Report.Add((New-Row $o.Name 'None' '' '' '' '' 'In vRNI only' $why)); continue
+        }
+        Write-Host "  DELETE app '$($o.Name)' and all its tiers (no DFW policy in NSX)" -ForegroundColor Red
+        if ($DryRun) { $Report.Add((New-Row $o.Name 'Delete' '' '' '' '' 'DryRun' 'No DFW policy in NSX')); continue }
+        $answer = Get-UserConfirm -Prompt "DELETE '$($o.Name)' from vRNI?" -Kind 'delete'
+        if ($answer -eq 'N') { $Report.Add((New-Row $o.Name 'None' '' '' '' '' 'In vRNI only' 'Delete declined')); continue }
+        if ($answer -eq 'Q') { $script:QuitNow = $true; $Report.Add((New-Row $o.Name 'None' '' '' '' '' 'In vRNI only' 'Delete skipped - quit')); continue }
+        try {
+            Invoke-Vrni -Method DELETE -Path "/groups/applications/$($o.Id)" | Out-Null
+            $Report.Add((New-Row $o.Name 'Delete' '' '' '' '' 'Applied' 'No DFW policy in NSX'))
+            Write-Host "DELETED: $($o.Name)" -ForegroundColor Green
+        } catch { $Report.Add((New-Row $o.Name 'Delete' '' '' '' '' 'Failed' "$_")); Write-Host "FAILED : delete of $($o.Name) - $_" -ForegroundColor Red }
+    }
+    if ($orphans.Count -gt 0) { Show-Step "$($orphans.Count) vRNI apps have no matching DFW policy in NSX$(if ($toDelete.Count) { " - $($toDelete.Count) planned for delete" } else { " - listed as 'In vRNI only' in the CSV" })" 'Yellow' }
+    ,@($orphans.Count, $toDelete.Count)
+}
+
+# Save the report and print the totals by result
+function Save-Report {
+    param($Report, [string]$Prefix)
+    $file = Join-Path $OutputDir "$Prefix`_$stamp.csv"
+    $Report | Export-Csv -Path $file -NoTypeInformation -Encoding UTF8
+    Write-Host ''
+    Write-Host "Saved: $file"
+    $Report | Group-Object Result | Sort-Object Name | ForEach-Object { Write-Host ("  {0,-22} {1}" -f $_.Name, $_.Count) }
+}
+
+# Per-app summary of the update rows: need changes / for review / already compliant
+function Get-UpdateCounts {
+    param($Report, [string[]]$AppNames)
+    $rows  = @($Report | Where-Object { $AppNames -contains $_.Application })
+    $byApp = @($rows | Group-Object Application)
+    $nReview = @($byApp | Where-Object { $_.Group.Action -contains 'Review' }).Count
+    $nChange = @($byApp | Where-Object { $_.Group.Action -notcontains 'Review' -and (@($_.Group.Action) -match '^(Add|Rename|RenameApp)$').Count -gt 0 }).Count
+    $nOk     = @($byApp | Where-Object { $_.Group.Action -notcontains 'Review' -and (@($_.Group.Action) -match '^(Add|Rename|RenameApp)$').Count -eq 0 }).Count
+    @{ Change = $nChange; Review = $nReview; Ok = $nOk }
+}
+
 # Connect, read the application list, then run the chosen mode (token is deleted in finally)
 try {
+    if ($Mode -notin 'List', 'Update', 'Create', 'Sync') { throw "Unknown `$Mode '$Mode' - use 'List', 'Update', 'Create' or 'Sync'." }
     Connect-Vrni -Credential $cred
 
     # Application list gives IDs - names come from the fastest source available (see Get-AppIndex)
@@ -1015,13 +1201,15 @@ try {
     $swNames = [Diagnostics.Stopwatch]::StartNew()
     $apps = @(Get-AppIndex)
     Show-Step "Found $($apps.Count) applications (took $([math]::Round($swNames.Elapsed.TotalSeconds)) s)" 'Green'
+    $allApps = $apps
 
     # Every existing app name (before any CSV filter) so a rename never collides with another app
     $script:AppNames = @{}
     foreach ($a in $apps) { $script:AppNames[$a.Name.ToLower()] = $true }
 
-    # Update mode only - limit to the names in the CSV (exact vRNI names, spaces included)
-    if ($UpdateCSV -and $Mode -eq 'Update') {
+    # Optional CSV - limits Update / Create / Sync to these apps (exact vRNI names; for new apps, the DFW policy name)
+    $wanted = $null; $limitNorm = $null
+    if ($UpdateCSV -and $Mode -ne 'List') {
         if (-not (Test-Path -LiteralPath $UpdateCSV)) { throw "Update CSV not found: $UpdateCSV" }
         $rows = @(Import-Csv -LiteralPath $UpdateCSV)
         # Column can be ApplicationName, or Application (so a filtered report can be fed straight back in)
@@ -1033,9 +1221,11 @@ try {
         if (-not $col) { throw "Update CSV needs a column named ApplicationName or Application: $UpdateCSV" }
         $wanted = @($rows | ForEach-Object { [string]$_.$col } | Where-Object { $_ -and $_.Trim() } | ForEach-Object { $_.Trim() } | Select-Object -Unique)
         Show-Step "Update CSV: $($wanted.Count) app names read from column '$col'"
-        $missing = @($wanted | Where-Object { $apps.Name -cnotcontains $_ })
         $apps = @($apps | Where-Object { $wanted -ccontains $_.Name })
+        $limitNorm = @{}
+        foreach ($w in $wanted) { $limitNorm[(Get-NormName $w)] = $true }
     }
+    $report = New-Object System.Collections.Generic.List[object]
 
     # List mode - export every app and tier to CSV
     if ($Mode -eq 'List') {
@@ -1044,158 +1234,58 @@ try {
         Invoke-ListMode -Apps $apps | Export-Csv -Path $file -NoTypeInformation -Encoding UTF8
         Write-Host "Saved: $file"
     }
-    # Update mode - check each app against the four zone tiers, plan / apply, then export the report
+    # Update mode - existing vRNI apps only (NSX for the SG check, and the DFW policy names when renaming)
     elseif ($Mode -eq 'Update') {
-        $report = New-Object System.Collections.Generic.List[object]
-        foreach ($m in $missing) { $report.Add((New-Row $m 'Review' '' '' '' '' 'Review' 'Name from CSV not found in vRNI')) }
-        # NSX - DFW policy names (for the app rename, when $UseDfwNames) and every group name (for the SG check), read once
-        #   login and read are reported separately, so a 403 shows whether it was the login or the permissions
-        $nsxSet = $NsxServer -and $NsxServer -notlike '<*'
-        $needPolicies = $RenameApps -and $UseDfwNames
-        if ($needPolicies -and -not $nsxSet) { throw "`$UseDfwNames needs `$NsxServer - set it, or set `$UseDfwNames = `$false" }
-        if ($nsxSet -and ($NsxCrossCheck -or $needPolicies)) {
-            $nsxOk = $true
-            try { Show-Step 'Logging in to NSX Manager...'; Connect-Nsx -Credential $cred }
-            catch {
-                $nsxOk = $false
-                if ($needPolicies) { throw "$_ - the app rename needs NSX for the DFW policy names (or set `$UseDfwNames = `$false)" }
-                Show-Step "$_ - checking SGs through vRNI instead" 'Yellow'
-            }
-            if ($nsxOk -and $needPolicies) {
-                Show-Step 'Reading DFW security policies (the new application names)...'
-                $pn = @(Get-NsxPolicyNames)
-                if ($pn.Count -eq 0) { throw 'No DFW policies were read from NSX - check $NsxPolicyCategories, or set $UseDfwNames = $false' }
-                $script:PolicyByNorm = @{}
-                foreach ($x in $pn) {
-                    $k = Get-NormName $x
-                    if ($script:PolicyByNorm.ContainsKey($k) -and $script:PolicyByNorm[$k] -ne $x) { $script:PolicyByNorm[$k] = '?' } else { $script:PolicyByNorm[$k] = $x }
-                }
-                Show-Step "DFW policies loaded: $($pn.Count)" 'Green'
-            }
-            if ($nsxOk -and $NsxCrossCheck) {
-                try {
-                    $script:NsxGroupTable = Get-NsxGroupNames
-                    Show-Step "NSX groups loaded: $($script:NsxGroupTable.Count)" 'Green'
-                } catch { Show-Step "NSX login worked but reading the groups failed ($_) - the account may not have read access to NSX groups; checking SGs through vRNI instead" 'Yellow' }
-            }
-        }
-
+        if ($wanted) { foreach ($m in @($wanted | Where-Object { $allApps.Name -cnotcontains $_ })) { $report.Add((New-Row $m 'Review' '' '' '' '' 'Review' 'Name from CSV not found in vRNI')) } }
+        Initialize-Nsx -Credential $cred -NeedPolicies:($RenameApps -and $UseDfwNames) -NeedGroups:$NsxCrossCheck
         Initialize-TierCache -Apps $apps
         Initialize-LookupCache -Apps $apps
-
-        $n = $apps.Count; $i = 0
-        $swCheck = [Diagnostics.Stopwatch]::StartNew()
-        Show-Step "Checking $n applications against the four zone tiers" 'Cyan'
-        foreach ($app in $apps) {
-            if ($script:QuitNow) { break }
-            $i++
-            $left = ''
-            if ($i -gt 1) { $left = ", about $([math]::Ceiling($swCheck.Elapsed.TotalSeconds / ($i - 1) * ($n - $i + 1) / 60)) min left" }
-            Show-Step "[$i/$n] $($app.Name)$left"
-            if ($ShowProgress) { Write-Progress -Activity 'Checking applications' -Status "$i / $n - $($app.Name)" -PercentComplete (($i / [math]::Max($n, 1)) * 100) }
-            try {
-                foreach ($r in (Update-App -App $app)) {
-                    $report.Add($r)
-                    if ($r.Action -eq 'Review') { Show-Step "  REVIEW: $($r.Note)" 'Yellow' }
-                }
-            }
-            catch { $report.Add((New-Row $app.Name 'Error' '' '' '' '' 'Failed' "$_")); Write-Host "ERROR  : $($app.Name) - $_" -ForegroundColor Red }
-        }
-        Write-Progress -Activity 'Checking applications' -Completed
-        $file = Join-Path $OutputDir "vrni_tier_update_$stamp.csv"
-        $report | Export-Csv -Path $file -NoTypeInformation -Encoding UTF8
-        Write-Host ''
-        Write-Host "Saved: $file"
-        $report | Group-Object Result | Sort-Object Name | ForEach-Object { Write-Host ("  {0,-22} {1}" -f $_.Name, $_.Count) }
-        $byApp   = @($report | Group-Object Application)
-        $nReview = @($byApp | Where-Object { $_.Group.Action -contains 'Review' }).Count
-        $nChange = @($byApp | Where-Object { $_.Group.Action -notcontains 'Review' -and (@($_.Group.Action) -match '^(Add|Rename|RenameApp)$').Count -gt 0 }).Count
-        $nOk     = @($byApp | Where-Object { $_.Group.Action -notcontains 'Review' -and (@($_.Group.Action) -match '^(Add|Rename|RenameApp)$').Count -eq 0 }).Count
-        Show-Step "Apps checked: $($apps.Count)   need changes: $nChange   for review: $nReview   already compliant: $nOk" 'Cyan'
+        Invoke-UpdateStep -Apps $apps -Report $report
+        Save-Report -Report $report -Prefix 'vrni_tier_update'
+        $c = Get-UpdateCounts -Report $report -AppNames @($apps.Name)
+        Show-Step "Apps checked: $($apps.Count)   need changes: $($c.Change)   for review: $($c.Review)   already compliant: $($c.Ok)" 'Cyan'
     }
-    # Create mode - new vRNI apps from the NSX DFW policy list
-    elseif ($Mode -eq 'Create') {
-        # 1. NSX - DFW policy names are the application list, group names are for the SG check
-        Show-Step 'Logging in to NSX Manager...'
-        Connect-Nsx -Credential $cred
-        Show-Step 'Logged in to NSX - reading DFW security policies...'
-        $policyNames = @(Get-NsxPolicyNames)
-        $nsxGroups   = $null
-        if ($NsxCrossCheck) { $nsxGroups = Get-NsxGroupNames }
-        Show-Step "Found $($policyNames.Count) application policies in NSX$(if ($nsxGroups) { " and $($nsxGroups.Count) groups" })" 'Green'
+    # Create and Sync - the DFW policies (from every NSX Manager) are the list of applications
+    else {
+        Initialize-Nsx -Credential $cred -NeedPolicies -NeedGroups:$NsxCrossCheck
+        $policies = @($script:NsxPolicies)
+        if ($limitNorm) { $policies = @($policies | Where-Object { $limitNorm.ContainsKey((Get-NormName $_)) }) }
 
-        # 2. Skip any policy vRNI already has (name match ignores case and _ versus space)
-        $known = @{}
-        foreach ($a in $apps) { $known[(Get-NormName $a.Name)] = $a.Name }
+        # Which policy each vRNI app belongs to - by app name, then by FrontEnd SG name (needs the tiers of every app)
+        Initialize-TierCache -Apps $allApps
+        Show-Step 'Matching vRNI apps to DFW policies (app name, then FrontEnd SG name)...'
+        $appPolicy = Resolve-AppPolicies -Apps $allApps
+        $matched   = @($apps | Where-Object { $appPolicy[$_.Id] -and $appPolicy[$_.Id] -ne '?' })
 
-        # 3. Plan / create the rest, then export the report
-        $report = New-Object System.Collections.Generic.List[object]
-        $n = $policyNames.Count; $i = 0
-        foreach ($pn in $policyNames) {
-            if ($script:QuitNow) { break }
-            $i++
-            if ($ShowProgress) { Write-Progress -Activity 'Checking NSX policies' -Status "$i / $n - $pn" -PercentComplete (($i / [math]::Max($n, 1)) * 100) }
-            $norm = Get-NormName $pn
-            if ($known.ContainsKey($norm)) {
-                $vrniName = $known[$norm]
-                Write-Host "EXISTS : $pn (vRNI: $vrniName)"
-                $report.Add((New-Row $pn 'None' '' '' '' '' 'Already in vRNI' "vRNI name: $vrniName"))
-                continue
-            }
-            try { foreach ($r in (New-AppFromPolicy -Name $pn -NsxGroups $nsxGroups)) { $report.Add($r) } }
-            catch { $report.Add((New-Row $pn 'Error' '' '' '' '' 'Failed' "$_")); Write-Host "ERROR  : $pn - $_" -ForegroundColor Red }
-        }
-        Write-Progress -Activity 'Checking NSX policies' -Completed
-
-        # 4. The other direction - apps in vRNI with no DFW policy of the same name in NSX
-        #    report only, unless $RemoveOrphans is on - then they are deleted (with all their tiers) after a separate Y/N/A/Q
-        $policyNorm = @{}
-        foreach ($pn in $policyNames) { $policyNorm[(Get-NormName $pn)] = $true }
-        $orphans  = @($apps | Where-Object { -not $policyNorm.ContainsKey((Get-NormName $_.Name)) })
-        $toDelete = @()
-        if ($RemoveOrphans -and $orphans.Count -gt 0) {
-            $toDelete = @($orphans | Where-Object { -not ($RemoveExclude -and $_.Name -match $RemoveExclude) })
-            $pct = [math]::Round(100 * $toDelete.Count / [math]::Max($apps.Count, 1))
-            if ($policyNames.Count -eq 0) {
-                Show-Step 'No DFW policies were read from NSX - nothing will be deleted' 'Red'; $toDelete = @()
-            } elseif ($pct -gt $RemoveMaxPercent) {
-                Show-Step "$($toDelete.Count) of $($apps.Count) apps ($pct%) would be deleted - over the $RemoveMaxPercent% safety limit, so nothing is deleted. Check the policy list / categories, or raise `$RemoveMaxPercent" 'Red'
-                $toDelete = @()
+        if ($wanted) {
+            foreach ($m in @($wanted | Where-Object { ($allApps.Name -cnotcontains $_) -and -not ($policies | Where-Object { (Get-NormName $_) -eq (Get-NormName $m) }) })) {
+                $report.Add((New-Row $m 'Review' '' '' '' '' 'Review' 'Name from CSV not found in vRNI or in the DFW policies'))
             }
         }
-        $deleteIds = @{}
-        foreach ($d in $toDelete) { $deleteIds[$d.Id] = $true }
 
-        foreach ($o in $orphans) {
-            if ($script:QuitNow -or -not $deleteIds.ContainsKey($o.Id)) {
-                $why = 'No DFW policy in NSX with this name (ignoring _ / spaces / punctuation / case)'
-                if ($RemoveOrphans -and $RemoveExclude -and $o.Name -match $RemoveExclude) { $why += ' - excluded from delete by $RemoveExclude' }
-                $report.Add((New-Row $o.Name 'None' '' '' '' '' 'In vRNI only' $why)); continue
-            }
-            Write-Host "  DELETE app '$($o.Name)' and all its tiers (no DFW policy in NSX)" -ForegroundColor Red
-            if ($DryRun) { $report.Add((New-Row $o.Name 'Delete' '' '' '' '' 'DryRun' 'No DFW policy in NSX')); continue }
-            $answer = Get-UserConfirm -Prompt "DELETE '$($o.Name)' from vRNI?" -Kind 'delete'
-            if ($answer -eq 'N') { $report.Add((New-Row $o.Name 'None' '' '' '' '' 'In vRNI only' 'Delete declined')); continue }
-            if ($answer -eq 'Q') { $script:QuitNow = $true; $report.Add((New-Row $o.Name 'None' '' '' '' '' 'In vRNI only' 'Delete skipped - quit')); continue }
-            try {
-                Invoke-Vrni -Method DELETE -Path "/groups/applications/$($o.Id)" | Out-Null
-                $report.Add((New-Row $o.Name 'Delete' '' '' '' '' 'Applied' 'No DFW policy in NSX'))
-                Write-Host "DELETED: $($o.Name)" -ForegroundColor Green
-            } catch { $report.Add((New-Row $o.Name 'Delete' '' '' '' '' 'Failed' "$_")); Write-Host "FAILED : delete of $($o.Name) - $_" -ForegroundColor Red }
+        if ($Mode -eq 'Sync') {
+            Show-Step "Sync step 1 of 3 - update the $($matched.Count) apps that have a DFW policy" 'Cyan'
+            Initialize-LookupCache -Apps $matched
+            Invoke-UpdateStep -Apps $matched -Report $report
+            Show-Step 'Sync step 2 of 3 - create apps for DFW policies that are not in vRNI' 'Cyan'
+            Invoke-CreateStep -Policies $policies -AppPolicy $appPolicy -AllApps $allApps -Report $report -QuietExisting
+            Show-Step 'Sync step 3 of 3 - apps in vRNI with no DFW policy' 'Cyan'
+        } else {
+            Invoke-CreateStep -Policies $policies -AppPolicy $appPolicy -AllApps $allApps -Report $report
         }
-        if ($orphans.Count -gt 0) { Show-Step "$($orphans.Count) vRNI apps have no matching DFW policy in NSX$(if ($toDelete.Count) { " - $($toDelete.Count) planned for delete" } else { " - listed as 'In vRNI only' in the CSV" })" 'Yellow' }
+        $orph = Invoke-OrphanStep -Apps $apps -AppPolicy $appPolicy -AllAppCount $allApps.Count -Report $report
 
-        $file = Join-Path $OutputDir "vrni_create_$stamp.csv"
-        $report | Export-Csv -Path $file -NoTypeInformation -Encoding UTF8
-        Write-Host ''
-        Write-Host "Saved: $file"
-        $report | Group-Object Result | Sort-Object Name | ForEach-Object { Write-Host ("  {0,-22} {1}" -f $_.Name, $_.Count) }
-        $nExist  = @($report | Where-Object { $_.Result -eq 'Already in vRNI' }).Count
-        $nReview = @($report | Where-Object { $_.Action -eq 'Review' }).Count
-        $nNew    = @($report | Where-Object { $_.Action -eq 'CreateApp' } | Select-Object -ExpandProperty Application -Unique).Count
-        Show-Step "Policies: $n   already in vRNI: $nExist   to create / created: $nNew   for review: $nReview   in vRNI only: $($orphans.Count)   to delete: $($toDelete.Count)" 'Cyan'
+        Save-Report -Report $report -Prefix $(if ($Mode -eq 'Sync') { 'vrni_sync' } else { 'vrni_create' })
+        $nNew = @($report | Where-Object { $_.Action -eq 'CreateApp' } | Select-Object -ExpandProperty Application -Unique).Count
+        if ($Mode -eq 'Sync') {
+            $c = Get-UpdateCounts -Report $report -AppNames @($matched.Name)
+            Show-Step "Policies: $($policies.Count)   apps updated / to update: $($c.Change)   already compliant: $($c.Ok)   for review: $($c.Review)   new apps: $nNew   in vRNI only: $($orph[0])   to delete: $($orph[1])" 'Cyan'
+        } else {
+            $nExist  = @($report | Where-Object { $_.Result -eq 'Already in vRNI' }).Count
+            $nReview = @($report | Where-Object { $_.Action -eq 'Review' }).Count
+            Show-Step "Policies: $($policies.Count)   already in vRNI: $nExist   to create / created: $nNew   for review: $nReview   in vRNI only: $($orph[0])   to delete: $($orph[1])" 'Cyan'
+        }
     }
-    else { throw "Unknown `$Mode '$Mode' - use 'List', 'Update' or 'Create'." }
 
     Show-Step ("Finished in {0} s" -f [math]::Round($swTotal.Elapsed.TotalSeconds)) 'Green'
 }
