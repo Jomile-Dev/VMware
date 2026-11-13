@@ -1251,10 +1251,24 @@ try {
         $policies = @($script:NsxPolicies)
         if ($limitNorm) { $policies = @($policies | Where-Object { $limitNorm.ContainsKey((Get-NormName $_)) }) }
 
-        # Which policy each vRNI app belongs to - by app name, then by FrontEnd SG name (needs the tiers of every app)
-        Initialize-TierCache -Apps $allApps
-        Show-Step 'Matching vRNI apps to DFW policies (app name, then FrontEnd SG name)...'
-        $appPolicy = Resolve-AppPolicies -Apps $allApps
+        # Which policy each vRNI app belongs to - by app name, then by FrontEnd SG name
+        #   no CSV : the tiers of every app are read, so every app can also be matched on its FrontEnd SG
+        #   CSV    : only the listed apps are read in full; apps outside the CSV are matched by name only (no tier reads)
+        if ($limitNorm) {
+            Initialize-TierCache -Apps $apps
+            $listed = @{}
+            foreach ($a in $apps) { $listed[$a.Id] = $true }
+            $appPolicy = @{}
+            foreach ($a in $allApps) {
+                $sgCi = if ($listed.ContainsKey($a.Id)) { Get-AppSgCi -App $a } else { $null }
+                $appPolicy[$a.Id] = Find-DfwPolicy -AppName $a.Name -SgCi $sgCi
+            }
+            Show-Step "CSV run - only the $($apps.Count) listed app(s) are read in full; other apps are matched to policies by name only" 'Yellow'
+        } else {
+            Initialize-TierCache -Apps $allApps
+            Show-Step 'Matching vRNI apps to DFW policies (app name, then FrontEnd SG name)...'
+            $appPolicy = Resolve-AppPolicies -Apps $allApps
+        }
         $matched   = @($apps | Where-Object { $appPolicy[$_.Id] -and $appPolicy[$_.Id] -ne '?' })
 
         if ($wanted) {
