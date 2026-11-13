@@ -48,6 +48,7 @@ $Zones               = @('FrontEnd', 'Management', 'Internal', 'Protected')   # 
 # Create / Sync - which DFW security policies count as applications, and what to do with apps that have no policy
 $NsxPolicyCategories = @('Application')                          # DFW categories to read - blank array = all categories
 $NsxPolicyExclude    = ''                                        # regex of policy names to skip, e.g. '^(Default|Sample)'
+$SkipEmptyPolicies   = $true                                     # Create / Sync - do not add DFW policies with 0 rules to vRNI
 $RemoveOrphans       = $false                                    # Create / Sync - DELETE vRNI apps that have no DFW policy in NSX (asks Y/N/A/Q for each, separately)
 $RemoveExclude       = ''                                        # regex of vRNI app names never to delete, e.g. '^(SDDC Manager|Other App)$'
 $RemoveMaxPercent    = 25                                        # safety - delete nothing if more than this % of all apps would go
@@ -75,6 +76,7 @@ $script:ApproveAll = @{}
 $script:QuitNow    = $false
 $script:NsxSessions = @{}
 $script:NsxPolicies = @()
+$script:PolicyRules = @{}
 $script:NsxGroupTable = $null
 $script:TierCache  = $null
 $script:LookupCache = $null
@@ -654,6 +656,7 @@ function Get-NsxPaged {
 }
 
 # DFW security policy names on one NSX Manager = its application list (default / system policies and excluded names dropped)
+#   also records each policy's rule count in $script:PolicyRules, so empty policies can be skipped
 function Get-NsxPolicyNames {
     param([string]$Server)
     $pol = @(Get-NsxPaged -Server $Server -Path '/policy/api/v1/infra/domains/default/security-policies')
@@ -661,6 +664,14 @@ function Get-NsxPolicyNames {
         if ($x.is_default -or $x._system_owned) { continue }
         if ($NsxPolicyCategories.Count -gt 0 -and $NsxPolicyCategories -notcontains $x.category) { continue }
         if ($NsxPolicyExclude -and $x.display_name -match $NsxPolicyExclude) { continue }
+        # Rule count - NSX returns rule_count with each policy; if it is missing, ask for the policy's rules (1 per page)
+        $cnt = $null
+        if ($x.PSObject.Properties.Name -contains 'rule_count') { $cnt = [int]$x.rule_count }
+        elseif ($SkipEmptyPolicies -and $x.id) {
+            try { $cnt = [int](Invoke-Nsx -Server $Server -Path "/policy/api/v1/infra/domains/default/security-policies/$($x.id)/rules?page_size=1").result_count } catch { $cnt = $null }
+        }
+        # Same policy name on two NSX Managers - it has rules if either copy has
+        if ($null -ne $cnt) { $prev = 0; if ($script:PolicyRules.ContainsKey($x.display_name)) { $prev = $script:PolicyRules[$x.display_name] }; $script:PolicyRules[$x.display_name] = $prev + $cnt }
         $x.display_name
     }
     @($names | Where-Object { $_ } | Sort-Object -Unique)
@@ -719,6 +730,8 @@ function Initialize-Nsx {
             if ($script:PolicyByNorm.ContainsKey($k) -and $script:PolicyByNorm[$k] -ne $x) { $script:PolicyByNorm[$k] = '?' } else { $script:PolicyByNorm[$k] = $x }
         }
         Show-Step "DFW policies loaded: $($script:NsxPolicies.Count) from $($servers.Count) NSX Manager(s)" 'Green'
+        $empty = @($script:NsxPolicies | Where-Object { $script:PolicyRules.ContainsKey($_) -and $script:PolicyRules[$_] -eq 0 })
+        if ($empty.Count -gt 0) { Show-Step "  $($empty.Count) of them have 0 rules$(if ($SkipEmptyPolicies) { ' - they will not be added to vRNI' })" 'Yellow' }
     }
     if ($groupsOk) { $script:NsxGroupTable = $groups; Show-Step "NSX groups loaded: $($groups.Count) from $($servers.Count) NSX Manager(s)" 'Green' }
 }
@@ -1104,6 +1117,7 @@ function Invoke-UpdateStep {
 }
 
 # Create step - a new vRNI app for every DFW policy that no vRNI app belongs to (Create and Sync)
+#   policies with 0 rules are skipped when $SkipEmptyPolicies is on (they still count as a policy, so their vRNI apps are not orphans)
 function Invoke-CreateStep {
     param([string[]]$Policies, $AppPolicy, $AllApps, $Report, [switch]$QuietExisting)
     $owned = @{}
@@ -1119,6 +1133,10 @@ function Invoke-CreateStep {
                 $Report.Add((New-Row $pn 'None' '' '' '' '' 'Already in vRNI' "vRNI name: $($owned[$pn])"))
             }
             continue
+        }
+        if ($SkipEmptyPolicies -and $script:PolicyRules.ContainsKey($pn) -and $script:PolicyRules[$pn] -eq 0) {
+            Write-Host "SKIP   : $pn (DFW policy has 0 rules)" -ForegroundColor DarkYellow
+            $Report.Add((New-Row $pn 'None' '' '' '' '' 'Skipped - 0 rules' 'DFW policy has no rules - not added to vRNI')); continue
         }
         try { foreach ($r in (New-AppFromPolicy -Name $pn -NsxGroups $script:NsxGroupTable)) { $Report.Add($r) } }
         catch { $Report.Add((New-Row $pn 'Error' '' '' '' '' 'Failed' "$_")); Write-Host "ERROR  : $pn - $_" -ForegroundColor Red }
