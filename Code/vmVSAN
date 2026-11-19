@@ -1,6 +1,7 @@
 # VMware PowerCLI Script to get ALL VMs with storage location and actual storage usage
 # Reports whether each VM is on SAN, vSAN, NFS, other storage, or a mix
 # Loops through multiple vCenter Servers
+# Includes network (portgroup) names per VM
 # Optimized for performance
 
 # vCenter Servers to process (replace with your vCenter details)
@@ -201,6 +202,22 @@ foreach ($vCenterServer in $vCenterServers) {
 
             $storageBreakdown = Get-VMStorageBreakdown -VM $vm -DatastoreInfo $datastoreInfo
 
+            # Get network names
+            $networkNames = "None"
+            try {
+                $networkAdapters = Get-NetworkAdapter -VM $vm -Server $viServer -ErrorAction Stop
+                if ($networkAdapters) {
+                    $networkList = $networkAdapters | Select-Object -ExpandProperty NetworkName | Where-Object { $_ }
+                    if ($networkList) {
+                        $networkNames = ($networkList | Select-Object -Unique) -join ", "
+                    }
+                }
+            }
+            catch {
+                Write-Warning "Error getting network adapters for $($vm.Name): $($_.Exception.Message)"
+                $networkNames = "Error"
+            }
+
             $vmResults += [PSCustomObject]@{
                 vCenter              = $vCenterServer
                 VMName               = $vm.Name
@@ -240,6 +257,7 @@ foreach ($vCenterServer in $vCenterServers) {
                 # Metadata
                 Host                 = $vm.VMHost.Name
                 Cluster              = (Get-Cluster -VM $vm -Server $viServer).Name
+                Networks             = $networkNames
             }
         }
 
@@ -257,7 +275,7 @@ foreach ($vCenterServer in $vCenterServers) {
 
 # Display results
 Write-Host "`nAll VMs (showing storage location and actual used/provisioned space):" -ForegroundColor Yellow
-$vmResults | Sort-Object vCenter, StorageLocation, VMName | Format-Table vCenter, VMName, StorageLocation, PowerState, CPUs, MemoryGB, vSAN_UsedGB, SAN_UsedGB, Total_UsedGB, Total_ProvisionedGB -AutoSize
+$vmResults | Sort-Object vCenter, StorageLocation, VMName | Format-Table vCenter, VMName, StorageLocation, Networks, PowerState, CPUs, MemoryGB, vSAN_UsedGB, SAN_UsedGB, Total_UsedGB, Total_ProvisionedGB -AutoSize
 
 # Export to CSV (all vCenters combined)
 $exportPath = "C:\temp\VM_Storage_Location_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
